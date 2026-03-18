@@ -1,4 +1,5 @@
 import { Feather } from "@expo/vector-icons";
+import Slider from "@react-native-community/slider";
 import * as Haptics from "expo-haptics";
 import React, { useState } from "react";
 import {
@@ -129,6 +130,56 @@ function PillSelector({
             </Pressable>
           );
         })}
+      </View>
+    </View>
+  );
+}
+
+function SliderSetting({
+  label,
+  value,
+  min,
+  max,
+  step,
+  onChange,
+  displayValue,
+  hint,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (v: number) => void;
+  displayValue: string;
+  hint: string;
+}) {
+  return (
+    <View style={styles.sliderSetting}>
+      <View style={styles.sliderHeader}>
+        <Text style={styles.settingLabel}>{label}</Text>
+        <View style={styles.sliderValueBadge}>
+          <Text style={styles.sliderValueText}>{displayValue}</Text>
+        </View>
+      </View>
+      <Slider
+        style={styles.slider}
+        minimumValue={min}
+        maximumValue={max}
+        step={step}
+        value={value}
+        onValueChange={(v) => {
+          onChange(Math.round(v / step) * step);
+        }}
+        onSlidingComplete={() => Haptics.selectionAsync()}
+        minimumTrackTintColor={C.gold}
+        maximumTrackTintColor={C.border}
+        thumbTintColor={C.gold}
+      />
+      <View style={styles.sliderRange}>
+        <Text style={styles.sliderRangeText}>{min} pips</Text>
+        <Text style={styles.sliderHint}>{hint}</Text>
+        <Text style={styles.sliderRangeText}>{max} pips</Text>
       </View>
     </View>
   );
@@ -376,20 +427,20 @@ export default function SettingsScreen() {
 
             <View style={styles.cascadeDivider} />
 
-            <SettingRow
+            <PillSelector
               label="Number of positions"
-              hint="How many orders to place per cascade"
+              hint="Total orders per cascade (1 market + limits)"
+              options={[1, 2, 3, 4, 5]}
               value={cs.numPositions}
-              display={String(cs.numPositions)}
-              onDec={() => updateSettings({ numPositions: Math.max(1, cs.numPositions - 1) })}
-              onInc={() => updateSettings({ numPositions: Math.min(10, cs.numPositions + 1) })}
+              onChange={(v) => updateSettings({ numPositions: v })}
+              suffix=""
             />
 
             <View style={styles.cascadeDivider} />
 
             <PillSelector
               label="Pips between orders"
-              hint={`${(cs.pipsBetween * 0.10).toFixed(2)} price gap per level`}
+              hint={`${(cs.pipsBetween * 0.10).toFixed(2)} price gap between each level`}
               options={[5, 10, 15, 20]}
               value={cs.pipsBetween}
               onChange={(v) => updateSettings({ pipsBetween: v })}
@@ -397,22 +448,26 @@ export default function SettingsScreen() {
 
             <View style={styles.cascadeDivider} />
 
-            <PillSelector
+            <SliderSetting
               label="Stop loss"
-              hint={`${(cs.slPips * 0.10).toFixed(2)} below/above last entry — same on all orders`}
-              options={[10, 20, 30, 50]}
               value={cs.slPips}
+              min={10}
+              max={200}
+              step={5}
               onChange={(v) => updateSettings({ slPips: v })}
+              displayValue={`${cs.slPips} pips`}
+              hint={`${(cs.slPips * 0.10).toFixed(2)} — same on all orders`}
             />
 
             <View style={styles.cascadePreviewBox}>
-              <Text style={styles.cascadePreviewTitle}>Example with current settings</Text>
+              <Text style={styles.cascadePreviewTitle}>Preview with current settings (buy example)</Text>
               <Text style={styles.cascadePreviewText}>
-                {`If first entry = 5058.00 (buy):\n`}
-                {Array.from({ length: cs.numPositions }, (_, i) =>
-                  `  Entry ${i + 1}: ${(5058 - i * cs.pipsBetween * 0.10).toFixed(2)}`
+                {`#1  Market  @ 5058.00  ← instant\n`}
+                {Array.from({ length: cs.numPositions - 1 }, (_, i) =>
+                  `#${i + 2}  Limit   @ ${(5058 - (i + 1) * cs.pipsBetween * 0.10).toFixed(2)}`
                 ).join("\n")}
-                {`\n  Stop Loss: ${(5058 - (cs.numPositions - 1) * cs.pipsBetween * 0.10 - cs.slPips * 0.10).toFixed(2)}`}
+                {cs.numPositions > 1 ? "\n" : ""}
+                {`SL  ${(5058 - (cs.numPositions - 1) * cs.pipsBetween * 0.10 - cs.slPips * 0.10).toFixed(2)}  ← all orders`}
               </Text>
             </View>
           </View>
@@ -739,6 +794,50 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_700Bold",
     color: C.gold,
     paddingHorizontal: 4,
+  },
+  sliderSetting: {
+    paddingVertical: 14,
+    gap: 6,
+  },
+  sliderHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  sliderValueBadge: {
+    backgroundColor: C.surface,
+    borderRadius: 20,
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderWidth: 1,
+    borderColor: C.gold,
+  },
+  sliderValueText: {
+    fontSize: 13,
+    fontFamily: "Inter_700Bold",
+    color: C.gold,
+  },
+  slider: {
+    width: "100%",
+    height: 36,
+  },
+  sliderRange: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginTop: -4,
+  },
+  sliderRangeText: {
+    fontSize: 11,
+    fontFamily: "Inter_400Regular",
+    color: C.textMuted,
+  },
+  sliderHint: {
+    fontSize: 11,
+    fontFamily: "Inter_400Regular",
+    color: C.textSecondary,
+    textAlign: "center",
+    flex: 1,
   },
   pillGroup: {
     flexDirection: "row",
