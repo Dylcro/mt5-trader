@@ -2,8 +2,9 @@ import { Router, type IRouter, type Request, type Response } from "express";
 
 const router: IRouter = Router();
 
-const PROVISIONING_BASE = "https://mt-provisioning-api-v1.agiliumtrade.ai";
-const CLIENT_BASE = "https://mt-client-api-v1.london.agiliumtrade.ai";
+const PROVISIONING_BASE = "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai";
+const CLIENT_DOMAIN = "agiliumtrade.ai";
+const DEFAULT_REGION = "london";
 
 function getToken(): string {
   const token = process.env.METAAPI_TOKEN;
@@ -15,21 +16,44 @@ function authHeaders(token: string) {
   return { "auth-token": token, "Content-Type": "application/json" };
 }
 
+function clientBase(region: string = DEFAULT_REGION): string {
+  return `https://mt-client-api-v1.${region}.${CLIENT_DOMAIN}`;
+}
+
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+interface ProvisioningAccount {
+  id?: string;
+  region?: string;
+  connectionStatus?: string;
+  state?: string;
+  message?: string;
+}
+
+async function getProvisioningAccount(token: string, accountId: string): Promise<ProvisioningAccount> {
+  const res = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
+    headers: authHeaders(token),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({})) as { message?: string };
+    throw new Error(err.message ?? `Account lookup failed: ${res.status}`);
+  }
+  return res.json() as Promise<ProvisioningAccount>;
 }
 
 async function waitForConnection(token: string, accountId: string, timeoutMs = 90000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await sleep(5000);
-    const res = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
-      headers: authHeaders(token),
-    });
-    if (!res.ok) continue;
-    const data = await res.json() as { connectionStatus?: string; state?: string };
-    if (data.connectionStatus === "CONNECTED") return true;
-    if (data.state === "DEPLOY_FAILED") return false;
+    try {
+      const data = await getProvisioningAccount(token, accountId);
+      if (data.connectionStatus === "CONNECTED") return true;
+      if (data.state === "DEPLOY_FAILED") return false;
+    } catch {
+      // ignore transient errors during polling
+    }
   }
   return false;
 }
@@ -41,9 +65,9 @@ async function deployAccount(token: string, accountId: string): Promise<void> {
   });
 }
 
-async function getAccountInfo(token: string, accountId: string) {
+async function getAccountInfo(token: string, accountId: string, region: string = DEFAULT_REGION) {
   const res = await fetch(
-    `${CLIENT_BASE}/users/current/accounts/${accountId}/account-information`,
+    `${clientBase(region)}/users/current/accounts/${accountId}/account-information`,
     { headers: authHeaders(token) }
   );
   if (!res.ok) {
@@ -67,17 +91,16 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
     };
 
     let accountId: string;
+    let region: string = DEFAULT_REGION;
 
     if (existingId) {
       // Reconnect existing account — check its state and deploy if needed
       accountId = existingId;
-      const statusRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
-        headers: authHeaders(token),
-      });
-      if (!statusRes.ok) {
+      const status = await getProvisioningAccount(token, accountId).catch(() => null);
+      if (!status) {
         return res.status(404).json({ error: "Account not found. Please log in again." });
       }
-      const status = await statusRes.json() as { connectionStatus?: string; state?: string };
+      region = status.region ?? DEFAULT_REGION;
       if (status.connectionStatus !== "CONNECTED") {
         await deployAccount(token, accountId);
         const connected = await waitForConnection(token, accountId);
@@ -105,15 +128,16 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         }),
       });
 
-      const created = await createRes.json() as { id?: string; message?: string };
+      const created = await createRes.json() as ProvisioningAccount;
       if (!createRes.ok || !created.id) {
         return res.status(createRes.status).json({
           error: created.message ?? "Failed to create account. Check your login details and server name.",
         });
       }
       accountId = created.id;
+      region = created.region ?? DEFAULT_REGION;
 
-      // Deploy the account
+      // Deploy the account and wait for connection
       await deployAccount(token, accountId);
       const connected = await waitForConnection(token, accountId);
       if (!connected) {
@@ -121,15 +145,15 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
           method: "DELETE",
           headers: authHeaders(token),
-        });
+        }).catch(() => {});
         return res.status(503).json({
           error: "Could not connect to MT5. Please check your credentials and server name.",
         });
       }
     }
 
-    // Fetch account info
-    const info = await getAccountInfo(token, accountId) as {
+    // Fetch account info using the correct regional client URL
+    const info = await getAccountInfo(token, accountId, region) as {
       balance?: number;
       equity?: number;
       margin?: number;
@@ -141,6 +165,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
 
     return res.json({
       accountId,
+      region,
       name: info.name ?? `Account ${accountId.slice(0, 6)}`,
       balance: info.balance ?? 0,
       equity: info.equity ?? 0,
@@ -170,23 +195,25 @@ router.post("/mt5/account/:accountId/disconnect", async (req: Request, res: Resp
   }
 });
 
-// GET /api/mt5/account/:accountId/info
+// GET /api/mt5/account/:accountId/info?region=london
 router.get("/mt5/account/:accountId/info", async (req: Request, res: Response) => {
   try {
     const token = getToken();
-    const info = await getAccountInfo(token, req.params.accountId);
+    const region = (req.query.region as string) || DEFAULT_REGION;
+    const info = await getAccountInfo(token, req.params.accountId, region);
     return res.json(info);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
   }
 });
 
-// GET /api/mt5/account/:accountId/price
+// GET /api/mt5/account/:accountId/price?region=london
 router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) => {
   try {
     const token = getToken();
+    const region = (req.query.region as string) || DEFAULT_REGION;
     const priceRes = await fetch(
-      `${CLIENT_BASE}/users/current/accounts/${req.params.accountId}/symbols/XAUUSD/current-price`,
+      `${clientBase(region)}/users/current/accounts/${req.params.accountId}/symbols/XAUUSD/current-price`,
       { headers: authHeaders(token) }
     );
     if (!priceRes.ok) return res.status(priceRes.status).json({ error: "Price fetch failed" });
@@ -196,12 +223,13 @@ router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) 
   }
 });
 
-// GET /api/mt5/account/:accountId/positions
+// GET /api/mt5/account/:accountId/positions?region=london
 router.get("/mt5/account/:accountId/positions", async (req: Request, res: Response) => {
   try {
     const token = getToken();
+    const region = (req.query.region as string) || DEFAULT_REGION;
     const posRes = await fetch(
-      `${CLIENT_BASE}/users/current/accounts/${req.params.accountId}/positions`,
+      `${clientBase(region)}/users/current/accounts/${req.params.accountId}/positions`,
       { headers: authHeaders(token) }
     );
     if (!posRes.ok) return res.status(posRes.status).json({ error: "Positions fetch failed" });
@@ -211,12 +239,13 @@ router.get("/mt5/account/:accountId/positions", async (req: Request, res: Respon
   }
 });
 
-// POST /api/mt5/account/:accountId/trade
+// POST /api/mt5/account/:accountId/trade?region=london
 router.post("/mt5/account/:accountId/trade", async (req: Request, res: Response) => {
   try {
     const token = getToken();
+    const region = (req.query.region as string) || DEFAULT_REGION;
     const tradeRes = await fetch(
-      `${CLIENT_BASE}/users/current/accounts/${req.params.accountId}/trade`,
+      `${clientBase(region)}/users/current/accounts/${req.params.accountId}/trade`,
       {
         method: "POST",
         headers: authHeaders(token),

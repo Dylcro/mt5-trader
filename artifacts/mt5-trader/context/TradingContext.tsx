@@ -104,10 +104,13 @@ function resolveApiBase(): string {
 const API_BASE = resolveApiBase();
 console.log("[API] base:", API_BASE);
 
+const DEFAULT_REGION = "london";
+
 const TradingContext = createContext<TradingContextValue | null>(null);
 
 export function TradingProvider({ children }: { children: React.ReactNode }) {
   const [accountId, setAccountIdState] = useState("");
+  const [region, setRegionState] = useState(DEFAULT_REGION);
   const [credentials, setCredentialsState] = useState<Mt5Credentials>({
     login: "",
     password: "",
@@ -124,13 +127,15 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
   // Load saved credentials + accountId on startup and auto-reconnect
   useEffect(() => {
-    AsyncStorage.multiGet(["mt5_login", "mt5_server", "mt5_account_id"]).then((pairs) => {
+    AsyncStorage.multiGet(["mt5_login", "mt5_server", "mt5_account_id", "mt5_region"]).then((pairs) => {
       const login = pairs[0][1] ?? "";
       const server = pairs[1][1] ?? "";
       const savedAccountId = pairs[2][1] ?? "";
+      const savedRegion = pairs[3][1] ?? DEFAULT_REGION;
       if (login) setCredentialsState((prev) => ({ ...prev, login, server }));
       if (savedAccountId) {
         setAccountIdState(savedAccountId);
+        setRegionState(savedRegion);
         // Auto-reconnect silently
         reconnectSaved(savedAccountId);
       }
@@ -146,9 +151,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ accountId: savedId }),
       });
-      const data = await res.json() as { error?: string; accountId?: string } & Partial<AccountInfo>;
+      const data = await res.json() as { error?: string; accountId?: string; region?: string } & Partial<AccountInfo>;
       if (!res.ok || data.error) throw new Error(data.error ?? "Reconnect failed");
-      setAccountIdState(data.accountId ?? savedId);
+      const accId = data.accountId ?? savedId;
+      const accRegion = data.region ?? DEFAULT_REGION;
+      setAccountIdState(accId);
+      setRegionState(accRegion);
+      await AsyncStorage.setItem("mt5_region", accRegion);
       setAccountInfo({
         balance: data.balance ?? 0,
         equity: data.equity ?? 0,
@@ -159,7 +168,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         name: data.name ?? "Account",
       });
       setStatus("connected");
-      startPolling(data.accountId ?? savedId);
+      startPolling(accId, accRegion);
     } catch {
       setStatus("disconnected");
       setAccountIdState("");
@@ -175,8 +184,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     ]);
   }, []);
 
-  const fetchPriceData = useCallback(async (accId: string): Promise<Price> => {
-    const res = await fetch(`${API_BASE}/mt5/account/${accId}/price`);
+  const fetchPriceData = useCallback(async (accId: string, accRegion: string): Promise<Price> => {
+    const res = await fetch(`${API_BASE}/mt5/account/${accId}/price?region=${accRegion}`);
     if (!res.ok) throw new Error(`Price fetch failed: ${res.status}`);
     const data = await res.json() as { bid?: number; ask?: number; time?: string };
     const bid = data.bid ?? 0;
@@ -189,8 +198,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
-  const fetchPositionsData = useCallback(async (accId: string): Promise<Position[]> => {
-    const res = await fetch(`${API_BASE}/mt5/account/${accId}/positions`);
+  const fetchPositionsData = useCallback(async (accId: string, accRegion: string): Promise<Position[]> => {
+    const res = await fetch(`${API_BASE}/mt5/account/${accId}/positions?region=${accRegion}`);
     if (!res.ok) throw new Error(`Positions fetch failed: ${res.status}`);
     const data = await res.json() as unknown[];
     return (Array.isArray(data) ? data : []).map((p) => {
@@ -211,8 +220,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
-  const fetchAccountInfoData = useCallback(async (accId: string): Promise<AccountInfo> => {
-    const res = await fetch(`${API_BASE}/mt5/account/${accId}/info`);
+  const fetchAccountInfoData = useCallback(async (accId: string, accRegion: string): Promise<AccountInfo> => {
+    const res = await fetch(`${API_BASE}/mt5/account/${accId}/info?region=${accRegion}`);
     if (!res.ok) throw new Error(`Account info failed: ${res.status}`);
     const data = await res.json() as Record<string, unknown>;
     return {
@@ -227,12 +236,12 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const startPolling = useCallback(
-    (accId: string) => {
+    (accId: string, accRegion: string) => {
       if (priceIntervalRef.current) clearInterval(priceIntervalRef.current);
       if (positionsIntervalRef.current) clearInterval(positionsIntervalRef.current);
 
-      const pollPrice = () => fetchPriceData(accId).then(setPrice).catch(() => {});
-      const pollPositions = () => fetchPositionsData(accId).then(setPositions).catch(() => {});
+      const pollPrice = () => fetchPriceData(accId, accRegion).then(setPrice).catch(() => {});
+      const pollPositions = () => fetchPositionsData(accId, accRegion).then(setPositions).catch(() => {});
 
       pollPrice();
       pollPositions();
@@ -275,12 +284,17 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         } catch (netErr) {
           throw new Error(`Cannot reach server at ${connectUrl}. Check your connection. (${netErr instanceof Error ? netErr.message : netErr})`);
         }
-        const data = await res.json() as { error?: string; accountId?: string } & Partial<AccountInfo>;
+        const data = await res.json() as { error?: string; accountId?: string; region?: string } & Partial<AccountInfo>;
         if (!res.ok || data.error) throw new Error(data.error ?? "Connection failed");
 
         const accId = data.accountId!;
+        const accRegion = data.region ?? DEFAULT_REGION;
         setAccountIdState(accId);
-        await AsyncStorage.setItem("mt5_account_id", accId);
+        setRegionState(accRegion);
+        await AsyncStorage.multiSet([
+          ["mt5_account_id", accId],
+          ["mt5_region", accRegion],
+        ]);
         setAccountInfo({
           balance: data.balance ?? 0,
           equity: data.equity ?? 0,
@@ -291,7 +305,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           name: data.name ?? "Account",
         });
         setStatus("connected");
-        startPolling(accId);
+        startPolling(accId, accRegion);
       } catch (err) {
         setStatus("error");
         setErrorMsg(err instanceof Error ? err.message : "Connection failed");
@@ -307,8 +321,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         await fetch(`${API_BASE}/mt5/account/${accountId}/disconnect`, { method: "POST" });
       } catch {}
     }
-    await AsyncStorage.removeItem("mt5_account_id");
+    await AsyncStorage.multiRemove(["mt5_account_id", "mt5_region"]);
     setAccountIdState("");
+    setRegionState(DEFAULT_REGION);
     setStatus("disconnected");
     setAccountInfo(null);
     setPositions([]);
@@ -318,18 +333,18 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
   const refreshPrice = useCallback(async () => {
     if (status !== "connected" || !accountId) return;
-    try { setPrice(await fetchPriceData(accountId)); } catch {}
-  }, [status, accountId, fetchPriceData]);
+    try { setPrice(await fetchPriceData(accountId, region)); } catch {}
+  }, [status, accountId, region, fetchPriceData]);
 
   const refreshPositions = useCallback(async () => {
     if (status !== "connected" || !accountId) return;
-    try { setPositions(await fetchPositionsData(accountId)); } catch {}
-  }, [status, accountId, fetchPositionsData]);
+    try { setPositions(await fetchPositionsData(accountId, region)); } catch {}
+  }, [status, accountId, region, fetchPositionsData]);
 
   const refreshAccountInfo = useCallback(async () => {
     if (status !== "connected" || !accountId) return;
-    try { setAccountInfo(await fetchAccountInfoData(accountId)); } catch {}
-  }, [status, accountId, fetchAccountInfoData]);
+    try { setAccountInfo(await fetchAccountInfoData(accountId, region)); } catch {}
+  }, [status, accountId, region, fetchAccountInfoData]);
 
   const placeTrade = useCallback(
     async (params: PlaceTradeParams): Promise<{ success: boolean; message: string }> => {
@@ -350,7 +365,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         if (params.limitPrice != null) body.openPrice = params.limitPrice;
         if (params.stopLoss != null) body.stopLoss = params.stopLoss;
         if (params.takeProfit != null) body.takeProfit = params.takeProfit;
-        const res = await fetch(`${API_BASE}/mt5/account/${accountId}/trade`, {
+        const res = await fetch(`${API_BASE}/mt5/account/${accountId}/trade?region=${region}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
@@ -366,7 +381,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         return { success: false, message: err instanceof Error ? err.message : "Trade failed" };
       }
     },
-    [status, accountId, refreshPositions, refreshAccountInfo]
+    [status, accountId, region, refreshPositions, refreshAccountInfo]
   );
 
   const placeCascadeOrders = useCallback(
@@ -412,7 +427,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     async (positionId: string): Promise<{ success: boolean; message: string }> => {
       if (status !== "connected") return { success: false, message: "Not connected" };
       try {
-        const res = await fetch(`${API_BASE}/mt5/account/${accountId}/trade`, {
+        const res = await fetch(`${API_BASE}/mt5/account/${accountId}/trade?region=${region}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ actionType: "POSITION_CLOSE_ID", positionId }),
@@ -426,7 +441,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         return { success: false, message: err instanceof Error ? err.message : "Close failed" };
       }
     },
-    [status, accountId, refreshPositions, refreshAccountInfo]
+    [status, accountId, region, refreshPositions, refreshAccountInfo]
   );
 
   return (

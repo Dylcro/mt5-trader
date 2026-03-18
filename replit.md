@@ -91,6 +91,28 @@ Generated Zod schemas from the OpenAPI spec (e.g. `HealthCheckResponse`). Used b
 
 Generated React Query hooks and fetch client from the OpenAPI spec (e.g. `useHealthCheck`, `healthCheck`).
 
+### `artifacts/mt5-trader` (`@workspace/mt5-trader`)
+
+Expo React Native mobile app for trading XAUUSD (Gold) on MetaTrader 5 via MetaAPI.
+
+- Dark theme: gold `#C9A84C`, buy `#0ECB81`, sell `#F6465D`
+- Features: live price feed, cascade ladder orders, single buy/sell, positions viewer
+- Key files: `app/(tabs)/index.tsx` (trading), `app/(tabs)/positions.tsx`, `app/(tabs)/settings.tsx`
+- State: `context/TradingContext.tsx` — all API calls, connection state, region-aware
+- Settings: `hooks/useCascadeSettings.ts`
+- API URL baked in via `EXPO_PUBLIC_API_URL=https://$REPLIT_DEV_DOMAIN/api`
+
+### MetaAPI Integration (api-server)
+
+The API server proxies MetaTrader 5 operations through MetaAPI Cloud.
+
+**Critical DNS note**: From the Replit environment, `mt-provisioning-api-v1.agiliumtrade.ai` does NOT resolve (ENOTFOUND). Use the correct URL: `mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai` (double subdomain — this is MetaAPI's current working hostname). The client API `mt-client-api-v1.{region}.agiliumtrade.ai` resolves fine.
+
+- Provisioning base: `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai`
+- Client base: `https://mt-client-api-v1.{region}.agiliumtrade.ai`
+- Region is returned from `/connect` and stored in AsyncStorage; passed as `?region=` query param on all subsequent calls
+- `METAAPI_TOKEN` env secret is required
+
 ### `scripts` (`@workspace/scripts`)
 
 Utility scripts package. Each script is a `.ts` file in `src/` with a corresponding npm script in `package.json`. Run scripts via `pnpm --filter @workspace/scripts run <script>`. Scripts can import any workspace package (e.g., `@workspace/db`) by adding it as a dependency in `scripts/package.json`.
