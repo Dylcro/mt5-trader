@@ -239,6 +239,48 @@ router.get("/mt5/account/:accountId/positions", async (req: Request, res: Respon
   }
 });
 
+// MT5 trade return code map — https://www.mql5.com/en/docs/constants/errorswarnings/enum_trade_return_codes
+const TRADE_SUCCESS_CODES = new Set([10008, 10009, 10010]);
+const TRADE_ERROR_MESSAGES: Record<number, string> = {
+  10004: "Requote — price changed before execution. Please retry.",
+  10006: "Order rejected by the broker.",
+  10007: "Order cancelled.",
+  10011: "Trade request processing error.",
+  10012: "Trade request timed out. Please retry.",
+  10013: "Invalid trade request.",
+  10014: "Invalid trade volume.",
+  10015: "Invalid trade price.",
+  10016: "Invalid stop loss or take profit level.",
+  10017: "Trading is disabled for this account.",
+  10018: "Market is closed. Please try during trading hours.",
+  10019: "Insufficient funds. Please top up your account.",
+  10020: "Price changed — no longer valid. Please retry.",
+  10021: "No quotes available. Please retry shortly.",
+  10022: "Invalid order expiration date.",
+  10023: "Order state changed.",
+  10024: "Too many requests — please wait before retrying.",
+  10025: "No changes in the trade request.",
+  10026: "Automated trading disabled by the server.",
+  10027: "Automated trading disabled by the client terminal.",
+  10028: "Order is locked for processing.",
+  10029: "Order or position is frozen.",
+  10030: "Invalid order filling type.",
+  10031: "No connection to the trade server.",
+  10032: "Operation allowed only for live accounts.",
+  10033: "Pending order limit reached.",
+  10034: "Total volume limit for orders/positions reached.",
+  10035: "Invalid or prohibited order type.",
+  10036: "Position already closed.",
+  10038: "Close volume exceeds current position volume.",
+  10039: "A close order already exists for this position.",
+  10040: "Maximum number of open positions reached.",
+  10041: "Pending order activation request rejected.",
+  10042: "Only long (buy) positions allowed for this symbol.",
+  10043: "Only short (sell) positions allowed for this symbol.",
+  10044: "Only position closing allowed for this symbol.",
+  10045: "Positions can only be closed in FIFO order.",
+};
+
 // POST /api/mt5/account/:accountId/trade?region=london
 router.post("/mt5/account/:accountId/trade", async (req: Request, res: Response) => {
   try {
@@ -252,10 +294,21 @@ router.post("/mt5/account/:accountId/trade", async (req: Request, res: Response)
         body: JSON.stringify(req.body),
       }
     );
-    const data = await tradeRes.json();
-    return res.status(tradeRes.status).json(data);
+    const data = await tradeRes.json() as { numericCode?: number; message?: string; orderId?: string; positionId?: string };
+    const code = data.numericCode ?? 0;
+    const success = TRADE_SUCCESS_CODES.has(code);
+    const errorMessage = success
+      ? undefined
+      : (TRADE_ERROR_MESSAGES[code] ?? data.message ?? `Trade failed (code ${code})`);
+    return res.status(tradeRes.ok ? 200 : tradeRes.status).json({
+      success,
+      code,
+      message: success ? "Trade executed successfully" : errorMessage,
+      orderId: data.orderId,
+      positionId: data.positionId,
+    });
   } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : "Trade failed" });
+    return res.status(500).json({ success: false, code: 0, message: err instanceof Error ? err.message : "Trade failed" });
   }
 });
 

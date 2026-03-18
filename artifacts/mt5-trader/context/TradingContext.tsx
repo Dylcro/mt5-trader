@@ -370,13 +370,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
-        const data = await res.json() as { numericCode?: number; message?: string };
-        if (!res.ok || data.numericCode === 10006) {
-          return { success: false, message: data.message ?? `Trade failed: ${res.status}` };
+        const data = await res.json() as { success?: boolean; code?: number; message?: string };
+        if (!res.ok || data.success === false) {
+          return { success: false, message: data.message ?? `Trade failed (code ${data.code ?? res.status})` };
         }
         await refreshPositions();
         await refreshAccountInfo();
-        return { success: true, message: "Trade placed successfully" };
+        return { success: true, message: data.message ?? "Trade placed successfully" };
       } catch (err) {
         return { success: false, message: err instanceof Error ? err.message : "Trade failed" };
       }
@@ -432,8 +432,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ actionType: "POSITION_CLOSE_ID", positionId }),
         });
-        const data = await res.json() as { message?: string };
-        if (!res.ok) return { success: false, message: data.message ?? `Close failed: ${res.status}` };
+        const data = await res.json() as { success?: boolean; code?: number; message?: string };
+        if (!res.ok || data.success === false) return { success: false, message: data.message ?? `Close failed (code ${data.code ?? res.status})` };
         await refreshPositions();
         await refreshAccountInfo();
         return { success: true, message: "Position closed" };
