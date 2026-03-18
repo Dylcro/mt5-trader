@@ -23,14 +23,22 @@ import { useCascadeSettings } from "@/hooks/useCascadeSettings";
 const C = Colors.dark;
 
 const POPULAR_SERVERS = [
+  "Vantage-Live",
+  "Vantage-Demo",
+  "Vantage-Live 2",
+  "Vantage-Demo 2",
+  "VantageFX-Live",
+  "VantageFX-Demo",
+  "VantageFX-Live 2",
+  "VantageFX-Demo 2",
+  "VantageInternational-Live",
+  "VantageInternational-Demo",
   "MetaQuotes-Demo",
   "Exness-MT5Trial",
   "ICMarketsSC-MT5",
   "XM-MT5",
   "FBS-MT5",
   "Pepperstone-MT5",
-  "Vantage-Live",
-  "Vantage-Demo",
 ];
 
 function InfoRow({ label, value, color }: { label: string; value: string; color?: string }) {
