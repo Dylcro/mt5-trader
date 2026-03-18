@@ -1,0 +1,27 @@
+kind = "mobile"
+previewPath = "/"
+title = "MT5 Trader"
+version = "1.0.0"
+id = "artifacts/mt5-trader"
+router = "expo-domain"
+
+[[integratedSkills]]
+name = "expo"
+version = "1.0.0"
+
+[[services]]
+ensurePreviewReachable = "/status"
+localPort = 20362
+name = "expo"
+paths = ["/"]
+
+[services.development]
+run = "pnpm --filter @workspace/mt5-trader run dev"
+
+[services.env]
+PORT = "20362"
+BASE_PATH = "/"
+
+[services.production]
+build = ["pnpm", "--filter", "@workspace/mt5-trader", "run", "build"]
+run = ["pnpm", "--filter", "@workspace/mt5-trader", "run", "serve"]

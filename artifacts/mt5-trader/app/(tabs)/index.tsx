@@ -1,0 +1,711 @@
+import { Feather, MaterialCommunityIcons } from "@expo/vector-icons";
+import * as Haptics from "expo-haptics";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import {
+  ActivityIndicator,
+  Alert,
+  Animated,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+import Colors from "@/constants/colors";
+import { useTrading, type SLMode } from "@/context/TradingContext";
+
+const C = Colors.dark;
+
+type Direction = "buy" | "sell";
+
+function formatPrice(n: number) {
+  return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function PriceRow({
+  label,
+  value,
+  color,
+  sublabel,
+}: {
+  label: string;
+  value: string;
+  color: string;
+  sublabel?: string;
+}) {
+  return (
+    <View style={styles.priceRow}>
+      <Text style={styles.priceLabel}>{label}</Text>
+      <View style={{ alignItems: "flex-end" }}>
+        <Text style={[styles.priceValue, { color }]}>{value}</Text>
+        {sublabel ? <Text style={styles.priceSublabel}>{sublabel}</Text> : null}
+      </View>
+    </View>
+  );
+}
+
+function StepInput({
+  value,
+  onChange,
+  step,
+  min,
+  max,
+  decimals = 2,
+}: {
+  value: number;
+  onChange: (n: number) => void;
+  step: number;
+  min: number;
+  max: number;
+  decimals?: number;
+}) {
+  const [text, setText] = useState(value.toFixed(decimals));
+
+  useEffect(() => {
+    setText(value.toFixed(decimals));
+  }, [value, decimals]);
+
+  const dec = () => {
+    const next = Math.max(min, parseFloat((value - step).toFixed(decimals)));
+    onChange(next);
+  };
+  const inc = () => {
+    const next = Math.min(max, parseFloat((value + step).toFixed(decimals)));
+    onChange(next);
+  };
+
+  return (
+    <View style={styles.stepRow}>
+      <Pressable style={styles.stepBtn} onPress={dec} hitSlop={8}>
+        <Feather name="minus" size={16} color={C.text} />
+      </Pressable>
+      <TextInput
+        style={styles.stepInput}
+        value={text}
+        onChangeText={setText}
+        keyboardType="decimal-pad"
+        onBlur={() => {
+          const n = parseFloat(text);
+          if (!isNaN(n)) {
+            const clamped = Math.min(max, Math.max(min, n));
+            onChange(parseFloat(clamped.toFixed(decimals)));
+          } else {
+            setText(value.toFixed(decimals));
+          }
+        }}
+        selectTextOnFocus
+        placeholderTextColor={C.textMuted}
+      />
+      <Pressable style={styles.stepBtn} onPress={inc} hitSlop={8}>
+        <Feather name="plus" size={16} color={C.text} />
+      </Pressable>
+    </View>
+  );
+}
+
+type SLOption = { key: SLMode; label: string; icon: string };
+const SL_OPTIONS: SLOption[] = [
+  { key: "points", label: "Points", icon: "trending-down" },
+  { key: "percent", label: "% Risk", icon: "percent" },
+  { key: "manual", label: "Manual", icon: "edit-2" },
+];
+
+function computeSL(
+  mode: SLMode,
+  direction: Direction,
+  entryPrice: number,
+  slPoints: number,
+  slPercent: number,
+  slManual: number,
+  lotSize: number,
+  balance: number
+): number | undefined {
+  if (entryPrice <= 0) return undefined;
+  if (mode === "points") {
+    const dist = slPoints * 0.01;
+    return direction === "buy"
+      ? parseFloat((entryPrice - dist).toFixed(2))
+      : parseFloat((entryPrice + dist).toFixed(2));
+  }
+  if (mode === "percent") {
+    const riskDollars = balance * (slPercent / 100);
+    const distDollars = riskDollars / (lotSize * 100);
+    return direction === "buy"
+      ? parseFloat((entryPrice - distDollars).toFixed(2))
+      : parseFloat((entryPrice + distDollars).toFixed(2));
+  }
+  if (mode === "manual") {
+    return slManual > 0 ? parseFloat(slManual.toFixed(2)) : undefined;
+  }
+  return undefined;
+}
+
+function computeRiskDollars(
+  mode: SLMode,
+  direction: Direction,
+  entryPrice: number,
+  slPoints: number,
+  slPercent: number,
+  slManual: number,
+  lotSize: number,
+  balance: number
+): number {
+  const sl = computeSL(mode, direction, entryPrice, slPoints, slPercent, slManual, lotSize, balance);
+  if (sl == null || entryPrice <= 0) return 0;
+  const dist = Math.abs(entryPrice - sl);
+  return dist * lotSize * 100;
+}
+
+export default function TradeScreen() {
+  const insets = useSafeAreaInsets();
+  const { status, price, accountInfo, placeTrade, refreshPrice } = useTrading();
+
+  const [direction, setDirection] = useState<Direction>("buy");
+  const [lotSize, setLotSize] = useState(0.01);
+  const [slMode, setSlMode] = useState<SLMode>("points");
+  const [slPoints, setSlPoints] = useState(200);
+  const [slPercent, setSlPercent] = useState(1);
+  const [slManual, setSlManual] = useState(0);
+  const [slManualText, setSlManualText] = useState("");
+  const [isPlacing, setIsPlacing] = useState(false);
+
+  const blinkAnim = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(blinkAnim, { toValue: 0.3, duration: 600, useNativeDriver: true }),
+        Animated.timing(blinkAnim, { toValue: 1, duration: 600, useNativeDriver: true }),
+      ])
+    );
+    if (status === "connected") loop.start();
+    else loop.stop();
+    return () => loop.stop();
+  }, [status, blinkAnim]);
+
+  const entryPrice = direction === "buy" ? (price?.ask ?? 0) : (price?.bid ?? 0);
+  const balance = accountInfo?.balance ?? 10000;
+  const sl = computeSL(slMode, direction, entryPrice, slPoints, slPercent, slManual, lotSize, balance);
+  const riskDollars = computeRiskDollars(slMode, direction, entryPrice, slPoints, slPercent, slManual, lotSize, balance);
+
+  const handleTrade = useCallback(async () => {
+    if (isPlacing) return;
+    if (status !== "connected") {
+      Alert.alert("Not Connected", "Please connect your MetaAPI account in Settings first.");
+      return;
+    }
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    setIsPlacing(true);
+    const result = await placeTrade({ direction, volume: lotSize, stopLoss: sl });
+    setIsPlacing(false);
+    if (result.success) {
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      Alert.alert("Order Placed", result.message);
+    } else {
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      Alert.alert("Order Failed", result.message);
+    }
+  }, [isPlacing, status, direction, lotSize, sl, placeTrade]);
+
+  const webTopPad = Platform.OS === "web" ? 67 : 0;
+
+  return (
+    <View style={[styles.container, { paddingTop: insets.top + webTopPad }]}>
+      {/* Header */}
+      <View style={styles.header}>
+        <View style={styles.headerLeft}>
+          <Text style={styles.symbol}>XAUUSD</Text>
+          <View style={styles.liveDot}>
+            <Animated.View style={[styles.dot, { opacity: status === "connected" ? blinkAnim : 0.2 }]} />
+            <Text style={styles.liveLabel}>{status === "connected" ? "LIVE" : status.toUpperCase()}</Text>
+          </View>
+        </View>
+        <Pressable onPress={refreshPrice} hitSlop={12}>
+          <Feather name="refresh-cw" size={18} color={C.textSecondary} />
+        </Pressable>
+      </View>
+
+      <ScrollView
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={[styles.scroll, { paddingBottom: insets.bottom + 100 }]}
+        keyboardShouldPersistTaps="handled"
+      >
+        {/* Price Card */}
+        <View style={styles.card}>
+          {price ? (
+            <>
+              <PriceRow
+                label="BID"
+                value={formatPrice(price.bid)}
+                color={C.sell}
+                sublabel="Sell at"
+              />
+              <View style={styles.divider} />
+              <PriceRow
+                label="ASK"
+                value={formatPrice(price.ask)}
+                color={C.buy}
+                sublabel="Buy at"
+              />
+              <View style={styles.divider} />
+              <PriceRow
+                label="SPREAD"
+                value={`${price.spread} pts`}
+                color={C.textSecondary}
+              />
+            </>
+          ) : (
+            <View style={styles.noPrice}>
+              <MaterialCommunityIcons name="chart-line" size={28} color={C.textMuted} />
+              <Text style={styles.noPriceText}>
+                {status === "connecting" ? "Fetching price..." : "Connect account to see live price"}
+              </Text>
+            </View>
+          )}
+        </View>
+
+        {/* Direction Toggle */}
+        <View style={styles.directionRow}>
+          <Pressable
+            style={[styles.dirBtn, direction === "buy" && styles.dirBtnBuyActive]}
+            onPress={() => { setDirection("buy"); Haptics.selectionAsync(); }}
+          >
+            <Feather name="trending-up" size={18} color={direction === "buy" ? "#000" : C.buy} />
+            <Text style={[styles.dirLabel, direction === "buy" ? styles.dirLabelActiveBuy : { color: C.buy }]}>
+              BUY
+            </Text>
+          </Pressable>
+          <Pressable
+            style={[styles.dirBtn, direction === "sell" && styles.dirBtnSellActive]}
+            onPress={() => { setDirection("sell"); Haptics.selectionAsync(); }}
+          >
+            <Feather name="trending-down" size={18} color={direction === "sell" ? "#fff" : C.sell} />
+            <Text style={[styles.dirLabel, direction === "sell" ? styles.dirLabelActiveSell : { color: C.sell }]}>
+              SELL
+            </Text>
+          </Pressable>
+        </View>
+
+        {/* Lot Size */}
+        <View style={styles.sectionCard}>
+          <View style={styles.sectionHeader}>
+            <Text style={styles.sectionTitle}>Lot Size</Text>
+            <Text style={styles.sectionHint}>1 lot = 100 oz gold</Text>
+          </View>
+          <StepInput
+            value={lotSize}
+            onChange={setLotSize}
+            step={0.01}
+            min={0.01}
+            max={100}
+            decimals={2}
+          />
+        </View>
+
+        {/* Stop Loss */}
+        <View style={styles.sectionCard}>
+          <View style={styles.sectionHeader}>
+            <Text style={styles.sectionTitle}>Stop Loss</Text>
+            <Text style={[styles.sectionHint, { color: C.sell }]}>
+              {sl != null ? `SL: $${formatPrice(sl)}` : "No SL set"}
+            </Text>
+          </View>
+
+          {/* SL Mode Tabs */}
+          <View style={styles.slModeRow}>
+            {SL_OPTIONS.map((opt) => (
+              <Pressable
+                key={opt.key}
+                style={[styles.slModeBtn, slMode === opt.key && styles.slModeBtnActive]}
+                onPress={() => { setSlMode(opt.key); Haptics.selectionAsync(); }}
+              >
+                <Feather
+                  name={opt.icon as any}
+                  size={12}
+                  color={slMode === opt.key ? C.gold : C.textSecondary}
+                />
+                <Text style={[styles.slModeLabel, slMode === opt.key && styles.slModeLabelActive]}>
+                  {opt.label}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+
+          {/* SL Input */}
+          {slMode === "points" && (
+            <View style={styles.slInputArea}>
+              <StepInput value={slPoints} onChange={setSlPoints} step={10} min={10} max={5000} decimals={0} />
+              <Text style={styles.slNote}>
+                {entryPrice > 0 && sl != null
+                  ? `Entry ${formatPrice(entryPrice)} → SL ${formatPrice(sl)}`
+                  : "Connect to see calculated SL"}
+              </Text>
+            </View>
+          )}
+
+          {slMode === "percent" && (
+            <View style={styles.slInputArea}>
+              <StepInput value={slPercent} onChange={setSlPercent} step={0.1} min={0.1} max={20} decimals={1} />
+              <Text style={styles.slNote}>
+                {entryPrice > 0 && sl != null
+                  ? `Risk $${riskDollars.toFixed(2)} → SL ${formatPrice(sl)}`
+                  : "Connect to calculate"}
+              </Text>
+            </View>
+          )}
+
+          {slMode === "manual" && (
+            <View style={styles.slInputArea}>
+              <TextInput
+                style={styles.manualInput}
+                placeholder="Enter exact SL price"
+                placeholderTextColor={C.textMuted}
+                keyboardType="decimal-pad"
+                value={slManualText}
+                onChangeText={(t) => {
+                  setSlManualText(t);
+                  const n = parseFloat(t);
+                  if (!isNaN(n)) setSlManual(n);
+                }}
+              />
+              {sl != null && entryPrice > 0 && (
+                <Text style={styles.slNote}>
+                  {`Distance: ${Math.abs(entryPrice - sl).toFixed(2)} pts`}
+                </Text>
+              )}
+            </View>
+          )}
+        </View>
+
+        {/* Risk Summary */}
+        {status === "connected" && entryPrice > 0 && (
+          <View style={styles.riskCard}>
+            <View style={styles.riskRow}>
+              <Text style={styles.riskLabel}>Entry</Text>
+              <Text style={styles.riskValue}>${formatPrice(entryPrice)}</Text>
+            </View>
+            <View style={styles.riskRow}>
+              <Text style={styles.riskLabel}>Stop Loss</Text>
+              <Text style={[styles.riskValue, { color: C.sell }]}>
+                {sl != null ? `$${formatPrice(sl)}` : "None"}
+              </Text>
+            </View>
+            <View style={styles.riskRow}>
+              <Text style={styles.riskLabel}>Est. Risk</Text>
+              <Text style={[styles.riskValue, { color: C.gold }]}>
+                ${riskDollars.toFixed(2)}
+              </Text>
+            </View>
+            {accountInfo && (
+              <View style={styles.riskRow}>
+                <Text style={styles.riskLabel}>Balance</Text>
+                <Text style={styles.riskValue}>${formatPrice(accountInfo.balance)}</Text>
+              </View>
+            )}
+          </View>
+        )}
+
+        {/* Trade Button */}
+        <Pressable
+          style={({ pressed }) => [
+            styles.tradeBtn,
+            direction === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
+            pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
+            isPlacing && { opacity: 0.6 },
+          ]}
+          onPress={handleTrade}
+          disabled={isPlacing}
+        >
+          {isPlacing ? (
+            <ActivityIndicator color={direction === "buy" ? "#000" : "#fff"} />
+          ) : (
+            <>
+              <Feather
+                name={direction === "buy" ? "trending-up" : "trending-down"}
+                size={20}
+                color={direction === "buy" ? "#000" : "#fff"}
+              />
+              <Text style={[styles.tradeBtnText, direction === "buy" ? { color: "#000" } : { color: "#fff" }]}>
+                {direction === "buy" ? "BUY XAUUSD" : "SELL XAUUSD"}
+              </Text>
+            </>
+          )}
+        </Pressable>
+      </ScrollView>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: C.background,
+  },
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 20,
+    paddingVertical: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: C.border,
+  },
+  headerLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  symbol: {
+    fontSize: 22,
+    fontFamily: "Inter_700Bold",
+    color: C.text,
+    letterSpacing: 1,
+  },
+  liveDot: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    backgroundColor: C.surface,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 20,
+  },
+  dot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: C.buy,
+  },
+  liveLabel: {
+    fontSize: 10,
+    fontFamily: "Inter_600SemiBold",
+    color: C.buy,
+    letterSpacing: 0.5,
+  },
+  scroll: {
+    padding: 16,
+    gap: 12,
+  },
+  card: {
+    backgroundColor: C.card,
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  priceRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingVertical: 10,
+  },
+  priceLabel: {
+    fontSize: 12,
+    fontFamily: "Inter_600SemiBold",
+    color: C.textSecondary,
+    letterSpacing: 1,
+  },
+  priceValue: {
+    fontSize: 26,
+    fontFamily: "Inter_700Bold",
+    letterSpacing: 0.5,
+  },
+  priceSublabel: {
+    fontSize: 10,
+    fontFamily: "Inter_400Regular",
+    color: C.textSecondary,
+    textAlign: "right",
+    marginTop: 1,
+  },
+  divider: {
+    height: 1,
+    backgroundColor: C.border,
+  },
+  noPrice: {
+    alignItems: "center",
+    paddingVertical: 20,
+    gap: 8,
+  },
+  noPriceText: {
+    fontSize: 14,
+    fontFamily: "Inter_400Regular",
+    color: C.textMuted,
+    textAlign: "center",
+  },
+  directionRow: {
+    flexDirection: "row",
+    gap: 10,
+    marginTop: 4,
+  },
+  dirBtn: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    paddingVertical: 14,
+    borderRadius: 14,
+    backgroundColor: C.card,
+    borderWidth: 1.5,
+    borderColor: C.border,
+  },
+  dirBtnBuyActive: {
+    backgroundColor: C.buy,
+    borderColor: C.buy,
+  },
+  dirBtnSellActive: {
+    backgroundColor: C.sell,
+    borderColor: C.sell,
+  },
+  dirLabel: {
+    fontSize: 16,
+    fontFamily: "Inter_700Bold",
+    letterSpacing: 1.5,
+  },
+  dirLabelActiveBuy: {
+    color: "#000",
+  },
+  dirLabelActiveSell: {
+    color: "#fff",
+  },
+  sectionCard: {
+    backgroundColor: C.card,
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: C.border,
+    gap: 14,
+  },
+  sectionHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  sectionTitle: {
+    fontSize: 13,
+    fontFamily: "Inter_600SemiBold",
+    color: C.textSecondary,
+    letterSpacing: 0.8,
+    textTransform: "uppercase",
+  },
+  sectionHint: {
+    fontSize: 12,
+    fontFamily: "Inter_500Medium",
+    color: C.textSecondary,
+  },
+  stepRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: C.surface,
+    borderRadius: 12,
+    overflow: "hidden",
+  },
+  stepBtn: {
+    width: 44,
+    height: 44,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  stepInput: {
+    flex: 1,
+    height: 44,
+    textAlign: "center",
+    fontSize: 20,
+    fontFamily: "Inter_700Bold",
+    color: C.text,
+  },
+  slModeRow: {
+    flexDirection: "row",
+    gap: 8,
+  },
+  slModeBtn: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 5,
+    paddingVertical: 8,
+    borderRadius: 10,
+    backgroundColor: C.surface,
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  slModeBtnActive: {
+    borderColor: C.gold,
+    backgroundColor: "rgba(201, 168, 76, 0.1)",
+  },
+  slModeLabel: {
+    fontSize: 11,
+    fontFamily: "Inter_600SemiBold",
+    color: C.textSecondary,
+  },
+  slModeLabelActive: {
+    color: C.gold,
+  },
+  slInputArea: {
+    gap: 8,
+  },
+  slNote: {
+    fontSize: 12,
+    fontFamily: "Inter_400Regular",
+    color: C.textSecondary,
+    textAlign: "center",
+  },
+  manualInput: {
+    backgroundColor: C.surface,
+    borderRadius: 12,
+    height: 44,
+    paddingHorizontal: 16,
+    fontSize: 18,
+    fontFamily: "Inter_600SemiBold",
+    color: C.text,
+    textAlign: "center",
+  },
+  riskCard: {
+    backgroundColor: C.card,
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: C.border,
+    gap: 10,
+  },
+  riskRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  riskLabel: {
+    fontSize: 13,
+    fontFamily: "Inter_400Regular",
+    color: C.textSecondary,
+  },
+  riskValue: {
+    fontSize: 14,
+    fontFamily: "Inter_600SemiBold",
+    color: C.text,
+  },
+  tradeBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10,
+    paddingVertical: 18,
+    borderRadius: 16,
+    marginTop: 6,
+  },
+  tradeBtnBuy: {
+    backgroundColor: C.buy,
+  },
+  tradeBtnSell: {
+    backgroundColor: C.sell,
+  },
+  tradeBtnText: {
+    fontSize: 17,
+    fontFamily: "Inter_700Bold",
+    letterSpacing: 1.5,
+  },
+});
