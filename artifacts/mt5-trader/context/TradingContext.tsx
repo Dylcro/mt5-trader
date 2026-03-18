@@ -1,4 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import Constants from "expo-constants";
 import React, {
   createContext,
   useCallback,
@@ -84,9 +85,24 @@ export interface CascadeOrderParams {
   stopLoss: number;
 }
 
-const API_BASE = process.env.EXPO_PUBLIC_DOMAIN
-  ? `https://${process.env.EXPO_PUBLIC_DOMAIN}/api`
-  : "/api";
+// Determine the API base URL.
+// EXPO_PUBLIC_API_URL is the full URL: https://<domain>/api
+// Fall back to deriving from Constants.expoConfig hostUri (strips expo. subdomain)
+function resolveApiBase(): string {
+  if (process.env.EXPO_PUBLIC_API_URL) return process.env.EXPO_PUBLIC_API_URL;
+  if (process.env.EXPO_PUBLIC_DOMAIN) return `https://${process.env.EXPO_PUBLIC_DOMAIN}/api`;
+  // Dynamic fallback: derive standard domain from expo packager host
+  const hostUri = (Constants.expoConfig as { hostUri?: string } | null)?.hostUri;
+  if (hostUri) {
+    const host = hostUri.split(":")[0];
+    const apiHost = host.replace(".expo.spock.", ".spock.");
+    return `https://${apiHost}/api`;
+  }
+  return "/api";
+}
+
+const API_BASE = resolveApiBase();
+console.log("[API] base:", API_BASE);
 
 const TradingContext = createContext<TradingContextValue | null>(null);
 
@@ -243,15 +259,22 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       setStatus("connecting");
       setErrorMsg("");
       try {
-        const res = await fetch(`${API_BASE}/mt5/connect`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            login: useCreds.login.trim(),
-            password: useCreds.password.trim(),
-            server: useCreds.server.trim(),
-          }),
-        });
+        const connectUrl = `${API_BASE}/mt5/connect`;
+        console.log("[connect] POST", connectUrl);
+        let res: Response;
+        try {
+          res = await fetch(connectUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              login: useCreds.login.trim(),
+              password: useCreds.password.trim(),
+              server: useCreds.server.trim(),
+            }),
+          });
+        } catch (netErr) {
+          throw new Error(`Cannot reach server at ${connectUrl}. Check your connection. (${netErr instanceof Error ? netErr.message : netErr})`);
+        }
         const data = await res.json() as { error?: string; accountId?: string } & Partial<AccountInfo>;
         if (!res.ok || data.error) throw new Error(data.error ?? "Connection failed");
 

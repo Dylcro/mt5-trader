@@ -483,6 +483,12 @@ export default function SettingsScreen() {
             <Text style={styles.aboutText}>
               Connects to your MT5 broker account via MetaAPI. Trades are placed live on your account. Always use a demo account first to test.
             </Text>
+            <View style={styles.apiUrlRow}>
+              <Feather name="server" size={11} color={C.textMuted} />
+              <Text style={styles.apiUrlText} numberOfLines={1} ellipsizeMode="middle">
+                {process.env.EXPO_PUBLIC_API_URL ?? process.env.EXPO_PUBLIC_DOMAIN ?? "unknown"}
+              </Text>
+            </View>
           </View>
         </ScrollView>
       </View>
@@ -903,6 +909,8 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_500Medium",
     color: "rgba(0,0,0,0.55)",
   },
+  apiUrlRow: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 8 },
+  apiUrlText: { fontSize: 10, fontFamily: "Inter_400Regular", color: C.textMuted, flex: 1 },
   aboutText: {
     fontSize: 13,
     fontFamily: "Inter_400Regular",
