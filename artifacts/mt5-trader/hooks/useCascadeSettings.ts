@@ -9,8 +9,8 @@ export interface CascadeSettings {
 
 const DEFAULTS: CascadeSettings = {
   numPositions: 3,
-  pipsBetween: 20,
-  slPips: 10,
+  pipsBetween: 10,
+  slPips: 20,
 };
 
 const KEYS = {

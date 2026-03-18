@@ -89,6 +89,51 @@ function SettingRow({
   );
 }
 
+function PillSelector({
+  label,
+  hint,
+  options,
+  value,
+  onChange,
+  suffix = "pips",
+}: {
+  label: string;
+  hint: string;
+  options: number[];
+  value: number;
+  onChange: (v: number) => void;
+  suffix?: string;
+}) {
+  return (
+    <View style={styles.settingRow}>
+      <View style={styles.settingRowLeft}>
+        <Text style={styles.settingLabel}>{label}</Text>
+        <Text style={styles.settingHint}>{hint}</Text>
+      </View>
+      <View style={styles.pillGroup}>
+        {options.map((opt) => {
+          const selected = opt === value;
+          return (
+            <Pressable
+              key={opt}
+              style={[styles.pill, selected && styles.pillActive]}
+              onPress={() => {
+                Haptics.selectionAsync();
+                onChange(opt);
+              }}
+              hitSlop={4}
+            >
+              <Text style={[styles.pillText, selected && styles.pillTextActive]}>
+                {opt}{suffix}
+              </Text>
+            </Pressable>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
+
 export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
   const { credentials, status, errorMsg, accountInfo, connect, disconnect } = useTrading();
@@ -342,24 +387,22 @@ export default function SettingsScreen() {
 
             <View style={styles.cascadeDivider} />
 
-            <SettingRow
-              label="Pips between positions"
+            <PillSelector
+              label="Pips between orders"
               hint={`${(cs.pipsBetween * 0.10).toFixed(2)} price gap per level`}
+              options={[5, 10, 15, 20]}
               value={cs.pipsBetween}
-              display={`${cs.pipsBetween} pips`}
-              onDec={() => updateSettings({ pipsBetween: Math.max(5, cs.pipsBetween - 5) })}
-              onInc={() => updateSettings({ pipsBetween: Math.min(200, cs.pipsBetween + 5) })}
+              onChange={(v) => updateSettings({ pipsBetween: v })}
             />
 
             <View style={styles.cascadeDivider} />
 
-            <SettingRow
+            <PillSelector
               label="Stop loss"
-              hint={`${(cs.slPips * 0.10).toFixed(2)} price below/above last entry`}
+              hint={`${(cs.slPips * 0.10).toFixed(2)} below/above last entry — same on all orders`}
+              options={[10, 20, 30, 50]}
               value={cs.slPips}
-              display={`${cs.slPips} pips`}
-              onDec={() => updateSettings({ slPips: Math.max(5, cs.slPips - 5) })}
-              onInc={() => updateSettings({ slPips: Math.min(500, cs.slPips + 5) })}
+              onChange={(v) => updateSettings({ slPips: v })}
             />
 
             <View style={styles.cascadePreviewBox}>
@@ -696,6 +739,32 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_700Bold",
     color: C.gold,
     paddingHorizontal: 4,
+  },
+  pillGroup: {
+    flexDirection: "row",
+    gap: 6,
+    flexWrap: "wrap",
+    justifyContent: "flex-end",
+  },
+  pill: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 20,
+    backgroundColor: C.surface,
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  pillActive: {
+    backgroundColor: C.gold,
+    borderColor: C.gold,
+  },
+  pillText: {
+    fontSize: 13,
+    fontFamily: "Inter_600SemiBold",
+    color: C.textSecondary,
+  },
+  pillTextActive: {
+    color: "#000",
   },
   cascadePreviewBox: {
     backgroundColor: C.surface,
