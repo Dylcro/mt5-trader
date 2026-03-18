@@ -109,16 +109,19 @@ function StepInput({
 
 type SLOption = { key: SLMode; label: string; icon: string };
 const SL_OPTIONS: SLOption[] = [
-  { key: "points", label: "Points", icon: "trending-down" },
+  { key: "points", label: "Pips", icon: "trending-down" },
   { key: "percent", label: "% Risk", icon: "percent" },
   { key: "manual", label: "Manual", icon: "edit-2" },
 ];
+
+// XAUUSD: 1 pip = $0.10 price movement (e.g. 5570 → 5571 = 10 pips)
+const PIP_SIZE = 0.10;
 
 function computeSL(
   mode: SLMode,
   direction: Direction,
   entryPrice: number,
-  slPoints: number,
+  slPips: number,
   slPercent: number,
   slManual: number,
   lotSize: number,
@@ -126,7 +129,7 @@ function computeSL(
 ): number | undefined {
   if (entryPrice <= 0) return undefined;
   if (mode === "points") {
-    const dist = slPoints * 0.01;
+    const dist = slPips * PIP_SIZE;
     return direction === "buy"
       ? parseFloat((entryPrice - dist).toFixed(2))
       : parseFloat((entryPrice + dist).toFixed(2));
@@ -148,13 +151,13 @@ function computeRiskDollars(
   mode: SLMode,
   direction: Direction,
   entryPrice: number,
-  slPoints: number,
+  slPips: number,
   slPercent: number,
   slManual: number,
   lotSize: number,
   balance: number
 ): number {
-  const sl = computeSL(mode, direction, entryPrice, slPoints, slPercent, slManual, lotSize, balance);
+  const sl = computeSL(mode, direction, entryPrice, slPips, slPercent, slManual, lotSize, balance);
   if (sl == null || entryPrice <= 0) return 0;
   const dist = Math.abs(entryPrice - sl);
   return dist * lotSize * 100;
@@ -167,7 +170,7 @@ export default function TradeScreen() {
   const [direction, setDirection] = useState<Direction>("buy");
   const [lotSize, setLotSize] = useState(0.01);
   const [slMode, setSlMode] = useState<SLMode>("points");
-  const [slPoints, setSlPoints] = useState(200);
+  const [slPips, setSlPips] = useState(50);
   const [slPercent, setSlPercent] = useState(1);
   const [slManual, setSlManual] = useState(0);
   const [slManualText, setSlManualText] = useState("");
@@ -189,8 +192,8 @@ export default function TradeScreen() {
 
   const entryPrice = direction === "buy" ? (price?.ask ?? 0) : (price?.bid ?? 0);
   const balance = accountInfo?.balance ?? 10000;
-  const sl = computeSL(slMode, direction, entryPrice, slPoints, slPercent, slManual, lotSize, balance);
-  const riskDollars = computeRiskDollars(slMode, direction, entryPrice, slPoints, slPercent, slManual, lotSize, balance);
+  const sl = computeSL(slMode, direction, entryPrice, slPips, slPercent, slManual, lotSize, balance);
+  const riskDollars = computeRiskDollars(slMode, direction, entryPrice, slPips, slPercent, slManual, lotSize, balance);
 
   const handleTrade = useCallback(async () => {
     if (isPlacing) return;
@@ -254,7 +257,7 @@ export default function TradeScreen() {
               <View style={styles.divider} />
               <PriceRow
                 label="SPREAD"
-                value={`${price.spread} pts`}
+                value={`${price.spread} pips`}
                 color={C.textSecondary}
               />
             </>
@@ -338,10 +341,10 @@ export default function TradeScreen() {
           {/* SL Input */}
           {slMode === "points" && (
             <View style={styles.slInputArea}>
-              <StepInput value={slPoints} onChange={setSlPoints} step={10} min={10} max={5000} decimals={0} />
+              <StepInput value={slPips} onChange={setSlPips} step={5} min={5} max={500} decimals={0} />
               <Text style={styles.slNote}>
                 {entryPrice > 0 && sl != null
-                  ? `Entry ${formatPrice(entryPrice)} → SL ${formatPrice(sl)}`
+                  ? `Entry ${formatPrice(entryPrice)} → SL ${formatPrice(sl)}  (${slPips} pips = $${(slPips * PIP_SIZE).toFixed(2)})`
                   : "Connect to see calculated SL"}
               </Text>
             </View>
@@ -374,7 +377,7 @@ export default function TradeScreen() {
               />
               {sl != null && entryPrice > 0 && (
                 <Text style={styles.slNote}>
-                  {`Distance: ${Math.abs(entryPrice - sl).toFixed(2)} pts`}
+                  {`Distance: $${Math.abs(entryPrice - sl).toFixed(2)}  (${(Math.abs(entryPrice - sl) / PIP_SIZE).toFixed(0)} pips)`}
                 </Text>
               )}
             </View>
