@@ -80,7 +80,7 @@ export interface PlaceTradeParams {
 export interface CascadeOrderParams {
   direction: "buy" | "sell";
   volume: number;
-  entries: number[];
+  limitEntries: number[];
   stopLoss: number;
 }
 
@@ -351,22 +351,36 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       if (status !== "connected") return { success: false, placed: 0, failed: 0, message: "Not connected" };
       let placed = 0;
       let failed = 0;
-      for (let i = 0; i < params.entries.length; i++) {
+      const total = 1 + params.limitEntries.length;
+
+      // First order: market order (instant execution at current price)
+      const marketResult = await placeTrade({
+        direction: params.direction,
+        volume: params.volume,
+        stopLoss: params.stopLoss,
+        comment: `Cascade 1/${total}`,
+      });
+      if (marketResult.success) placed++;
+      else failed++;
+
+      // Remaining orders: limit orders at set price levels
+      for (let i = 0; i < params.limitEntries.length; i++) {
         const result = await placeTrade({
           direction: params.direction,
           volume: params.volume,
-          limitPrice: params.entries[i],
+          limitPrice: params.limitEntries[i],
           stopLoss: params.stopLoss,
-          comment: `Cascade ${i + 1}/${params.entries.length}`,
+          comment: `Cascade ${i + 2}/${total}`,
         });
         if (result.success) placed++;
         else failed++;
       }
+
       await refreshPositions();
       await refreshAccountInfo();
       if (placed === 0) return { success: false, placed, failed, message: "All orders failed to place" };
-      if (failed > 0) return { success: true, placed, failed, message: `${placed} orders placed, ${failed} failed` };
-      return { success: true, placed, failed, message: `${placed} limit orders placed successfully` };
+      if (failed > 0) return { success: true, placed, failed, message: `${placed} of ${total} orders placed (${failed} failed)` };
+      return { success: true, placed, failed, message: `${placed} orders placed — 1 market + ${params.limitEntries.length} limit` };
     },
     [status, placeTrade, refreshPositions, refreshAccountInfo]
   );

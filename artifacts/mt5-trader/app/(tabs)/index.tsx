@@ -167,18 +167,21 @@ function computeRiskDollars(
 
 // ─── Cascade Ladder Preview ───────────────────────────────────────────────────
 function CascadeLadder({
-  entries,
+  marketPrice,
+  limitEntries,
   stopLoss,
   direction,
   lotSize,
 }: {
-  entries: number[];
+  marketPrice: number;
+  limitEntries: number[];
   stopLoss: number;
   direction: Direction;
   lotSize: number;
 }) {
   const color = direction === "buy" ? C.buy : C.sell;
-  const totalRisk = entries.reduce((sum, entry) => {
+  const allPrices = [marketPrice, ...limitEntries];
+  const totalRisk = allPrices.reduce((sum, entry) => {
     return sum + Math.abs(entry - stopLoss) * lotSize * 100;
   }, 0);
 
@@ -192,13 +195,27 @@ function CascadeLadder({
       </View>
 
       <View style={styles.ladderList}>
-        {entries.map((price, i) => (
+        {/* Market order row — always first */}
+        <View style={[styles.ladderRow, styles.ladderRowMarket]}>
+          <View style={[styles.ladderDot, { backgroundColor: color }]} />
+          <View style={styles.ladderLine} />
+          <View style={styles.ladderEntry}>
+            <Text style={[styles.ladderEntryLabel, { color }]}>
+              {direction === "buy" ? "BUY" : "SELL"} #1 · MARKET
+            </Text>
+            <Text style={styles.ladderEntryPrice}>{formatPrice(marketPrice)}</Text>
+          </View>
+          <Text style={styles.ladderLot}>{lotSize.toFixed(2)} lot</Text>
+        </View>
+
+        {/* Limit order rows */}
+        {limitEntries.map((price, i) => (
           <View key={i} style={styles.ladderRow}>
-            <View style={[styles.ladderDot, { backgroundColor: color }]} />
+            <View style={[styles.ladderDot, { backgroundColor: color, opacity: 0.6 }]} />
             <View style={styles.ladderLine} />
             <View style={styles.ladderEntry}>
-              <Text style={[styles.ladderEntryLabel, { color }]}>
-                {direction === "buy" ? "BUY" : "SELL"} #{i + 1}
+              <Text style={[styles.ladderEntryLabel, { color, opacity: 0.8 }]}>
+                {direction === "buy" ? "BUY" : "SELL"} #{i + 2} · LIMIT
               </Text>
               <Text style={styles.ladderEntryPrice}>{formatPrice(price)}</Text>
             </View>
@@ -211,10 +228,10 @@ function CascadeLadder({
           <View style={[styles.ladderDot, styles.ladderDotSL]} />
           <View style={[styles.ladderLine, { backgroundColor: C.sell }]} />
           <View style={styles.ladderEntry}>
-            <Text style={[styles.ladderEntryLabel, { color: C.sell }]}>STOP LOSS</Text>
+            <Text style={[styles.ladderEntryLabel, { color: C.sell }]}>STOP LOSS · ALL</Text>
             <Text style={[styles.ladderEntryPrice, { color: C.sell }]}>{formatPrice(stopLoss)}</Text>
           </View>
-          <Text style={styles.ladderLot}>All orders</Text>
+          <Text style={styles.ladderLot}>{allPrices.length} orders</Text>
         </View>
       </View>
     </View>
@@ -241,8 +258,6 @@ export default function TradeScreen() {
   // Cascade state
   const [cascadeDirection, setCascadeDirection] = useState<Direction>("buy");
   const [cascadeLotSize, setCascadeLotSize] = useState(0.01);
-  const [firstPriceText, setFirstPriceText] = useState("");
-  const [firstPrice, setFirstPrice] = useState(0);
 
   const [isPlacing, setIsPlacing] = useState(false);
 
@@ -265,9 +280,10 @@ export default function TradeScreen() {
   const sl = computeSL(slMode, direction, marketEntry, slPips, slPercent, slManual, lotSize, balance);
   const riskDollars = computeRiskDollars(slMode, direction, marketEntry, slPips, slPercent, slManual, lotSize, balance);
 
-  // Cascade levels
-  const cascadeLevels = firstPrice > 0
-    ? buildCascadeLevels(firstPrice, cascadeDirection, cascadeSettings)
+  // Cascade levels — built from live market price (ask for buy, bid for sell)
+  const cascadeMarketPrice = cascadeDirection === "buy" ? (price?.ask ?? 0) : (price?.bid ?? 0);
+  const cascadeLevels = cascadeMarketPrice > 0
+    ? buildCascadeLevels(cascadeMarketPrice, cascadeDirection, cascadeSettings)
     : null;
 
   const handleSingleTrade = useCallback(async () => {
@@ -295,13 +311,11 @@ export default function TradeScreen() {
       Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
       return;
     }
-    if (firstPrice <= 0) {
-      Alert.alert("Enter Price", "Please enter the first entry price for the cascade.");
-      return;
-    }
+    const total = 1 + cascadeLevels.limitEntries.length;
+    const limitList = cascadeLevels.limitEntries.map((p) => formatPrice(p)).join(", ");
     Alert.alert(
-      `Place ${cascadeLevels.entries.length} ${cascadeDirection.toUpperCase()} Orders`,
-      `Entries: ${cascadeLevels.entries.map((p) => formatPrice(p)).join(", ")}\nStop Loss: ${formatPrice(cascadeLevels.stopLoss)}\nLot per order: ${cascadeLotSize.toFixed(2)}`,
+      `Place ${total} ${cascadeDirection.toUpperCase()} Orders`,
+      `#1 Market @ ${formatPrice(cascadeMarketPrice)}${cascadeLevels.limitEntries.length > 0 ? `\nLimits: ${limitList}` : ""}\nStop Loss: ${formatPrice(cascadeLevels.stopLoss)}\nLot per order: ${cascadeLotSize.toFixed(2)}`,
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -312,15 +326,13 @@ export default function TradeScreen() {
             const result = await placeCascadeOrders({
               direction: cascadeDirection,
               volume: cascadeLotSize,
-              entries: cascadeLevels.entries,
+              limitEntries: cascadeLevels.limitEntries,
               stopLoss: cascadeLevels.stopLoss,
             });
             setIsPlacing(false);
             if (result.success) {
               await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
               Alert.alert("Orders Placed", result.message);
-              setFirstPriceText("");
-              setFirstPrice(0);
             } else {
               await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
               Alert.alert("Orders Failed", result.message);
@@ -329,10 +341,10 @@ export default function TradeScreen() {
         },
       ]
     );
-  }, [isPlacing, cascadeLevels, status, firstPrice, cascadeDirection, cascadeLotSize, placeCascadeOrders]);
+  }, [isPlacing, cascadeLevels, status, cascadeMarketPrice, cascadeDirection, cascadeLotSize, placeCascadeOrders]);
 
   const webTopPad = Platform.OS === "web" ? 67 : 0;
-  const isCascadeReady = firstPrice > 0 && cascadeLevels != null && status === "connected";
+  const isCascadeReady = cascadeMarketPrice > 0 && cascadeLevels != null && status === "connected";
 
   return (
     <View style={[styles.container, { paddingTop: insets.top + webTopPad }]}>
@@ -422,43 +434,28 @@ export default function TradeScreen() {
               </Pressable>
             </View>
 
-            {/* First Entry Price */}
+            {/* Live price info card */}
             <View style={styles.sectionCard}>
               <View style={styles.sectionHeader}>
-                <Text style={styles.sectionTitle}>First Entry Price</Text>
-                {price && (
-                  <Pressable
-                    onPress={() => {
-                      const p = cascadeDirection === "buy" ? price.ask : price.bid;
-                      setFirstPriceText(p.toFixed(2));
-                      setFirstPrice(p);
-                    }}
-                    hitSlop={8}
-                  >
-                    <Text style={styles.useMarketBtn}>Use market</Text>
-                  </Pressable>
-                )}
+                <Text style={styles.sectionTitle}>Market Entry</Text>
+                <Pressable onPress={refreshPrice} hitSlop={8}>
+                  <Text style={styles.useMarketBtn}>Refresh</Text>
+                </Pressable>
               </View>
-              <View style={styles.priceInputWrap}>
-                <TextInput
-                  style={styles.priceInput}
-                  value={firstPriceText}
-                  onChangeText={(t) => {
-                    setFirstPriceText(t);
-                    const n = parseFloat(t);
-                    setFirstPrice(isNaN(n) ? 0 : n);
-                  }}
-                  placeholder={price ? price.ask.toFixed(2) : "e.g. 5058.00"}
-                  placeholderTextColor={C.textMuted}
-                  keyboardType="decimal-pad"
-                  selectTextOnFocus
-                />
-              </View>
-              <Text style={styles.priceInputNote}>
-                {cascadeDirection === "buy"
-                  ? `Orders placed at and below this price (${cascadeSettings.numPositions} levels, ${cascadeSettings.pipsBetween} pips apart)`
-                  : `Orders placed at and above this price (${cascadeSettings.numPositions} levels, ${cascadeSettings.pipsBetween} pips apart)`}
-              </Text>
+              {cascadeMarketPrice > 0 ? (
+                <>
+                  <Text style={[styles.liveEntryPrice, { color: cascadeDirection === "buy" ? C.buy : C.sell }]}>
+                    {formatPrice(cascadeMarketPrice)}
+                  </Text>
+                  <Text style={styles.priceInputNote}>
+                    {cascadeDirection === "buy"
+                      ? `Order #1 buys instantly at this price. ${cascadeSettings.numPositions - 1} limit order${cascadeSettings.numPositions - 1 !== 1 ? "s" : ""} placed ${cascadeSettings.pipsBetween} pips apart below.`
+                      : `Order #1 sells instantly at this price. ${cascadeSettings.numPositions - 1} limit order${cascadeSettings.numPositions - 1 !== 1 ? "s" : ""} placed ${cascadeSettings.pipsBetween} pips apart above.`}
+                  </Text>
+                </>
+              ) : (
+                <Text style={styles.priceInputNote}>Connect your MT5 account to see the live price.</Text>
+              )}
             </View>
 
             {/* Lot Size */}
@@ -470,26 +467,25 @@ export default function TradeScreen() {
               <StepInput value={cascadeLotSize} onChange={setCascadeLotSize} step={0.01} min={0.01} max={100} decimals={2} />
             </View>
 
-            {/* Cascade Preview */}
-            {cascadeLevels && firstPrice > 0 && (
+            {/* Cascade Ladder Preview */}
+            {cascadeLevels && cascadeMarketPrice > 0 ? (
               <CascadeLadder
-                entries={cascadeLevels.entries}
+                marketPrice={cascadeMarketPrice}
+                limitEntries={cascadeLevels.limitEntries}
                 stopLoss={cascadeLevels.stopLoss}
                 direction={cascadeDirection}
                 lotSize={cascadeLotSize}
               />
-            )}
-
-            {!firstPrice && (
+            ) : (
               <View style={styles.cascadeHint}>
                 <Feather name="info" size={14} color={C.textMuted} />
                 <Text style={styles.cascadeHintText}>
-                  Enter a price above to preview your order ladder. Configure positions, spacing and SL in Settings.
+                  Connect your account to preview the order ladder. Adjust positions, spacing and SL in Settings.
                 </Text>
               </View>
             )}
 
-            {/* Cascade Button */}
+            {/* Cascade BUY / SELL buttons */}
             <Pressable
               style={({ pressed }) => [
                 styles.tradeBtn,
@@ -862,6 +858,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 10,
   },
+  ladderRowMarket: { borderWidth: 1, borderColor: C.gold + "55" },
   ladderDot: { width: 10, height: 10, borderRadius: 5 },
   ladderDotSL: { backgroundColor: C.sell },
   ladderLine: { width: 2, height: 18, backgroundColor: C.border, borderRadius: 1 },
@@ -869,6 +866,7 @@ const styles = StyleSheet.create({
   ladderEntryLabel: { fontSize: 10, fontFamily: "Inter_700Bold", letterSpacing: 0.8 },
   ladderEntryPrice: { fontSize: 16, fontFamily: "Inter_700Bold", color: C.text },
   ladderLot: { fontSize: 11, fontFamily: "Inter_500Medium", color: C.textMuted },
+  liveEntryPrice: { fontSize: 28, fontFamily: "Inter_700Bold", marginTop: 4, marginBottom: 4 },
   cascadeHint: {
     flexDirection: "row",
     alignItems: "flex-start",

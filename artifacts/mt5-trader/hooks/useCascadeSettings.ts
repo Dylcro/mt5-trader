@@ -51,27 +51,38 @@ export function useCascadeSettings() {
 // XAUUSD: 1 pip = $0.10
 const PIP = 0.10;
 
+/**
+ * Builds the cascade levels from the current market price.
+ * The first order is always a market order (placed instantly).
+ * The remaining (numPositions - 1) orders are limit orders placed
+ * below market for buys, or above market for sells.
+ * All orders share the same stop loss.
+ */
 export function buildCascadeLevels(
-  firstPrice: number,
+  marketPrice: number,
   direction: "buy" | "sell",
   settings: CascadeSettings
-): { entries: number[]; stopLoss: number } {
+): { limitEntries: number[]; stopLoss: number } {
   const { numPositions, pipsBetween, slPips } = settings;
   const step = pipsBetween * PIP;
   const slDist = slPips * PIP;
 
-  const entries: number[] = [];
-  for (let i = 0; i < numPositions; i++) {
+  // Limit entries start one interval away from market price
+  const limitEntries: number[] = [];
+  for (let i = 1; i < numPositions; i++) {
     const price = direction === "buy"
-      ? parseFloat((firstPrice - i * step).toFixed(2))
-      : parseFloat((firstPrice + i * step).toFixed(2));
-    entries.push(price);
+      ? parseFloat((marketPrice - i * step).toFixed(2))
+      : parseFloat((marketPrice + i * step).toFixed(2));
+    limitEntries.push(price);
   }
 
-  const lastEntry = entries[entries.length - 1];
+  // SL is measured from the furthest limit entry (or market if no limits)
+  const furthestEntry = limitEntries.length > 0
+    ? limitEntries[limitEntries.length - 1]
+    : marketPrice;
   const stopLoss = direction === "buy"
-    ? parseFloat((lastEntry - slDist).toFixed(2))
-    : parseFloat((lastEntry + slDist).toFixed(2));
+    ? parseFloat((furthestEntry - slDist).toFixed(2))
+    : parseFloat((furthestEntry + slDist).toFixed(2));
 
-  return { entries, stopLoss };
+  return { limitEntries, stopLoss };
 }
