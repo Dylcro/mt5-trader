@@ -344,7 +344,7 @@ export default function SettingsScreen() {
 
             <SettingRow
               label="Pips between positions"
-              hint={`$${(cs.pipsBetween * 0.10).toFixed(2)} price gap per level`}
+              hint={`${(cs.pipsBetween * 0.10).toFixed(2)} price gap per level`}
               value={cs.pipsBetween}
               display={`${cs.pipsBetween} pips`}
               onDec={() => updateSettings({ pipsBetween: Math.max(5, cs.pipsBetween - 5) })}
@@ -355,7 +355,7 @@ export default function SettingsScreen() {
 
             <SettingRow
               label="Stop loss"
-              hint={`$${(cs.slPips * 0.10).toFixed(2)} below/above last entry`}
+              hint={`${(cs.slPips * 0.10).toFixed(2)} price below/above last entry`}
               value={cs.slPips}
               display={`${cs.slPips} pips`}
               onDec={() => updateSettings({ slPips: Math.max(5, cs.slPips - 5) })}
@@ -367,9 +367,9 @@ export default function SettingsScreen() {
               <Text style={styles.cascadePreviewText}>
                 {`If first entry = 5058.00 (buy):\n`}
                 {Array.from({ length: cs.numPositions }, (_, i) =>
-                  `  Entry ${i + 1}: $${(5058 - i * cs.pipsBetween * 0.10).toFixed(2)}`
+                  `  Entry ${i + 1}: ${(5058 - i * cs.pipsBetween * 0.10).toFixed(2)}`
                 ).join("\n")}
-                {`\n  Stop Loss: $${(5058 - (cs.numPositions - 1) * cs.pipsBetween * 0.10 - cs.slPips * 0.10).toFixed(2)}`}
+                {`\n  Stop Loss: ${(5058 - (cs.numPositions - 1) * cs.pipsBetween * 0.10 - cs.slPips * 0.10).toFixed(2)}`}
               </Text>
             </View>
           </View>

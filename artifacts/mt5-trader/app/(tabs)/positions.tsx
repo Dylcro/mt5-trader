@@ -73,13 +73,13 @@ function PositionCard({ pos, onClose }: { pos: Position; isBusy: boolean; onClos
       <View style={styles.posPriceRow}>
         <View style={styles.posPriceItem}>
           <Text style={styles.posPriceLabel}>OPEN</Text>
-          <Text style={styles.posPriceVal}>${formatPrice(pos.openPrice)}</Text>
+          <Text style={styles.posPriceVal}>{formatPrice(pos.openPrice)}</Text>
         </View>
         <View style={styles.posPriceDivider} />
         <View style={styles.posPriceItem}>
           <Text style={styles.posPriceLabel}>CURRENT</Text>
           <Text style={[styles.posPriceVal, { color: pos.profit >= 0 ? C.buy : C.sell }]}>
-            ${formatPrice(pos.currentPrice)}
+            {formatPrice(pos.currentPrice)}
           </Text>
         </View>
         {pos.stopLoss != null && (
@@ -87,7 +87,7 @@ function PositionCard({ pos, onClose }: { pos: Position; isBusy: boolean; onClos
             <View style={styles.posPriceDivider} />
             <View style={styles.posPriceItem}>
               <Text style={styles.posPriceLabel}>STOP LOSS</Text>
-              <Text style={[styles.posPriceVal, { color: C.sell }]}>${formatPrice(pos.stopLoss)}</Text>
+              <Text style={[styles.posPriceVal, { color: C.sell }]}>{formatPrice(pos.stopLoss)}</Text>
             </View>
           </>
         )}
@@ -131,7 +131,7 @@ export default function PositionsScreen() {
     async (pos: Position) => {
       Alert.alert(
         "Close Position",
-        `Close ${pos.type === "POSITION_TYPE_BUY" ? "BUY" : "SELL"} ${pos.volume} lots @ $${formatPrice(pos.currentPrice)}?\n\nP&L: ${pos.profit >= 0 ? "+" : ""}$${pos.profit.toFixed(2)}`,
+        `Close ${pos.type === "POSITION_TYPE_BUY" ? "BUY" : "SELL"} ${pos.volume} lots @ ${formatPrice(pos.currentPrice)}?\n\nP&L: ${pos.profit >= 0 ? "+" : ""}${pos.profit.toFixed(2)}`,
         [
           { text: "Cancel", style: "cancel" },
           {
@@ -163,7 +163,7 @@ export default function PositionsScreen() {
         <Text style={styles.headerTitle}>Positions</Text>
         {positions.length > 0 && (
           <Text style={[styles.totalPL, { color: totalPL >= 0 ? C.buy : C.sell }]}>
-            {totalPL >= 0 ? "+" : ""}${totalPL.toFixed(2)}
+            {totalPL >= 0 ? "+" : ""}{totalPL.toFixed(2)}
           </Text>
         )}
       </View>
@@ -172,19 +172,19 @@ export default function PositionsScreen() {
         <View style={styles.accountBar}>
           <View style={styles.accountItem}>
             <Text style={styles.accountLabel}>BALANCE</Text>
-            <Text style={styles.accountVal}>${formatPrice(accountInfo.balance)}</Text>
+            <Text style={styles.accountVal}>{formatPrice(accountInfo.balance)}</Text>
           </View>
           <View style={styles.accountDivider} />
           <View style={styles.accountItem}>
             <Text style={styles.accountLabel}>EQUITY</Text>
             <Text style={[styles.accountVal, { color: accountInfo.equity >= accountInfo.balance ? C.buy : C.sell }]}>
-              ${formatPrice(accountInfo.equity)}
+              {formatPrice(accountInfo.equity)}
             </Text>
           </View>
           <View style={styles.accountDivider} />
           <View style={styles.accountItem}>
             <Text style={styles.accountLabel}>FREE MARGIN</Text>
-            <Text style={styles.accountVal}>${formatPrice(accountInfo.freeMargin)}</Text>
+            <Text style={styles.accountVal}>{formatPrice(accountInfo.freeMargin)}</Text>
           </View>
         </View>
       )}

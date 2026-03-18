@@ -187,7 +187,7 @@ function CascadeLadder({
       <View style={styles.ladderHeader}>
         <Text style={styles.ladderTitle}>ORDER LADDER</Text>
         <Text style={[styles.ladderRisk, { color: C.sell }]}>
-          Total Risk ~${totalRisk.toFixed(2)}
+          Total Risk ~{totalRisk.toFixed(2)}
         </Text>
       </View>
 
@@ -200,7 +200,7 @@ function CascadeLadder({
               <Text style={[styles.ladderEntryLabel, { color }]}>
                 {direction === "buy" ? "BUY" : "SELL"} #{i + 1}
               </Text>
-              <Text style={styles.ladderEntryPrice}>${formatPrice(price)}</Text>
+              <Text style={styles.ladderEntryPrice}>{formatPrice(price)}</Text>
             </View>
             <Text style={styles.ladderLot}>{lotSize.toFixed(2)} lot</Text>
           </View>
@@ -212,7 +212,7 @@ function CascadeLadder({
           <View style={[styles.ladderLine, { backgroundColor: C.sell }]} />
           <View style={styles.ladderEntry}>
             <Text style={[styles.ladderEntryLabel, { color: C.sell }]}>STOP LOSS</Text>
-            <Text style={[styles.ladderEntryPrice, { color: C.sell }]}>${formatPrice(stopLoss)}</Text>
+            <Text style={[styles.ladderEntryPrice, { color: C.sell }]}>{formatPrice(stopLoss)}</Text>
           </View>
           <Text style={styles.ladderLot}>All orders</Text>
         </View>
@@ -301,7 +301,7 @@ export default function TradeScreen() {
     }
     Alert.alert(
       `Place ${cascadeLevels.entries.length} ${cascadeDirection.toUpperCase()} Orders`,
-      `Entries: ${cascadeLevels.entries.map((p) => `$${formatPrice(p)}`).join(", ")}\nStop Loss: $${formatPrice(cascadeLevels.stopLoss)}\nLot per order: ${cascadeLotSize.toFixed(2)}`,
+      `Entries: ${cascadeLevels.entries.map((p) => formatPrice(p)).join(", ")}\nStop Loss: ${formatPrice(cascadeLevels.stopLoss)}\nLot per order: ${cascadeLotSize.toFixed(2)}`,
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -440,7 +440,6 @@ export default function TradeScreen() {
                 )}
               </View>
               <View style={styles.priceInputWrap}>
-                <Text style={styles.priceInputCurrency}>$</Text>
                 <TextInput
                   style={styles.priceInput}
                   value={firstPriceText}
@@ -554,7 +553,7 @@ export default function TradeScreen() {
               <View style={styles.sectionHeader}>
                 <Text style={styles.sectionTitle}>Stop Loss</Text>
                 <Text style={[styles.sectionHint, { color: C.sell }]}>
-                  {sl != null ? `SL: $${formatPrice(sl)}` : "No SL set"}
+                  {sl != null ? `SL: ${formatPrice(sl)}` : "No SL set"}
                 </Text>
               </View>
               <View style={styles.slModeRow}>
@@ -577,7 +576,7 @@ export default function TradeScreen() {
                   <StepInput value={slPips} onChange={setSlPips} step={5} min={5} max={500} decimals={0} />
                   <Text style={styles.slNote}>
                     {marketEntry > 0 && sl != null
-                      ? `Entry ${formatPrice(marketEntry)} → SL ${formatPrice(sl)}  (${slPips} pips = $${(slPips * PIP_SIZE).toFixed(2)})`
+                      ? `Entry ${formatPrice(marketEntry)} → SL ${formatPrice(sl)}  (${slPips} pips = ${(slPips * PIP_SIZE).toFixed(2)})`
                       : "Connect to see calculated SL"}
                   </Text>
                 </View>
@@ -588,7 +587,7 @@ export default function TradeScreen() {
                   <StepInput value={slPercent} onChange={setSlPercent} step={0.1} min={0.1} max={20} decimals={1} />
                   <Text style={styles.slNote}>
                     {marketEntry > 0 && sl != null
-                      ? `Risk $${riskDollars.toFixed(2)} → SL ${formatPrice(sl)}`
+                      ? `Risk ${riskDollars.toFixed(2)} → SL ${formatPrice(sl)}`
                       : "Connect to calculate"}
                   </Text>
                 </View>
@@ -610,7 +609,7 @@ export default function TradeScreen() {
                   />
                   {sl != null && marketEntry > 0 && (
                     <Text style={styles.slNote}>
-                      {`Distance: $${Math.abs(marketEntry - sl).toFixed(2)}  (${(Math.abs(marketEntry - sl) / PIP_SIZE).toFixed(0)} pips)`}
+                      {`Distance: ${Math.abs(marketEntry - sl).toFixed(2)}  (${(Math.abs(marketEntry - sl) / PIP_SIZE).toFixed(0)} pips)`}
                     </Text>
                   )}
                 </View>
@@ -622,22 +621,22 @@ export default function TradeScreen() {
               <View style={styles.riskCard}>
                 <View style={styles.riskRow}>
                   <Text style={styles.riskLabel}>Entry</Text>
-                  <Text style={styles.riskValue}>${formatPrice(marketEntry)}</Text>
+                  <Text style={styles.riskValue}>{formatPrice(marketEntry)}</Text>
                 </View>
                 <View style={styles.riskRow}>
                   <Text style={styles.riskLabel}>Stop Loss</Text>
                   <Text style={[styles.riskValue, { color: C.sell }]}>
-                    {sl != null ? `$${formatPrice(sl)}` : "None"}
+                    {sl != null ? formatPrice(sl) : "None"}
                   </Text>
                 </View>
                 <View style={styles.riskRow}>
                   <Text style={styles.riskLabel}>Est. Risk</Text>
-                  <Text style={[styles.riskValue, { color: C.gold }]}>${riskDollars.toFixed(2)}</Text>
+                  <Text style={[styles.riskValue, { color: C.gold }]}>{riskDollars.toFixed(2)}</Text>
                 </View>
                 {accountInfo && (
                   <View style={styles.riskRow}>
                     <Text style={styles.riskLabel}>Balance</Text>
-                    <Text style={styles.riskValue}>${formatPrice(accountInfo.balance)}</Text>
+                    <Text style={styles.riskValue}>{formatPrice(accountInfo.balance)}</Text>
                   </View>
                 )}
               </View>
