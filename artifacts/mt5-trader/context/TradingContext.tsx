@@ -43,22 +43,28 @@ export interface Price {
 
 export type SLMode = "points" | "percent" | "manual";
 
+export interface Mt5Credentials {
+  login: string;
+  password: string;
+  server: string;
+}
+
 interface TradingContextValue {
-  token: string;
   accountId: string;
-  setToken: (t: string) => void;
-  setAccountId: (id: string) => void;
+  credentials: Mt5Credentials;
+  setCredentials: (c: Mt5Credentials) => void;
   status: ConnectionStatus;
   errorMsg: string;
   accountInfo: AccountInfo | null;
   positions: Position[];
   price: Price | null;
-  connect: () => Promise<void>;
-  disconnect: () => void;
+  connect: (creds?: Mt5Credentials) => Promise<void>;
+  disconnect: () => Promise<void>;
   placeTrade: (params: PlaceTradeParams) => Promise<{ success: boolean; message: string }>;
   closePosition: (positionId: string) => Promise<{ success: boolean; message: string }>;
   refreshPositions: () => Promise<void>;
   refreshPrice: () => Promise<void>;
+  refreshAccountInfo: () => Promise<void>;
 }
 
 export interface PlaceTradeParams {
@@ -69,13 +75,19 @@ export interface PlaceTradeParams {
   comment?: string;
 }
 
-const BASE_URL = "https://mt-client-api-v1.london.agiliumtrade.ai";
+const API_BASE = process.env.EXPO_PUBLIC_DOMAIN
+  ? `https://${process.env.EXPO_PUBLIC_DOMAIN}/api`
+  : "/api";
 
 const TradingContext = createContext<TradingContextValue | null>(null);
 
 export function TradingProvider({ children }: { children: React.ReactNode }) {
-  const [token, setTokenState] = useState("");
   const [accountId, setAccountIdState] = useState("");
+  const [credentials, setCredentialsState] = useState<Mt5Credentials>({
+    login: "",
+    password: "",
+    server: "",
+  });
   const [status, setStatus] = useState<ConnectionStatus>("disconnected");
   const [errorMsg, setErrorMsg] = useState("");
   const [accountInfo, setAccountInfo] = useState<AccountInfo | null>(null);
@@ -85,42 +97,34 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const priceIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const positionsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Load saved credentials + accountId on startup and auto-reconnect
   useEffect(() => {
-    AsyncStorage.multiGet(["metaapi_token", "metaapi_account_id"]).then((pairs) => {
-      const t = pairs[0][1] ?? "";
-      const a = pairs[1][1] ?? "";
-      if (t) setTokenState(t);
-      if (a) setAccountIdState(a);
+    AsyncStorage.multiGet(["mt5_login", "mt5_server", "mt5_account_id"]).then((pairs) => {
+      const login = pairs[0][1] ?? "";
+      const server = pairs[1][1] ?? "";
+      const savedAccountId = pairs[2][1] ?? "";
+      if (login) setCredentialsState((prev) => ({ ...prev, login, server }));
+      if (savedAccountId) {
+        setAccountIdState(savedAccountId);
+        // Auto-reconnect silently
+        reconnectSaved(savedAccountId);
+      }
     });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const setToken = useCallback((t: string) => {
-    setTokenState(t);
-    AsyncStorage.setItem("metaapi_token", t);
-  }, []);
-
-  const setAccountId = useCallback((id: string) => {
-    setAccountIdState(id);
-    AsyncStorage.setItem("metaapi_account_id", id);
-  }, []);
-
-  const apiHeaders = useCallback(
-    (tok: string) => ({
-      "auth-token": tok,
-      "Content-Type": "application/json",
-    }),
-    []
-  );
-
-  const fetchAccountInfo = useCallback(
-    async (tok: string, accId: string): Promise<AccountInfo> => {
-      const res = await fetch(
-        `${BASE_URL}/users/current/accounts/${accId}/account-information`,
-        { headers: apiHeaders(tok) }
-      );
-      if (!res.ok) throw new Error(`Account info failed: ${res.status}`);
-      const data = await res.json();
-      return {
+  const reconnectSaved = async (savedId: string) => {
+    setStatus("connecting");
+    try {
+      const res = await fetch(`${API_BASE}/mt5/connect`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accountId: savedId }),
+      });
+      const data = await res.json() as { error?: string; accountId?: string } & Partial<AccountInfo>;
+      if (!res.ok || data.error) throw new Error(data.error ?? "Reconnect failed");
+      setAccountIdState(data.accountId ?? savedId);
+      setAccountInfo({
         balance: data.balance ?? 0,
         equity: data.equity ?? 0,
         margin: data.margin ?? 0,
@@ -128,76 +132,89 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         currency: data.currency ?? "USD",
         leverage: data.leverage ?? 100,
         name: data.name ?? "Account",
-      };
-    },
-    [apiHeaders]
-  );
+      });
+      setStatus("connected");
+      startPolling(data.accountId ?? savedId);
+    } catch {
+      setStatus("disconnected");
+      setAccountIdState("");
+      await AsyncStorage.removeItem("mt5_account_id");
+    }
+  };
 
-  const fetchPrice = useCallback(
-    async (tok: string, accId: string): Promise<Price> => {
-      const res = await fetch(
-        `${BASE_URL}/users/current/accounts/${accId}/symbols/XAUUSD/current-price`,
-        { headers: apiHeaders(tok) }
-      );
-      if (!res.ok) throw new Error(`Price fetch failed: ${res.status}`);
-      const data = await res.json();
-      const bid = data.bid ?? 0;
-      const ask = data.ask ?? 0;
+  const setCredentials = useCallback((c: Mt5Credentials) => {
+    setCredentialsState(c);
+    AsyncStorage.multiSet([
+      ["mt5_login", c.login],
+      ["mt5_server", c.server],
+    ]);
+  }, []);
+
+  const fetchPriceData = useCallback(async (accId: string): Promise<Price> => {
+    const res = await fetch(`${API_BASE}/mt5/account/${accId}/price`);
+    if (!res.ok) throw new Error(`Price fetch failed: ${res.status}`);
+    const data = await res.json() as { bid?: number; ask?: number; time?: string };
+    const bid = data.bid ?? 0;
+    const ask = data.ask ?? 0;
+    return {
+      bid,
+      ask,
+      spread: Math.round((ask - bid) * 10),
+      time: data.time ?? new Date().toISOString(),
+    };
+  }, []);
+
+  const fetchPositionsData = useCallback(async (accId: string): Promise<Position[]> => {
+    const res = await fetch(`${API_BASE}/mt5/account/${accId}/positions`);
+    if (!res.ok) throw new Error(`Positions fetch failed: ${res.status}`);
+    const data = await res.json() as unknown[];
+    return (Array.isArray(data) ? data : []).map((p) => {
+      const pos = p as Record<string, unknown>;
       return {
-        bid,
-        ask,
-        spread: Math.round((ask - bid) * 100),
-        time: data.time ?? new Date().toISOString(),
+        id: String(pos.id ?? ""),
+        symbol: String(pos.symbol ?? ""),
+        type: pos.type as Position["type"],
+        volume: Number(pos.volume ?? 0),
+        openPrice: Number(pos.openPrice ?? 0),
+        currentPrice: Number(pos.currentPrice ?? 0),
+        stopLoss: pos.stopLoss != null ? Number(pos.stopLoss) : undefined,
+        takeProfit: pos.takeProfit != null ? Number(pos.takeProfit) : undefined,
+        profit: Number(pos.profit ?? 0),
+        time: String(pos.time ?? ""),
+        comment: pos.comment != null ? String(pos.comment) : undefined,
       };
-    },
-    [apiHeaders]
-  );
+    });
+  }, []);
 
-  const fetchPositions = useCallback(
-    async (tok: string, accId: string): Promise<Position[]> => {
-      const res = await fetch(
-        `${BASE_URL}/users/current/accounts/${accId}/positions`,
-        { headers: apiHeaders(tok) }
-      );
-      if (!res.ok) throw new Error(`Positions fetch failed: ${res.status}`);
-      const data = await res.json();
-      return (Array.isArray(data) ? data : []).map((p: Record<string, unknown>) => ({
-        id: String(p.id ?? ""),
-        symbol: String(p.symbol ?? ""),
-        type: p.type as Position["type"],
-        volume: Number(p.volume ?? 0),
-        openPrice: Number(p.openPrice ?? 0),
-        currentPrice: Number(p.currentPrice ?? 0),
-        stopLoss: p.stopLoss != null ? Number(p.stopLoss) : undefined,
-        takeProfit: p.takeProfit != null ? Number(p.takeProfit) : undefined,
-        profit: Number(p.profit ?? 0),
-        time: String(p.time ?? ""),
-        comment: p.comment != null ? String(p.comment) : undefined,
-      }));
-    },
-    [apiHeaders]
-  );
+  const fetchAccountInfoData = useCallback(async (accId: string): Promise<AccountInfo> => {
+    const res = await fetch(`${API_BASE}/mt5/account/${accId}/info`);
+    if (!res.ok) throw new Error(`Account info failed: ${res.status}`);
+    const data = await res.json() as Record<string, unknown>;
+    return {
+      balance: Number(data.balance ?? 0),
+      equity: Number(data.equity ?? 0),
+      margin: Number(data.margin ?? 0),
+      freeMargin: Number(data.freeMargin ?? 0),
+      currency: String(data.currency ?? "USD"),
+      leverage: Number(data.leverage ?? 100),
+      name: String(data.name ?? "Account"),
+    };
+  }, []);
 
   const startPolling = useCallback(
-    (tok: string, accId: string) => {
+    (accId: string) => {
       if (priceIntervalRef.current) clearInterval(priceIntervalRef.current);
       if (positionsIntervalRef.current) clearInterval(positionsIntervalRef.current);
 
-      const pollPrice = () =>
-        fetchPrice(tok, accId)
-          .then(setPrice)
-          .catch(() => {});
-      const pollPositions = () =>
-        fetchPositions(tok, accId)
-          .then(setPositions)
-          .catch(() => {});
+      const pollPrice = () => fetchPriceData(accId).then(setPrice).catch(() => {});
+      const pollPositions = () => fetchPositionsData(accId).then(setPositions).catch(() => {});
 
       pollPrice();
       pollPositions();
       priceIntervalRef.current = setInterval(pollPrice, 5000);
       positionsIntervalRef.current = setInterval(pollPositions, 10000);
     },
-    [fetchPrice, fetchPositions]
+    [fetchPriceData, fetchPositionsData]
   );
 
   const stopPolling = useCallback(() => {
@@ -205,49 +222,82 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     if (positionsIntervalRef.current) clearInterval(positionsIntervalRef.current);
   }, []);
 
-  const connect = useCallback(async () => {
-    if (!token.trim() || !accountId.trim()) {
-      setErrorMsg("Please enter your MetaAPI token and account ID.");
-      setStatus("error");
-      return;
-    }
-    setStatus("connecting");
-    setErrorMsg("");
-    try {
-      const info = await fetchAccountInfo(token, accountId);
-      setAccountInfo(info);
-      setStatus("connected");
-      startPolling(token, accountId);
-    } catch (err) {
-      setStatus("error");
-      setErrorMsg(err instanceof Error ? err.message : "Connection failed");
-    }
-  }, [token, accountId, fetchAccountInfo, startPolling]);
+  const connect = useCallback(
+    async (creds?: Mt5Credentials) => {
+      const useCreds = creds ?? credentials;
+      if (!useCreds.login.trim() || !useCreds.password.trim() || !useCreds.server.trim()) {
+        setErrorMsg("Please fill in your MT5 account number, password, and server.");
+        setStatus("error");
+        return;
+      }
+      if (creds) setCredentials(creds);
+      setStatus("connecting");
+      setErrorMsg("");
+      try {
+        const res = await fetch(`${API_BASE}/mt5/connect`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            login: useCreds.login.trim(),
+            password: useCreds.password.trim(),
+            server: useCreds.server.trim(),
+          }),
+        });
+        const data = await res.json() as { error?: string; accountId?: string } & Partial<AccountInfo>;
+        if (!res.ok || data.error) throw new Error(data.error ?? "Connection failed");
 
-  const disconnect = useCallback(() => {
+        const accId = data.accountId!;
+        setAccountIdState(accId);
+        await AsyncStorage.setItem("mt5_account_id", accId);
+        setAccountInfo({
+          balance: data.balance ?? 0,
+          equity: data.equity ?? 0,
+          margin: data.margin ?? 0,
+          freeMargin: data.freeMargin ?? 0,
+          currency: data.currency ?? "USD",
+          leverage: data.leverage ?? 100,
+          name: data.name ?? "Account",
+        });
+        setStatus("connected");
+        startPolling(accId);
+      } catch (err) {
+        setStatus("error");
+        setErrorMsg(err instanceof Error ? err.message : "Connection failed");
+      }
+    },
+    [credentials, setCredentials, startPolling]
+  );
+
+  const disconnect = useCallback(async () => {
     stopPolling();
+    if (accountId) {
+      try {
+        await fetch(`${API_BASE}/mt5/account/${accountId}/disconnect`, { method: "POST" });
+      } catch {}
+    }
+    await AsyncStorage.removeItem("mt5_account_id");
+    setAccountIdState("");
     setStatus("disconnected");
     setAccountInfo(null);
     setPositions([]);
     setPrice(null);
     setErrorMsg("");
-  }, [stopPolling]);
+  }, [accountId, stopPolling]);
 
   const refreshPrice = useCallback(async () => {
-    if (status !== "connected") return;
-    try {
-      const p = await fetchPrice(token, accountId);
-      setPrice(p);
-    } catch {}
-  }, [status, token, accountId, fetchPrice]);
+    if (status !== "connected" || !accountId) return;
+    try { setPrice(await fetchPriceData(accountId)); } catch {}
+  }, [status, accountId, fetchPriceData]);
 
   const refreshPositions = useCallback(async () => {
-    if (status !== "connected") return;
-    try {
-      const p = await fetchPositions(token, accountId);
-      setPositions(p);
-    } catch {}
-  }, [status, token, accountId, fetchPositions]);
+    if (status !== "connected" || !accountId) return;
+    try { setPositions(await fetchPositionsData(accountId)); } catch {}
+  }, [status, accountId, fetchPositionsData]);
+
+  const refreshAccountInfo = useCallback(async () => {
+    if (status !== "connected" || !accountId) return;
+    try { setAccountInfo(await fetchAccountInfoData(accountId)); } catch {}
+  }, [status, accountId, fetchAccountInfoData]);
 
   const placeTrade = useCallback(
     async (params: PlaceTradeParams): Promise<{ success: boolean; message: string }> => {
@@ -257,83 +307,56 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           actionType: params.direction === "buy" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
           symbol: "XAUUSD",
           volume: params.volume,
-          comment: params.comment ?? "MT5 Trader App",
+          comment: params.comment ?? "XAUUSD Trader App",
         };
         if (params.stopLoss != null) body.stopLoss = params.stopLoss;
         if (params.takeProfit != null) body.takeProfit = params.takeProfit;
-        const res = await fetch(
-          `${BASE_URL}/users/current/accounts/${accountId}/trade`,
-          {
-            method: "POST",
-            headers: apiHeaders(token),
-            body: JSON.stringify(body),
-          }
-        );
-        const data = await res.json();
+        const res = await fetch(`${API_BASE}/mt5/account/${accountId}/trade`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json() as { numericCode?: number; message?: string };
         if (!res.ok || data.numericCode === 10006) {
-          return {
-            success: false,
-            message: data.message ?? `Trade failed: ${res.status}`,
-          };
+          return { success: false, message: data.message ?? `Trade failed: ${res.status}` };
         }
         await refreshPositions();
-        const acc = await fetchAccountInfo(token, accountId);
-        setAccountInfo(acc);
+        await refreshAccountInfo();
         return { success: true, message: "Trade placed successfully" };
       } catch (err) {
-        return {
-          success: false,
-          message: err instanceof Error ? err.message : "Trade failed",
-        };
+        return { success: false, message: err instanceof Error ? err.message : "Trade failed" };
       }
     },
-    [status, accountId, token, apiHeaders, refreshPositions, fetchAccountInfo]
+    [status, accountId, refreshPositions, refreshAccountInfo]
   );
 
   const closePosition = useCallback(
     async (positionId: string): Promise<{ success: boolean; message: string }> => {
       if (status !== "connected") return { success: false, message: "Not connected" };
       try {
-        const body = {
-          actionType: "POSITION_CLOSE_ID",
-          positionId,
-        };
-        const res = await fetch(
-          `${BASE_URL}/users/current/accounts/${accountId}/trade`,
-          {
-            method: "POST",
-            headers: apiHeaders(token),
-            body: JSON.stringify(body),
-          }
-        );
-        const data = await res.json();
-        if (!res.ok) {
-          return {
-            success: false,
-            message: data.message ?? `Close failed: ${res.status}`,
-          };
-        }
+        const res = await fetch(`${API_BASE}/mt5/account/${accountId}/trade`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ actionType: "POSITION_CLOSE_ID", positionId }),
+        });
+        const data = await res.json() as { message?: string };
+        if (!res.ok) return { success: false, message: data.message ?? `Close failed: ${res.status}` };
         await refreshPositions();
-        const acc = await fetchAccountInfo(token, accountId);
-        setAccountInfo(acc);
+        await refreshAccountInfo();
         return { success: true, message: "Position closed" };
       } catch (err) {
-        return {
-          success: false,
-          message: err instanceof Error ? err.message : "Close failed",
-        };
+        return { success: false, message: err instanceof Error ? err.message : "Close failed" };
       }
     },
-    [status, accountId, token, apiHeaders, refreshPositions, fetchAccountInfo]
+    [status, accountId, refreshPositions, refreshAccountInfo]
   );
 
   return (
     <TradingContext.Provider
       value={{
-        token,
         accountId,
-        setToken,
-        setAccountId,
+        credentials,
+        setCredentials,
         status,
         errorMsg,
         accountInfo,
@@ -345,6 +368,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         closePosition,
         refreshPositions,
         refreshPrice,
+        refreshAccountInfo,
       }}
     >
       {children}
