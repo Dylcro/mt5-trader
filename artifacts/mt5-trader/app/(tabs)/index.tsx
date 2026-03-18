@@ -17,10 +17,12 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import Colors from "@/constants/colors";
 import { useTrading, type SLMode } from "@/context/TradingContext";
+import { buildCascadeLevels, useCascadeSettings } from "@/hooks/useCascadeSettings";
 
 const C = Colors.dark;
 
 type Direction = "buy" | "sell";
+type TradeMode = "single" | "cascade";
 
 function formatPrice(n: number) {
   return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -114,7 +116,7 @@ const SL_OPTIONS: SLOption[] = [
   { key: "manual", label: "Manual", icon: "edit-2" },
 ];
 
-// XAUUSD: 1 pip = $0.10 price movement (e.g. 5570 → 5571 = 10 pips)
+// XAUUSD: 1 pip = $0.10 price movement
 const PIP_SIZE = 0.10;
 
 function computeSL(
@@ -163,10 +165,71 @@ function computeRiskDollars(
   return dist * lotSize * 100;
 }
 
+// ─── Cascade Ladder Preview ───────────────────────────────────────────────────
+function CascadeLadder({
+  entries,
+  stopLoss,
+  direction,
+  lotSize,
+}: {
+  entries: number[];
+  stopLoss: number;
+  direction: Direction;
+  lotSize: number;
+}) {
+  const color = direction === "buy" ? C.buy : C.sell;
+  const totalRisk = entries.reduce((sum, entry) => {
+    return sum + Math.abs(entry - stopLoss) * lotSize * 100;
+  }, 0);
+
+  return (
+    <View style={styles.ladder}>
+      <View style={styles.ladderHeader}>
+        <Text style={styles.ladderTitle}>ORDER LADDER</Text>
+        <Text style={[styles.ladderRisk, { color: C.sell }]}>
+          Total Risk ~${totalRisk.toFixed(2)}
+        </Text>
+      </View>
+
+      <View style={styles.ladderList}>
+        {entries.map((price, i) => (
+          <View key={i} style={styles.ladderRow}>
+            <View style={[styles.ladderDot, { backgroundColor: color }]} />
+            <View style={styles.ladderLine} />
+            <View style={styles.ladderEntry}>
+              <Text style={[styles.ladderEntryLabel, { color }]}>
+                {direction === "buy" ? "BUY" : "SELL"} #{i + 1}
+              </Text>
+              <Text style={styles.ladderEntryPrice}>${formatPrice(price)}</Text>
+            </View>
+            <Text style={styles.ladderLot}>{lotSize.toFixed(2)} lot</Text>
+          </View>
+        ))}
+
+        {/* SL Row */}
+        <View style={[styles.ladderRow, { marginTop: 4 }]}>
+          <View style={[styles.ladderDot, styles.ladderDotSL]} />
+          <View style={[styles.ladderLine, { backgroundColor: C.sell }]} />
+          <View style={styles.ladderEntry}>
+            <Text style={[styles.ladderEntryLabel, { color: C.sell }]}>STOP LOSS</Text>
+            <Text style={[styles.ladderEntryPrice, { color: C.sell }]}>${formatPrice(stopLoss)}</Text>
+          </View>
+          <Text style={styles.ladderLot}>All orders</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
-  const { status, price, accountInfo, placeTrade, refreshPrice } = useTrading();
+  const { status, price, accountInfo, placeTrade, placeCascadeOrders, refreshPrice } = useTrading();
+  const { settings: cascadeSettings } = useCascadeSettings();
 
+  // Mode
+  const [tradeMode, setTradeMode] = useState<TradeMode>("cascade");
+
+  // Single trade state
   const [direction, setDirection] = useState<Direction>("buy");
   const [lotSize, setLotSize] = useState(0.01);
   const [slMode, setSlMode] = useState<SLMode>("points");
@@ -174,6 +237,13 @@ export default function TradeScreen() {
   const [slPercent, setSlPercent] = useState(1);
   const [slManual, setSlManual] = useState(0);
   const [slManualText, setSlManualText] = useState("");
+
+  // Cascade state
+  const [cascadeDirection, setCascadeDirection] = useState<Direction>("buy");
+  const [cascadeLotSize, setCascadeLotSize] = useState(0.01);
+  const [firstPriceText, setFirstPriceText] = useState("");
+  const [firstPrice, setFirstPrice] = useState(0);
+
   const [isPlacing, setIsPlacing] = useState(false);
 
   const blinkAnim = useRef(new Animated.Value(1)).current;
@@ -190,15 +260,20 @@ export default function TradeScreen() {
     return () => loop.stop();
   }, [status, blinkAnim]);
 
-  const entryPrice = direction === "buy" ? (price?.ask ?? 0) : (price?.bid ?? 0);
+  const marketEntry = direction === "buy" ? (price?.ask ?? 0) : (price?.bid ?? 0);
   const balance = accountInfo?.balance ?? 10000;
-  const sl = computeSL(slMode, direction, entryPrice, slPips, slPercent, slManual, lotSize, balance);
-  const riskDollars = computeRiskDollars(slMode, direction, entryPrice, slPips, slPercent, slManual, lotSize, balance);
+  const sl = computeSL(slMode, direction, marketEntry, slPips, slPercent, slManual, lotSize, balance);
+  const riskDollars = computeRiskDollars(slMode, direction, marketEntry, slPips, slPercent, slManual, lotSize, balance);
 
-  const handleTrade = useCallback(async () => {
+  // Cascade levels
+  const cascadeLevels = firstPrice > 0
+    ? buildCascadeLevels(firstPrice, cascadeDirection, cascadeSettings)
+    : null;
+
+  const handleSingleTrade = useCallback(async () => {
     if (isPlacing) return;
     if (status !== "connected") {
-      Alert.alert("Not Connected", "Please connect your MetaAPI account in Settings first.");
+      Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
       return;
     }
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
@@ -214,7 +289,50 @@ export default function TradeScreen() {
     }
   }, [isPlacing, status, direction, lotSize, sl, placeTrade]);
 
+  const handleCascadeTrade = useCallback(async () => {
+    if (isPlacing || !cascadeLevels) return;
+    if (status !== "connected") {
+      Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
+      return;
+    }
+    if (firstPrice <= 0) {
+      Alert.alert("Enter Price", "Please enter the first entry price for the cascade.");
+      return;
+    }
+    Alert.alert(
+      `Place ${cascadeLevels.entries.length} ${cascadeDirection.toUpperCase()} Orders`,
+      `Entries: ${cascadeLevels.entries.map((p) => `$${formatPrice(p)}`).join(", ")}\nStop Loss: $${formatPrice(cascadeLevels.stopLoss)}\nLot per order: ${cascadeLotSize.toFixed(2)}`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Confirm",
+          onPress: async () => {
+            await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+            setIsPlacing(true);
+            const result = await placeCascadeOrders({
+              direction: cascadeDirection,
+              volume: cascadeLotSize,
+              entries: cascadeLevels.entries,
+              stopLoss: cascadeLevels.stopLoss,
+            });
+            setIsPlacing(false);
+            if (result.success) {
+              await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+              Alert.alert("Orders Placed", result.message);
+              setFirstPriceText("");
+              setFirstPrice(0);
+            } else {
+              await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+              Alert.alert("Orders Failed", result.message);
+            }
+          },
+        },
+      ]
+    );
+  }, [isPlacing, cascadeLevels, status, firstPrice, cascadeDirection, cascadeLotSize, placeCascadeOrders]);
+
   const webTopPad = Platform.OS === "web" ? 67 : 0;
+  const isCascadeReady = firstPrice > 0 && cascadeLevels != null && status === "connected";
 
   return (
     <View style={[styles.container, { paddingTop: insets.top + webTopPad }]}>
@@ -241,25 +359,11 @@ export default function TradeScreen() {
         <View style={styles.card}>
           {price ? (
             <>
-              <PriceRow
-                label="BID"
-                value={formatPrice(price.bid)}
-                color={C.sell}
-                sublabel="Sell at"
-              />
+              <PriceRow label="BID" value={formatPrice(price.bid)} color={C.sell} sublabel="Sell at" />
               <View style={styles.divider} />
-              <PriceRow
-                label="ASK"
-                value={formatPrice(price.ask)}
-                color={C.buy}
-                sublabel="Buy at"
-              />
+              <PriceRow label="ASK" value={formatPrice(price.ask)} color={C.buy} sublabel="Buy at" />
               <View style={styles.divider} />
-              <PriceRow
-                label="SPREAD"
-                value={`${price.spread} pips`}
-                color={C.textSecondary}
-              />
+              <PriceRow label="SPREAD" value={`${price.spread} pips`} color={C.textSecondary} />
             </>
           ) : (
             <View style={styles.noPrice}>
@@ -271,183 +375,309 @@ export default function TradeScreen() {
           )}
         </View>
 
-        {/* Direction Toggle */}
-        <View style={styles.directionRow}>
+        {/* Mode Toggle */}
+        <View style={styles.modeToggle}>
           <Pressable
-            style={[styles.dirBtn, direction === "buy" && styles.dirBtnBuyActive]}
-            onPress={() => { setDirection("buy"); Haptics.selectionAsync(); }}
+            style={[styles.modeBtn, tradeMode === "cascade" && styles.modeBtnActive]}
+            onPress={() => { setTradeMode("cascade"); Haptics.selectionAsync(); }}
           >
-            <Feather name="trending-up" size={18} color={direction === "buy" ? "#000" : C.buy} />
-            <Text style={[styles.dirLabel, direction === "buy" ? styles.dirLabelActiveBuy : { color: C.buy }]}>
-              BUY
+            <Feather name="layers" size={14} color={tradeMode === "cascade" ? C.gold : C.textSecondary} />
+            <Text style={[styles.modeBtnText, tradeMode === "cascade" && styles.modeBtnTextActive]}>
+              Cascade
             </Text>
           </Pressable>
           <Pressable
-            style={[styles.dirBtn, direction === "sell" && styles.dirBtnSellActive]}
-            onPress={() => { setDirection("sell"); Haptics.selectionAsync(); }}
+            style={[styles.modeBtn, tradeMode === "single" && styles.modeBtnActive]}
+            onPress={() => { setTradeMode("single"); Haptics.selectionAsync(); }}
           >
-            <Feather name="trending-down" size={18} color={direction === "sell" ? "#fff" : C.sell} />
-            <Text style={[styles.dirLabel, direction === "sell" ? styles.dirLabelActiveSell : { color: C.sell }]}>
-              SELL
+            <Feather name="zap" size={14} color={tradeMode === "single" ? C.gold : C.textSecondary} />
+            <Text style={[styles.modeBtnText, tradeMode === "single" && styles.modeBtnTextActive]}>
+              Single Order
             </Text>
           </Pressable>
         </View>
 
-        {/* Lot Size */}
-        <View style={styles.sectionCard}>
-          <View style={styles.sectionHeader}>
-            <Text style={styles.sectionTitle}>Lot Size</Text>
-            <Text style={styles.sectionHint}>1 lot = 100 oz gold</Text>
-          </View>
-          <StepInput
-            value={lotSize}
-            onChange={setLotSize}
-            step={0.01}
-            min={0.01}
-            max={100}
-            decimals={2}
-          />
-        </View>
-
-        {/* Stop Loss */}
-        <View style={styles.sectionCard}>
-          <View style={styles.sectionHeader}>
-            <Text style={styles.sectionTitle}>Stop Loss</Text>
-            <Text style={[styles.sectionHint, { color: C.sell }]}>
-              {sl != null ? `SL: $${formatPrice(sl)}` : "No SL set"}
-            </Text>
-          </View>
-
-          {/* SL Mode Tabs */}
-          <View style={styles.slModeRow}>
-            {SL_OPTIONS.map((opt) => (
+        {/* ═══ CASCADE MODE ═══════════════════════════════════════════════════ */}
+        {tradeMode === "cascade" && (
+          <>
+            {/* Direction */}
+            <View style={styles.directionRow}>
               <Pressable
-                key={opt.key}
-                style={[styles.slModeBtn, slMode === opt.key && styles.slModeBtnActive]}
-                onPress={() => { setSlMode(opt.key); Haptics.selectionAsync(); }}
+                style={[styles.dirBtn, cascadeDirection === "buy" && styles.dirBtnBuyActive]}
+                onPress={() => { setCascadeDirection("buy"); Haptics.selectionAsync(); }}
               >
-                <Feather
-                  name={opt.icon as any}
-                  size={12}
-                  color={slMode === opt.key ? C.gold : C.textSecondary}
-                />
-                <Text style={[styles.slModeLabel, slMode === opt.key && styles.slModeLabelActive]}>
-                  {opt.label}
+                <Feather name="trending-up" size={18} color={cascadeDirection === "buy" ? "#000" : C.buy} />
+                <Text style={[styles.dirLabel, cascadeDirection === "buy" ? styles.dirLabelActiveBuy : { color: C.buy }]}>
+                  BUY
                 </Text>
               </Pressable>
-            ))}
-          </View>
-
-          {/* SL Input */}
-          {slMode === "points" && (
-            <View style={styles.slInputArea}>
-              <StepInput value={slPips} onChange={setSlPips} step={5} min={5} max={500} decimals={0} />
-              <Text style={styles.slNote}>
-                {entryPrice > 0 && sl != null
-                  ? `Entry ${formatPrice(entryPrice)} → SL ${formatPrice(sl)}  (${slPips} pips = $${(slPips * PIP_SIZE).toFixed(2)})`
-                  : "Connect to see calculated SL"}
-              </Text>
-            </View>
-          )}
-
-          {slMode === "percent" && (
-            <View style={styles.slInputArea}>
-              <StepInput value={slPercent} onChange={setSlPercent} step={0.1} min={0.1} max={20} decimals={1} />
-              <Text style={styles.slNote}>
-                {entryPrice > 0 && sl != null
-                  ? `Risk $${riskDollars.toFixed(2)} → SL ${formatPrice(sl)}`
-                  : "Connect to calculate"}
-              </Text>
-            </View>
-          )}
-
-          {slMode === "manual" && (
-            <View style={styles.slInputArea}>
-              <TextInput
-                style={styles.manualInput}
-                placeholder="Enter exact SL price"
-                placeholderTextColor={C.textMuted}
-                keyboardType="decimal-pad"
-                value={slManualText}
-                onChangeText={(t) => {
-                  setSlManualText(t);
-                  const n = parseFloat(t);
-                  if (!isNaN(n)) setSlManual(n);
-                }}
-              />
-              {sl != null && entryPrice > 0 && (
-                <Text style={styles.slNote}>
-                  {`Distance: $${Math.abs(entryPrice - sl).toFixed(2)}  (${(Math.abs(entryPrice - sl) / PIP_SIZE).toFixed(0)} pips)`}
+              <Pressable
+                style={[styles.dirBtn, cascadeDirection === "sell" && styles.dirBtnSellActive]}
+                onPress={() => { setCascadeDirection("sell"); Haptics.selectionAsync(); }}
+              >
+                <Feather name="trending-down" size={18} color={cascadeDirection === "sell" ? "#fff" : C.sell} />
+                <Text style={[styles.dirLabel, cascadeDirection === "sell" ? styles.dirLabelActiveSell : { color: C.sell }]}>
+                  SELL
                 </Text>
-              )}
+              </Pressable>
             </View>
-          )}
-        </View>
 
-        {/* Risk Summary */}
-        {status === "connected" && entryPrice > 0 && (
-          <View style={styles.riskCard}>
-            <View style={styles.riskRow}>
-              <Text style={styles.riskLabel}>Entry</Text>
-              <Text style={styles.riskValue}>${formatPrice(entryPrice)}</Text>
-            </View>
-            <View style={styles.riskRow}>
-              <Text style={styles.riskLabel}>Stop Loss</Text>
-              <Text style={[styles.riskValue, { color: C.sell }]}>
-                {sl != null ? `$${formatPrice(sl)}` : "None"}
+            {/* First Entry Price */}
+            <View style={styles.sectionCard}>
+              <View style={styles.sectionHeader}>
+                <Text style={styles.sectionTitle}>First Entry Price</Text>
+                {price && (
+                  <Pressable
+                    onPress={() => {
+                      const p = cascadeDirection === "buy" ? price.ask : price.bid;
+                      setFirstPriceText(p.toFixed(2));
+                      setFirstPrice(p);
+                    }}
+                    hitSlop={8}
+                  >
+                    <Text style={styles.useMarketBtn}>Use market</Text>
+                  </Pressable>
+                )}
+              </View>
+              <View style={styles.priceInputWrap}>
+                <Text style={styles.priceInputCurrency}>$</Text>
+                <TextInput
+                  style={styles.priceInput}
+                  value={firstPriceText}
+                  onChangeText={(t) => {
+                    setFirstPriceText(t);
+                    const n = parseFloat(t);
+                    setFirstPrice(isNaN(n) ? 0 : n);
+                  }}
+                  placeholder={price ? price.ask.toFixed(2) : "e.g. 5058.00"}
+                  placeholderTextColor={C.textMuted}
+                  keyboardType="decimal-pad"
+                  selectTextOnFocus
+                />
+              </View>
+              <Text style={styles.priceInputNote}>
+                {cascadeDirection === "buy"
+                  ? `Orders placed at and below this price (${cascadeSettings.numPositions} levels, ${cascadeSettings.pipsBetween} pips apart)`
+                  : `Orders placed at and above this price (${cascadeSettings.numPositions} levels, ${cascadeSettings.pipsBetween} pips apart)`}
               </Text>
             </View>
-            <View style={styles.riskRow}>
-              <Text style={styles.riskLabel}>Est. Risk</Text>
-              <Text style={[styles.riskValue, { color: C.gold }]}>
-                ${riskDollars.toFixed(2)}
-              </Text>
+
+            {/* Lot Size */}
+            <View style={styles.sectionCard}>
+              <View style={styles.sectionHeader}>
+                <Text style={styles.sectionTitle}>Lot Size (per order)</Text>
+                <Text style={styles.sectionHint}>1 lot = 100 oz gold</Text>
+              </View>
+              <StepInput value={cascadeLotSize} onChange={setCascadeLotSize} step={0.01} min={0.01} max={100} decimals={2} />
             </View>
-            {accountInfo && (
-              <View style={styles.riskRow}>
-                <Text style={styles.riskLabel}>Balance</Text>
-                <Text style={styles.riskValue}>${formatPrice(accountInfo.balance)}</Text>
+
+            {/* Cascade Preview */}
+            {cascadeLevels && firstPrice > 0 && (
+              <CascadeLadder
+                entries={cascadeLevels.entries}
+                stopLoss={cascadeLevels.stopLoss}
+                direction={cascadeDirection}
+                lotSize={cascadeLotSize}
+              />
+            )}
+
+            {!firstPrice && (
+              <View style={styles.cascadeHint}>
+                <Feather name="info" size={14} color={C.textMuted} />
+                <Text style={styles.cascadeHintText}>
+                  Enter a price above to preview your order ladder. Configure positions, spacing and SL in Settings.
+                </Text>
               </View>
             )}
-          </View>
+
+            {/* Cascade Button */}
+            <Pressable
+              style={({ pressed }) => [
+                styles.tradeBtn,
+                cascadeDirection === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
+                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
+                (!isCascadeReady || isPlacing) && { opacity: 0.45 },
+              ]}
+              onPress={handleCascadeTrade}
+              disabled={!isCascadeReady || isPlacing}
+            >
+              {isPlacing ? (
+                <ActivityIndicator color={cascadeDirection === "buy" ? "#000" : "#fff"} />
+              ) : (
+                <>
+                  <Feather name="layers" size={20} color={cascadeDirection === "buy" ? "#000" : "#fff"} />
+                  <Text style={[styles.tradeBtnText, cascadeDirection === "buy" ? { color: "#000" } : { color: "#fff" }]}>
+                    {`Place ${cascadeSettings.numPositions} ${cascadeDirection.toUpperCase()} Orders`}
+                  </Text>
+                </>
+              )}
+            </Pressable>
+          </>
         )}
 
-        {/* Trade Button */}
-        <Pressable
-          style={({ pressed }) => [
-            styles.tradeBtn,
-            direction === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
-            pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
-            isPlacing && { opacity: 0.6 },
-          ]}
-          onPress={handleTrade}
-          disabled={isPlacing}
-        >
-          {isPlacing ? (
-            <ActivityIndicator color={direction === "buy" ? "#000" : "#fff"} />
-          ) : (
-            <>
-              <Feather
-                name={direction === "buy" ? "trending-up" : "trending-down"}
-                size={20}
-                color={direction === "buy" ? "#000" : "#fff"}
-              />
-              <Text style={[styles.tradeBtnText, direction === "buy" ? { color: "#000" } : { color: "#fff" }]}>
-                {direction === "buy" ? "BUY XAUUSD" : "SELL XAUUSD"}
-              </Text>
-            </>
-          )}
-        </Pressable>
+        {/* ═══ SINGLE MODE ════════════════════════════════════════════════════ */}
+        {tradeMode === "single" && (
+          <>
+            {/* Direction Toggle */}
+            <View style={styles.directionRow}>
+              <Pressable
+                style={[styles.dirBtn, direction === "buy" && styles.dirBtnBuyActive]}
+                onPress={() => { setDirection("buy"); Haptics.selectionAsync(); }}
+              >
+                <Feather name="trending-up" size={18} color={direction === "buy" ? "#000" : C.buy} />
+                <Text style={[styles.dirLabel, direction === "buy" ? styles.dirLabelActiveBuy : { color: C.buy }]}>
+                  BUY
+                </Text>
+              </Pressable>
+              <Pressable
+                style={[styles.dirBtn, direction === "sell" && styles.dirBtnSellActive]}
+                onPress={() => { setDirection("sell"); Haptics.selectionAsync(); }}
+              >
+                <Feather name="trending-down" size={18} color={direction === "sell" ? "#fff" : C.sell} />
+                <Text style={[styles.dirLabel, direction === "sell" ? styles.dirLabelActiveSell : { color: C.sell }]}>
+                  SELL
+                </Text>
+              </Pressable>
+            </View>
+
+            {/* Lot Size */}
+            <View style={styles.sectionCard}>
+              <View style={styles.sectionHeader}>
+                <Text style={styles.sectionTitle}>Lot Size</Text>
+                <Text style={styles.sectionHint}>1 lot = 100 oz gold</Text>
+              </View>
+              <StepInput value={lotSize} onChange={setLotSize} step={0.01} min={0.01} max={100} decimals={2} />
+            </View>
+
+            {/* Stop Loss */}
+            <View style={styles.sectionCard}>
+              <View style={styles.sectionHeader}>
+                <Text style={styles.sectionTitle}>Stop Loss</Text>
+                <Text style={[styles.sectionHint, { color: C.sell }]}>
+                  {sl != null ? `SL: $${formatPrice(sl)}` : "No SL set"}
+                </Text>
+              </View>
+              <View style={styles.slModeRow}>
+                {SL_OPTIONS.map((opt) => (
+                  <Pressable
+                    key={opt.key}
+                    style={[styles.slModeBtn, slMode === opt.key && styles.slModeBtnActive]}
+                    onPress={() => { setSlMode(opt.key); Haptics.selectionAsync(); }}
+                  >
+                    <Feather name={opt.icon as any} size={12} color={slMode === opt.key ? C.gold : C.textSecondary} />
+                    <Text style={[styles.slModeLabel, slMode === opt.key && styles.slModeLabelActive]}>
+                      {opt.label}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+
+              {slMode === "points" && (
+                <View style={styles.slInputArea}>
+                  <StepInput value={slPips} onChange={setSlPips} step={5} min={5} max={500} decimals={0} />
+                  <Text style={styles.slNote}>
+                    {marketEntry > 0 && sl != null
+                      ? `Entry ${formatPrice(marketEntry)} → SL ${formatPrice(sl)}  (${slPips} pips = $${(slPips * PIP_SIZE).toFixed(2)})`
+                      : "Connect to see calculated SL"}
+                  </Text>
+                </View>
+              )}
+
+              {slMode === "percent" && (
+                <View style={styles.slInputArea}>
+                  <StepInput value={slPercent} onChange={setSlPercent} step={0.1} min={0.1} max={20} decimals={1} />
+                  <Text style={styles.slNote}>
+                    {marketEntry > 0 && sl != null
+                      ? `Risk $${riskDollars.toFixed(2)} → SL ${formatPrice(sl)}`
+                      : "Connect to calculate"}
+                  </Text>
+                </View>
+              )}
+
+              {slMode === "manual" && (
+                <View style={styles.slInputArea}>
+                  <TextInput
+                    style={styles.manualInput}
+                    placeholder="Enter exact SL price"
+                    placeholderTextColor={C.textMuted}
+                    keyboardType="decimal-pad"
+                    value={slManualText}
+                    onChangeText={(t) => {
+                      setSlManualText(t);
+                      const n = parseFloat(t);
+                      if (!isNaN(n)) setSlManual(n);
+                    }}
+                  />
+                  {sl != null && marketEntry > 0 && (
+                    <Text style={styles.slNote}>
+                      {`Distance: $${Math.abs(marketEntry - sl).toFixed(2)}  (${(Math.abs(marketEntry - sl) / PIP_SIZE).toFixed(0)} pips)`}
+                    </Text>
+                  )}
+                </View>
+              )}
+            </View>
+
+            {/* Risk Summary */}
+            {status === "connected" && marketEntry > 0 && (
+              <View style={styles.riskCard}>
+                <View style={styles.riskRow}>
+                  <Text style={styles.riskLabel}>Entry</Text>
+                  <Text style={styles.riskValue}>${formatPrice(marketEntry)}</Text>
+                </View>
+                <View style={styles.riskRow}>
+                  <Text style={styles.riskLabel}>Stop Loss</Text>
+                  <Text style={[styles.riskValue, { color: C.sell }]}>
+                    {sl != null ? `$${formatPrice(sl)}` : "None"}
+                  </Text>
+                </View>
+                <View style={styles.riskRow}>
+                  <Text style={styles.riskLabel}>Est. Risk</Text>
+                  <Text style={[styles.riskValue, { color: C.gold }]}>${riskDollars.toFixed(2)}</Text>
+                </View>
+                {accountInfo && (
+                  <View style={styles.riskRow}>
+                    <Text style={styles.riskLabel}>Balance</Text>
+                    <Text style={styles.riskValue}>${formatPrice(accountInfo.balance)}</Text>
+                  </View>
+                )}
+              </View>
+            )}
+
+            {/* Trade Button */}
+            <Pressable
+              style={({ pressed }) => [
+                styles.tradeBtn,
+                direction === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
+                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
+                isPlacing && { opacity: 0.6 },
+              ]}
+              onPress={handleSingleTrade}
+              disabled={isPlacing}
+            >
+              {isPlacing ? (
+                <ActivityIndicator color={direction === "buy" ? "#000" : "#fff"} />
+              ) : (
+                <>
+                  <Feather
+                    name={direction === "buy" ? "trending-up" : "trending-down"}
+                    size={20}
+                    color={direction === "buy" ? "#000" : "#fff"}
+                  />
+                  <Text style={[styles.tradeBtnText, direction === "buy" ? { color: "#000" } : { color: "#fff" }]}>
+                    {direction === "buy" ? "BUY XAUUSD" : "SELL XAUUSD"}
+                  </Text>
+                </>
+              )}
+            </Pressable>
+          </>
+        )}
       </ScrollView>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: C.background,
-  },
+  container: { flex: 1, backgroundColor: C.background },
   header: {
     flexDirection: "row",
     alignItems: "center",
@@ -457,17 +687,8 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: C.border,
   },
-  headerLeft: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 12,
-  },
-  symbol: {
-    fontSize: 22,
-    fontFamily: "Inter_700Bold",
-    color: C.text,
-    letterSpacing: 1,
-  },
+  headerLeft: { flexDirection: "row", alignItems: "center", gap: 12 },
+  symbol: { fontSize: 22, fontFamily: "Inter_700Bold", color: C.text, letterSpacing: 1 },
   liveDot: {
     flexDirection: "row",
     alignItems: "center",
@@ -477,22 +698,9 @@ const styles = StyleSheet.create({
     paddingVertical: 3,
     borderRadius: 20,
   },
-  dot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
-    backgroundColor: C.buy,
-  },
-  liveLabel: {
-    fontSize: 10,
-    fontFamily: "Inter_600SemiBold",
-    color: C.buy,
-    letterSpacing: 0.5,
-  },
-  scroll: {
-    padding: 16,
-    gap: 12,
-  },
+  dot: { width: 6, height: 6, borderRadius: 3, backgroundColor: C.buy },
+  liveLabel: { fontSize: 10, fontFamily: "Inter_600SemiBold", color: C.buy, letterSpacing: 0.5 },
+  scroll: { padding: 16, gap: 12 },
   card: {
     backgroundColor: C.card,
     borderRadius: 16,
@@ -506,44 +714,34 @@ const styles = StyleSheet.create({
     alignItems: "center",
     paddingVertical: 10,
   },
-  priceLabel: {
-    fontSize: 12,
-    fontFamily: "Inter_600SemiBold",
-    color: C.textSecondary,
-    letterSpacing: 1,
-  },
-  priceValue: {
-    fontSize: 26,
-    fontFamily: "Inter_700Bold",
-    letterSpacing: 0.5,
-  },
-  priceSublabel: {
-    fontSize: 10,
-    fontFamily: "Inter_400Regular",
-    color: C.textSecondary,
-    textAlign: "right",
-    marginTop: 1,
-  },
-  divider: {
-    height: 1,
-    backgroundColor: C.border,
-  },
-  noPrice: {
-    alignItems: "center",
-    paddingVertical: 20,
-    gap: 8,
-  },
-  noPriceText: {
-    fontSize: 14,
-    fontFamily: "Inter_400Regular",
-    color: C.textMuted,
-    textAlign: "center",
-  },
-  directionRow: {
+  priceLabel: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: C.textSecondary, letterSpacing: 1 },
+  priceValue: { fontSize: 26, fontFamily: "Inter_700Bold", letterSpacing: 0.5 },
+  priceSublabel: { fontSize: 10, fontFamily: "Inter_400Regular", color: C.textSecondary, textAlign: "right", marginTop: 1 },
+  divider: { height: 1, backgroundColor: C.border },
+  noPrice: { alignItems: "center", paddingVertical: 20, gap: 8 },
+  noPriceText: { fontSize: 14, fontFamily: "Inter_400Regular", color: C.textMuted, textAlign: "center" },
+  modeToggle: {
     flexDirection: "row",
-    gap: 10,
-    marginTop: 4,
+    backgroundColor: C.card,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: C.border,
+    padding: 4,
+    gap: 4,
   },
+  modeBtn: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    paddingVertical: 9,
+    borderRadius: 10,
+  },
+  modeBtnActive: { backgroundColor: "rgba(201,168,76,0.12)", borderWidth: 1, borderColor: C.gold },
+  modeBtnText: { fontSize: 13, fontFamily: "Inter_600SemiBold", color: C.textSecondary },
+  modeBtnTextActive: { color: C.gold },
+  directionRow: { flexDirection: "row", gap: 10 },
   dirBtn: {
     flex: 1,
     flexDirection: "row",
@@ -556,25 +754,11 @@ const styles = StyleSheet.create({
     borderWidth: 1.5,
     borderColor: C.border,
   },
-  dirBtnBuyActive: {
-    backgroundColor: C.buy,
-    borderColor: C.buy,
-  },
-  dirBtnSellActive: {
-    backgroundColor: C.sell,
-    borderColor: C.sell,
-  },
-  dirLabel: {
-    fontSize: 16,
-    fontFamily: "Inter_700Bold",
-    letterSpacing: 1.5,
-  },
-  dirLabelActiveBuy: {
-    color: "#000",
-  },
-  dirLabelActiveSell: {
-    color: "#fff",
-  },
+  dirBtnBuyActive: { backgroundColor: C.buy, borderColor: C.buy },
+  dirBtnSellActive: { backgroundColor: C.sell, borderColor: C.sell },
+  dirLabel: { fontSize: 16, fontFamily: "Inter_700Bold", letterSpacing: 1.5 },
+  dirLabelActiveBuy: { color: "#000" },
+  dirLabelActiveSell: { color: "#fff" },
   sectionCard: {
     backgroundColor: C.card,
     borderRadius: 16,
@@ -583,11 +767,7 @@ const styles = StyleSheet.create({
     borderColor: C.border,
     gap: 14,
   },
-  sectionHeader: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-  },
+  sectionHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   sectionTitle: {
     fontSize: 13,
     fontFamily: "Inter_600SemiBold",
@@ -595,11 +775,28 @@ const styles = StyleSheet.create({
     letterSpacing: 0.8,
     textTransform: "uppercase",
   },
-  sectionHint: {
-    fontSize: 12,
-    fontFamily: "Inter_500Medium",
-    color: C.textSecondary,
+  sectionHint: { fontSize: 12, fontFamily: "Inter_500Medium", color: C.textSecondary },
+  useMarketBtn: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: C.gold },
+  priceInputWrap: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: C.surface,
+    borderRadius: 14,
+    borderWidth: 1.5,
+    borderColor: C.gold,
+    paddingHorizontal: 16,
+    height: 56,
+    gap: 8,
   },
+  priceInputCurrency: { fontSize: 20, fontFamily: "Inter_700Bold", color: C.textSecondary },
+  priceInput: {
+    flex: 1,
+    fontSize: 26,
+    fontFamily: "Inter_700Bold",
+    color: C.text,
+    height: 56,
+  },
+  priceInputNote: { fontSize: 11, fontFamily: "Inter_400Regular", color: C.textMuted, lineHeight: 16 },
   stepRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -607,12 +804,7 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     overflow: "hidden",
   },
-  stepBtn: {
-    width: 44,
-    height: 44,
-    alignItems: "center",
-    justifyContent: "center",
-  },
+  stepBtn: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
   stepInput: {
     flex: 1,
     height: 44,
@@ -621,10 +813,7 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_700Bold",
     color: C.text,
   },
-  slModeRow: {
-    flexDirection: "row",
-    gap: 8,
-  },
+  slModeRow: { flexDirection: "row", gap: 8 },
   slModeBtn: {
     flex: 1,
     flexDirection: "row",
@@ -637,27 +826,11 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: C.border,
   },
-  slModeBtnActive: {
-    borderColor: C.gold,
-    backgroundColor: "rgba(201, 168, 76, 0.1)",
-  },
-  slModeLabel: {
-    fontSize: 11,
-    fontFamily: "Inter_600SemiBold",
-    color: C.textSecondary,
-  },
-  slModeLabelActive: {
-    color: C.gold,
-  },
-  slInputArea: {
-    gap: 8,
-  },
-  slNote: {
-    fontSize: 12,
-    fontFamily: "Inter_400Regular",
-    color: C.textSecondary,
-    textAlign: "center",
-  },
+  slModeBtnActive: { borderColor: C.gold, backgroundColor: "rgba(201, 168, 76, 0.1)" },
+  slModeLabel: { fontSize: 11, fontFamily: "Inter_600SemiBold", color: C.textSecondary },
+  slModeLabelActive: { color: C.gold },
+  slInputArea: { gap: 8 },
+  slNote: { fontSize: 12, fontFamily: "Inter_400Regular", color: C.textSecondary, textAlign: "center" },
   manualInput: {
     backgroundColor: C.surface,
     borderRadius: 12,
@@ -668,6 +841,46 @@ const styles = StyleSheet.create({
     color: C.text,
     textAlign: "center",
   },
+  // Ladder
+  ladder: {
+    backgroundColor: C.card,
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: C.border,
+    gap: 12,
+  },
+  ladderHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  ladderTitle: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: C.textSecondary, letterSpacing: 1, textTransform: "uppercase" },
+  ladderRisk: { fontSize: 12, fontFamily: "Inter_600SemiBold" },
+  ladderList: { gap: 6 },
+  ladderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    backgroundColor: C.surface,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  ladderDot: { width: 10, height: 10, borderRadius: 5 },
+  ladderDotSL: { backgroundColor: C.sell },
+  ladderLine: { width: 2, height: 18, backgroundColor: C.border, borderRadius: 1 },
+  ladderEntry: { flex: 1, gap: 1 },
+  ladderEntryLabel: { fontSize: 10, fontFamily: "Inter_700Bold", letterSpacing: 0.8 },
+  ladderEntryPrice: { fontSize: 16, fontFamily: "Inter_700Bold", color: C.text },
+  ladderLot: { fontSize: 11, fontFamily: "Inter_500Medium", color: C.textMuted },
+  cascadeHint: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 8,
+    backgroundColor: C.card,
+    borderRadius: 12,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  cascadeHintText: { flex: 1, fontSize: 12, fontFamily: "Inter_400Regular", color: C.textMuted, lineHeight: 18 },
   riskCard: {
     backgroundColor: C.card,
     borderRadius: 16,
@@ -676,21 +889,9 @@ const styles = StyleSheet.create({
     borderColor: C.border,
     gap: 10,
   },
-  riskRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-  },
-  riskLabel: {
-    fontSize: 13,
-    fontFamily: "Inter_400Regular",
-    color: C.textSecondary,
-  },
-  riskValue: {
-    fontSize: 14,
-    fontFamily: "Inter_600SemiBold",
-    color: C.text,
-  },
+  riskRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  riskLabel: { fontSize: 13, fontFamily: "Inter_400Regular", color: C.textSecondary },
+  riskValue: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: C.text },
   tradeBtn: {
     flexDirection: "row",
     alignItems: "center",
@@ -698,17 +899,9 @@ const styles = StyleSheet.create({
     gap: 10,
     paddingVertical: 18,
     borderRadius: 16,
-    marginTop: 6,
+    marginTop: 4,
   },
-  tradeBtnBuy: {
-    backgroundColor: C.buy,
-  },
-  tradeBtnSell: {
-    backgroundColor: C.sell,
-  },
-  tradeBtnText: {
-    fontSize: 17,
-    fontFamily: "Inter_700Bold",
-    letterSpacing: 1.5,
-  },
+  tradeBtnBuy: { backgroundColor: C.buy },
+  tradeBtnSell: { backgroundColor: C.sell },
+  tradeBtnText: { fontSize: 17, fontFamily: "Inter_700Bold", letterSpacing: 1.5 },
 });

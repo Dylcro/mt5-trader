@@ -61,6 +61,7 @@ interface TradingContextValue {
   connect: (creds?: Mt5Credentials) => Promise<void>;
   disconnect: () => Promise<void>;
   placeTrade: (params: PlaceTradeParams) => Promise<{ success: boolean; message: string }>;
+  placeCascadeOrders: (params: CascadeOrderParams) => Promise<{ success: boolean; placed: number; failed: number; message: string }>;
   closePosition: (positionId: string) => Promise<{ success: boolean; message: string }>;
   refreshPositions: () => Promise<void>;
   refreshPrice: () => Promise<void>;
@@ -73,6 +74,14 @@ export interface PlaceTradeParams {
   stopLoss?: number;
   takeProfit?: number;
   comment?: string;
+  limitPrice?: number;
+}
+
+export interface CascadeOrderParams {
+  direction: "buy" | "sell";
+  volume: number;
+  entries: number[];
+  stopLoss: number;
 }
 
 const API_BASE = process.env.EXPO_PUBLIC_DOMAIN
@@ -303,12 +312,19 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     async (params: PlaceTradeParams): Promise<{ success: boolean; message: string }> => {
       if (status !== "connected") return { success: false, message: "Not connected" };
       try {
+        let actionType: string;
+        if (params.limitPrice != null) {
+          actionType = params.direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT";
+        } else {
+          actionType = params.direction === "buy" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL";
+        }
         const body: Record<string, unknown> = {
-          actionType: params.direction === "buy" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
+          actionType,
           symbol: "XAUUSD",
           volume: params.volume,
           comment: params.comment ?? "XAUUSD Trader App",
         };
+        if (params.limitPrice != null) body.openPrice = params.limitPrice;
         if (params.stopLoss != null) body.stopLoss = params.stopLoss;
         if (params.takeProfit != null) body.takeProfit = params.takeProfit;
         const res = await fetch(`${API_BASE}/mt5/account/${accountId}/trade`, {
@@ -328,6 +344,31 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       }
     },
     [status, accountId, refreshPositions, refreshAccountInfo]
+  );
+
+  const placeCascadeOrders = useCallback(
+    async (params: CascadeOrderParams): Promise<{ success: boolean; placed: number; failed: number; message: string }> => {
+      if (status !== "connected") return { success: false, placed: 0, failed: 0, message: "Not connected" };
+      let placed = 0;
+      let failed = 0;
+      for (let i = 0; i < params.entries.length; i++) {
+        const result = await placeTrade({
+          direction: params.direction,
+          volume: params.volume,
+          limitPrice: params.entries[i],
+          stopLoss: params.stopLoss,
+          comment: `Cascade ${i + 1}/${params.entries.length}`,
+        });
+        if (result.success) placed++;
+        else failed++;
+      }
+      await refreshPositions();
+      await refreshAccountInfo();
+      if (placed === 0) return { success: false, placed, failed, message: "All orders failed to place" };
+      if (failed > 0) return { success: true, placed, failed, message: `${placed} orders placed, ${failed} failed` };
+      return { success: true, placed, failed, message: `${placed} limit orders placed successfully` };
+    },
+    [status, placeTrade, refreshPositions, refreshAccountInfo]
   );
 
   const closePosition = useCallback(
@@ -365,6 +406,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         connect,
         disconnect,
         placeTrade,
+        placeCascadeOrders,
         closePosition,
         refreshPositions,
         refreshPrice,

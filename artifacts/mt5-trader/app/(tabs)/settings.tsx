@@ -17,6 +17,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import Colors from "@/constants/colors";
 import { useTrading } from "@/context/TradingContext";
+import { useCascadeSettings } from "@/hooks/useCascadeSettings";
 
 const C = Colors.dark;
 
@@ -54,9 +55,44 @@ function StatusDot({ status }: { status: string }) {
   );
 }
 
+function SettingRow({
+  label,
+  hint,
+  value,
+  onDec,
+  onInc,
+  display,
+}: {
+  label: string;
+  hint: string;
+  value: number;
+  onDec: () => void;
+  onInc: () => void;
+  display: string;
+}) {
+  return (
+    <View style={styles.settingRow}>
+      <View style={styles.settingRowLeft}>
+        <Text style={styles.settingLabel}>{label}</Text>
+        <Text style={styles.settingHint}>{hint}</Text>
+      </View>
+      <View style={styles.settingControls}>
+        <Pressable style={styles.settingBtn} onPress={onDec} hitSlop={8}>
+          <Feather name="minus" size={14} color={C.text} />
+        </Pressable>
+        <Text style={styles.settingValue}>{display}</Text>
+        <Pressable style={styles.settingBtn} onPress={onInc} hitSlop={8}>
+          <Feather name="plus" size={14} color={C.text} />
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
 export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
   const { credentials, status, errorMsg, accountInfo, connect, disconnect } = useTrading();
+  const { settings: cs, updateSettings } = useCascadeSettings();
 
   const [login, setLogin] = useState(credentials.login);
   const [password, setPassword] = useState("");
@@ -282,6 +318,61 @@ export default function SettingsScreen() {
               </Pressable>
             </>
           )}
+
+          {/* Cascade Order Settings — always visible */}
+          <View style={styles.cascadeCard}>
+            <View style={styles.cascadeCardHeader}>
+              <Feather name="layers" size={16} color={C.gold} />
+              <Text style={styles.cascadeCardTitle}>Cascade Orders</Text>
+            </View>
+            <Text style={styles.cascadeCardDesc}>
+              Configure the ladder of orders placed when you enter a price on the Trade screen.
+            </Text>
+
+            <View style={styles.cascadeDivider} />
+
+            <SettingRow
+              label="Number of positions"
+              hint="How many orders to place per cascade"
+              value={cs.numPositions}
+              display={String(cs.numPositions)}
+              onDec={() => updateSettings({ numPositions: Math.max(1, cs.numPositions - 1) })}
+              onInc={() => updateSettings({ numPositions: Math.min(10, cs.numPositions + 1) })}
+            />
+
+            <View style={styles.cascadeDivider} />
+
+            <SettingRow
+              label="Pips between positions"
+              hint={`$${(cs.pipsBetween * 0.10).toFixed(2)} price gap per level`}
+              value={cs.pipsBetween}
+              display={`${cs.pipsBetween} pips`}
+              onDec={() => updateSettings({ pipsBetween: Math.max(5, cs.pipsBetween - 5) })}
+              onInc={() => updateSettings({ pipsBetween: Math.min(200, cs.pipsBetween + 5) })}
+            />
+
+            <View style={styles.cascadeDivider} />
+
+            <SettingRow
+              label="Stop loss"
+              hint={`$${(cs.slPips * 0.10).toFixed(2)} below/above last entry`}
+              value={cs.slPips}
+              display={`${cs.slPips} pips`}
+              onDec={() => updateSettings({ slPips: Math.max(5, cs.slPips - 5) })}
+              onInc={() => updateSettings({ slPips: Math.min(500, cs.slPips + 5) })}
+            />
+
+            <View style={styles.cascadePreviewBox}>
+              <Text style={styles.cascadePreviewTitle}>Example with current settings</Text>
+              <Text style={styles.cascadePreviewText}>
+                {`If first entry = 5058.00 (buy):\n`}
+                {Array.from({ length: cs.numPositions }, (_, i) =>
+                  `  Entry ${i + 1}: $${(5058 - i * cs.pipsBetween * 0.10).toFixed(2)}`
+                ).join("\n")}
+                {`\n  Stop Loss: $${(5058 - (cs.numPositions - 1) * cs.pipsBetween * 0.10 - cs.slPips * 0.10).toFixed(2)}`}
+              </Text>
+            </View>
+          </View>
 
           {/* About */}
           <View style={styles.aboutCard}>
@@ -574,6 +665,48 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_600SemiBold",
     color: C.sell,
   },
+  cascadeCard: {
+    backgroundColor: C.card,
+    borderRadius: 20,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: C.border,
+    gap: 14,
+  },
+  cascadeCardHeader: { flexDirection: "row", alignItems: "center", gap: 10 },
+  cascadeCardTitle: { fontSize: 16, fontFamily: "Inter_700Bold", color: C.text },
+  cascadeCardDesc: { fontSize: 13, fontFamily: "Inter_400Regular", color: C.textSecondary, lineHeight: 19 },
+  cascadeDivider: { height: 1, backgroundColor: C.border },
+  settingRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 },
+  settingRowLeft: { flex: 1, gap: 2 },
+  settingLabel: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: C.text },
+  settingHint: { fontSize: 11, fontFamily: "Inter_400Regular", color: C.textSecondary },
+  settingControls: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: C.surface,
+    borderRadius: 10,
+    overflow: "hidden",
+  },
+  settingBtn: { width: 36, height: 36, alignItems: "center", justifyContent: "center" },
+  settingValue: {
+    minWidth: 64,
+    textAlign: "center",
+    fontSize: 13,
+    fontFamily: "Inter_700Bold",
+    color: C.gold,
+    paddingHorizontal: 4,
+  },
+  cascadePreviewBox: {
+    backgroundColor: C.surface,
+    borderRadius: 12,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: C.border,
+    gap: 6,
+  },
+  cascadePreviewTitle: { fontSize: 11, fontFamily: "Inter_600SemiBold", color: C.textSecondary, letterSpacing: 0.5 },
+  cascadePreviewText: { fontSize: 12, fontFamily: "Inter_400Regular", color: C.textMuted, lineHeight: 20 },
   aboutCard: {
     backgroundColor: C.card,
     borderRadius: 16,
