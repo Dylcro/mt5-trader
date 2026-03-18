@@ -253,7 +253,7 @@ const TRADE_ERROR_MESSAGES: Record<number, string> = {
   10016: "Invalid stop loss or take profit level.",
   10017: "Trading is disabled for this account.",
   10018: "Market is closed. Please try during trading hours.",
-  10019: "Insufficient funds. Please top up your account.",
+  10019: "Insufficient margin. Your free margin is too low for this trade size — try reducing the lot size, closing existing positions, or checking your leverage.",
   10020: "Price changed — no longer valid. Please retry.",
   10021: "No quotes available. Please retry shortly.",
   10022: "Invalid order expiration date.",
@@ -300,6 +300,9 @@ router.post("/mt5/account/:accountId/trade", async (req: Request, res: Response)
     const errorMessage = success
       ? undefined
       : (TRADE_ERROR_MESSAGES[code] ?? data.message ?? `Trade failed (code ${code})`);
+
+    console.log(`[trade] accountId=${req.params.accountId} action=${(req.body as Record<string,unknown>).actionType} volume=${(req.body as Record<string,unknown>).volume} code=${code} success=${success}${!success ? ` msg="${errorMessage}"` : ""}`);
+
     return res.status(tradeRes.ok ? 200 : tradeRes.status).json({
       success,
       code,
