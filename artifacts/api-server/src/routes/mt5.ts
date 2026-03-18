@@ -26,10 +26,14 @@ function sleep(ms: number) {
 
 interface ProvisioningAccount {
   id?: string;
+  _id?: string;
+  login?: string;
+  server?: string;
   region?: string;
   connectionStatus?: string;
   state?: string;
   message?: string;
+  reliability?: string;
 }
 
 async function getProvisioningAccount(token: string, accountId: string): Promise<ProvisioningAccount> {
@@ -94,14 +98,14 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
     let region: string = DEFAULT_REGION;
 
     if (existingId) {
-      // Reconnect existing account — check its state and deploy if needed
+      // Reconnect by stored MetaAPI account ID
       accountId = existingId;
-      const status = await getProvisioningAccount(token, accountId).catch(() => null);
-      if (!status) {
-        return res.status(404).json({ error: "Account not found. Please log in again." });
+      const acct = await getProvisioningAccount(token, accountId).catch(() => null);
+      if (!acct) {
+        return res.status(404).json({ error: "Account not found on MetaAPI. Please log in again with your credentials." });
       }
-      region = status.region ?? DEFAULT_REGION;
-      if (status.connectionStatus !== "CONNECTED") {
+      region = acct.region ?? DEFAULT_REGION;
+      if (acct.connectionStatus !== "CONNECTED") {
         await deployAccount(token, accountId);
         const connected = await waitForConnection(token, accountId);
         if (!connected) {
@@ -109,46 +113,83 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         }
       }
     } else {
-      // Provision a new account
+      // Login with credentials — check if account already provisioned on MetaAPI
       if (!login || !password || !server) {
         return res.status(400).json({ error: "login, password and server are required." });
       }
 
-      const createRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
-        method: "POST",
+      // Look up existing MetaAPI accounts for this login+server
+      const listRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
         headers: authHeaders(token),
-        body: JSON.stringify({
-          login,
-          password,
-          name: `MT5 ${login}`,
-          server,
-          platform: "mt5",
-          type: "cloud-g2",
-          magic: 47182,
-        }),
       });
+      const allAccounts = listRes.ok
+        ? (await listRes.json() as ProvisioningAccount[])
+        : [];
+      const existing = Array.isArray(allAccounts)
+        ? allAccounts.find((a) => a.login === login && a.server === server)
+        : undefined;
+      const existingId = existing?._id ?? existing?.id;
 
-      const created = await createRes.json() as ProvisioningAccount;
-      if (!createRes.ok || !created.id) {
-        return res.status(createRes.status).json({
-          error: created.message ?? "Failed to create account. Check your login details and server name.",
-        });
-      }
-      accountId = created.id;
-      region = created.region ?? DEFAULT_REGION;
-
-      // Deploy the account and wait for connection
-      await deployAccount(token, accountId);
-      const connected = await waitForConnection(token, accountId);
-      if (!connected) {
-        // Clean up on failure
+      if (existing && existingId) {
+        // Reuse existing MetaAPI account — update the password in case it changed
+        accountId = existingId;
+        region = existing.region ?? DEFAULT_REGION;
         await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
-          method: "DELETE",
+          method: "PUT",
           headers: authHeaders(token),
+          body: JSON.stringify({ password }),
         }).catch(() => {});
-        return res.status(503).json({
-          error: "Could not connect to MT5. Please check your credentials and server name.",
+        if (existing.connectionStatus !== "CONNECTED") {
+          await deployAccount(token, accountId);
+          const connected = await waitForConnection(token, accountId);
+          if (!connected) {
+            return res.status(503).json({ error: "Could not connect to MT5 account. Check broker server availability." });
+          }
+        }
+      } else {
+        // Create a brand-new MetaAPI account
+        const createRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
+          method: "POST",
+          headers: authHeaders(token),
+          body: JSON.stringify({
+            login,
+            password,
+            name: `MT5 ${login}`,
+            server,
+            platform: "mt5",
+            type: "cloud-g2",
+            reliability: "regular",
+            magic: 47182,
+          }),
         });
+
+        const created = await createRes.json() as ProvisioningAccount;
+        if (!createRes.ok || !created.id) {
+          // 403 = MetaAPI account billing limit — explain clearly
+          if (createRes.status === 403) {
+            return res.status(403).json({
+              error: "The MetaAPI service account has reached its provisioning limit. Please top up the MetaAPI account at metaapi.cloud, then try again.",
+            });
+          }
+          return res.status(createRes.status).json({
+            error: created.message ?? "Failed to create account. Check your login details and server name.",
+          });
+        }
+        accountId = created.id;
+        region = created.region ?? DEFAULT_REGION;
+
+        // Deploy and wait for connection
+        await deployAccount(token, accountId);
+        const connected = await waitForConnection(token, accountId);
+        if (!connected) {
+          await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
+            method: "DELETE",
+            headers: authHeaders(token),
+          }).catch(() => {});
+          return res.status(503).json({
+            error: "Could not connect to MT5. Please check your credentials and server name.",
+          });
+        }
       }
     }
 
