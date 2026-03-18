@@ -29,6 +29,8 @@ const POPULAR_SERVERS = [
   "XM-MT5",
   "FBS-MT5",
   "Pepperstone-MT5",
+  "Vantage-Live",
+  "Vantage-Demo",
 ];
 
 function InfoRow({ label, value, color }: { label: string; value: string; color?: string }) {
