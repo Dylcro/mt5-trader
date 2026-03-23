@@ -148,34 +148,59 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         }
       } else {
         // Create a brand-new MetaAPI account
-        const createRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
+        const createPayload = {
+          login,
+          password,
+          name: `MT5 ${login}`,
+          server,
+          platform: "mt5",
+          type: "cloud-g2",
+          reliability: "regular",
+          magic: 47182,
+        };
+
+        let createRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
           method: "POST",
           headers: authHeaders(token),
-          body: JSON.stringify({
-            login,
-            password,
-            name: `MT5 ${login}`,
-            server,
-            platform: "mt5",
-            type: "cloud-g2",
-            reliability: "regular",
-            magic: 47182,
-          }),
+          body: JSON.stringify(createPayload),
         });
 
-        const created = await createRes.json() as ProvisioningAccount;
-        if (!createRes.ok || !created.id) {
-          // 403 = MetaAPI account billing limit — explain clearly
+        // 202 = MetaAPI is auto-detecting broker settings — wait 70s and retry
+        if (createRes.status === 202) {
+          await sleep(70000);
+          createRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
+            method: "POST",
+            headers: authHeaders(token),
+            body: JSON.stringify(createPayload),
+          });
+        }
+
+        const created = await createRes.json() as ProvisioningAccount & { error?: string; details?: string };
+
+        if (!createRes.ok) {
+          // 403 = MetaAPI billing limit
           if (createRes.status === 403) {
             return res.status(403).json({
               error: "The MetaAPI service account has reached its provisioning limit. Please top up the MetaAPI account at metaapi.cloud, then try again.",
+            });
+          }
+          // E_AUTH = wrong login/password/server
+          if (created.details === "E_AUTH" || (created.error === "ValidationError" && created.message?.includes("authenticate"))) {
+            return res.status(401).json({
+              error: "Invalid credentials — check your MT5 login, password, and server name.",
             });
           }
           return res.status(createRes.status).json({
             error: created.message ?? "Failed to create account. Check your login details and server name.",
           });
         }
-        accountId = created.id;
+
+        // Successful creation returns a UUID id, not an integer
+        const newId = created._id ?? created.id;
+        if (!newId || typeof newId !== "string" || newId.length < 10) {
+          return res.status(500).json({ error: "Unexpected response from MetaAPI. Please try again." });
+        }
+        accountId = newId;
         region = created.region ?? DEFAULT_REGION;
 
         // Deploy and wait for connection
