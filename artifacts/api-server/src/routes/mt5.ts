@@ -94,12 +94,15 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       accountId?: string;
     };
 
+    console.log(`[connect] login=${login} server=${server} existingId=${existingId}`);
+
     let accountId: string;
     let region: string = DEFAULT_REGION;
 
     if (existingId) {
       // Reconnect by stored MetaAPI account ID
       accountId = existingId;
+      console.log(`[connect] reconnecting existingId=${existingId}`);
       const acct = await getProvisioningAccount(token, accountId).catch(() => null);
       if (!acct) {
         return res.status(404).json({ error: "Account not found on MetaAPI. Please log in again with your credentials." });
@@ -125,15 +128,18 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       const allAccounts = listRes.ok
         ? (await listRes.json() as ProvisioningAccount[])
         : [];
+      console.log(`[connect] found ${Array.isArray(allAccounts) ? allAccounts.length : 0} existing MetaAPI accounts`);
       const existing = Array.isArray(allAccounts)
         ? allAccounts.find((a) => a.login === login && a.server === server)
         : undefined;
       const existingId = existing?._id ?? existing?.id;
+      console.log(`[connect] existing match: ${existingId ?? "none"}`);
 
       if (existing && existingId) {
         // Reuse existing MetaAPI account — update the password in case it changed
         accountId = existingId;
         region = existing.region ?? DEFAULT_REGION;
+        console.log(`[connect] reusing account ${accountId}, status=${existing.connectionStatus}`);
         await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
           method: "PUT",
           headers: authHeaders(token),
@@ -159,14 +165,17 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
           magic: 47182,
         };
 
+        console.log(`[connect] creating new MetaAPI account for login=${login} server=${server}`);
         let createRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
           method: "POST",
           headers: authHeaders(token),
           body: JSON.stringify(createPayload),
         });
+        console.log(`[connect] create response status=${createRes.status}`);
 
         // 202 = MetaAPI is auto-detecting broker settings — wait 70s and retry
         if (createRes.status === 202) {
+          console.log(`[connect] 202 received — waiting 70s for broker detection`);
           await sleep(70000);
           createRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
             method: "POST",
@@ -176,6 +185,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         }
 
         const created = await createRes.json() as ProvisioningAccount & { error?: string; details?: string };
+        console.log(`[connect] create body: ${JSON.stringify(created).slice(0, 200)}`);
 
         if (!createRes.ok) {
           // 403 = MetaAPI billing limit
