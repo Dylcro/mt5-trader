@@ -342,6 +342,11 @@ export default function SettingsScreen() {
                 <View style={styles.errorBox}>
                   <Feather name="alert-circle" size={14} color={C.sell} />
                   <Text style={styles.errorText}>{errorMsg}</Text>
+                  {errorMsg.toLowerCase().includes("too many") && (
+                    <Text style={[styles.errorText, { marginTop: 6, opacity: 0.8, fontSize: 11 }]}>
+                      MetaAPI rate-limits after several failed credential attempts. Wait the indicated time, then try again with your correct password.
+                    </Text>
+                  )}
                 </View>
               ) : null}
 

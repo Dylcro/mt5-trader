@@ -24,6 +24,11 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function qstr(v: unknown): string | undefined {
+  if (Array.isArray(v)) return v[0] as string;
+  return v as string | undefined;
+}
+
 interface ProvisioningAccount {
   id?: string;
   _id?: string;
@@ -49,7 +54,8 @@ async function getProvisioningAccount(token: string, accountId: string): Promise
   return res.json() as Promise<ProvisioningAccount>;
 }
 
-async function getAccountInfo(token: string, accountId: string, region: string = DEFAULT_REGION) {
+async function getAccountInfo(token: string, accountId: string, region: string | undefined = DEFAULT_REGION) {
+  region = region || DEFAULT_REGION;
   const res = await fetch(
     `${clientBase(region)}/users/current/accounts/${accountId}/account-information`,
     { headers: authHeaders(token) }
@@ -181,17 +187,19 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
     const ctrl = new AbortController();
     const createTimer = setTimeout(() => ctrl.abort(), 38000);
 
-    let createRes: Response | null = null;
+    // Use a different name to avoid conflict with Express's Response type
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let fetchRes: any = null;
     let createTimedOut = false;
     try {
-      createRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
+      fetchRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
         method: "POST",
         headers: authHeaders(token),
         body: JSON.stringify(createPayload),
         signal: ctrl.signal,
       });
       clearTimeout(createTimer);
-      console.log(`[connect] create status=${createRes.status}`);
+      console.log(`[connect] create status=${fetchRes.status}`);
     } catch (fetchErr) {
       clearTimeout(createTimer);
       if ((fetchErr as Error).name === "AbortError") {
@@ -202,9 +210,27 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       }
     }
 
+    // Handle non-202 error statuses before the timeout/202 path
+    if (fetchRes && !createTimedOut && fetchRes.status !== 202 && !fetchRes.ok) {
+      const errBody = await fetchRes.json().catch(() => ({})) as ProvisioningAccount & { metadata?: { recommendedRetryTime?: string } };
+      console.log(`[connect] create error: status=${fetchRes.status} body=${JSON.stringify(errBody).slice(0, 200)}`);
+      if (fetchRes.status === 429) {
+        const retryAt = errBody.metadata?.recommendedRetryTime;
+        const retryMsg = retryAt ? ` Try again after ${new Date(retryAt).toLocaleTimeString()}.` : " Please try again in 1 hour.";
+        return res.status(429).json({ error: `Too many failed attempts for this account.${retryMsg}` });
+      }
+      if (fetchRes.status === 403) {
+        return res.status(403).json({ error: "The MetaAPI service account has reached its provisioning limit. Please top up at metaapi.cloud." });
+      }
+      if (errBody.details === "E_AUTH" || errBody.message?.includes("authenticate")) {
+        return res.status(401).json({ error: "Invalid credentials — check your MT5 login, password, and server name." });
+      }
+      return res.status(fetchRes.status).json({ error: errBody.message ?? "Failed to create account. Check your login details and server name." });
+    }
+
     // If the provisioning request timed out, MetaAPI may have queued the account.
     // Check the list — if it appeared, proceed. Otherwise ask client to retry.
-    if (createTimedOut || createRes?.status === 202) {
+    if (createTimedOut || fetchRes?.status === 202) {
       const listR = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, { headers: authHeaders(token) });
       const accts = listR.ok ? (await listR.json() as ProvisioningAccount[]) : [];
       const queued = Array.isArray(accts) ? accts.find((a) => a.login === login && a.server === server) : undefined;
@@ -220,24 +246,8 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       return res.json({ status: "pending_broker_detection", retryAfterMs: 70000 });
     }
 
-    const created = await createRes!.json() as ProvisioningAccount;
+    const created = await fetchRes.json() as ProvisioningAccount;
     console.log(`[connect] create body: ${JSON.stringify(created).slice(0, 250)}`);
-
-    if (!createRes!.ok) {
-      if (createRes!.status === 403) {
-        return res.status(403).json({
-          error: "The MetaAPI service account has reached its provisioning limit. Please top up at metaapi.cloud.",
-        });
-      }
-      if (created.details === "E_AUTH" || created.message?.includes("authenticate")) {
-        return res.status(401).json({
-          error: "Invalid credentials — check your MT5 login, password, and server name.",
-        });
-      }
-      return res.status(createRes!.status).json({
-        error: created.message ?? "Failed to create account. Check your login details and server name.",
-      });
-    }
 
     const newId = created._id ?? created.id;
     if (!newId || typeof newId !== "string" || newId.length < 10) {
@@ -263,8 +273,8 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
 router.get("/mt5/account/:accountId/status", async (req: Request, res: Response) => {
   try {
     const token = getToken();
-    const { accountId } = req.params;
-    const region = (req.query.region as string) || DEFAULT_REGION;
+    const accountId = String(req.params.accountId);
+    const region = qstr(req.query.region) || DEFAULT_REGION;
 
     const acct = await getProvisioningAccount(token, accountId);
     console.log(`[status] accountId=${accountId} state=${acct.state} connectionStatus=${acct.connectionStatus}`);
@@ -272,7 +282,7 @@ router.get("/mt5/account/:accountId/status", async (req: Request, res: Response)
     if (acct.connectionStatus === "CONNECTED") {
       let info: Record<string, unknown> = {};
       try {
-        info = await getAccountInfo(token, accountId, acct.region ?? region) as Record<string, unknown>;
+        info = await getAccountInfo(token, accountId, String(acct.region ?? region)) as Record<string, unknown>;
       } catch (infoErr) {
         // Client API not yet ready — report still connecting to keep polling
         console.warn(`[status] getAccountInfo failed for ${accountId}:`, (infoErr as Error).message);
@@ -321,8 +331,8 @@ router.post("/mt5/account/:accountId/disconnect", async (req: Request, res: Resp
 router.get("/mt5/account/:accountId/info", async (req: Request, res: Response) => {
   try {
     const token = getToken();
-    const region = (req.query.region as string) || DEFAULT_REGION;
-    const info = await getAccountInfo(token, req.params.accountId, region);
+    const region = qstr(req.query.region) || DEFAULT_REGION;
+    const info = await getAccountInfo(token, String(req.params.accountId), region);
     return res.json(info);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
@@ -333,7 +343,7 @@ router.get("/mt5/account/:accountId/info", async (req: Request, res: Response) =
 router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) => {
   try {
     const token = getToken();
-    const region = (req.query.region as string) || DEFAULT_REGION;
+    const region = qstr(req.query.region) || DEFAULT_REGION;
     const priceRes = await fetch(
       `${clientBase(region)}/users/current/accounts/${req.params.accountId}/symbols/XAUUSD/current-price`,
       { headers: authHeaders(token) }
@@ -349,7 +359,7 @@ router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) 
 router.get("/mt5/account/:accountId/positions", async (req: Request, res: Response) => {
   try {
     const token = getToken();
-    const region = (req.query.region as string) || DEFAULT_REGION;
+    const region = qstr(req.query.region) || DEFAULT_REGION;
     const posRes = await fetch(
       `${clientBase(region)}/users/current/accounts/${req.params.accountId}/positions`,
       { headers: authHeaders(token) }
@@ -407,7 +417,7 @@ const TRADE_ERROR_MESSAGES: Record<number, string> = {
 router.post("/mt5/account/:accountId/trade", async (req: Request, res: Response) => {
   try {
     const token = getToken();
-    const region = (req.query.region as string) || DEFAULT_REGION;
+    const region = qstr(req.query.region) || DEFAULT_REGION;
     const tradeRes = await fetch(
       `${clientBase(region)}/users/current/accounts/${req.params.accountId}/trade`,
       {
