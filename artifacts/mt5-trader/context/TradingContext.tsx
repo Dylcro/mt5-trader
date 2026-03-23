@@ -59,6 +59,7 @@ interface TradingContextValue {
   accountInfo: AccountInfo | null;
   positions: Position[];
   price: Price | null;
+  priceError: boolean;
   connect: (creds?: Mt5Credentials) => Promise<void>;
   disconnect: () => Promise<void>;
   placeTrade: (params: PlaceTradeParams) => Promise<{ success: boolean; message: string }>;
@@ -121,9 +122,12 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const [accountInfo, setAccountInfo] = useState<AccountInfo | null>(null);
   const [positions, setPositions] = useState<Position[]>([]);
   const [price, setPrice] = useState<Price | null>(null);
+  const [priceError, setPriceError] = useState(false);
 
   const priceIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const positionsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const priceFailCountRef = useRef(0);
+  const startPollingRef = useRef<((accId: string, accRegion: string) => void) | null>(null);
 
   // Load saved credentials + accountId on startup and auto-reconnect
   useEffect(() => {
@@ -172,7 +176,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
             name: d.name ?? "Account",
           });
           setStatus("connected");
-          startPolling(accId, finalRegion);
+          startPollingRef.current?.(accId, finalRegion);
           return;
         }
         if (d.connectionStatus === "DEPLOY_FAILED") throw new Error("Connection failed. Check your credentials and server.");
@@ -181,8 +185,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       }
     }
     throw new Error("Connection timed out. Please try again.");
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [startPolling]);
+  }, []);
 
   const reconnectSaved = async (savedId: string) => {
     setStatus("connecting");
@@ -289,8 +292,17 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     (accId: string, accRegion: string) => {
       if (priceIntervalRef.current) clearInterval(priceIntervalRef.current);
       if (positionsIntervalRef.current) clearInterval(positionsIntervalRef.current);
+      priceFailCountRef.current = 0;
+      setPriceError(false);
 
-      const pollPrice = () => fetchPriceData(accId, accRegion).then(setPrice).catch(() => {});
+      const pollPrice = () =>
+        fetchPriceData(accId, accRegion)
+          .then((p) => { priceFailCountRef.current = 0; setPriceError(false); setPrice(p); })
+          .catch(() => {
+            priceFailCountRef.current += 1;
+            if (priceFailCountRef.current >= 3) setPriceError(true);
+          });
+
       const pollPositions = () => fetchPositionsData(accId, accRegion).then(setPositions).catch(() => {});
 
       pollPrice();
@@ -300,6 +312,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     },
     [fetchPriceData, fetchPositionsData]
   );
+
+  // Keep the ref in sync so pollUntilConnected (declared before startPolling) can access it
+  useEffect(() => { startPollingRef.current = startPolling; }, [startPolling]);
 
   const stopPolling = useCallback(() => {
     if (priceIntervalRef.current) clearInterval(priceIntervalRef.current);
@@ -354,8 +369,12 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           return connect(useCreds);
         }
 
-        const accId = data.accountId!;
+        const accId = data.accountId;
         const accRegion = data.region ?? DEFAULT_REGION;
+
+        if (!accId || typeof accId !== "string") {
+          throw new Error("Server returned an invalid account ID. Please try again.");
+        }
 
         // Already fully connected — use info directly
         if (data.status === "connected") {
@@ -402,7 +421,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
   const refreshPrice = useCallback(async () => {
     if (status !== "connected" || !accountId) return;
-    try { setPrice(await fetchPriceData(accountId, region)); } catch {}
+    try {
+      setPrice(await fetchPriceData(accountId, region));
+      priceFailCountRef.current = 0;
+      setPriceError(false);
+    } catch {}
   }, [status, accountId, region, fetchPriceData]);
 
   const refreshPositions = useCallback(async () => {
@@ -524,6 +547,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         accountInfo,
         positions,
         price,
+        priceError,
         connect,
         disconnect,
         placeTrade,

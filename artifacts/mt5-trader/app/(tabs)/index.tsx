@@ -240,7 +240,7 @@ function CascadeLadder({
 
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
-  const { status, price, accountInfo, placeTrade, placeCascadeOrders, refreshPrice } = useTrading();
+  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice } = useTrading();
   const { settings: cascadeSettings } = useCascadeSettings();
 
   // Mode
@@ -376,12 +376,24 @@ export default function TradeScreen() {
               <PriceRow label="ASK" value={formatPrice(price.ask)} color={C.buy} sublabel="Buy at" />
               <View style={styles.divider} />
               <PriceRow label="SPREAD" value={`${price.spread} pips`} color={C.textSecondary} />
+              {priceError && (
+                <View style={styles.priceErrorBanner}>
+                  <Feather name="wifi-off" size={12} color={C.sell} />
+                  <Text style={styles.priceErrorText}>Price feed interrupted — tap{" "}
+                    <Text style={{ color: C.textSecondary }} onPress={refreshPrice}>↻</Text> to retry
+                  </Text>
+                </View>
+              )}
             </>
           ) : (
             <View style={styles.noPrice}>
               <MaterialCommunityIcons name="chart-line" size={28} color={C.textMuted} />
               <Text style={styles.noPriceText}>
-                {status === "connecting" ? "Fetching price..." : "Connect account to see live price"}
+                {priceError
+                  ? "Price feed failed — tap ↻ to retry"
+                  : status === "connecting"
+                    ? "Fetching price..."
+                    : "Connect account to see live price"}
               </Text>
             </View>
           )}
@@ -715,6 +727,8 @@ const styles = StyleSheet.create({
   divider: { height: 1, backgroundColor: C.border },
   noPrice: { alignItems: "center", paddingVertical: 20, gap: 8 },
   noPriceText: { fontSize: 14, fontFamily: "Inter_400Regular", color: C.textMuted, textAlign: "center" },
+  priceErrorBanner: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 10, paddingTop: 10, borderTopWidth: 1, borderTopColor: C.border },
+  priceErrorText: { fontSize: 12, fontFamily: "Inter_400Regular", color: C.sell, flex: 1 },
   modeToggle: {
     flexDirection: "row",
     backgroundColor: C.card,

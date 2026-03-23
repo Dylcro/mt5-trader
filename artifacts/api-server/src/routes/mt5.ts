@@ -176,10 +176,10 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
 
     console.log(`[connect] creating new account login=${login} server=${server}`);
 
-    // MetaAPI provisioning can take 30+ seconds for unknown brokers.
-    // Use a 12-second abort signal so we never block the HTTP handler.
+    // MetaAPI provisioning can take 30-40s for unknown brokers (it downloads the broker .dat file).
+    // Use a 38-second abort signal to capture the 202 response, then handle it.
     const ctrl = new AbortController();
-    const createTimer = setTimeout(() => ctrl.abort(), 12000);
+    const createTimer = setTimeout(() => ctrl.abort(), 38000);
 
     let createRes: Response | null = null;
     let createTimedOut = false;
@@ -215,9 +215,9 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         if (queued.connectionStatus !== "CONNECTED") await deployAccount(token, queuedId);
         return res.json({ status: "deploying", accountId: queuedId, region });
       }
-      // Account not visible yet — tell client to retry in 45s
-      console.log(`[connect] account not yet visible, asking client to retry`);
-      return res.json({ status: "pending_broker_detection", retryAfterMs: 45000 });
+      // Account not visible yet — tell client to retry in 70s (MetaAPI says wait 60s)
+      console.log(`[connect] account not yet visible, asking client to retry in 70s`);
+      return res.json({ status: "pending_broker_detection", retryAfterMs: 70000 });
     }
 
     const created = await createRes!.json() as ProvisioningAccount;
@@ -270,7 +270,14 @@ router.get("/mt5/account/:accountId/status", async (req: Request, res: Response)
     console.log(`[status] accountId=${accountId} state=${acct.state} connectionStatus=${acct.connectionStatus}`);
 
     if (acct.connectionStatus === "CONNECTED") {
-      const info = await getAccountInfo(token, accountId, region) as Record<string, unknown>;
+      let info: Record<string, unknown> = {};
+      try {
+        info = await getAccountInfo(token, accountId, acct.region ?? region) as Record<string, unknown>;
+      } catch (infoErr) {
+        // Client API not yet ready — report still connecting to keep polling
+        console.warn(`[status] getAccountInfo failed for ${accountId}:`, (infoErr as Error).message);
+        return res.json({ connectionStatus: "CONNECTING", state: acct.state });
+      }
       return res.json({
         connectionStatus: "CONNECTED",
         accountId,
