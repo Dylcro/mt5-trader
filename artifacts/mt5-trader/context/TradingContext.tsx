@@ -143,6 +143,47 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Poll /status until CONNECTED, then finalise the session
+  const pollUntilConnected = useCallback(async (accId: string, accRegion: string, maxWaitMs = 120000) => {
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 5000));
+      try {
+        const r = await fetch(`${API_BASE}/mt5/account/${accId}/status?region=${accRegion}`);
+        const d = await r.json() as {
+          connectionStatus?: string;
+          error?: string;
+          accountId?: string;
+          region?: string;
+        } & Partial<AccountInfo>;
+        if (!r.ok && d.error) throw new Error(d.error);
+        if (d.connectionStatus === "CONNECTED") {
+          const finalRegion = d.region ?? accRegion;
+          setAccountIdState(accId);
+          setRegionState(finalRegion);
+          await AsyncStorage.multiSet([["mt5_account_id", accId], ["mt5_region", finalRegion]]);
+          setAccountInfo({
+            balance: d.balance ?? 0,
+            equity: d.equity ?? 0,
+            margin: d.margin ?? 0,
+            freeMargin: d.freeMargin ?? 0,
+            currency: d.currency ?? "USD",
+            leverage: d.leverage ?? 100,
+            name: d.name ?? "Account",
+          });
+          setStatus("connected");
+          startPolling(accId, finalRegion);
+          return;
+        }
+        if (d.connectionStatus === "DEPLOY_FAILED") throw new Error("Connection failed. Check your credentials and server.");
+      } catch (err) {
+        throw err;
+      }
+    }
+    throw new Error("Connection timed out. Please try again.");
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [startPolling]);
+
   const reconnectSaved = async (savedId: string) => {
     setStatus("connecting");
     try {
@@ -151,24 +192,33 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ accountId: savedId }),
       });
-      const data = await res.json() as { error?: string; accountId?: string; region?: string } & Partial<AccountInfo>;
+      const data = await res.json() as {
+        status?: string;
+        error?: string;
+        accountId?: string;
+        region?: string;
+      } & Partial<AccountInfo>;
       if (!res.ok || data.error) throw new Error(data.error ?? "Reconnect failed");
+
       const accId = data.accountId ?? savedId;
       const accRegion = data.region ?? DEFAULT_REGION;
-      setAccountIdState(accId);
-      setRegionState(accRegion);
-      await AsyncStorage.setItem("mt5_region", accRegion);
-      setAccountInfo({
-        balance: data.balance ?? 0,
-        equity: data.equity ?? 0,
-        margin: data.margin ?? 0,
-        freeMargin: data.freeMargin ?? 0,
-        currency: data.currency ?? "USD",
-        leverage: data.leverage ?? 100,
-        name: data.name ?? "Account",
-      });
-      setStatus("connected");
-      startPolling(accId, accRegion);
+
+      if (data.status === "connected") {
+        setAccountIdState(accId);
+        setRegionState(accRegion);
+        await AsyncStorage.setItem("mt5_region", accRegion);
+        setAccountInfo({
+          balance: data.balance ?? 0, equity: data.equity ?? 0,
+          margin: data.margin ?? 0, freeMargin: data.freeMargin ?? 0,
+          currency: data.currency ?? "USD", leverage: data.leverage ?? 100,
+          name: data.name ?? "Account",
+        });
+        setStatus("connected");
+        startPolling(accId, accRegion);
+      } else {
+        // status === "deploying" — poll
+        await pollUntilConnected(accId, accRegion);
+      }
     } catch {
       setStatus("disconnected");
       setAccountIdState("");
@@ -282,36 +332,55 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
             }),
           });
         } catch (netErr) {
-          throw new Error(`Cannot reach server at ${connectUrl}. Check your connection. (${netErr instanceof Error ? netErr.message : netErr})`);
+          throw new Error(`Cannot reach server. Check your connection. (${netErr instanceof Error ? netErr.message : netErr})`);
         }
-        const data = await res.json() as { error?: string; accountId?: string; region?: string } & Partial<AccountInfo>;
+
+        const data = await res.json() as {
+          status?: string;
+          error?: string;
+          accountId?: string;
+          region?: string;
+          retryAfterMs?: number;
+        } & Partial<AccountInfo>;
+
         if (!res.ok || data.error) throw new Error(data.error ?? "Connection failed");
+
+        // MetaAPI is auto-detecting broker settings — wait and retry the whole connect
+        if (data.status === "pending_broker_detection") {
+          const waitMs = data.retryAfterMs ?? 75000;
+          console.log(`[connect] broker detection in progress, retrying in ${waitMs}ms`);
+          await new Promise((r) => setTimeout(r, waitMs));
+          // Retry recursively (without re-setting creds to avoid loop with setCredentials)
+          return connect(useCreds);
+        }
 
         const accId = data.accountId!;
         const accRegion = data.region ?? DEFAULT_REGION;
-        setAccountIdState(accId);
-        setRegionState(accRegion);
-        await AsyncStorage.multiSet([
-          ["mt5_account_id", accId],
-          ["mt5_region", accRegion],
-        ]);
-        setAccountInfo({
-          balance: data.balance ?? 0,
-          equity: data.equity ?? 0,
-          margin: data.margin ?? 0,
-          freeMargin: data.freeMargin ?? 0,
-          currency: data.currency ?? "USD",
-          leverage: data.leverage ?? 100,
-          name: data.name ?? "Account",
-        });
-        setStatus("connected");
-        startPolling(accId, accRegion);
+
+        // Already fully connected — use info directly
+        if (data.status === "connected") {
+          setAccountIdState(accId);
+          setRegionState(accRegion);
+          await AsyncStorage.multiSet([["mt5_account_id", accId], ["mt5_region", accRegion]]);
+          setAccountInfo({
+            balance: data.balance ?? 0, equity: data.equity ?? 0,
+            margin: data.margin ?? 0, freeMargin: data.freeMargin ?? 0,
+            currency: data.currency ?? "USD", leverage: data.leverage ?? 100,
+            name: data.name ?? "Account",
+          });
+          setStatus("connected");
+          startPolling(accId, accRegion);
+          return;
+        }
+
+        // status === "deploying" — poll until CONNECTED
+        await pollUntilConnected(accId, accRegion);
       } catch (err) {
         setStatus("error");
         setErrorMsg(err instanceof Error ? err.message : "Connection failed");
       }
     },
-    [credentials, setCredentials, startPolling]
+    [credentials, setCredentials, startPolling, pollUntilConnected]
   );
 
   const disconnect = useCallback(async () => {
