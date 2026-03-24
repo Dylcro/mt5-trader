@@ -374,15 +374,28 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
                   : p.ask <= watcher.entryPrice - dist;
               if (triggered) {
                 cascadeWatcherRef.current = null;
-                const toCancel = pendingOrdersRef.current;
-                if (toCancel.length > 0) {
-                  console.log(`[watcher] profit target hit — cancelling ${toCancel.length} pending orders`);
-                  void Promise.all(toCancel.map((o) =>
-                    fetch(`${API_BASE}/mt5/account/${accId}/order/${o.id}?region=${accRegion}`, {
-                      method: "DELETE",
-                    })
-                  ));
-                }
+                console.log(`[watcher] profit target hit (${watcher.pipsTarget} pips) — fetching fresh pending orders`);
+                void fetchPendingOrdersData(accId, accRegion).then(async (orders) => {
+                  pendingOrdersRef.current = orders;
+                  setPendingOrders(orders);
+                  if (orders.length === 0) {
+                    console.log("[watcher] no pending orders to cancel");
+                    return;
+                  }
+                  console.log(`[watcher] cancelling ${orders.length} pending orders`);
+                  await Promise.all(
+                    orders.map((o) =>
+                      fetch(`${API_BASE}/mt5/account/${accId}/order/${o.id}?region=${accRegion}`, {
+                        method: "DELETE",
+                      })
+                    )
+                  );
+                  // Refresh to reflect cancellations in UI
+                  void fetchPendingOrdersData(accId, accRegion).then((updated) => {
+                    pendingOrdersRef.current = updated;
+                    setPendingOrders(updated);
+                  });
+                });
               }
             }
           })
