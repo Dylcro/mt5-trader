@@ -347,14 +347,15 @@ export default function TradeScreen() {
       // the 10s poll may not have run yet. The API returns 4754 gracefully for already-gone orders.
       const ordersToCancel = tp.limitOrderIds ?? [];
 
-      console.log(`[tp-watcher id=${tp.id}] +${tp.pipsTarget}pip hit — closing posId=${tp.marketPositionId}, cancelling ${ordersToCancel.length} limits`);
+      const actualPips = ((tp.direction === "buy" ? price.bid - tp.entryPrice : tp.entryPrice - price.bid) / 0.10).toFixed(1);
+      console.log(`[tp-watcher id=${tp.id}] FIRE dir=${tp.direction} target=+${tp.pipsTarget}pip actual=+${actualPips}pip bid=${price.bid} entry=${tp.entryPrice} — closing posId=${tp.marketPositionId}, cancelling ${ordersToCancel.length} limits`);
       void Promise.all([
         ...positionsToClose.map((id) => closePosition(id)),
         ...ordersToCancel.map((id) => cancelOrder(id)),
       ]).then(() => {
         void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         showToast(
-          `TP +${tp.pipsTarget}pip hit`,
+          `TP +${actualPips}pip hit (target ${tp.pipsTarget})`,
           "success",
           true
         );
@@ -380,7 +381,8 @@ export default function TradeScreen() {
       // The API returns 4754 gracefully for already-gone orders.
       const ordersToCancel = w.limitOrderIds ?? [];
       if (ordersToCancel.length === 0) continue;
-      console.log(`[watcher id=${w.id}] +${w.pipsTarget}pip hit — cancelling ${ordersToCancel.length} limit(s)`);
+      const actualPips = ((w.direction === "buy" ? price.bid - w.entryPrice : w.entryPrice - price.bid) / 0.10).toFixed(1);
+      console.log(`[watcher id=${w.id}] FIRE dir=${w.direction} target=+${w.pipsTarget}pip actual=+${actualPips}pip bid=${price.bid} entry=${w.entryPrice} — cancelling ${ordersToCancel.length} limit(s)`);
       void Promise.all(ordersToCancel.map((id) => cancelOrder(id))).then(() => {
         void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         showToast(
@@ -493,7 +495,8 @@ export default function TradeScreen() {
         // Always use bid as the reference price for watcher triggers — same price the user sees on the chart
         const watcherEntryPrice = p?.bid ?? mktPrice;
         if (cs.autoCloseLimitsEnabled && cs.autoCloseLimitsPips > 0) {
-          console.log(`[watcher id=${cascadeId}] arming +${cs.autoCloseLimitsPips}pip from entry ${watcherEntryPrice} (${dir}) limitOrderIds=${JSON.stringify(result.limitOrderIds)}`);
+          const lTrigger = dir === "buy" ? watcherEntryPrice + cs.autoCloseLimitsPips * 0.10 : watcherEntryPrice - cs.autoCloseLimitsPips * 0.10;
+          console.log(`[watcher id=${cascadeId}] arming +${cs.autoCloseLimitsPips}pip dir=${dir} entry(bid)=${watcherEntryPrice} trigger=${lTrigger} limitOrderIds=${JSON.stringify(result.limitOrderIds)}`);
           watchersRef.current.push({
             id: cascadeId,
             entryPrice: watcherEntryPrice,
@@ -506,7 +509,8 @@ export default function TradeScreen() {
           });
         }
         if (cs.takeProfitEnabled && cs.takeProfitPips > 0) {
-          console.log(`[tp-watcher id=${cascadeId}] arming +${cs.takeProfitPips}pip from entry ${watcherEntryPrice} (${dir}) posId=${result.marketPositionId} limitIds=${JSON.stringify(result.limitOrderIds)}`);
+          const tpTrigger = dir === "buy" ? watcherEntryPrice + cs.takeProfitPips * 0.10 : watcherEntryPrice - cs.takeProfitPips * 0.10;
+          console.log(`[tp-watcher id=${cascadeId}] arming +${cs.takeProfitPips}pip dir=${dir} entry(bid)=${watcherEntryPrice} trigger=${tpTrigger} posId=${result.marketPositionId}`);
           tpWatchersRef.current.push({
             id: cascadeId,
             entryPrice: watcherEntryPrice,
