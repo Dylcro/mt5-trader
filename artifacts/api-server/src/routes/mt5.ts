@@ -82,10 +82,16 @@ async function getAccountInfo(token: string, accountId: string, region: string |
 }
 
 async function deployAccount(token: string, accountId: string): Promise<void> {
-  await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}/deploy`, {
+  const res = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}/deploy`, {
     method: "POST",
     headers: authHeaders(token),
   });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({})) as { message?: string };
+    const msg = body.message ?? `Deploy failed (HTTP ${res.status})`;
+    console.warn(`[deploy] ${accountId} failed ${res.status}: ${msg}`);
+    throw new Error(msg);
+  }
 }
 
 // POST /api/mt5/connect
@@ -130,7 +136,17 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       }
 
       // Not connected — trigger deploy and return "deploying" immediately
-      await deployAccount(token, existingId);
+      try {
+        await deployAccount(token, existingId);
+      } catch (deployErr) {
+        const msg = (deployErr as Error).message ?? "Deploy failed";
+        const isBilling = msg.toLowerCase().includes("top up") || msg.toLowerCase().includes("forbidden");
+        return res.status(503).json({
+          error: isBilling
+            ? "MetaAPI free-tier limit reached. Please top up your MetaAPI account at metaapi.cloud to continue trading."
+            : msg,
+        });
+      }
       return res.json({ status: "deploying", accountId: existingId, region });
     }
 
@@ -326,10 +342,19 @@ router.get("/mt5/account/:accountId/status", async (req: Request, res: Response)
     // re-trigger deployment so the client doesn't get stuck polling forever.
     if (acct.state === "UNDEPLOYED") {
       console.log(`[status] account ${accountId} is UNDEPLOYED — re-triggering deploy`);
-      await deployAccount(token, accountId).catch((e) =>
-        console.warn(`[status] re-deploy failed:`, (e as Error).message)
-      );
-      return res.json({ connectionStatus: "DEPLOYING", state: "DEPLOYING" });
+      try {
+        await deployAccount(token, accountId);
+        return res.json({ connectionStatus: "DEPLOYING", state: "DEPLOYING" });
+      } catch (deployErr) {
+        const msg = (deployErr as Error).message ?? "Deploy failed";
+        const isBilling = msg.toLowerCase().includes("top up") || msg.toLowerCase().includes("forbidden");
+        return res.status(503).json({
+          connectionStatus: "DEPLOY_FAILED",
+          error: isBilling
+            ? "MetaAPI free-tier limit reached. Please top up your MetaAPI account at metaapi.cloud to continue trading."
+            : msg,
+        });
+      }
     }
 
     return res.json({ connectionStatus: acct.connectionStatus ?? "DEPLOYING", state: acct.state });

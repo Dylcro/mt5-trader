@@ -344,6 +344,13 @@ export default function SettingsScreen() {
                       MetaAPI rate-limits after several failed credential attempts. Wait the indicated time, then try again with your correct password.
                     </Text>
                   )}
+                  {(errorMsg.toLowerCase().includes("top up") || errorMsg.toLowerCase().includes("free-tier")) && (
+                    <Text style={[styles.errorText, { marginTop: 8, lineHeight: 18 }]}>
+                      {"→ Go to "}
+                      <Text style={{ color: C.gold, textDecorationLine: "underline" }}>metaapi.cloud</Text>
+                      {" → Billing → top up or upgrade your plan, then tap Connect again."}
+                    </Text>
+                  )}
                 </View>
               ) : null}
 

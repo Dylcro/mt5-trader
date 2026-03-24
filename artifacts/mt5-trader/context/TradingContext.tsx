@@ -198,7 +198,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           startPollingRef.current?.(accId, finalRegion);
           return;
         }
-        if (d.connectionStatus === "DEPLOY_FAILED") throw new Error("Connection failed. Check your credentials and server.");
+        if (d.connectionStatus === "DEPLOY_FAILED") throw new Error(d.error ?? "Connection failed. Check your credentials and server.");
       } catch (err) {
         throw err;
       }
@@ -251,8 +251,10 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     } catch (err) {
       // Transient error (network blip, timeout) — leave accountId intact so
       // the user can retry without re-entering credentials.
-      console.warn("[reconnect] failed:", String(err));
-      setStatus("disconnected");
+      const msg = err instanceof Error ? err.message : "Reconnect failed";
+      console.warn("[reconnect] failed:", msg);
+      setErrorMsg(msg);
+      setStatus("error");
     }
   };
 
