@@ -269,7 +269,7 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, setCascadeWatcher } = useTrading();
+  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPositions, refreshPendingOrders } = useTrading();
   const { settings: cascadeSettings } = useCascadeSettings();
 
   const [toast, setToast] = useState<ToastState>(null);
@@ -301,6 +301,38 @@ export default function TradeScreen() {
   const [cascadeLotSize, setCascadeLotSize] = useState(0.01);
 
   const [isPlacing, setIsPlacing] = useState(false);
+
+  // Auto-cancel limits watcher — armed after a cascade, activates after 3s to let orders register
+  const watcherRef = useRef<{
+    entryPrice: number;
+    direction: "buy" | "sell";
+    pipsTarget: number;
+    readyAt: number;
+  } | null>(null);
+
+  useEffect(() => {
+    const watcher = watcherRef.current;
+    if (!price || !watcher || Date.now() < watcher.readyAt) return;
+    const dist = watcher.pipsTarget * 0.10;
+    const triggered =
+      watcher.direction === "buy"
+        ? price.bid >= watcher.entryPrice + dist
+        : price.ask <= watcher.entryPrice - dist;
+    if (!triggered) return;
+    watcherRef.current = null;
+    const toCancel = pendingOrders;
+    if (toCancel.length === 0) return;
+    console.log(`[watcher] +${watcher.pipsTarget}pip target hit — cancelling ${toCancel.length} pending orders`);
+    void Promise.all(toCancel.map((o) => cancelOrder(o.id))).then(() => {
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      showToast(
+        `Auto-cancelled ${toCancel.length} limit order${toCancel.length !== 1 ? "s" : ""} at +${watcher.pipsTarget}pip profit`,
+        "success",
+        true
+      );
+      void refreshPendingOrders();
+    });
+  }, [price, pendingOrders, cancelOrder, refreshPendingOrders, showToast]);
 
   // Safety valve: if isPlacing somehow gets stuck, auto-reset after 90 seconds
   useEffect(() => {
@@ -387,7 +419,12 @@ export default function TradeScreen() {
         const failNote = result.failed > 0 ? ` (${result.failed} limit${result.failed > 1 ? "s" : ""} failed)` : "";
         showToast(`${result.placed}/${total} ${dir.toUpperCase()} orders placed ✓${failNote}`, "success", true);
         if (cascadeSettings.autoCloseLimitsEnabled && cascadeSettings.autoCloseLimitsPips > 0) {
-          setCascadeWatcher({ entryPrice: mktPrice, direction: dir, pipsTarget: cascadeSettings.autoCloseLimitsPips });
+          watcherRef.current = {
+            entryPrice: mktPrice,
+            direction: dir,
+            pipsTarget: cascadeSettings.autoCloseLimitsPips,
+            readyAt: Date.now() + 3000,
+          };
         }
       } else {
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
