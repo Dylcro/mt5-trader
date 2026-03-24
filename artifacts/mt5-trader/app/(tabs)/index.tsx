@@ -957,7 +957,6 @@ export default function TradeScreen() {
                 direction === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
                 pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
                 isPlacing && { opacity: 0.6 },
-                { flexDirection: "column", gap: 2 },
               ]}
               onPress={handleSingleTrade}
               disabled={isPlacing}
@@ -966,29 +965,13 @@ export default function TradeScreen() {
                 <ActivityIndicator color={direction === "buy" ? "#000" : "#fff"} />
               ) : (
                 <>
-                  <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-                    <Feather
-                      name={direction === "buy" ? "trending-up" : "trending-down"}
-                      size={20}
-                      color={direction === "buy" ? "#000" : "#fff"}
-                    />
-                    <Text style={[styles.tradeBtnText, direction === "buy" ? { color: "#000" } : { color: "#fff" }]}>
-                      {direction === "buy" ? "BUY XAUUSD" : "SELL XAUUSD"}
-                    </Text>
-                  </View>
-                  <Text style={{
-                    fontSize: 18,
-                    lineHeight: 22,
-                    fontFamily: "Inter_700Bold",
-                    color: price != null
-                      ? (direction === "buy" ? "rgba(0,0,0,0.75)" : "rgba(255,255,255,0.75)")
-                      : "transparent",
-                    letterSpacing: 0.5,
-                    fontVariant: ["tabular-nums"],
-                  }}>
-                    {price != null
-                      ? formatPrice(direction === "buy" ? price.ask : price.bid)
-                      : "0000.00"}
+                  <Feather
+                    name={direction === "buy" ? "trending-up" : "trending-down"}
+                    size={20}
+                    color={direction === "buy" ? "#000" : "#fff"}
+                  />
+                  <Text style={[styles.tradeBtnText, direction === "buy" ? { color: "#000" } : { color: "#fff" }]}>
+                    {direction === "buy" ? "BUY XAUUSD" : "SELL XAUUSD"}
                   </Text>
                 </>
               )}
@@ -1241,14 +1224,13 @@ const styles = StyleSheet.create({
   riskLabel: { fontSize: 15, fontFamily: "Inter_400Regular", color: C.textSecondary, flex: 1 },
   riskValue: { fontSize: 17, fontFamily: "Inter_600SemiBold", color: C.text, minWidth: 130, textAlign: "right", fontVariant: ["tabular-nums"] },
   tradeBtn: {
-    height: 80,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
     gap: 10,
+    paddingVertical: 18,
     borderRadius: 16,
     marginTop: 4,
-    overflow: "hidden",
   },
   tradeBtnRow: { flexDirection: "row", gap: 10, marginTop: 4 },
   tradeBtnHalf: { flex: 1, marginTop: 0 },
