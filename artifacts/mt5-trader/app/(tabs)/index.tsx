@@ -336,7 +336,7 @@ export default function TradeScreen() {
     for (const tp of tpWatchersRef.current) {
       if (now < tp.readyAt) continue;
       const dist = tp.pipsTarget * 0.10;
-      const hit = tp.direction === "buy" ? price.bid >= tp.entryPrice + dist : price.ask <= tp.entryPrice - dist;
+      const hit = tp.direction === "buy" ? price.bid >= tp.entryPrice + dist : price.bid <= tp.entryPrice - dist;
       if (!hit) continue;
       firedTpIds.add(tp.id);
 
@@ -372,7 +372,7 @@ export default function TradeScreen() {
     for (const w of watchersRef.current) {
       if (now < w.readyAt) continue;
       const dist = w.pipsTarget * 0.10;
-      const hit = w.direction === "buy" ? price.bid >= w.entryPrice + dist : price.ask <= w.entryPrice - dist;
+      const hit = w.direction === "buy" ? price.bid >= w.entryPrice + dist : price.bid <= w.entryPrice - dist;
       if (!hit) continue;
       firedLimitIds.add(w.id);
 
@@ -488,8 +488,8 @@ export default function TradeScreen() {
         const cascadeId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
         const limitPrices = levels.limitEntries;
         const readyAt = Date.now() + 3000;
-        // Use bid for BUY watcher, ask for SELL — so trigger fires at exactly N pips of market movement
-        const watcherEntryPrice = dir === "buy" ? (p?.bid ?? mktPrice) : (p?.ask ?? mktPrice);
+        // Always use bid as the reference price for watcher triggers — same price the user sees on the chart
+        const watcherEntryPrice = p?.bid ?? mktPrice;
         if (cs.autoCloseLimitsEnabled && cs.autoCloseLimitsPips > 0) {
           console.log(`[watcher id=${cascadeId}] arming +${cs.autoCloseLimitsPips}pip from entry ${watcherEntryPrice} (${dir}) limitOrderIds=${JSON.stringify(result.limitOrderIds)}`);
           watchersRef.current.push({
