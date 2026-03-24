@@ -363,19 +363,24 @@ export default function TradeScreen() {
           onPress: async () => {
             await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
             setIsPlacing(true);
-            const result = await placeCascadeOrders({
-              direction: cascadeDirection,
-              volume: cascadeLotSize,
-              limitEntries: cascadeLevels.limitEntries,
-              stopLoss: cascadeLevels.stopLoss,
-            });
-            setIsPlacing(false);
-            if (result.success) {
-              await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-              showToast(`${result.placed} ${cascadeDirection.toUpperCase()} orders placed ✓`, "success", true);
-            } else {
-              await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-              showToast(result.message, "error");
+            try {
+              const result = await placeCascadeOrders({
+                direction: cascadeDirection,
+                volume: cascadeLotSize,
+                limitEntries: cascadeLevels.limitEntries,
+                stopLoss: cascadeLevels.stopLoss,
+              });
+              if (result.success) {
+                await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                showToast(`${result.placed} ${cascadeDirection.toUpperCase()} orders placed ✓`, "success", true);
+              } else {
+                await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+                showToast(result.message, "error");
+              }
+            } catch (err) {
+              showToast(err instanceof Error ? err.message : "Cascade failed", "error");
+            } finally {
+              setIsPlacing(false);
             }
           },
         },

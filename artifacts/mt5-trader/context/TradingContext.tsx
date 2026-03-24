@@ -483,41 +483,52 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     try { setAccountInfo(await fetchAccountInfoData(accountId, region)); } catch {}
   }, [status, accountId, region, fetchAccountInfoData]);
 
+  // Raw order submission — no side-effect refreshes. Used by both placeTrade and placeCascadeOrders.
+  const submitOrderRaw = useCallback(
+    async (params: PlaceTradeParams): Promise<{ success: boolean; message: string }> => {
+      let actionType: string;
+      if (params.limitPrice != null) {
+        actionType = params.direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT";
+      } else {
+        actionType = params.direction === "buy" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL";
+      }
+      const body: Record<string, unknown> = {
+        actionType,
+        symbol: "XAUUSD",
+        volume: params.volume,
+        comment: params.comment ?? "XAUUSD Trader App",
+      };
+      if (params.limitPrice != null) body.openPrice = params.limitPrice;
+      if (params.stopLoss != null) body.stopLoss = params.stopLoss;
+      if (params.takeProfit != null) body.takeProfit = params.takeProfit;
+      const res = await fetch(`${API_BASE}/mt5/account/${accountId}/trade?region=${region}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json() as { success?: boolean; code?: number; message?: string };
+      if (!res.ok || data.success === false) {
+        return { success: false, message: data.message ?? `Trade failed (code ${data.code ?? res.status})` };
+      }
+      return { success: true, message: data.message ?? "Trade placed successfully" };
+    },
+    [accountId, region]
+  );
+
   const placeTrade = useCallback(
     async (params: PlaceTradeParams): Promise<{ success: boolean; message: string }> => {
       if (status !== "connected") return { success: false, message: "Not connected" };
       try {
-        let actionType: string;
-        if (params.limitPrice != null) {
-          actionType = params.direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT";
-        } else {
-          actionType = params.direction === "buy" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL";
+        const result = await submitOrderRaw(params);
+        if (result.success) {
+          await Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
         }
-        const body: Record<string, unknown> = {
-          actionType,
-          symbol: "XAUUSD",
-          volume: params.volume,
-          comment: params.comment ?? "XAUUSD Trader App",
-        };
-        if (params.limitPrice != null) body.openPrice = params.limitPrice;
-        if (params.stopLoss != null) body.stopLoss = params.stopLoss;
-        if (params.takeProfit != null) body.takeProfit = params.takeProfit;
-        const res = await fetch(`${API_BASE}/mt5/account/${accountId}/trade?region=${region}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        const data = await res.json() as { success?: boolean; code?: number; message?: string };
-        if (!res.ok || data.success === false) {
-          return { success: false, message: data.message ?? `Trade failed (code ${data.code ?? res.status})` };
-        }
-        await Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
-        return { success: true, message: data.message ?? "Trade placed successfully" };
+        return result;
       } catch (err) {
         return { success: false, message: err instanceof Error ? err.message : "Trade failed" };
       }
     },
-    [status, accountId, region, refreshPositions, refreshPendingOrders, refreshAccountInfo]
+    [status, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo]
   );
 
   const placeCascadeOrders = useCallback(
@@ -525,38 +536,49 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       if (status !== "connected") return { success: false, placed: 0, failed: 0, message: "Not connected" };
       let placed = 0;
       let failed = 0;
+      const errors: string[] = [];
       const total = 1 + params.limitEntries.length;
 
-      // First order: market order (instant execution at current price)
-      const marketResult = await placeTrade({
-        direction: params.direction,
-        volume: params.volume,
-        stopLoss: params.stopLoss,
-        comment: `Cascade 1/${total}`,
-      });
-      if (marketResult.success) placed++;
-      else failed++;
-
-      // Remaining orders: limit orders at set price levels
-      for (let i = 0; i < params.limitEntries.length; i++) {
-        const result = await placeTrade({
+      try {
+        // 1. Market order first — instant fill
+        const marketResult = await submitOrderRaw({
           direction: params.direction,
           volume: params.volume,
-          limitPrice: params.limitEntries[i],
           stopLoss: params.stopLoss,
-          comment: `Cascade ${i + 2}/${total}`,
+          comment: `Cascade 1/${total}`,
         });
-        if (result.success) placed++;
-        else failed++;
+        if (marketResult.success) placed++;
+        else { failed++; errors.push(`Market: ${marketResult.message}`); }
+
+        // 2. Limit orders — one at a time, small delay between each to avoid rate limits
+        for (let i = 0; i < params.limitEntries.length; i++) {
+          await new Promise((r) => setTimeout(r, 300));
+          const result = await submitOrderRaw({
+            direction: params.direction,
+            volume: params.volume,
+            limitPrice: params.limitEntries[i],
+            stopLoss: params.stopLoss,
+            comment: `Cascade ${i + 2}/${total}`,
+          });
+          if (result.success) placed++;
+          else { failed++; errors.push(`Limit ${i + 1}: ${result.message}`); }
+        }
+      } catch (err) {
+        errors.push(err instanceof Error ? err.message : "Unknown error");
       }
 
-      await refreshPositions();
-      await refreshAccountInfo();
-      if (placed === 0) return { success: false, placed, failed, message: "All orders failed to place" };
-      if (failed > 0) return { success: true, placed, failed, message: `${placed} of ${total} orders placed (${failed} failed)` };
+      // Single refresh at the end
+      await Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
+
+      if (placed === 0) {
+        return { success: false, placed, failed, message: errors[0] ?? "All orders failed to place" };
+      }
+      if (failed > 0) {
+        return { success: true, placed, failed, message: `${placed}/${total} placed. Failed: ${errors.join("; ")}` };
+      }
       return { success: true, placed, failed, message: `${placed} orders placed — 1 market + ${params.limitEntries.length} limit` };
     },
-    [status, placeTrade, refreshPositions, refreshAccountInfo]
+    [status, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo]
   );
 
   const closePosition = useCallback(
