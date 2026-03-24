@@ -569,13 +569,13 @@ export default function TradeScreen() {
               </View>
             )}
 
-            {/* Place cascade button */}
+            {/* Place cascade button — no disabled prop so it always fires the handler */}
             <Pressable
               style={({ pressed }) => [
                 styles.tradeBtn,
                 cascadeDirection === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
                 pressed && !isPlacing && { opacity: 0.85, transform: [{ scale: 0.98 }] },
-                (status !== "connected" || isPlacing) && { opacity: 0.45 },
+                isPlacing && { opacity: 0.6 },
               ]}
               onPress={() => handleCascadeTrade(cascadeDirection)}
             >
@@ -750,6 +750,7 @@ export default function TradeScreen() {
           </>
         )}
       </ScrollView>
+
     </View>
   );
 }
@@ -779,6 +780,17 @@ const styles = StyleSheet.create({
   dot: { width: 6, height: 6, borderRadius: 3, backgroundColor: C.buy },
   liveLabel: { fontSize: 10, fontFamily: "Inter_600SemiBold", color: C.buy, letterSpacing: 0.5 },
   scroll: { padding: 16, gap: 12 },
+  stickyFooter: {
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: C.border,
+    backgroundColor: C.background,
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+  },
   card: {
     backgroundColor: C.card,
     borderRadius: 16,
