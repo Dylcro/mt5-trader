@@ -305,8 +305,10 @@ export default function TradeScreen() {
   const [slManual, setSlManual] = useState(0);
   const [slManualText, setSlManualText] = useState("");
 
-  // Shared SL session (single order mode)
-  type SharedSLSession = { direction: Direction; stopLoss: number; anchorEntry: number };
+  // Shared SL session (single order mode): first trade sets the anchor SL;
+  // every subsequent same-direction trade uses it automatically.
+  // Resets when all positions are closed.
+  type SharedSLSession = { direction: Direction; stopLoss: number };
   const [sharedSLSession, setSharedSLSession] = useState<SharedSLSession | null>(null);
   const sharedSLSessionRef = useRef<SharedSLSession | null>(null);
   useEffect(() => { sharedSLSessionRef.current = sharedSLSession; }, [sharedSLSession]);
@@ -405,18 +407,10 @@ export default function TradeScreen() {
     }
   }, [price, cancelOrder, closePosition, refreshPendingOrders, showToast]);
 
-  // Auto-reset shared SL session when all positions in the range are closed
+  // Auto-reset shared SL session when ALL positions are closed
   useEffect(() => {
-    const session = sharedSLSession;
-    if (!session) { sharedSLHasHadPositionRef.current = false; return; }
-    const [lo, hi] = session.direction === "buy"
-      ? [session.stopLoss, session.anchorEntry]
-      : [session.anchorEntry, session.stopLoss];
-    const posType = session.direction === "buy" ? "POSITION_TYPE_BUY" : "POSITION_TYPE_SELL";
-    const hasPosition = positions.some(
-      (p) => p.type === posType && p.openPrice >= lo - 0.01 && p.openPrice <= hi + 0.01
-    );
-    if (hasPosition) {
+    if (!sharedSLSession) { sharedSLHasHadPositionRef.current = false; return; }
+    if (positions.length > 0) {
       sharedSLHasHadPositionRef.current = true;
     } else if (sharedSLHasHadPositionRef.current) {
       setSharedSLSession(null);
@@ -461,15 +455,7 @@ export default function TradeScreen() {
 
   // Session-aware SL for single order mode
   const sessionActive = sharedSLSession !== null && sharedSLSession.direction === direction;
-  const sessionInRange = (() => {
-    if (!sessionActive || !sharedSLSession) return false;
-    const currentPrice = direction === "buy" ? (price?.ask ?? 0) : (price?.bid ?? 0);
-    const [lo, hi] = direction === "buy"
-      ? [sharedSLSession.stopLoss, sharedSLSession.anchorEntry]
-      : [sharedSLSession.anchorEntry, sharedSLSession.stopLoss];
-    return currentPrice > lo && currentPrice <= hi;
-  })();
-  const effectiveDisplaySL = sessionInRange ? sharedSLSession!.stopLoss : sl;
+  const effectiveDisplaySL = sessionActive ? sharedSLSession!.stopLoss : sl;
 
   const handleSingleTrade = useCallback(async () => {
     if (isPlacingRef.current) return;
@@ -477,22 +463,11 @@ export default function TradeScreen() {
       Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
       return;
     }
-    const p = priceRef.current;
     const session = sharedSLSessionRef.current;
 
-    // Determine effective SL — use session SL automatically when price is within session range
-    let effectiveSL: number | undefined = slRef.current;
-    let isSessionTrade = false;
-    if (session && session.direction === direction) {
-      const [lo, hi] = direction === "buy"
-        ? [session.stopLoss, session.anchorEntry]
-        : [session.anchorEntry, session.stopLoss];
-      const currentPrice = direction === "buy" ? (p?.ask ?? 0) : (p?.bid ?? 0);
-      if (currentPrice > lo && currentPrice <= hi) {
-        effectiveSL = session.stopLoss;
-        isSessionTrade = true;
-      }
-    }
+    // Session active + same direction → always use the session SL
+    const isSessionTrade = session !== null && session.direction === direction;
+    const effectiveSL: number | undefined = isSessionTrade ? session!.stopLoss : slRef.current;
 
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     isPlacingRef.current = true;
@@ -504,17 +479,13 @@ export default function TradeScreen() {
     if (result.success) {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       if (!session && effectiveSL != null) {
-        // Start a new session anchored at this entry price
-        const anchorEntry = direction === "buy" ? (p?.ask ?? 0) : (p?.bid ?? 0);
-        setSharedSLSession({ direction, stopLoss: effectiveSL, anchorEntry });
-        showToast(`${direction.toUpperCase()} placed ✓ — SL session started, SL ${formatPrice(effectiveSL)}`, "success", true);
+        // First trade — start a new session
+        setSharedSLSession({ direction, stopLoss: effectiveSL });
+        showToast(`${direction.toUpperCase()} ✓ — SL session started @ ${formatPrice(effectiveSL)}`, "success", true);
+      } else if (isSessionTrade) {
+        showToast(`${direction.toUpperCase()} ✓ — shared SL ${formatPrice(effectiveSL!)}`, "success", true);
       } else {
-        showToast(
-          isSessionTrade
-            ? `${direction.toUpperCase()} ✓ — shared SL ${formatPrice(effectiveSL!)} applied`
-            : `${direction.toUpperCase()} order placed ✓  ${lotSize} lot`,
-          "success", true
-        );
+        showToast(`${direction.toUpperCase()} order placed ✓  ${lotSize} lot`, "success", true);
       }
     } else {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
@@ -811,7 +782,7 @@ export default function TradeScreen() {
           <>
             {/* Shared SL Session Banner */}
             {sharedSLSession && (
-              <View style={[styles.sectionCard, { borderColor: C.gold, borderWidth: 1 }]}>
+              <View style={[styles.sectionCard, { borderColor: C.gold, borderWidth: 1, gap: 0 }]}>
                 <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
                   <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
                     <Feather name="shield" size={14} color={C.gold} />
@@ -826,17 +797,11 @@ export default function TradeScreen() {
                     <Feather name="x" size={16} color={C.textSecondary} />
                   </Pressable>
                 </View>
-                <View style={{ marginTop: 8, gap: 4 }}>
-                  <Text style={{ color: C.textSecondary, fontSize: 12 }}>
-                    Anchor: <Text style={{ color: C.text }}>{formatPrice(sharedSLSession.anchorEntry)}</Text>
-                    {"   "}SL: <Text style={{ color: C.sell }}>{formatPrice(sharedSLSession.stopLoss)}</Text>
-                  </Text>
-                  <Text style={{ color: sessionInRange ? C.buy : C.textMuted, fontSize: 12 }}>
-                    {sessionInRange
-                      ? `Price in range — next ${sharedSLSession.direction} uses SL ${formatPrice(sharedSLSession.stopLoss)} automatically`
-                      : `Price outside range [${formatPrice(Math.min(sharedSLSession.stopLoss, sharedSLSession.anchorEntry))}–${formatPrice(Math.max(sharedSLSession.stopLoss, sharedSLSession.anchorEntry))}]`}
-                  </Text>
-                </View>
+                <Text style={{ color: C.textSecondary, fontSize: 12, marginTop: 6 }}>
+                  All {sharedSLSession.direction.toUpperCase()} trades use SL{" "}
+                  <Text style={{ color: C.sell, fontWeight: "700" }}>{formatPrice(sharedSLSession.stopLoss)}</Text>
+                  {" "}until all positions are closed
+                </Text>
               </View>
             )}
 
@@ -880,7 +845,7 @@ export default function TradeScreen() {
                 </Text>
               </View>
 
-              {sessionInRange ? (
+              {sessionActive ? (
                 /* Locked to session SL — no manual controls */
                 <View style={[styles.slInputArea, { alignItems: "center", paddingVertical: 6 }]}>
                   <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
@@ -966,7 +931,7 @@ export default function TradeScreen() {
                   <Text style={styles.riskLabel}>Stop Loss</Text>
                   <Text style={[styles.riskValue, { color: C.sell }]}>
                     {effectiveDisplaySL != null ? formatPrice(effectiveDisplaySL) : "None"}
-                    {sessionInRange ? <Text style={{ color: C.gold, fontSize: 11 }}> 🔒</Text> : null}
+                    {sessionActive ? <Text style={{ color: C.gold, fontSize: 11 }}> 🔒</Text> : null}
                   </Text>
                 </View>
                 <View style={styles.riskRow}>
