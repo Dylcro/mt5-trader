@@ -84,12 +84,11 @@ export function buildCascadeLevels(
     limitEntries.push(price);
   }
 
-  const furthestEntry = limitEntries.length > 0
-    ? limitEntries[limitEntries.length - 1]
-    : marketPrice;
+  // SL is anchored to the market entry (order #1) so the setting always means
+  // "X pips from my first fill", regardless of how many limits are stacked.
   const stopLoss = direction === "buy"
-    ? parseFloat((furthestEntry - slDist).toFixed(2))
-    : parseFloat((furthestEntry + slDist).toFixed(2));
+    ? parseFloat((marketPrice - slDist).toFixed(2))
+    : parseFloat((marketPrice + slDist).toFixed(2));
 
   return { limitEntries, stopLoss };
 }

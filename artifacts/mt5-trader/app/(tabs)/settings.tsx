@@ -489,14 +489,14 @@ export default function SettingsScreen() {
             <View style={styles.cascadeDivider} />
 
             <SliderSetting
-              label="Stop loss"
+              label="Stop loss (from entry)"
               value={cs.slPips}
               min={10}
-              max={200}
+              max={500}
               step={5}
               onChange={(v) => updateSettings({ slPips: v })}
               displayValue={`${cs.slPips} pips`}
-              hint={`${(cs.slPips * 0.10).toFixed(2)} — same on all orders`}
+              hint={`${(cs.slPips * 0.10).toFixed(2)} below market entry — shared by all orders`}
             />
 
             <View style={styles.cascadePreviewBox}>
@@ -507,7 +507,7 @@ export default function SettingsScreen() {
                   `#${i + 2}  Limit   @ ${(5058 - (i + 1) * cs.pipsBetween * 0.10).toFixed(2)}`
                 ).join("\n")}
                 {cs.numPositions > 1 ? "\n" : ""}
-                {`SL  ${(5058 - (cs.numPositions - 1) * cs.pipsBetween * 0.10 - cs.slPips * 0.10).toFixed(2)}  ← all orders`}
+                {`SL  ${(5058 - cs.slPips * 0.10).toFixed(2)}  ← all orders (${cs.slPips} pips from entry)`}
               </Text>
             </View>
           </View>

@@ -17,6 +17,7 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import Colors from "@/constants/colors";
+import { TradingViewChart } from "@/components/TradingViewChart";
 import { useTrading, type SLMode } from "@/context/TradingContext";
 import { buildCascadeLevels, useCascadeSettings } from "@/hooks/useCascadeSettings";
 
@@ -438,6 +439,13 @@ export default function TradeScreen() {
           <Feather name="refresh-cw" size={18} color={C.textSecondary} />
         </Pressable>
       </View>
+
+      {/* Live TradingView Chart */}
+      {status === "connected" && (
+        <View style={{ paddingHorizontal: 12 }}>
+          <TradingViewChart height={200} />
+        </View>
+      )}
 
       <ScrollView
         showsVerticalScrollIndicator={false}
