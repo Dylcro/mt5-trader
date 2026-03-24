@@ -447,7 +447,7 @@ router.get("/mt5/account/:accountId/info", async (req: Request, res: Response) =
 router.get("/mt5/account/:accountId/candles", (req: Request, res: Response) => {
   const timeframe = qstr(req.query.timeframe) || "5m";
   const limit = Math.min(parseInt(qstr(req.query.limit) || "150", 10) || 150, 500);
-  const candles = buildCandles(req.params.accountId, timeframe, limit);
+  const candles = buildCandles(String(req.params.accountId), timeframe, limit);
   return res.json(candles);
 });
 
@@ -463,7 +463,7 @@ router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) 
     if (!priceRes.ok) return res.status(priceRes.status).json({ error: "Price fetch failed" });
     const priceData = await priceRes.json() as { bid?: number; ask?: number };
     // Accumulate tick for chart history
-    if (priceData.bid && priceData.ask) storeTick(req.params.accountId, priceData.bid, priceData.ask);
+    if (priceData.bid && priceData.ask) storeTick(String(req.params.accountId), priceData.bid, priceData.ask);
     return res.json(priceData);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
@@ -570,6 +570,165 @@ const TRADE_ERROR_MESSAGES: Record<number, string> = {
   10044: "Only position closing allowed for this symbol.",
   10045: "Positions can only be closed in FIFO order.",
 };
+
+// ── Background SL Monitor ────────────────────────────────────────────────────
+interface MonitorSession {
+  accountId: string;
+  region: string;
+  direction: "buy" | "sell";
+  stopLoss: number;
+  anchorEntry: number | null;
+  seenPositionIds: Set<string>;
+  hasHadPosition: boolean;
+  patchedCount: number;
+  lastPollAt: number | null;
+  lastPollError: string | null;
+  startedAt: number;
+}
+
+const monitorSessions = new Map<string, MonitorSession>();
+
+async function pollMonitorSession(session: MonitorSession): Promise<void> {
+  const token = process.env.METAAPI_TOKEN;
+  if (!token) return;
+  const { accountId, region, direction, stopLoss } = session;
+  session.lastPollAt = Date.now();
+
+  let allPositions: Array<{ id: string; type: string; openPrice: number }>;
+  try {
+    const posRes = await fetch(
+      `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
+      { headers: authHeaders(token) }
+    );
+    if (!posRes.ok) { session.lastPollError = `positions ${posRes.status}`; return; }
+    allPositions = await posRes.json() as typeof allPositions;
+    session.lastPollError = null;
+  } catch (err) {
+    session.lastPollError = err instanceof Error ? err.message : "fetch error";
+    return;
+  }
+
+  const posType = direction === "buy" ? "POSITION_TYPE_BUY" : "POSITION_TYPE_SELL";
+  const sessionPositions = allPositions.filter((p) => {
+    if (p.type !== posType) return false;
+    if (session.anchorEntry == null) return true;
+    const [lo, hi] = direction === "buy"
+      ? [session.stopLoss - 0.01, session.anchorEntry + 0.01]
+      : [session.anchorEntry - 0.01, session.stopLoss + 0.01];
+    return p.openPrice >= lo && p.openPrice <= hi;
+  });
+
+  const newPositions = sessionPositions.filter((p) => !session.seenPositionIds.has(p.id));
+
+  if (newPositions.length > 0) {
+    if (session.anchorEntry == null) {
+      session.anchorEntry = newPositions[0].openPrice;
+      console.log(`[monitor ${accountId}] anchor=${session.anchorEntry}`);
+    }
+    for (const pos of newPositions) {
+      session.seenPositionIds.add(pos.id);
+      console.log(`[monitor ${accountId}] patching posId=${pos.id} openPrice=${pos.openPrice} → SL ${stopLoss}`);
+      try {
+        const tRes = await fetch(
+          `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
+          {
+            method: "POST",
+            headers: authHeaders(token),
+            body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: pos.id, stopLoss }),
+          }
+        );
+        const td = await tRes.json() as { numericCode?: number; message?: string };
+        console.log(`[monitor ${accountId}] POSITION_MODIFY code=${td.numericCode} msg=${td.message ?? "ok"}`);
+        session.patchedCount++;
+      } catch (err) {
+        console.error(`[monitor ${accountId}] patch error:`, err);
+      }
+    }
+    session.hasHadPosition = true;
+  }
+
+  // Auto-stop when all session positions are closed
+  if (session.anchorEntry != null && sessionPositions.length === 0 && session.hasHadPosition) {
+    console.log(`[monitor ${accountId}] all positions closed — auto-stopping`);
+    monitorSessions.delete(accountId);
+  }
+}
+
+// Global 2-second poll loop
+setInterval(() => {
+  for (const session of monitorSessions.values()) {
+    void pollMonitorSession(session).catch(() => {});
+  }
+}, 2000);
+
+// POST /api/mt5/account/:accountId/monitor  — start a server-side SL monitor session
+router.post("/mt5/account/:accountId/monitor", async (req: Request, res: Response) => {
+  try {
+    const accountId = String(req.params.accountId);
+    const { region = DEFAULT_REGION, direction, stopLoss } = req.body as { region?: string; direction: "buy" | "sell"; stopLoss: number };
+    if (!direction || stopLoss == null) return res.status(400).json({ error: "direction and stopLoss required" });
+    const token = getToken();
+    const normRegion = normalizeRegion(region);
+
+    // Seed seen IDs with existing positions so we don't patch pre-session trades
+    let seenIds = new Set<string>();
+    try {
+      const posRes = await fetch(
+        `${clientBase(normRegion)}/users/current/accounts/${accountId}/positions`,
+        { headers: authHeaders(token) }
+      );
+      if (posRes.ok) {
+        const positions = await posRes.json() as Array<{ id: string }>;
+        seenIds = new Set(positions.map((p) => p.id));
+        console.log(`[monitor ${accountId}] seeded ${seenIds.size} existing position IDs`);
+      }
+    } catch {}
+
+    monitorSessions.set(accountId, {
+      accountId,
+      region: normRegion,
+      direction,
+      stopLoss,
+      anchorEntry: null,
+      seenPositionIds: seenIds,
+      hasHadPosition: false,
+      patchedCount: 0,
+      lastPollAt: null,
+      lastPollError: null,
+      startedAt: Date.now(),
+    });
+    console.log(`[monitor ${accountId}] started dir=${direction} sl=${stopLoss}`);
+    return res.json({ active: true, direction, stopLoss, anchorEntry: null, patchedCount: 0 });
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed to start monitor" });
+  }
+});
+
+// GET /api/mt5/account/:accountId/monitor  — get current session status
+router.get("/mt5/account/:accountId/monitor", (req: Request, res: Response) => {
+  const accountId = String(req.params.accountId);
+  const session = monitorSessions.get(accountId);
+  if (!session) return res.json({ active: false });
+  return res.json({
+    active: true,
+    direction: session.direction,
+    stopLoss: session.stopLoss,
+    anchorEntry: session.anchorEntry,
+    patchedCount: session.patchedCount,
+    lastPollAt: session.lastPollAt,
+    lastPollError: session.lastPollError,
+    hasHadPosition: session.hasHadPosition,
+  });
+});
+
+// DELETE /api/mt5/account/:accountId/monitor  — stop the session
+router.delete("/mt5/account/:accountId/monitor", (req: Request, res: Response) => {
+  const accountId = String(req.params.accountId);
+  const existed = monitorSessions.has(accountId);
+  monitorSessions.delete(accountId);
+  console.log(`[monitor ${accountId}] stopped (existed=${existed})`);
+  return res.json({ stopped: existed });
+});
 
 // POST /api/mt5/account/:accountId/trade?region=london
 router.post("/mt5/account/:accountId/trade", async (req: Request, res: Response) => {

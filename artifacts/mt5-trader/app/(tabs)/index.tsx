@@ -314,11 +314,9 @@ export default function TradeScreen() {
   useEffect(() => { sharedSLSessionRef.current = sharedSLSession; }, [sharedSLSession]);
   const sharedSLHasHadPositionRef = useRef(false);
 
-  // MT5 monitor session — watches for trades placed in the MT5 app and auto-applies SL
-  type MT5MonitorSession = { direction: Direction; stopLoss: number; anchorEntry: number | null };
+  // MT5 monitor session — server-side SL monitor (state is UI mirror of server)
+  type MT5MonitorSession = { direction: Direction; stopLoss: number; anchorEntry: number | null; patchedCount: number };
   const [mt5MonitorSession, setMT5MonitorSession] = useState<MT5MonitorSession | null>(null);
-  const mt5PatchedIdsRef = useRef<Set<string>>(new Set());
-  const mt5HasHadPositionRef = useRef(false);
 
   // Cascade state
   const [cascadeDirection, setCascadeDirection] = useState<Direction>("buy");
@@ -433,76 +431,55 @@ export default function TradeScreen() {
     }
   }, [positions, sharedSLSession, showToast]);
 
-  // MT5 monitor: on each positions poll, patch SL on new matching positions
-  useEffect(() => {
-    const session = mt5MonitorSession;
-    if (!session) { mt5HasHadPositionRef.current = false; return; }
-    const posType = session.direction === "buy" ? "POSITION_TYPE_BUY" : "POSITION_TYPE_SELL";
-
-    // Positions matching this session's direction + range (range is open until first anchor is set)
-    const sessionPositions = positions.filter((p) => {
-      if (p.type !== posType) return false;
-      if (session.anchorEntry == null) return true; // before anchor: accept all matching direction
-      const [lo, hi] = session.direction === "buy"
-        ? [session.stopLoss - 0.01, session.anchorEntry + 0.01]
-        : [session.anchorEntry - 0.01, session.stopLoss + 0.01];
-      return p.openPrice >= lo && p.openPrice <= hi;
-    });
-
-    const newPositions = sessionPositions.filter((p) => !mt5PatchedIdsRef.current.has(p.id));
-
-    if (newPositions.length > 0) {
-      // Set anchor from the first new position if not yet set
-      if (session.anchorEntry == null) {
-        const anchor = newPositions[0].openPrice;
-        setMT5MonitorSession((s) => s ? { ...s, anchorEntry: anchor } : s);
-        console.log(`[mt5-monitor] anchor set to ${anchor}`);
-      }
-      // Patch SL on all new positions
-      for (const pos of newPositions) {
-        mt5PatchedIdsRef.current.add(pos.id);
-        const posSl = session.stopLoss;
-        console.log(`[mt5-monitor] patching posId=${pos.id} openPrice=${pos.openPrice} → SL ${posSl}`);
-        void modifyPosition(pos.id, posSl).then((result) => {
-          if (result.success) {
+  // Fetch server monitor status and sync to local state
+  const fetchServerMonitorStatus = useCallback(async () => {
+    if (!accountId) return;
+    try {
+      const res = await fetch(`${apiBase}/mt5/account/${accountId}/monitor`);
+      const data = await res.json() as {
+        active: boolean; direction?: Direction; stopLoss?: number;
+        anchorEntry?: number | null; patchedCount?: number; lastPollError?: string | null;
+      };
+      if (data.active && data.direction && data.stopLoss != null) {
+        setMT5MonitorSession((prev) => {
+          const next = {
+            direction: data.direction!,
+            stopLoss: data.stopLoss!,
+            anchorEntry: data.anchorEntry ?? null,
+            patchedCount: data.patchedCount ?? 0,
+          };
+          // Toast when new patches applied
+          if (prev && data.patchedCount != null && data.patchedCount > (prev.patchedCount ?? 0)) {
             void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-            showToast(`SL ${formatPrice(posSl)} auto-applied to MT5 ${session.direction.toUpperCase()} @ ${formatPrice(pos.openPrice)}`, "success", true);
-          } else {
-            console.warn(`[mt5-monitor] modifyPosition failed: ${result.message}`);
-            showToast(`SL patch failed: ${result.message}`, "error");
+            showToast(`SL ${formatPrice(data.stopLoss!)} applied to MT5 ${data.direction!.toUpperCase()} trade`, "success", true);
           }
+          return next;
         });
+      } else if (!data.active && mt5MonitorSessionRef.current) {
+        setMT5MonitorSession(null);
+        showToast("MT5 monitor session reset — all positions closed", "success");
       }
-      mt5HasHadPositionRef.current = true;
-    }
+    } catch {}
+  }, [accountId, apiBase, showToast]);
 
-    // Auto-reset once all monitored positions are gone
-    if (session.anchorEntry != null && sessionPositions.length === 0 && mt5HasHadPositionRef.current) {
-      setMT5MonitorSession(null);
-      mt5PatchedIdsRef.current.clear();
-      mt5HasHadPositionRef.current = false;
-      showToast("MT5 monitor session reset — all positions closed", "success");
-    }
-  }, [positions, mt5MonitorSession, modifyPosition, showToast]);
-
-  // Fast positions poll (2s) while MT5 monitor session is active
-  useEffect(() => {
-    if (!mt5MonitorSession) return;
-    const id = setInterval(() => { void refreshPositions(); }, 2000);
-    return () => clearInterval(id);
-  }, [mt5MonitorSession, refreshPositions]);
-
-  // Immediate refresh when app returns to foreground during MT5 monitor session
+  // Poll server status every 4s when session is active
   const mt5MonitorSessionRef = useRef(mt5MonitorSession);
   useEffect(() => { mt5MonitorSessionRef.current = mt5MonitorSession; }, [mt5MonitorSession]);
   useEffect(() => {
+    if (!mt5MonitorSession) return;
+    const id = setInterval(() => { void fetchServerMonitorStatus(); }, 4000);
+    return () => clearInterval(id);
+  }, [mt5MonitorSession, fetchServerMonitorStatus]);
+
+  // Immediate server status fetch when app returns to foreground
+  useEffect(() => {
     const sub = AppState.addEventListener("change", (nextState) => {
       if (nextState === "active" && mt5MonitorSessionRef.current) {
-        void refreshPositions();
+        void fetchServerMonitorStatus();
       }
     });
     return () => sub.remove();
-  }, [refreshPositions]);
+  }, [fetchServerMonitorStatus]);
 
   // Safety valve: if isPlacing somehow gets stuck, auto-reset after 90 seconds
   useEffect(() => {
@@ -610,12 +587,26 @@ export default function TradeScreen() {
       Alert.alert("No Stop Loss Set", "Please set a stop loss before starting the MT5 monitor session.");
       return;
     }
-    // Start session then open MT5
-    setMT5MonitorSession({ direction, stopLoss: slRef.current, anchorEntry: null });
-    mt5PatchedIdsRef.current.clear();
-    mt5HasHadPositionRef.current = false;
+    const sl = slRef.current;
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    showToast(`Monitoring MT5 ${direction.toUpperCase()} trades — SL ${formatPrice(slRef.current)} will auto-apply`, "success", true);
+    // Register session on server — server polls every 2s regardless of app state
+    try {
+      const res = await fetch(`${apiBase}/mt5/account/${accountId}/monitor`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ direction, stopLoss: sl, region }),
+      });
+      const data = await res.json() as { active?: boolean; error?: string };
+      if (!res.ok || !data.active) {
+        showToast(data.error ?? "Failed to start server monitor", "error");
+        return;
+      }
+    } catch {
+      showToast("Could not reach server — check connection", "error");
+      return;
+    }
+    setMT5MonitorSession({ direction, stopLoss: sl, anchorEntry: null, patchedCount: 0 });
+    showToast(`Server monitoring ON — SL ${formatPrice(sl)} auto-applies to all MT5 ${direction.toUpperCase()} trades`, "success", true);
     try {
       const canOpen = await Linking.canOpenURL("metatrader5://");
       if (canOpen) {
@@ -626,7 +617,7 @@ export default function TradeScreen() {
     } catch {
       showToast("Could not open MT5 — please open it manually", "error");
     }
-  }, [direction, showToast]);
+  }, [direction, apiBase, accountId, region, showToast]);
 
   const handleCascadeTrade = useCallback(async (dir: Direction) => {
     const p = priceRef.current;
@@ -926,7 +917,11 @@ export default function TradeScreen() {
                     </Text>
                   </View>
                   <Pressable
-                    onPress={() => { setMT5MonitorSession(null); mt5PatchedIdsRef.current.clear(); mt5HasHadPositionRef.current = false; void Haptics.selectionAsync(); }}
+                    onPress={() => {
+                      void fetch(`${apiBase}/mt5/account/${accountId}/monitor`, { method: "DELETE" });
+                      setMT5MonitorSession(null);
+                      void Haptics.selectionAsync();
+                    }}
                     hitSlop={8}
                   >
                     <Feather name="x" size={16} color={C.textSecondary} />
@@ -940,7 +935,9 @@ export default function TradeScreen() {
                       : <Text style={{ color: C.textMuted }}> — waiting for first trade…</Text>}
                   </Text>
                   <Text style={{ color: C.textMuted, fontSize: 11 }}>
-                    Place a {mt5MonitorSession.direction} in MT5 — SL will be applied within ~10s
+                    {mt5MonitorSession.patchedCount > 0
+                      ? `${mt5MonitorSession.patchedCount} trade${mt5MonitorSession.patchedCount !== 1 ? "s" : ""} patched — server monitoring active`
+                      : `Server monitoring active — place a ${mt5MonitorSession.direction} in MT5`}
                   </Text>
                 </View>
               </View>
@@ -1159,7 +1156,11 @@ export default function TradeScreen() {
                 pressed && { opacity: 0.8 },
               ]}
               onPress={mt5MonitorSession
-                ? () => { setMT5MonitorSession(null); mt5PatchedIdsRef.current.clear(); mt5HasHadPositionRef.current = false; void Haptics.selectionAsync(); }
+                ? () => {
+                    void fetch(`${apiBase}/mt5/account/${accountId}/monitor`, { method: "DELETE" });
+                    setMT5MonitorSession(null);
+                    void Haptics.selectionAsync();
+                  }
                 : openMT5AndMonitor
               }
             >
