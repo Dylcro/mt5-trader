@@ -301,6 +301,13 @@ export default function TradeScreen() {
 
   const [isPlacing, setIsPlacing] = useState(false);
 
+  // Safety valve: if isPlacing somehow gets stuck, auto-reset after 90 seconds
+  useEffect(() => {
+    if (!isPlacing) return;
+    const t = setTimeout(() => setIsPlacing(false), 90_000);
+    return () => clearTimeout(t);
+  }, [isPlacing]);
+
   const blinkAnim = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
@@ -346,9 +353,16 @@ export default function TradeScreen() {
   }, [isPlacing, status, direction, lotSize, sl, placeTrade, showToast]);
 
   const handleCascadeTrade = useCallback(async () => {
-    if (isPlacing || !cascadeLevels) return;
+    if (isPlacing) {
+      Alert.alert("Order in Progress", "Please wait for the current order to complete.");
+      return;
+    }
     if (status !== "connected") {
       Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
+      return;
+    }
+    if (!cascadeLevels || cascadeMarketPrice <= 0) {
+      Alert.alert("Price Unavailable", "Waiting for live price data. Please wait a moment and try again.");
       return;
     }
     const total = 1 + cascadeLevels.limitEntries.length;
@@ -549,10 +563,10 @@ export default function TradeScreen() {
                 styles.tradeBtn,
                 cascadeDirection === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
                 pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
-                (!isCascadeReady || isPlacing) && { opacity: 0.45 },
+                (status !== "connected" || isPlacing) && { opacity: 0.45 },
               ]}
               onPress={handleCascadeTrade}
-              disabled={!isCascadeReady || isPlacing}
+              disabled={status !== "connected" || isPlacing}
             >
               {isPlacing ? (
                 <ActivityIndicator color={cascadeDirection === "buy" ? "#000" : "#fff"} />
