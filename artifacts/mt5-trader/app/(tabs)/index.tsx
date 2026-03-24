@@ -6,6 +6,7 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  AppState,
   Linking,
   Platform,
   Pressable,
@@ -490,6 +491,18 @@ export default function TradeScreen() {
     const id = setInterval(() => { void refreshPositions(); }, 2000);
     return () => clearInterval(id);
   }, [mt5MonitorSession, refreshPositions]);
+
+  // Immediate refresh when app returns to foreground during MT5 monitor session
+  const mt5MonitorSessionRef = useRef(mt5MonitorSession);
+  useEffect(() => { mt5MonitorSessionRef.current = mt5MonitorSession; }, [mt5MonitorSession]);
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (nextState) => {
+      if (nextState === "active" && mt5MonitorSessionRef.current) {
+        void refreshPositions();
+      }
+    });
+    return () => sub.remove();
+  }, [refreshPositions]);
 
   // Safety valve: if isPlacing somehow gets stuck, auto-reset after 90 seconds
   useEffect(() => {
