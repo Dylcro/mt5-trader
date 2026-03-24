@@ -502,6 +502,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   }, [status, accountId, region, fetchAccountInfoData]);
 
   // Raw order submission — no side-effect refreshes. Used by both placeTrade and placeCascadeOrders.
+  // Retries up to 2 times on transient "not ready" errors (MetaAPI warming up after reconnect).
   const submitOrderRaw = useCallback(
     async (params: PlaceTradeParams): Promise<{ success: boolean; message: string; positionId?: string; orderId?: string }> => {
       let actionType: string;
@@ -519,18 +520,34 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       if (params.limitPrice != null) body.openPrice = params.limitPrice;
       if (params.stopLoss != null) body.stopLoss = params.stopLoss;
       if (params.takeProfit != null) body.takeProfit = params.takeProfit;
-      console.log("[submitOrderRaw] →", actionType, "vol=" + String(params.volume), params.limitPrice != null ? "openPrice=" + String(params.limitPrice) : "market", "sl=" + String(params.stopLoss ?? "none"));
-      const res = await fetch(`${API_BASE}/mt5/account/${accountId}/trade?region=${region}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const data = await res.json() as { success?: boolean; code?: number; message?: string; positionId?: string; orderId?: string };
-      console.log("[submitOrderRaw] ←", actionType, "httpStatus=" + String(res.status), "success=" + String(data.success) + " code=" + String(data.code) + " msg=" + String(data.message));
-      if (!res.ok || data.success === false) {
+
+      const isTransient = (msg?: string) =>
+        msg?.toLowerCase().includes("failed to execute a callable") ||
+        msg?.toLowerCase().includes("not connected to broker") ||
+        msg?.toLowerCase().includes("account is not connected");
+
+      const MAX_ATTEMPTS = 3;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        console.log("[submitOrderRaw] →", actionType, "vol=" + String(params.volume), params.limitPrice != null ? "openPrice=" + String(params.limitPrice) : "market", "sl=" + String(params.stopLoss ?? "none"), attempt > 1 ? `(attempt ${attempt})` : "");
+        const res = await fetch(`${API_BASE}/mt5/account/${accountId}/trade?region=${region}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json() as { success?: boolean; code?: number; message?: string; positionId?: string; orderId?: string };
+        console.log("[submitOrderRaw] ←", actionType, "httpStatus=" + String(res.status), "success=" + String(data.success) + " code=" + String(data.code) + " msg=" + String(data.message));
+        if (res.ok && data.success !== false) {
+          return { success: true, message: data.message ?? "Trade placed successfully", positionId: data.positionId, orderId: data.orderId };
+        }
+        // Retry on transient broker-not-ready errors
+        if (attempt < MAX_ATTEMPTS && isTransient(data.message)) {
+          console.log("[submitOrderRaw] transient error — retrying in 1.5s");
+          await new Promise((r) => setTimeout(r, 1500));
+          continue;
+        }
         return { success: false, message: data.message ?? `Trade failed (code ${data.code ?? res.status})` };
       }
-      return { success: true, message: data.message ?? "Trade placed successfully", positionId: data.positionId, orderId: data.orderId };
+      return { success: false, message: "Trade failed after retries" };
     },
     [accountId, region]
   );
