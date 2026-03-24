@@ -57,6 +57,41 @@ function authHeaders(token: string) {
   return { "auth-token": token, "Content-Type": "application/json" };
 }
 
+// ── Server-side price cache ──────────────────────────────────────────────────
+// Background poller fetches from MetaAPI every 100ms per active account.
+// Client /price requests return from this cache instantly (no MetaAPI RTT on hot path).
+interface PriceCacheEntry { bid: number; ask: number; fetchedAt: number; }
+const priceCache = new Map<string, PriceCacheEntry>(); // key = `${accountId}:${region}`
+const pricePollTimers = new Map<string, ReturnType<typeof setInterval>>();
+
+function startPricePoller(accountId: string, region: string, token: string) {
+  const key = `${accountId}:${region}`;
+  if (pricePollTimers.has(key)) return; // already running
+  const run = async () => {
+    try {
+      const r = await fetch(
+        `${clientBase(region)}/users/current/accounts/${accountId}/symbols/XAUUSD/current-price`,
+        { headers: authHeaders(token), signal: AbortSignal.timeout(3000) }
+      );
+      if (!r.ok) return;
+      const d = await r.json() as { bid?: number; ask?: number };
+      if (d.bid && d.ask) {
+        priceCache.set(key, { bid: d.bid, ask: d.ask, fetchedAt: Date.now() });
+        storeTick(accountId, d.bid, d.ask);
+      }
+    } catch { /* ignore transient errors */ }
+  };
+  void run(); // immediate first fetch
+  pricePollTimers.set(key, setInterval(run, 100));
+}
+
+function stopPricePoller(accountId: string, region: string) {
+  const key = `${accountId}:${region}`;
+  const t = pricePollTimers.get(key);
+  if (t) { clearInterval(t); pricePollTimers.delete(key); }
+  priceCache.delete(key);
+}
+
 // Normalise whatever MetaAPI returns as "region" to the short subdomain form (e.g. "london").
 // MetaAPI may return the full host like "mt-client-api-v1.london.agiliumtrade.ai".
 function normalizeRegion(region: string | undefined): string {
@@ -420,6 +455,8 @@ router.post("/mt5/account/:accountId/disconnect", async (req: Request, res: Resp
   try {
     const token = getToken();
     const { accountId } = req.params;
+    const region = qstr(req.query.region) || DEFAULT_REGION;
+    stopPricePoller(accountId, region);
     await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}/undeploy`, {
       method: "POST",
       headers: authHeaders(token),
@@ -455,15 +492,30 @@ router.get("/mt5/account/:accountId/candles", (req: Request, res: Response) => {
 router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) => {
   try {
     const token = getToken();
+    const { accountId } = req.params;
     const region = qstr(req.query.region) || DEFAULT_REGION;
+    const key = `${accountId}:${region}`;
+
+    // Start background poller on first request for this account (idempotent)
+    startPricePoller(accountId, region, token);
+
+    // Return from cache if fresh (≤ 200ms old) — avoids MetaAPI RTT on hot path
+    const cached = priceCache.get(key);
+    if (cached && Date.now() - cached.fetchedAt <= 200) {
+      return res.json({ bid: cached.bid, ask: cached.ask });
+    }
+
+    // Cache miss / stale — fetch directly and update cache
     const priceRes = await fetch(
-      `${clientBase(region)}/users/current/accounts/${req.params.accountId}/symbols/XAUUSD/current-price`,
-      { headers: authHeaders(token) }
+      `${clientBase(region)}/users/current/accounts/${accountId}/symbols/XAUUSD/current-price`,
+      { headers: authHeaders(token), signal: AbortSignal.timeout(4000) }
     );
     if (!priceRes.ok) return res.status(priceRes.status).json({ error: "Price fetch failed" });
     const priceData = await priceRes.json() as { bid?: number; ask?: number };
-    // Accumulate tick for chart history
-    if (priceData.bid && priceData.ask) storeTick(req.params.accountId, priceData.bid, priceData.ask);
+    if (priceData.bid && priceData.ask) {
+      priceCache.set(key, { bid: priceData.bid, ask: priceData.ask, fetchedAt: Date.now() });
+      storeTick(accountId, priceData.bid, priceData.ask);
+    }
     return res.json(priceData);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });

@@ -364,7 +364,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
       pollPrice();
       pollPositions();
-      priceIntervalRef.current = setInterval(pollPrice, 500);
+      priceIntervalRef.current = setInterval(pollPrice, 200);
       positionsIntervalRef.current = setInterval(pollPositions, 10000);
     },
     [fetchPriceData, fetchPositionsData, fetchPendingOrdersData]
