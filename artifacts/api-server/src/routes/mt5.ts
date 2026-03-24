@@ -58,43 +58,12 @@ function authHeaders(token: string) {
 }
 
 // ── Server-side price cache ──────────────────────────────────────────────────
-// Background poller fetches from MetaAPI every 100ms per active account.
-// Client /price requests return from this cache instantly (no MetaAPI RTT on hot path).
+// Caches the last successful price per account. Served instantly on repeat
+// client polls so we don't hit MetaAPI on every request.
+// MetaAPI rate limit: ~3,600 req/hr (1/s) — client must poll no faster than 1s.
 interface PriceCacheEntry { bid: number; ask: number; fetchedAt: number; }
 const priceCache = new Map<string, PriceCacheEntry>(); // key = `${accountId}:${region}`
-const pricePollTimers = new Map<string, ReturnType<typeof setInterval>>();
-
-function startPricePoller(accountId: string, region: string, token: string) {
-  const key = `${accountId}:${region}`;
-  if (pricePollTimers.has(key)) return; // already running
-  let inFlight = false;
-  const run = () => {
-    if (inFlight) return;
-    inFlight = true;
-    fetch(
-      `${clientBase(region)}/users/current/accounts/${accountId}/symbols/XAUUSD/current-price`,
-      { headers: authHeaders(token), signal: AbortSignal.timeout(2000) }
-    )
-      .then((r) => r.ok ? r.json() : null)
-      .then((d: { bid?: number; ask?: number } | null) => {
-        if (d?.bid && d?.ask) {
-          priceCache.set(key, { bid: d.bid, ask: d.ask, fetchedAt: Date.now() });
-          storeTick(accountId, d.bid, d.ask);
-        }
-      })
-      .catch(() => { /* ignore transient errors */ })
-      .finally(() => { inFlight = false; });
-  };
-  run(); // immediate first fetch
-  pricePollTimers.set(key, setInterval(run, 200));
-}
-
-function stopPricePoller(accountId: string, region: string) {
-  const key = `${accountId}:${region}`;
-  const t = pricePollTimers.get(key);
-  if (t) { clearInterval(t); pricePollTimers.delete(key); }
-  priceCache.delete(key);
-}
+const priceRateLimitUntil = new Map<string, number>();  // key → epoch ms when quota resets
 
 // Normalise whatever MetaAPI returns as "region" to the short subdomain form (e.g. "london").
 // MetaAPI may return the full host like "mt-client-api-v1.london.agiliumtrade.ai".
@@ -460,7 +429,8 @@ router.post("/mt5/account/:accountId/disconnect", async (req: Request, res: Resp
     const token = getToken();
     const { accountId } = req.params;
     const region = qstr(req.query.region) || DEFAULT_REGION;
-    stopPricePoller(accountId, region);
+    priceCache.delete(`${accountId}:${region}`);
+    priceRateLimitUntil.delete(`${accountId}:${region}`);
     await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}/undeploy`, {
       method: "POST",
       headers: authHeaders(token),
@@ -499,22 +469,44 @@ router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) 
     const { accountId } = req.params;
     const region = qstr(req.query.region) || DEFAULT_REGION;
     const key = `${accountId}:${region}`;
+    const now = Date.now();
 
-    // Start background poller on first request for this account (idempotent)
-    startPricePoller(accountId, region, token);
-
-    // Return from cache if fresh (≤ 400ms old) — avoids MetaAPI RTT on hot path
+    // If rate-limited, serve cached price (stale is better than failing)
+    const rateLimitedUntil = priceRateLimitUntil.get(key) ?? 0;
     const cached = priceCache.get(key);
-    if (cached && Date.now() - cached.fetchedAt <= 400) {
+    if (now < rateLimitedUntil) {
+      if (cached) return res.json({ bid: cached.bid, ask: cached.ask, stale: true });
+      return res.status(429).json({ error: "Rate limited by MetaAPI — please wait" });
+    }
+
+    // Return from cache if fresh (≤ 800ms) to smooth over back-to-back client polls
+    if (cached && now - cached.fetchedAt <= 800) {
       return res.json({ bid: cached.bid, ask: cached.ask });
     }
 
-    // Cache miss / stale — fetch directly and update cache
+    // Fetch fresh price from MetaAPI
     const priceRes = await fetch(
       `${clientBase(region)}/users/current/accounts/${accountId}/symbols/XAUUSD/current-price`,
       { headers: authHeaders(token), signal: AbortSignal.timeout(4000) }
     );
-    if (!priceRes.ok) return res.status(priceRes.status).json({ error: "Price fetch failed" });
+
+    if (priceRes.status === 429) {
+      const errData = await priceRes.json().catch(() => ({})) as { metadata?: { recommendedRetryTime?: string } };
+      const retryTime = errData.metadata?.recommendedRetryTime;
+      const retryAt = retryTime ? new Date(retryTime).getTime() : now + 60_000;
+      priceRateLimitUntil.set(key, retryAt);
+      console.log(`[price] Rate limited until ${new Date(retryAt).toISOString()} — serving cached price`);
+      if (cached) return res.json({ bid: cached.bid, ask: cached.ask, stale: true });
+      return res.status(429).json({ error: "Rate limited by MetaAPI" });
+    }
+
+    if (!priceRes.ok) {
+      const errBody = await priceRes.text().catch(() => "(unreadable)");
+      console.log(`[price] MetaAPI ${priceRes.status} for ${accountId}: ${errBody}`);
+      if (cached) return res.json({ bid: cached.bid, ask: cached.ask, stale: true });
+      return res.status(priceRes.status).json({ error: "Price fetch failed" });
+    }
+
     const priceData = await priceRes.json() as { bid?: number; ask?: number };
     if (priceData.bid && priceData.ask) {
       priceCache.set(key, { bid: priceData.bid, ask: priceData.ask, fetchedAt: Date.now() });
@@ -522,6 +514,8 @@ router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) 
     }
     return res.json(priceData);
   } catch (err) {
+    const cached = priceCache.get(`${req.params.accountId}:${qstr(req.query.region) || DEFAULT_REGION}`);
+    if (cached) return res.json({ bid: cached.bid, ask: cached.ask, stale: true });
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
   }
 });
