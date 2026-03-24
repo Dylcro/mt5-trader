@@ -305,6 +305,13 @@ export default function TradeScreen() {
   const [slManual, setSlManual] = useState(0);
   const [slManualText, setSlManualText] = useState("");
 
+  // Shared SL session (single order mode)
+  type SharedSLSession = { direction: Direction; stopLoss: number; anchorEntry: number };
+  const [sharedSLSession, setSharedSLSession] = useState<SharedSLSession | null>(null);
+  const sharedSLSessionRef = useRef<SharedSLSession | null>(null);
+  useEffect(() => { sharedSLSessionRef.current = sharedSLSession; }, [sharedSLSession]);
+  const sharedSLHasHadPositionRef = useRef(false);
+
   // Cascade state
   const [cascadeDirection, setCascadeDirection] = useState<Direction>("buy");
   const [cascadeLotSize, setCascadeLotSize] = useState(0.01);
@@ -398,6 +405,26 @@ export default function TradeScreen() {
     }
   }, [price, cancelOrder, closePosition, refreshPendingOrders, showToast]);
 
+  // Auto-reset shared SL session when all positions in the range are closed
+  useEffect(() => {
+    const session = sharedSLSession;
+    if (!session) { sharedSLHasHadPositionRef.current = false; return; }
+    const [lo, hi] = session.direction === "buy"
+      ? [session.stopLoss, session.anchorEntry]
+      : [session.anchorEntry, session.stopLoss];
+    const posType = session.direction === "buy" ? "POSITION_TYPE_BUY" : "POSITION_TYPE_SELL";
+    const hasPosition = positions.some(
+      (p) => p.type === posType && p.openPrice >= lo - 0.01 && p.openPrice <= hi + 0.01
+    );
+    if (hasPosition) {
+      sharedSLHasHadPositionRef.current = true;
+    } else if (sharedSLHasHadPositionRef.current) {
+      setSharedSLSession(null);
+      sharedSLHasHadPositionRef.current = false;
+      showToast("SL session reset — all positions closed", "success");
+    }
+  }, [positions, sharedSLSession, showToast]);
+
   // Safety valve: if isPlacing somehow gets stuck, auto-reset after 90 seconds
   useEffect(() => {
     if (!isPlacing) return;
@@ -432,21 +459,63 @@ export default function TradeScreen() {
     ? buildCascadeLevels(cascadeMarketPrice, cascadeDirection, cascadeSettings)
     : null;
 
+  // Session-aware SL for single order mode
+  const sessionActive = sharedSLSession !== null && sharedSLSession.direction === direction;
+  const sessionInRange = (() => {
+    if (!sessionActive || !sharedSLSession) return false;
+    const currentPrice = direction === "buy" ? (price?.ask ?? 0) : (price?.bid ?? 0);
+    const [lo, hi] = direction === "buy"
+      ? [sharedSLSession.stopLoss, sharedSLSession.anchorEntry]
+      : [sharedSLSession.anchorEntry, sharedSLSession.stopLoss];
+    return currentPrice > lo && currentPrice <= hi;
+  })();
+  const effectiveDisplaySL = sessionInRange ? sharedSLSession!.stopLoss : sl;
+
   const handleSingleTrade = useCallback(async () => {
     if (isPlacingRef.current) return;
     if (statusRef.current !== "connected") {
       Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
       return;
     }
+    const p = priceRef.current;
+    const session = sharedSLSessionRef.current;
+
+    // Determine effective SL — use session SL automatically when price is within session range
+    let effectiveSL: number | undefined = slRef.current;
+    let isSessionTrade = false;
+    if (session && session.direction === direction) {
+      const [lo, hi] = direction === "buy"
+        ? [session.stopLoss, session.anchorEntry]
+        : [session.anchorEntry, session.stopLoss];
+      const currentPrice = direction === "buy" ? (p?.ask ?? 0) : (p?.bid ?? 0);
+      if (currentPrice > lo && currentPrice <= hi) {
+        effectiveSL = session.stopLoss;
+        isSessionTrade = true;
+      }
+    }
+
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     isPlacingRef.current = true;
     setIsPlacing(true);
-    const result = await placeTrade({ direction, volume: lotSize, stopLoss: slRef.current });
+    const result = await placeTrade({ direction, volume: lotSize, stopLoss: effectiveSL });
     isPlacingRef.current = false;
     setIsPlacing(false);
+
     if (result.success) {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      showToast(`${direction.toUpperCase()} order placed ✓  ${lotSize} lot XAUUSD`, "success", true);
+      if (!session && effectiveSL != null) {
+        // Start a new session anchored at this entry price
+        const anchorEntry = direction === "buy" ? (p?.ask ?? 0) : (p?.bid ?? 0);
+        setSharedSLSession({ direction, stopLoss: effectiveSL, anchorEntry });
+        showToast(`${direction.toUpperCase()} placed ✓ — SL session started, SL ${formatPrice(effectiveSL)}`, "success", true);
+      } else {
+        showToast(
+          isSessionTrade
+            ? `${direction.toUpperCase()} ✓ — shared SL ${formatPrice(effectiveSL!)} applied`
+            : `${direction.toUpperCase()} order placed ✓  ${lotSize} lot`,
+          "success", true
+        );
+      }
     } else {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       showToast(result.message, "error");
@@ -740,6 +809,37 @@ export default function TradeScreen() {
         {/* ═══ SINGLE MODE ════════════════════════════════════════════════════ */}
         {tradeMode === "single" && (
           <>
+            {/* Shared SL Session Banner */}
+            {sharedSLSession && (
+              <View style={[styles.sectionCard, { borderColor: C.gold, borderWidth: 1 }]}>
+                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                    <Feather name="shield" size={14} color={C.gold} />
+                    <Text style={{ color: C.gold, fontWeight: "700", fontSize: 13 }}>
+                      {sharedSLSession.direction.toUpperCase()} Session Active
+                    </Text>
+                  </View>
+                  <Pressable
+                    onPress={() => { setSharedSLSession(null); sharedSLHasHadPositionRef.current = false; void Haptics.selectionAsync(); }}
+                    hitSlop={8}
+                  >
+                    <Feather name="x" size={16} color={C.textSecondary} />
+                  </Pressable>
+                </View>
+                <View style={{ marginTop: 8, gap: 4 }}>
+                  <Text style={{ color: C.textSecondary, fontSize: 12 }}>
+                    Anchor: <Text style={{ color: C.text }}>{formatPrice(sharedSLSession.anchorEntry)}</Text>
+                    {"   "}SL: <Text style={{ color: C.sell }}>{formatPrice(sharedSLSession.stopLoss)}</Text>
+                  </Text>
+                  <Text style={{ color: sessionInRange ? C.buy : C.textMuted, fontSize: 12 }}>
+                    {sessionInRange
+                      ? `Price in range — next ${sharedSLSession.direction} uses SL ${formatPrice(sharedSLSession.stopLoss)} automatically`
+                      : `Price outside range [${formatPrice(Math.min(sharedSLSession.stopLoss, sharedSLSession.anchorEntry))}–${formatPrice(Math.max(sharedSLSession.stopLoss, sharedSLSession.anchorEntry))}]`}
+                  </Text>
+                </View>
+              </View>
+            )}
+
             {/* Direction Toggle */}
             <View style={styles.directionRow}>
               <Pressable
@@ -776,66 +876,82 @@ export default function TradeScreen() {
               <View style={styles.sectionHeader}>
                 <Text style={styles.sectionTitle}>Stop Loss</Text>
                 <Text style={[styles.sectionHint, { color: C.sell }]}>
-                  {sl != null ? `SL: ${formatPrice(sl)}` : "No SL set"}
+                  {effectiveDisplaySL != null ? `SL: ${formatPrice(effectiveDisplaySL)}` : "No SL set"}
                 </Text>
               </View>
-              <View style={styles.slModeRow}>
-                {SL_OPTIONS.map((opt) => (
-                  <Pressable
-                    key={opt.key}
-                    style={[styles.slModeBtn, slMode === opt.key && styles.slModeBtnActive]}
-                    onPress={() => { setSlMode(opt.key); Haptics.selectionAsync(); }}
-                  >
-                    <Feather name={opt.icon as any} size={12} color={slMode === opt.key ? C.gold : C.textSecondary} />
-                    <Text style={[styles.slModeLabel, slMode === opt.key && styles.slModeLabelActive]}>
-                      {opt.label}
+
+              {sessionInRange ? (
+                /* Locked to session SL — no manual controls */
+                <View style={[styles.slInputArea, { alignItems: "center", paddingVertical: 6 }]}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                    <Feather name="lock" size={14} color={C.gold} />
+                    <Text style={{ color: C.gold, fontWeight: "700", fontSize: 15 }}>
+                      {formatPrice(sharedSLSession!.stopLoss)}
                     </Text>
-                  </Pressable>
-                ))}
-              </View>
-
-              {slMode === "points" && (
-                <View style={styles.slInputArea}>
-                  <StepInput value={slPips} onChange={setSlPips} step={5} min={5} max={500} decimals={0} />
-                  <Text style={styles.slNote}>
-                    {marketEntry > 0 && sl != null
-                      ? `Entry ${formatPrice(marketEntry)} → SL ${formatPrice(sl)}  (${slPips} pips = ${(slPips * PIP_SIZE).toFixed(2)})`
-                      : "Connect to see calculated SL"}
-                  </Text>
+                    <Text style={{ color: C.textSecondary, fontSize: 12 }}>shared from session</Text>
+                  </View>
                 </View>
-              )}
+              ) : (
+                <>
+                  <View style={styles.slModeRow}>
+                    {SL_OPTIONS.map((opt) => (
+                      <Pressable
+                        key={opt.key}
+                        style={[styles.slModeBtn, slMode === opt.key && styles.slModeBtnActive]}
+                        onPress={() => { setSlMode(opt.key); Haptics.selectionAsync(); }}
+                      >
+                        <Feather name={opt.icon as any} size={12} color={slMode === opt.key ? C.gold : C.textSecondary} />
+                        <Text style={[styles.slModeLabel, slMode === opt.key && styles.slModeLabelActive]}>
+                          {opt.label}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
 
-              {slMode === "percent" && (
-                <View style={styles.slInputArea}>
-                  <StepInput value={slPercent} onChange={setSlPercent} step={0.1} min={0.1} max={20} decimals={1} />
-                  <Text style={styles.slNote}>
-                    {marketEntry > 0 && sl != null
-                      ? `Risk ${riskDollars.toFixed(2)} → SL ${formatPrice(sl)}`
-                      : "Connect to calculate"}
-                  </Text>
-                </View>
-              )}
-
-              {slMode === "manual" && (
-                <View style={styles.slInputArea}>
-                  <TextInput
-                    style={styles.manualInput}
-                    placeholder="Enter exact SL price"
-                    placeholderTextColor={C.textMuted}
-                    keyboardType="decimal-pad"
-                    value={slManualText}
-                    onChangeText={(t) => {
-                      setSlManualText(t);
-                      const n = parseFloat(t);
-                      if (!isNaN(n)) setSlManual(n);
-                    }}
-                  />
-                  {sl != null && marketEntry > 0 && (
-                    <Text style={styles.slNote}>
-                      {`Distance: ${Math.abs(marketEntry - sl).toFixed(2)}  (${(Math.abs(marketEntry - sl) / PIP_SIZE).toFixed(0)} pips)`}
-                    </Text>
+                  {slMode === "points" && (
+                    <View style={styles.slInputArea}>
+                      <StepInput value={slPips} onChange={setSlPips} step={5} min={5} max={500} decimals={0} />
+                      <Text style={styles.slNote}>
+                        {marketEntry > 0 && sl != null
+                          ? `Entry ${formatPrice(marketEntry)} → SL ${formatPrice(sl)}  (${slPips} pips = ${(slPips * PIP_SIZE).toFixed(2)})`
+                          : "Connect to see calculated SL"}
+                      </Text>
+                    </View>
                   )}
-                </View>
+
+                  {slMode === "percent" && (
+                    <View style={styles.slInputArea}>
+                      <StepInput value={slPercent} onChange={setSlPercent} step={0.1} min={0.1} max={20} decimals={1} />
+                      <Text style={styles.slNote}>
+                        {marketEntry > 0 && sl != null
+                          ? `Risk ${riskDollars.toFixed(2)} → SL ${formatPrice(sl)}`
+                          : "Connect to calculate"}
+                      </Text>
+                    </View>
+                  )}
+
+                  {slMode === "manual" && (
+                    <View style={styles.slInputArea}>
+                      <TextInput
+                        style={styles.manualInput}
+                        placeholder="Enter exact SL price"
+                        placeholderTextColor={C.textMuted}
+                        keyboardType="decimal-pad"
+                        value={slManualText}
+                        onChangeText={(t) => {
+                          setSlManualText(t);
+                          const n = parseFloat(t);
+                          if (!isNaN(n)) setSlManual(n);
+                        }}
+                      />
+                      {sl != null && marketEntry > 0 && (
+                        <Text style={styles.slNote}>
+                          {`Distance: ${Math.abs(marketEntry - sl).toFixed(2)}  (${(Math.abs(marketEntry - sl) / PIP_SIZE).toFixed(0)} pips)`}
+                        </Text>
+                      )}
+                    </View>
+                  )}
+                </>
               )}
             </View>
 
@@ -849,7 +965,8 @@ export default function TradeScreen() {
                 <View style={styles.riskRow}>
                   <Text style={styles.riskLabel}>Stop Loss</Text>
                   <Text style={[styles.riskValue, { color: C.sell }]}>
-                    {sl != null ? formatPrice(sl) : "None"}
+                    {effectiveDisplaySL != null ? formatPrice(effectiveDisplaySL) : "None"}
+                    {sessionInRange ? <Text style={{ color: C.gold, fontSize: 11 }}> 🔒</Text> : null}
                   </Text>
                 </View>
                 <View style={styles.riskRow}>
