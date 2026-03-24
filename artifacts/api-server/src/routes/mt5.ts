@@ -16,8 +16,22 @@ function authHeaders(token: string) {
   return { "auth-token": token, "Content-Type": "application/json" };
 }
 
+// Normalise whatever MetaAPI returns as "region" to the short subdomain form (e.g. "london").
+// MetaAPI may return the full host like "mt-client-api-v1.london.agiliumtrade.ai".
+function normalizeRegion(region: string | undefined): string {
+  if (!region) return DEFAULT_REGION;
+  // Already short form: "london", "new-york", etc.
+  if (!region.includes(".")) return region;
+  // Full host: "mt-client-api-v1.london.agiliumtrade.ai" → extract "london"
+  const m = region.match(/^mt-client-api-v1\.(.+?)\.agiliumtrade\.ai$/);
+  if (m?.[1]) return m[1];
+  // Fallback: use as-is and let MetaAPI reject it with a clear error
+  return region;
+}
+
 function clientBase(region: string = DEFAULT_REGION): string {
-  return `https://mt-client-api-v1.${region}.${CLIENT_DOMAIN}`;
+  const r = normalizeRegion(region);
+  return `https://mt-client-api-v1.${r}.${CLIENT_DOMAIN}`;
 }
 
 function sleep(ms: number) {
@@ -95,8 +109,8 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       if (!acct) {
         return res.status(404).json({ error: "Account not found. Please log in again with your credentials." });
       }
-      const region = acct.region ?? DEFAULT_REGION;
-      console.log(`[connect] reconnect status=${acct.connectionStatus}`);
+      const region = normalizeRegion(acct.region);
+      console.log(`[connect] reconnect status=${acct.connectionStatus} region=${region}`);
 
       if (acct.connectionStatus === "CONNECTED") {
         // Already connected — fetch info and return immediately
@@ -146,7 +160,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         body: JSON.stringify({ password }),
       }).catch(() => {});
 
-      const region = existing.region ?? DEFAULT_REGION;
+      const region = normalizeRegion(existing.region);
 
       if (existing.connectionStatus === "CONNECTED") {
         const info = await getAccountInfo(token, foundId, region) as Record<string, unknown>;
@@ -237,7 +251,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       const queuedId = queued?._id ?? queued?.id;
       if (queued && queuedId) {
         console.log(`[connect] found queued account ${queuedId} — deploying`);
-        const region = queued.region ?? DEFAULT_REGION;
+        const region = normalizeRegion(queued.region);
         if (queued.connectionStatus !== "CONNECTED") await deployAccount(token, queuedId);
         return res.json({ status: "deploying", accountId: queuedId, region });
       }
@@ -254,7 +268,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       return res.status(500).json({ error: "Unexpected response from MetaAPI. Please try again." });
     }
 
-    const region = created.region ?? DEFAULT_REGION;
+    const region = normalizeRegion(created.region);
     console.log(`[connect] created accountId=${newId} region=${region} — deploying`);
 
     // Kick off deploy and return immediately — client will poll /status
@@ -282,16 +296,18 @@ router.get("/mt5/account/:accountId/status", async (req: Request, res: Response)
     if (acct.connectionStatus === "CONNECTED") {
       let info: Record<string, unknown> = {};
       try {
-        info = await getAccountInfo(token, accountId, String(acct.region ?? region)) as Record<string, unknown>;
+        const effectiveRegion = normalizeRegion(acct.region) || region;
+        info = await getAccountInfo(token, accountId, effectiveRegion) as Record<string, unknown>;
       } catch (infoErr) {
         // Client API not yet ready — report still connecting to keep polling
         console.warn(`[status] getAccountInfo failed for ${accountId}:`, (infoErr as Error).message);
         return res.json({ connectionStatus: "CONNECTING", state: acct.state });
       }
+      const effectiveRegion = normalizeRegion(acct.region) || region;
       return res.json({
         connectionStatus: "CONNECTED",
         accountId,
-        region: acct.region ?? region,
+        region: effectiveRegion,
         name: info.name ?? "Account",
         balance: info.balance ?? 0,
         equity: info.equity ?? 0,
