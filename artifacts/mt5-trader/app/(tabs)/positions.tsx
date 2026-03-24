@@ -257,6 +257,17 @@ export default function PositionsScreen() {
     [closePosition]
   );
 
+  const [cancellingAll, setCancellingAll] = useState(false);
+
+  const handleCancelAllLimits = useCallback(async () => {
+    if (cancellingAll || pendingOrders.length === 0) return;
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    setCancellingAll(true);
+    await Promise.all(pendingOrders.map((o) => cancelOrder(o.id)));
+    await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    setCancellingAll(false);
+  }, [cancellingAll, pendingOrders, cancelOrder]);
+
   const totalPL = positions.reduce((sum, p) => sum + p.profit, 0);
   const webTopPad = Platform.OS === "web" ? 67 : 0;
   const hasAnything = positions.length > 0 || pendingOrders.length > 0;
@@ -333,9 +344,23 @@ export default function PositionsScreen() {
             )}
             {pendingOrders.length > 0 && (
               <>
-                <Text style={[styles.sectionLabel, { marginTop: positions.length > 0 ? 20 : 0 }]}>
-                  PENDING  ·  {pendingOrders.length}
-                </Text>
+                <View style={[styles.sectionRow, { marginTop: positions.length > 0 ? 20 : 0 }]}>
+                  <Text style={styles.sectionLabel}>PENDING  ·  {pendingOrders.length}</Text>
+                  <Pressable
+                    style={({ pressed }) => [styles.cancelAllBtn, (pressed || cancellingAll) && { opacity: 0.6 }]}
+                    onPress={handleCancelAllLimits}
+                    disabled={cancellingAll}
+                  >
+                    {cancellingAll ? (
+                      <ActivityIndicator size="small" color={C.sell} />
+                    ) : (
+                      <>
+                        <Feather name="x" size={12} color={C.sell} />
+                        <Text style={styles.cancelAllText}>Cancel All Limits</Text>
+                      </>
+                    )}
+                  </Pressable>
+                </View>
                 {pendingOrders.map((order) => (
                   <PendingOrderCard
                     key={order.id}
@@ -535,12 +560,33 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_600SemiBold",
     color: C.textSecondary,
   },
+  sectionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 4,
+  },
   sectionLabel: {
     fontSize: 10,
     fontFamily: "Inter_700Bold",
     color: C.textMuted,
     letterSpacing: 1.2,
-    marginBottom: 4,
+  },
+  cancelAllBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "rgba(246,70,93,0.35)",
+    backgroundColor: "rgba(246,70,93,0.1)",
+  },
+  cancelAllText: {
+    fontSize: 11,
+    fontFamily: "Inter_600SemiBold",
+    color: C.sell,
   },
   pendingCard: {
     borderStyle: "dashed",
