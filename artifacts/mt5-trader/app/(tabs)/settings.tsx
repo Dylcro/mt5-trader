@@ -4,7 +4,6 @@ import * as Haptics from "expo-haptics";
 import React, { useState } from "react";
 import {
   ActivityIndicator,
-  Alert,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -216,19 +215,17 @@ export default function SettingsScreen() {
     await connect({ login: login.trim(), password: password.trim(), server: server.trim() });
   };
 
-  const handleDisconnect = () => {
-    Alert.alert("Disconnect", "Disconnect from your MT5 account?", [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Disconnect",
-        style: "destructive",
-        onPress: async () => {
-          await disconnect();
-          setPassword("");
-          await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-        },
-      },
-    ]);
+  const [disconnecting, setDisconnecting] = useState(false);
+
+  const handleDisconnect = async () => {
+    setDisconnecting(true);
+    try {
+      await disconnect();
+      setPassword("");
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+    } finally {
+      setDisconnecting(false);
+    }
   };
 
   return (
@@ -381,7 +378,7 @@ export default function SettingsScreen() {
             </View>
           )}
 
-          {/* Account Info — when connected */}
+          {/* Account Info — when connected with loaded info */}
           {isConnected && accountInfo && (
             <>
               <View style={styles.accountHero}>
@@ -419,15 +416,36 @@ export default function SettingsScreen() {
                 <View style={styles.infoDivider} />
                 <InfoRow label="Currency" value={accountInfo.currency} />
               </View>
-
-              <Pressable
-                style={({ pressed }) => [styles.disconnectBtn, pressed && { opacity: 0.75 }]}
-                onPress={handleDisconnect}
-              >
-                <Feather name="log-out" size={16} color={C.sell} />
-                <Text style={styles.disconnectText}>Disconnect Account</Text>
-              </Pressable>
             </>
+          )}
+
+          {/* Disconnect — visible whenever connected (even if accountInfo not loaded yet) */}
+          {isConnected && (
+            <Pressable
+              style={({ pressed }) => [styles.disconnectBtn, pressed && { opacity: 0.75 }, disconnecting && { opacity: 0.5 }]}
+              onPress={handleDisconnect}
+              disabled={disconnecting}
+            >
+              {disconnecting ? (
+                <ActivityIndicator size="small" color={C.sell} />
+              ) : (
+                <Feather name="log-out" size={16} color={C.sell} />
+              )}
+              <Text style={styles.disconnectText}>
+                {disconnecting ? "Disconnecting..." : "Disconnect Account"}
+              </Text>
+            </Pressable>
+          )}
+
+          {/* Cancel — visible while connecting (stuck state escape hatch) */}
+          {isConnecting && (
+            <Pressable
+              style={({ pressed }) => [styles.disconnectBtn, pressed && { opacity: 0.75 }]}
+              onPress={handleDisconnect}
+            >
+              <Feather name="x-circle" size={16} color={C.textSecondary} />
+              <Text style={[styles.disconnectText, { color: C.textSecondary }]}>Cancel Connection</Text>
+            </Pressable>
           )}
 
           {/* Cascade Order Settings — always visible */}
