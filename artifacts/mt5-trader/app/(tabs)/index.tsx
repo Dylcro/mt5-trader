@@ -1,5 +1,6 @@
 import { Feather, MaterialCommunityIcons } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
+import { useRouter } from "expo-router";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -238,10 +239,49 @@ function CascadeLadder({
   );
 }
 
+type ToastState = { message: string; type: "success" | "error" } | null;
+
+function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }) {
+  const anim = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    if (toast) {
+      Animated.spring(anim, { toValue: 1, useNativeDriver: true, damping: 14, stiffness: 160 }).start();
+    } else {
+      Animated.timing(anim, { toValue: 0, duration: 200, useNativeDriver: true }).start();
+    }
+  }, [toast, anim]);
+  if (!toast) return null;
+  const isOk = toast.type === "success";
+  return (
+    <Animated.View style={[
+      styles.toast,
+      { top: insetTop + 8, backgroundColor: isOk ? C.buy : C.sell,
+        transform: [{ translateY: anim.interpolate({ inputRange: [0, 1], outputRange: [-80, 0] }) }],
+        opacity: anim }
+    ]}>
+      <Feather name={isOk ? "check-circle" : "alert-circle"} size={18} color="#fff" />
+      <Text style={styles.toastText}>{toast.message}</Text>
+    </Animated.View>
+  );
+}
+
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
+  const router = useRouter();
   const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice } = useTrading();
   const { settings: cascadeSettings } = useCascadeSettings();
+
+  const [toast, setToast] = useState<ToastState>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showToast = useCallback((message: string, type: "success" | "error", navigatePositions = false) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToast({ message, type });
+    toastTimerRef.current = setTimeout(() => setToast(null), 3500);
+    if (navigatePositions && type === "success") {
+      setTimeout(() => router.navigate("/(tabs)/positions"), 1000);
+    }
+  }, [router]);
 
   // Mode
   const [tradeMode, setTradeMode] = useState<TradeMode>("cascade");
@@ -298,12 +338,12 @@ export default function TradeScreen() {
     setIsPlacing(false);
     if (result.success) {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      Alert.alert("Order Placed", result.message);
+      showToast(`${direction.toUpperCase()} order placed ✓  ${lotSize} lot XAUUSD`, "success", true);
     } else {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-      Alert.alert("Order Failed", result.message);
+      showToast(result.message, "error");
     }
-  }, [isPlacing, status, direction, lotSize, sl, placeTrade]);
+  }, [isPlacing, status, direction, lotSize, sl, placeTrade, showToast]);
 
   const handleCascadeTrade = useCallback(async () => {
     if (isPlacing || !cascadeLevels) return;
@@ -332,22 +372,23 @@ export default function TradeScreen() {
             setIsPlacing(false);
             if (result.success) {
               await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-              Alert.alert("Orders Placed", result.message);
+              showToast(`${result.placed} ${cascadeDirection.toUpperCase()} orders placed ✓`, "success", true);
             } else {
               await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-              Alert.alert("Orders Failed", result.message);
+              showToast(result.message, "error");
             }
           },
         },
       ]
     );
-  }, [isPlacing, cascadeLevels, status, cascadeMarketPrice, cascadeDirection, cascadeLotSize, placeCascadeOrders]);
+  }, [isPlacing, cascadeLevels, status, cascadeMarketPrice, cascadeDirection, cascadeLotSize, placeCascadeOrders, showToast]);
 
   const webTopPad = Platform.OS === "web" ? 67 : 0;
   const isCascadeReady = cascadeMarketPrice > 0 && cascadeLevels != null && status === "connected";
 
   return (
     <View style={[styles.container, { paddingTop: insets.top + webTopPad }]}>
+      <TradeToast toast={toast} insetTop={insets.top + webTopPad} />
       {/* Header */}
       <View style={styles.header}>
         <View style={styles.headerLeft}>
@@ -729,6 +770,14 @@ const styles = StyleSheet.create({
   noPriceText: { fontSize: 14, fontFamily: "Inter_400Regular", color: C.textMuted, textAlign: "center" },
   priceErrorBanner: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 10, paddingTop: 10, borderTopWidth: 1, borderTopColor: C.border },
   priceErrorText: { fontSize: 12, fontFamily: "Inter_400Regular", color: C.sell, flex: 1 },
+  toast: {
+    position: "absolute", left: 16, right: 16, zIndex: 999,
+    flexDirection: "row", alignItems: "center", gap: 10,
+    paddingHorizontal: 16, paddingVertical: 14,
+    borderRadius: 14, shadowColor: "#000", shadowOpacity: 0.3, shadowRadius: 12, shadowOffset: { width: 0, height: 4 },
+    elevation: 8,
+  },
+  toastText: { fontSize: 15, fontFamily: "Inter_600SemiBold", color: "#fff", flex: 1 },
   modeToggle: {
     flexDirection: "row",
     backgroundColor: C.card,
