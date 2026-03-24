@@ -978,6 +978,7 @@ export default function TradeScreen() {
                   </View>
                   <Text style={{
                     fontSize: 18,
+                    lineHeight: 22,
                     fontFamily: "Inter_700Bold",
                     color: price != null
                       ? (direction === "buy" ? "rgba(0,0,0,0.75)" : "rgba(255,255,255,0.75)")
@@ -1240,13 +1241,14 @@ const styles = StyleSheet.create({
   riskLabel: { fontSize: 15, fontFamily: "Inter_400Regular", color: C.textSecondary, flex: 1 },
   riskValue: { fontSize: 17, fontFamily: "Inter_600SemiBold", color: C.text, minWidth: 130, textAlign: "right", fontVariant: ["tabular-nums"] },
   tradeBtn: {
+    height: 80,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
     gap: 10,
-    paddingVertical: 18,
     borderRadius: 16,
     marginTop: 4,
+    overflow: "hidden",
   },
   tradeBtnRow: { flexDirection: "row", gap: 10, marginTop: 4 },
   tradeBtnHalf: { flex: 1, marginTop: 0 },
