@@ -463,24 +463,21 @@ export default function TradeScreen() {
       Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
       return;
     }
-    // Lock immediately — before any await — to prevent double-tap races
-    isPlacingRef.current = true;
-    setIsPlacing(true);
-
     const session = sharedSLSessionRef.current;
 
     // Session active + same direction → always use the session SL
     const isSessionTrade = session !== null && session.direction === direction;
     const effectiveSL: number | undefined = isSessionTrade ? session!.stopLoss : slRef.current;
 
-    // Fire haptics in parallel with the fetch — don't await before sending
-    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    isPlacingRef.current = true;
+    setIsPlacing(true);
     const result = await placeTrade({ direction, volume: lotSize, stopLoss: effectiveSL });
     isPlacingRef.current = false;
     setIsPlacing(false);
 
     if (result.success) {
-      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       if (!session && effectiveSL != null) {
         // First trade — start a new session
         setSharedSLSession({ direction, stopLoss: effectiveSL });
@@ -491,7 +488,7 @@ export default function TradeScreen() {
         showToast(`${direction.toUpperCase()} order placed ✓  ${lotSize} lot`, "success", true);
       }
     } else {
-      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       showToast(result.message, "error");
     }
   }, [direction, lotSize, placeTrade, showToast]);
