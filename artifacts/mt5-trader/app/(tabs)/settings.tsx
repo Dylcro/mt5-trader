@@ -544,7 +544,7 @@ export default function SettingsScreen() {
               label="Take profit"
               hint={
                 cs.takeProfitEnabled
-                  ? `Close all positions + delete limits at +${cs.takeProfitPips} pips (£${(cs.takeProfitPips * 0.10).toFixed(2)}) from 1st entry`
+                  ? `Close all positions at +${cs.takeProfitPips} pips (£${(cs.takeProfitPips * 0.10).toFixed(2)}) from 1st entry`
                   : "Disabled — no automatic close on profit"
               }
               options={[0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]}
