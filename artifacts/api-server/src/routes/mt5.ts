@@ -119,20 +119,26 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       console.log(`[connect] reconnect status=${acct.connectionStatus} region=${region}`);
 
       if (acct.connectionStatus === "CONNECTED") {
-        // Already connected — fetch info and return immediately
-        const info = await getAccountInfo(token, existingId, region) as Record<string, unknown>;
-        return res.json({
-          status: "connected",
-          accountId: existingId,
-          region,
-          name: info.name ?? "Account",
-          balance: info.balance ?? 0,
-          equity: info.equity ?? 0,
-          margin: info.margin ?? 0,
-          freeMargin: info.freeMargin ?? 0,
-          currency: info.currency ?? "USD",
-          leverage: info.leverage ?? 100,
-        });
+        // Already connected — fetch info and return immediately.
+        // If the client API isn't warm yet (just redeployed), fall back to polling.
+        try {
+          const info = await getAccountInfo(token, existingId, region) as Record<string, unknown>;
+          return res.json({
+            status: "connected",
+            accountId: existingId,
+            region,
+            name: info.name ?? "Account",
+            balance: info.balance ?? 0,
+            equity: info.equity ?? 0,
+            margin: info.margin ?? 0,
+            freeMargin: info.freeMargin ?? 0,
+            currency: info.currency ?? "USD",
+            leverage: info.leverage ?? 100,
+          });
+        } catch {
+          console.log(`[connect] client API not ready yet for ${existingId} — falling back to polling`);
+          return res.json({ status: "deploying", accountId: existingId, region });
+        }
       }
 
       // Not connected — trigger deploy and return "deploying" immediately
@@ -179,19 +185,24 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       const region = normalizeRegion(existing.region);
 
       if (existing.connectionStatus === "CONNECTED") {
-        const info = await getAccountInfo(token, foundId, region) as Record<string, unknown>;
-        return res.json({
-          status: "connected",
-          accountId: foundId,
-          region,
-          name: info.name ?? "Account",
-          balance: info.balance ?? 0,
-          equity: info.equity ?? 0,
-          margin: info.margin ?? 0,
-          freeMargin: info.freeMargin ?? 0,
-          currency: info.currency ?? "USD",
-          leverage: info.leverage ?? 100,
-        });
+        try {
+          const info = await getAccountInfo(token, foundId, region) as Record<string, unknown>;
+          return res.json({
+            status: "connected",
+            accountId: foundId,
+            region,
+            name: info.name ?? "Account",
+            balance: info.balance ?? 0,
+            equity: info.equity ?? 0,
+            margin: info.margin ?? 0,
+            freeMargin: info.freeMargin ?? 0,
+            currency: info.currency ?? "USD",
+            leverage: info.leverage ?? 100,
+          });
+        } catch {
+          console.log(`[connect] client API not ready for ${foundId} — falling back to polling`);
+          return res.json({ status: "deploying", accountId: foundId, region });
+        }
       }
 
       await deployAccount(token, foundId);
