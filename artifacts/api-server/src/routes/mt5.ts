@@ -74,8 +74,10 @@ async function fetchFallbackPrice(): Promise<{ bid: number; ask: number } | null
     );
     if (!r.ok) return null;
     const data = await r.json() as Array<{ spreadProfilePrices?: Array<{ spreadProfile: string; bid: number; ask: number }> }>;
-    const standard = data[0]?.spreadProfilePrices?.find((p) => p.spreadProfile === "standard");
-    if (standard?.bid && standard?.ask) return { bid: standard.bid, ask: standard.ask };
+    // Use "standard" if present, otherwise fall back to the first available profile
+    const profiles = data[0]?.spreadProfilePrices ?? [];
+    const profile = profiles.find((p) => p.spreadProfile === "standard") ?? profiles[0];
+    if (profile?.bid && profile?.ask) return { bid: profile.bid, ask: profile.ask };
     return null;
   } catch {
     return null;
@@ -525,8 +527,15 @@ router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) 
       const retryTime = errData.metadata?.recommendedRetryTime;
       const retryAt = retryTime ? new Date(retryTime).getTime() : now + 60_000;
       priceRateLimitUntil.set(key, retryAt);
-      console.log(`[price] Rate limited until ${new Date(retryAt).toISOString()} — serving cached price`);
+      console.log(`[price] Rate limited until ${new Date(retryAt).toISOString()}`);
       if (cached) return res.json({ bid: cached.bid, ask: cached.ask, stale: true });
+      // No cache yet — try Swissquote fallback immediately
+      const fallback = await fetchFallbackPrice();
+      if (fallback) {
+        priceCache.set(key, { ...fallback, fetchedAt: Date.now() });
+        console.log(`[price] Rate limited — Swissquote fallback bid=${fallback.bid}`);
+        return res.json({ bid: fallback.bid, ask: fallback.ask, stale: true });
+      }
       return res.status(429).json({ error: "Rate limited by MetaAPI" });
     }
 
@@ -544,8 +553,16 @@ router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) 
     }
     return res.json(priceData);
   } catch (err) {
-    const cached = priceCache.get(`${req.params.accountId}:${qstr(req.query.region) || DEFAULT_REGION}`);
+    const cacheKey = `${req.params.accountId}:${qstr(req.query.region) || DEFAULT_REGION}`;
+    const cached = priceCache.get(cacheKey);
     if (cached) return res.json({ bid: cached.bid, ask: cached.ask, stale: true });
+    // MetaAPI timed out or unreachable — try Swissquote fallback
+    const fallback = await fetchFallbackPrice();
+    if (fallback) {
+      priceCache.set(cacheKey, { ...fallback, fetchedAt: Date.now() });
+      console.log(`[price] MetaAPI error — Swissquote fallback bid=${fallback.bid}`);
+      return res.json({ bid: fallback.bid, ask: fallback.ask, stale: true });
+    }
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
   }
 });
