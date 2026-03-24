@@ -578,17 +578,23 @@ export default function TradeScreen() {
     }
   }, [direction, lotSize, placeTrade, showToast]);
 
+  const [mt5MonitorStarting, setMT5MonitorStarting] = useState(false);
+
   const openMT5AndMonitor = useCallback(async () => {
     if (statusRef.current !== "connected") {
       Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
       return;
     }
-    if (slRef.current == null) {
-      Alert.alert("No Stop Loss Set", "Please set a stop loss before starting the MT5 monitor session.");
+    // Use sl directly — it is captured in the closure via the dependency array
+    if (sl == null) {
+      const hint = slMode === "manual"
+        ? "Enter a price in the Stop Loss field first."
+        : "Connect your account so a price-based SL can be calculated, or switch to Manual SL.";
+      Alert.alert("No Stop Loss Set", hint);
       return;
     }
-    const sl = slRef.current;
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    setMT5MonitorStarting(true);
     // Register session on server — server polls every 2s regardless of app state
     try {
       const res = await fetch(`${apiBase}/mt5/account/${accountId}/monitor`, {
@@ -599,25 +605,28 @@ export default function TradeScreen() {
       const data = await res.json() as { active?: boolean; error?: string };
       if (!res.ok || !data.active) {
         showToast(data.error ?? "Failed to start server monitor", "error");
+        setMT5MonitorStarting(false);
         return;
       }
-    } catch {
-      showToast("Could not reach server — check connection", "error");
+    } catch (e) {
+      showToast(`Server error: ${e instanceof Error ? e.message : "check connection"}`, "error");
+      setMT5MonitorStarting(false);
       return;
     }
+    setMT5MonitorStarting(false);
     setMT5MonitorSession({ direction, stopLoss: sl, anchorEntry: null, patchedCount: 0 });
-    showToast(`Server monitoring ON — SL ${formatPrice(sl)} auto-applies to all MT5 ${direction.toUpperCase()} trades`, "success", true);
+    showToast(`Monitor ON — SL ${formatPrice(sl)} auto-applies to every MT5 ${direction.toUpperCase()}`, "success", true);
     try {
       const canOpen = await Linking.canOpenURL("metatrader5://");
       if (canOpen) {
         await Linking.openURL("metatrader5://");
       } else {
-        showToast("MT5 app not found — please open it manually", "error");
+        showToast("MT5 app not found — open it manually", "error");
       }
     } catch {
-      showToast("Could not open MT5 — please open it manually", "error");
+      showToast("Could not open MT5 — open it manually", "error");
     }
-  }, [direction, apiBase, accountId, region, showToast]);
+  }, [direction, sl, slMode, apiBase, accountId, region, showToast]);
 
   const handleCascadeTrade = useCallback(async (dir: Direction) => {
     const p = priceRef.current;
@@ -1154,6 +1163,7 @@ export default function TradeScreen() {
                   marginTop: 8,
                 },
                 pressed && { opacity: 0.8 },
+                mt5MonitorStarting && { opacity: 0.6 },
               ]}
               onPress={mt5MonitorSession
                 ? () => {
@@ -1163,10 +1173,14 @@ export default function TradeScreen() {
                   }
                 : openMT5AndMonitor
               }
+              disabled={mt5MonitorStarting}
             >
-              <Feather name={mt5MonitorSession ? "eye-off" : "external-link"} size={18} color="#4A90E2" />
+              {mt5MonitorStarting
+                ? <ActivityIndicator size="small" color="#4A90E2" />
+                : <Feather name={mt5MonitorSession ? "eye-off" : "external-link"} size={18} color="#4A90E2" />
+              }
               <Text style={[styles.tradeBtnText, { color: "#4A90E2" }]}>
-                {mt5MonitorSession ? "Stop MT5 Monitor" : "Trade in MT5 App"}
+                {mt5MonitorStarting ? "Starting monitor…" : mt5MonitorSession ? "Stop MT5 Monitor" : "Trade in MT5 App"}
               </Text>
             </Pressable>
           </>
