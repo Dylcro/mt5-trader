@@ -1,5 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { useCallback, useEffect, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useState } from "react";
 
 export interface CascadeSettings {
   numPositions: number;
@@ -19,13 +19,20 @@ const KEYS = {
   slPips: "cascade_sl_pips",
 };
 
-export function useCascadeSettings() {
-  const [settings, setSettingsState] = useState<CascadeSettings>(DEFAULTS);
+interface CascadeSettingsContextValue {
+  settings: CascadeSettings;
+  updateSettings: (partial: Partial<CascadeSettings>) => void;
+}
+
+const CascadeSettingsContext = createContext<CascadeSettingsContextValue | null>(null);
+
+export function CascadeSettingsProvider({ children }: { children: React.ReactNode }) {
+  const [settings, setSettings] = useState<CascadeSettings>(DEFAULTS);
 
   useEffect(() => {
     AsyncStorage.multiGet(Object.values(KEYS)).then((pairs) => {
       const [num, between, sl] = pairs.map((p) => (p[1] ? parseFloat(p[1]) : null));
-      setSettingsState({
+      setSettings({
         numPositions: num ?? DEFAULTS.numPositions,
         pipsBetween: between ?? DEFAULTS.pipsBetween,
         slPips: sl ?? DEFAULTS.slPips,
@@ -34,7 +41,7 @@ export function useCascadeSettings() {
   }, []);
 
   const updateSettings = useCallback((partial: Partial<CascadeSettings>) => {
-    setSettingsState((prev) => {
+    setSettings((prev) => {
       const next = { ...prev, ...partial };
       AsyncStorage.multiSet([
         [KEYS.numPositions, String(next.numPositions)],
@@ -45,19 +52,21 @@ export function useCascadeSettings() {
     });
   }, []);
 
-  return { settings, updateSettings };
+  return React.createElement(
+    CascadeSettingsContext.Provider,
+    { value: { settings, updateSettings } },
+    children
+  );
 }
 
-// XAUUSD: 1 pip = $0.10
+export function useCascadeSettings() {
+  const ctx = useContext(CascadeSettingsContext);
+  if (!ctx) throw new Error("useCascadeSettings must be used inside CascadeSettingsProvider");
+  return ctx;
+}
+
 const PIP = 0.10;
 
-/**
- * Builds the cascade levels from the current market price.
- * The first order is always a market order (placed instantly).
- * The remaining (numPositions - 1) orders are limit orders placed
- * below market for buys, or above market for sells.
- * All orders share the same stop loss.
- */
 export function buildCascadeLevels(
   marketPrice: number,
   direction: "buy" | "sell",
@@ -67,7 +76,6 @@ export function buildCascadeLevels(
   const step = pipsBetween * PIP;
   const slDist = slPips * PIP;
 
-  // Limit entries start one interval away from market price
   const limitEntries: number[] = [];
   for (let i = 1; i < numPositions; i++) {
     const price = direction === "buy"
@@ -76,7 +84,6 @@ export function buildCascadeLevels(
     limitEntries.push(price);
   }
 
-  // SL is measured from the furthest limit entry (or market if no limits)
   const furthestEntry = limitEntries.length > 0
     ? limitEntries[limitEntries.length - 1]
     : marketPrice;

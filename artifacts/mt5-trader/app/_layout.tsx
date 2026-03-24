@@ -15,6 +15,7 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { TradingProvider } from "@/context/TradingContext";
+import { CascadeSettingsProvider } from "@/hooks/useCascadeSettings";
 
 SplashScreen.preventAutoHideAsync();
 
@@ -51,7 +52,9 @@ export default function RootLayout() {
           <GestureHandlerRootView style={{ flex: 1 }}>
             <KeyboardProvider>
               <TradingProvider>
-                <RootLayoutNav />
+                <CascadeSettingsProvider>
+                  <RootLayoutNav />
+                </CascadeSettingsProvider>
               </TradingProvider>
             </KeyboardProvider>
           </GestureHandlerRootView>
