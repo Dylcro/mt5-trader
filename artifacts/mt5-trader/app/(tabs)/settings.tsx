@@ -107,6 +107,7 @@ function PillSelector({
   value,
   onChange,
   suffix = "pips",
+  labels,
 }: {
   label: string;
   hint: string;
@@ -114,6 +115,7 @@ function PillSelector({
   value: number;
   onChange: (v: number) => void;
   suffix?: string;
+  labels?: Record<number, string>;
 }) {
   return (
     <View style={styles.settingRow}>
@@ -124,6 +126,7 @@ function PillSelector({
       <View style={styles.pillGroup}>
         {options.map((opt) => {
           const selected = opt === value;
+          const display = labels?.[opt] ?? `${opt}${suffix}`;
           return (
             <Pressable
               key={opt}
@@ -135,7 +138,7 @@ function PillSelector({
               hitSlop={4}
             >
               <Text style={[styles.pillText, selected && styles.pillTextActive]}>
-                {opt}{suffix}
+                {display}
               </Text>
             </Pressable>
           );
@@ -537,36 +540,24 @@ export default function SettingsScreen() {
             <View style={styles.cascadeDivider} />
 
             {/* Take Profit */}
-            <View style={styles.settingRow}>
-              <View style={styles.settingRowLeft}>
-                <Text style={styles.settingLabel}>Take profit</Text>
-                <Text style={styles.settingHint}>
-                  Closes all positions and deletes remaining limits when 1st entry hits target
-                </Text>
-              </View>
-              <Switch
-                value={cs.takeProfitEnabled}
-                onValueChange={(v) => {
-                  void Haptics.selectionAsync();
-                  updateSettings({ takeProfitEnabled: v });
-                }}
-                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
-                thumbColor={cs.takeProfitEnabled ? C.gold : C.textMuted}
-              />
-            </View>
-
-            {cs.takeProfitEnabled && (
-              <>
-                <View style={styles.cascadeDivider} />
-                <PillSelector
-                  label="Take profit (pips from 1st entry)"
-                  hint={`Close all positions + delete limits at +${cs.takeProfitPips} pips (£${(cs.takeProfitPips * 0.10).toFixed(2)}) from 1st entry`}
-                  options={[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]}
-                  value={cs.takeProfitPips}
-                  onChange={(v) => updateSettings({ takeProfitPips: v })}
-                />
-              </>
-            )}
+            <PillSelector
+              label="Take profit"
+              hint={
+                cs.takeProfitEnabled
+                  ? `Close all positions + delete limits at +${cs.takeProfitPips} pips (£${(cs.takeProfitPips * 0.10).toFixed(2)}) from 1st entry`
+                  : "Disabled — no automatic close on profit"
+              }
+              options={[0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]}
+              value={cs.takeProfitEnabled ? cs.takeProfitPips : 0}
+              labels={{ 0: "Off" }}
+              onChange={(v) => {
+                if (v === 0) {
+                  updateSettings({ takeProfitEnabled: false });
+                } else {
+                  updateSettings({ takeProfitEnabled: true, takeProfitPips: v });
+                }
+              }}
+            />
 
             <View style={styles.cascadePreviewBox}>
               <Text style={styles.cascadePreviewTitle}>Preview with current settings (buy example)</Text>
