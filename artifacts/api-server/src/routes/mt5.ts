@@ -68,24 +68,24 @@ function startPricePoller(accountId: string, region: string, token: string) {
   const key = `${accountId}:${region}`;
   if (pricePollTimers.has(key)) return; // already running
   let inFlight = false;
-  const run = async () => {
-    if (inFlight) return; // skip interval if previous fetch still in progress
+  const run = () => {
+    if (inFlight) return;
     inFlight = true;
-    try {
-      const r = await fetch(
-        `${clientBase(region)}/users/current/accounts/${accountId}/symbols/XAUUSD/current-price`,
-        { headers: authHeaders(token), signal: AbortSignal.timeout(2000) }
-      );
-      if (!r.ok) { inFlight = false; return; }
-      const d = await r.json() as { bid?: number; ask?: number };
-      if (d.bid && d.ask) {
-        priceCache.set(key, { bid: d.bid, ask: d.ask, fetchedAt: Date.now() });
-        storeTick(accountId, d.bid, d.ask);
-      }
-    } catch { /* ignore transient errors */ }
-    inFlight = false;
+    fetch(
+      `${clientBase(region)}/users/current/accounts/${accountId}/symbols/XAUUSD/current-price`,
+      { headers: authHeaders(token), signal: AbortSignal.timeout(2000) }
+    )
+      .then((r) => r.ok ? r.json() : null)
+      .then((d: { bid?: number; ask?: number } | null) => {
+        if (d?.bid && d?.ask) {
+          priceCache.set(key, { bid: d.bid, ask: d.ask, fetchedAt: Date.now() });
+          storeTick(accountId, d.bid, d.ask);
+        }
+      })
+      .catch(() => { /* ignore transient errors */ })
+      .finally(() => { inFlight = false; });
   };
-  void run(); // immediate first fetch
+  run(); // immediate first fetch
   pricePollTimers.set(key, setInterval(run, 200));
 }
 
