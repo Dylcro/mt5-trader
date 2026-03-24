@@ -355,23 +355,23 @@ export default function TradeScreen() {
   const handleCascadeTrade = useCallback(async (dir: Direction) => {
     console.log("[cascade] btn pressed dir=" + dir + " isPlacing=" + String(isPlacing) + " status=" + status + " ask=" + String(price?.ask) + " bid=" + String(price?.bid));
     if (isPlacing) {
-      Alert.alert("Order in Progress", "Please wait for the current order to complete.");
+      showToast("Order already in progress — please wait.", "error");
       return;
     }
     if (status !== "connected") {
-      Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
+      showToast("Not connected. Go to Settings to connect your MT5 account.", "error");
       return;
     }
     const mktPrice = dir === "buy" ? (price?.ask ?? 0) : (price?.bid ?? 0);
     if (!price || mktPrice <= 0) {
-      Alert.alert("Price Unavailable", "Waiting for live price data. Please wait a moment and try again.");
+      showToast("Waiting for live price — tap ↻ to refresh.", "error");
       return;
     }
-    console.log("[cascade] showing dialog mktPrice=" + String(mktPrice));
-    // Compute levels fresh from the pressed direction — no stale state dependency
+    // Compute levels fresh — no stale closure dependency
     const levels = buildCascadeLevels(mktPrice, dir, cascadeSettings);
     const total = 1 + levels.limitEntries.length;
     const limitList = levels.limitEntries.map((p) => formatPrice(p)).join(", ");
+    console.log("[cascade] showing confirm dialog mktPrice=" + String(mktPrice) + " levels=" + levels.limitEntries.join(",") + " sl=" + String(levels.stopLoss));
     Alert.alert(
       `Place ${total} ${dir.toUpperCase()} Orders`,
       `#1 Market @ ${formatPrice(mktPrice)}${levels.limitEntries.length > 0 ? `\nLimits: ${limitList}` : ""}\nStop Loss: ${formatPrice(levels.stopLoss)}\nLot per order: ${cascadeLotSize.toFixed(2)}`,
@@ -380,7 +380,7 @@ export default function TradeScreen() {
         {
           text: "Confirm",
           onPress: async () => {
-            console.log("[cascade] confirmed, placing orders dir=" + dir + " vol=" + String(cascadeLotSize) + " entries=" + levels.limitEntries.join(",") + " sl=" + String(levels.stopLoss));
+            console.log("[cascade] confirmed, placing dir=" + dir + " vol=" + String(cascadeLotSize) + " entries=[" + levels.limitEntries.join(",") + "] sl=" + String(levels.stopLoss));
             await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
             setIsPlacing(true);
             try {
@@ -390,10 +390,11 @@ export default function TradeScreen() {
                 limitEntries: levels.limitEntries,
                 stopLoss: levels.stopLoss,
               });
-              console.log("[cascade] result success=" + String(result.success) + " placed=" + String(result.placed) + " msg=" + result.message);
+              console.log("[cascade] done placed=" + String(result.placed) + " failed=" + String(result.failed) + " success=" + String(result.success) + " msg=" + result.message);
               if (result.success) {
                 await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-                showToast(`${result.placed} ${dir.toUpperCase()} orders placed ✓`, "success", true);
+                const failNote = result.failed > 0 ? ` (${result.failed} limit${result.failed > 1 ? "s" : ""} failed)` : "";
+                showToast(`${result.placed}/${total} ${dir.toUpperCase()} orders placed ✓${failNote}`, "success", true);
               } else {
                 await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
                 showToast(result.message, "error");
@@ -569,27 +570,45 @@ export default function TradeScreen() {
               </View>
             )}
 
-            {/* Place cascade button — no disabled prop so it always fires the handler */}
-            <Pressable
-              style={({ pressed }) => [
-                styles.tradeBtn,
-                cascadeDirection === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
-                pressed && !isPlacing && { opacity: 0.85, transform: [{ scale: 0.98 }] },
-                isPlacing && { opacity: 0.6 },
-              ]}
-              onPress={() => handleCascadeTrade(cascadeDirection)}
-            >
-              {isPlacing ? (
-                <ActivityIndicator color={cascadeDirection === "buy" ? "#000" : "#fff"} />
-              ) : (
-                <>
-                  <Feather name="layers" size={20} color={cascadeDirection === "buy" ? "#000" : "#fff"} />
-                  <Text style={[styles.tradeBtnText, cascadeDirection === "buy" ? { color: "#000" } : { color: "#fff" }]}>
-                    {`Place ${cascadeSettings.numPositions} ${cascadeDirection.toUpperCase()} Orders`}
-                  </Text>
-                </>
-              )}
-            </Pressable>
+            {/* Place cascade button */}
+            {(() => {
+              const cascadeReady = status === "connected" && !!price && cascadeMarketPrice > 0;
+              const cascadeBtnLabel = isPlacing
+                ? ""
+                : status !== "connected"
+                ? "Connect Account in Settings"
+                : !price || cascadeMarketPrice <= 0
+                ? "Waiting for Price..."
+                : `Place ${cascadeSettings.numPositions} ${cascadeDirection.toUpperCase()} Orders`;
+              const cascadeBtnColor = cascadeDirection === "buy" ? "#000" : "#fff";
+              return (
+                <Pressable
+                  style={({ pressed }) => [
+                    styles.tradeBtn,
+                    cascadeDirection === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
+                    !cascadeReady && !isPlacing && { opacity: 0.55 },
+                    pressed && { opacity: 0.8, transform: [{ scale: 0.98 }] },
+                    isPlacing && { opacity: 0.6 },
+                  ]}
+                  onPress={() => handleCascadeTrade(cascadeDirection)}
+                >
+                  {isPlacing ? (
+                    <ActivityIndicator color={cascadeBtnColor} />
+                  ) : (
+                    <>
+                      <Feather
+                        name={cascadeReady ? "layers" : status !== "connected" ? "wifi-off" : "clock"}
+                        size={20}
+                        color={cascadeBtnColor}
+                      />
+                      <Text style={[styles.tradeBtnText, { color: cascadeBtnColor }]}>
+                        {cascadeBtnLabel}
+                      </Text>
+                    </>
+                  )}
+                </Pressable>
+              );
+            })()}
           </>
         )}
 

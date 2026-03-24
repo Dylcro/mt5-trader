@@ -513,12 +513,14 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       if (params.limitPrice != null) body.openPrice = params.limitPrice;
       if (params.stopLoss != null) body.stopLoss = params.stopLoss;
       if (params.takeProfit != null) body.takeProfit = params.takeProfit;
+      console.log("[submitOrderRaw] →", actionType, "vol=" + String(params.volume), params.limitPrice != null ? "openPrice=" + String(params.limitPrice) : "market", "sl=" + String(params.stopLoss ?? "none"));
       const res = await fetch(`${API_BASE}/mt5/account/${accountId}/trade?region=${region}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
       const data = await res.json() as { success?: boolean; code?: number; message?: string };
+      console.log("[submitOrderRaw] ←", actionType, "httpStatus=" + String(res.status), "success=" + String(data.success) + " code=" + String(data.code) + " msg=" + String(data.message));
       if (!res.ok || data.success === false) {
         return { success: false, message: data.message ?? `Trade failed (code ${data.code ?? res.status})` };
       }
