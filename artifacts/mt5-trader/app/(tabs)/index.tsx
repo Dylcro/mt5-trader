@@ -468,10 +468,11 @@ export default function TradeScreen() {
     const cs = cascadeSettingsRef.current;
     const levels = buildCascadeLevels(mktPrice, dir, cs);
     const total = 1 + levels.limitEntries.length;
-    console.log("[cascade] placing dir=" + dir + " vol=" + String(cascadeLotSize) + " entries=[" + levels.limitEntries.join(",") + "] sl=" + String(levels.stopLoss));
-    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    // Lock immediately so button shows loading and double-taps are blocked
     isPlacingRef.current = true;
     setIsPlacing(true);
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    console.log("[cascade] placing dir=" + dir + " vol=" + String(cascadeLotSize) + " entries=[" + levels.limitEntries.join(",") + "] sl=" + String(levels.stopLoss));
     try {
       const result = await placeCascadeOrders({
         direction: dir,
