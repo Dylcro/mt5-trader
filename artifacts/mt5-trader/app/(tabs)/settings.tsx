@@ -9,6 +9,7 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
@@ -498,6 +499,40 @@ export default function SettingsScreen() {
               displayValue={`${cs.slPips} pips`}
               hint={`${(cs.slPips * 0.10).toFixed(2)} below market entry — shared by all orders`}
             />
+
+            <View style={styles.cascadeDivider} />
+
+            {/* Auto-cancel limits on profit */}
+            <View style={styles.settingRow}>
+              <View style={styles.settingRowLeft}>
+                <Text style={styles.settingLabel}>Auto-cancel limits on profit</Text>
+                <Text style={styles.settingHint}>
+                  Cancels all pending limit orders when the market order reaches the pip target in profit
+                </Text>
+              </View>
+              <Switch
+                value={cs.autoCloseLimitsEnabled}
+                onValueChange={(v) => {
+                  void Haptics.selectionAsync();
+                  updateSettings({ autoCloseLimitsEnabled: v });
+                }}
+                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
+                thumbColor={cs.autoCloseLimitsEnabled ? C.gold : C.textMuted}
+              />
+            </View>
+
+            {cs.autoCloseLimitsEnabled && (
+              <>
+                <View style={styles.cascadeDivider} />
+                <PillSelector
+                  label="Profit trigger (pips)"
+                  hint={`Cancel limits when market order is +${cs.autoCloseLimitsPips} pips (${(cs.autoCloseLimitsPips * 0.10).toFixed(2)}) in profit`}
+                  options={[5, 10, 15, 20, 25, 30]}
+                  value={cs.autoCloseLimitsPips}
+                  onChange={(v) => updateSettings({ autoCloseLimitsPips: v })}
+                />
+              </>
+            )}
 
             <View style={styles.cascadePreviewBox}>
               <Text style={styles.cascadePreviewTitle}>Preview with current settings (buy example)</Text>

@@ -84,6 +84,7 @@ interface TradingContextValue {
   refreshPositions: () => Promise<void>;
   refreshPrice: () => Promise<void>;
   refreshAccountInfo: () => Promise<void>;
+  setCascadeWatcher: (params: { entryPrice: number; direction: "buy" | "sell"; pipsTarget: number } | null) => void;
 }
 
 export interface PlaceTradeParams {
@@ -146,6 +147,17 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const priceFailCountRef = useRef(0);
   const startPollingRef = useRef<((accId: string, accRegion: string) => void) | null>(null);
   const reconnectInProgressRef = useRef(false);
+
+  // Cascade profit watcher — set after placing a cascade to auto-cancel limits at a pip target
+  const cascadeWatcherRef = useRef<{ entryPrice: number; direction: "buy" | "sell"; pipsTarget: number } | null>(null);
+  const pendingOrdersRef = useRef<PendingOrder[]>([]);
+
+  const setCascadeWatcher = useCallback(
+    (params: { entryPrice: number; direction: "buy" | "sell"; pipsTarget: number } | null) => {
+      cascadeWatcherRef.current = params;
+    },
+    []
+  );
 
   // Load saved credentials + accountId on startup and auto-reconnect
   useEffect(() => {
@@ -348,7 +360,32 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
       const pollPrice = () =>
         fetchPriceData(accId, accRegion)
-          .then((p) => { priceFailCountRef.current = 0; setPriceError(false); setPrice(p); })
+          .then((p) => {
+            priceFailCountRef.current = 0;
+            setPriceError(false);
+            setPrice(p);
+            // Check cascade profit watcher
+            const watcher = cascadeWatcherRef.current;
+            if (watcher) {
+              const dist = watcher.pipsTarget * 0.10;
+              const triggered =
+                watcher.direction === "buy"
+                  ? p.bid >= watcher.entryPrice + dist
+                  : p.ask <= watcher.entryPrice - dist;
+              if (triggered) {
+                cascadeWatcherRef.current = null;
+                const toCancel = pendingOrdersRef.current;
+                if (toCancel.length > 0) {
+                  console.log(`[watcher] profit target hit — cancelling ${toCancel.length} pending orders`);
+                  void Promise.all(toCancel.map((o) =>
+                    fetch(`${API_BASE}/mt5/account/${accId}/order/${o.id}?region=${accRegion}`, {
+                      method: "DELETE",
+                    })
+                  ));
+                }
+              }
+            }
+          })
           .catch(() => {
             priceFailCountRef.current += 1;
             if (priceFailCountRef.current >= 3) setPriceError(true);
@@ -357,7 +394,10 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       const pollPositions = () =>
         Promise.all([
           fetchPositionsData(accId, accRegion).then(setPositions).catch(() => {}),
-          fetchPendingOrdersData(accId, accRegion).then(setPendingOrders).catch(() => {}),
+          fetchPendingOrdersData(accId, accRegion).then((orders) => {
+            pendingOrdersRef.current = orders;
+            setPendingOrders(orders);
+          }).catch(() => {}),
         ]);
 
       pollPrice();
@@ -667,6 +707,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         refreshPositions,
         refreshPrice,
         refreshAccountInfo,
+        setCascadeWatcher,
       }}
     >
       {children}

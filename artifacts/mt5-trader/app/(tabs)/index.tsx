@@ -269,7 +269,7 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region } = useTrading();
+  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, setCascadeWatcher } = useTrading();
   const { settings: cascadeSettings } = useCascadeSettings();
 
   const [toast, setToast] = useState<ToastState>(null);
@@ -386,6 +386,9 @@ export default function TradeScreen() {
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         const failNote = result.failed > 0 ? ` (${result.failed} limit${result.failed > 1 ? "s" : ""} failed)` : "";
         showToast(`${result.placed}/${total} ${dir.toUpperCase()} orders placed ✓${failNote}`, "success", true);
+        if (cascadeSettings.autoCloseLimitsEnabled && cascadeSettings.autoCloseLimitsPips > 0) {
+          setCascadeWatcher({ entryPrice: mktPrice, direction: dir, pipsTarget: cascadeSettings.autoCloseLimitsPips });
+        }
       } else {
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
         showToast(result.message, "error");
