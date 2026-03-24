@@ -270,7 +270,7 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, modifyPosition } = useTrading();
+  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, modifyPosition, refreshPositions } = useTrading();
   const { settings: cascadeSettings } = useCascadeSettings();
   const cascadeSettingsRef = useRef(cascadeSettings);
   useEffect(() => { cascadeSettingsRef.current = cascadeSettings; }, [cascadeSettings]);
@@ -483,6 +483,13 @@ export default function TradeScreen() {
       showToast("MT5 monitor session reset — all positions closed", "success");
     }
   }, [positions, mt5MonitorSession, modifyPosition, showToast]);
+
+  // Fast positions poll (2s) while MT5 monitor session is active
+  useEffect(() => {
+    if (!mt5MonitorSession) return;
+    const id = setInterval(() => { void refreshPositions(); }, 2000);
+    return () => clearInterval(id);
+  }, [mt5MonitorSession, refreshPositions]);
 
   // Safety valve: if isPlacing somehow gets stuck, auto-reset after 90 seconds
   useEffect(() => {
