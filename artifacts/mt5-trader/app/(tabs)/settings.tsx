@@ -550,7 +550,7 @@ export default function SettingsScreen() {
                 trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
                 thumbColor={cs.takeProfitEnabled ? C.gold : C.textMuted}
               />
-              <Text style={[styles.settingLabel, { marginLeft: 10, flex: 1 }]}>Take profit level</Text>
+              <Text style={[styles.settingLabel, { marginLeft: 10, flex: 1 }]}>Take profit level (from 1st entry)</Text>
             </View>
 
             {cs.takeProfitEnabled && (
