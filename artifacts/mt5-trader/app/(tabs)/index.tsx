@@ -371,45 +371,31 @@ export default function TradeScreen() {
     // Compute levels fresh — no stale closure dependency
     const levels = buildCascadeLevels(mktPrice, dir, cascadeSettings);
     const total = 1 + levels.limitEntries.length;
-    const limitList = levels.limitEntries.map((p) => formatPrice(p)).join(", ");
-    console.log("[cascade] showing confirm dialog mktPrice=" + String(mktPrice) + " levels=" + levels.limitEntries.join(",") + " sl=" + String(levels.stopLoss));
-    Alert.alert(
-      `Place ${total} ${dir.toUpperCase()} Orders`,
-      `#1 Market @ ${formatPrice(mktPrice)}${levels.limitEntries.length > 0 ? `\nLimits: ${limitList}` : ""}\nStop Loss: ${formatPrice(levels.stopLoss)}\nLot per order: ${cascadeLotSize.toFixed(2)}`,
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Confirm",
-          onPress: async () => {
-            console.log("[cascade] confirmed, placing dir=" + dir + " vol=" + String(cascadeLotSize) + " entries=[" + levels.limitEntries.join(",") + "] sl=" + String(levels.stopLoss));
-            await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-            setIsPlacing(true);
-            try {
-              const result = await placeCascadeOrders({
-                direction: dir,
-                volume: cascadeLotSize,
-                limitEntries: levels.limitEntries,
-                stopLoss: levels.stopLoss,
-              });
-              console.log("[cascade] done placed=" + String(result.placed) + " failed=" + String(result.failed) + " success=" + String(result.success) + " msg=" + result.message);
-              if (result.success) {
-                await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-                const failNote = result.failed > 0 ? ` (${result.failed} limit${result.failed > 1 ? "s" : ""} failed)` : "";
-                showToast(`${result.placed}/${total} ${dir.toUpperCase()} orders placed ✓${failNote}`, "success", true);
-              } else {
-                await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-                showToast(result.message, "error");
-              }
-            } catch (err) {
-              console.log("[cascade] exception: " + String(err));
-              showToast(err instanceof Error ? err.message : "Cascade failed", "error");
-            } finally {
-              setIsPlacing(false);
-            }
-          },
-        },
-      ]
-    );
+    console.log("[cascade] placing dir=" + dir + " vol=" + String(cascadeLotSize) + " entries=[" + levels.limitEntries.join(",") + "] sl=" + String(levels.stopLoss));
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    setIsPlacing(true);
+    try {
+      const result = await placeCascadeOrders({
+        direction: dir,
+        volume: cascadeLotSize,
+        limitEntries: levels.limitEntries,
+        stopLoss: levels.stopLoss,
+      });
+      console.log("[cascade] done placed=" + String(result.placed) + " failed=" + String(result.failed) + " success=" + String(result.success) + " msg=" + result.message);
+      if (result.success) {
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        const failNote = result.failed > 0 ? ` (${result.failed} limit${result.failed > 1 ? "s" : ""} failed)` : "";
+        showToast(`${result.placed}/${total} ${dir.toUpperCase()} orders placed ✓${failNote}`, "success", true);
+      } else {
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+        showToast(result.message, "error");
+      }
+    } catch (err) {
+      console.log("[cascade] exception: " + String(err));
+      showToast(err instanceof Error ? err.message : "Cascade failed", "error");
+    } finally {
+      setIsPlacing(false);
+    }
   }, [isPlacing, status, price, cascadeSettings, cascadeLotSize, placeCascadeOrders, showToast]);
 
   const webTopPad = Platform.OS === "web" ? 67 : 0;
