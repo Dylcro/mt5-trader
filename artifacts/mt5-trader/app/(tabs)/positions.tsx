@@ -15,7 +15,7 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import Colors from "@/constants/colors";
-import { useTrading, type Position } from "@/context/TradingContext";
+import { useTrading, type PendingOrder, type Position } from "@/context/TradingContext";
 
 const C = Colors.dark;
 
@@ -115,9 +115,85 @@ function PositionCard({ pos, onClose }: { pos: Position; isBusy: boolean; onClos
   );
 }
 
+function PendingOrderCard({ order, onCancel }: { order: PendingOrder; onCancel: () => void }) {
+  const isBuyLimit = order.type.includes("BUY");
+  const [cancelling, setCancelling] = useState(false);
+
+  const typeLabel = order.type === "ORDER_TYPE_BUY_LIMIT" ? "BUY LIMIT"
+    : order.type === "ORDER_TYPE_SELL_LIMIT" ? "SELL LIMIT"
+    : order.type === "ORDER_TYPE_BUY_STOP" ? "BUY STOP"
+    : order.type === "ORDER_TYPE_SELL_STOP" ? "SELL STOP"
+    : order.type.replace("ORDER_TYPE_", "").replace(/_/g, " ");
+
+  const handleCancel = async () => {
+    setCancelling(true);
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    onCancel();
+    setCancelling(false);
+  };
+
+  return (
+    <View style={[styles.posCard, styles.pendingCard]}>
+      <View style={styles.posTop}>
+        <View style={styles.posLeft}>
+          <View style={[styles.dirPill, isBuyLimit ? styles.dirPillBuy : styles.dirPillSell]}>
+            <Feather name={isBuyLimit ? "trending-up" : "trending-down"} size={12} color={isBuyLimit ? "#000" : "#fff"} />
+            <Text style={[styles.dirPillText, { color: isBuyLimit ? "#000" : "#fff" }]}>{typeLabel}</Text>
+          </View>
+          <Text style={styles.posSymbol}>{order.symbol}</Text>
+          <Text style={styles.posVol}>{order.volume} lots</Text>
+        </View>
+        <View style={styles.pendingBadge}>
+          <Text style={styles.pendingBadgeText}>PENDING</Text>
+        </View>
+      </View>
+
+      <View style={styles.posPriceRow}>
+        <View style={styles.posPriceItem}>
+          <Text style={styles.posPriceLabel}>LIMIT PRICE</Text>
+          <Text style={[styles.posPriceVal, { color: isBuyLimit ? C.buy : C.sell }]}>{formatPrice(order.openPrice)}</Text>
+        </View>
+        {order.stopLoss != null && (
+          <>
+            <View style={styles.posPriceDivider} />
+            <View style={styles.posPriceItem}>
+              <Text style={styles.posPriceLabel}>STOP LOSS</Text>
+              <Text style={[styles.posPriceVal, { color: C.sell }]}>{formatPrice(order.stopLoss)}</Text>
+            </View>
+          </>
+        )}
+        {order.comment != null && order.comment !== "" && (
+          <>
+            <View style={styles.posPriceDivider} />
+            <View style={[styles.posPriceItem, { flex: 2 }]}>
+              <Text style={styles.posPriceLabel}>NOTE</Text>
+              <Text style={[styles.posPriceVal, { fontSize: 11 }]} numberOfLines={1}>{order.comment}</Text>
+            </View>
+          </>
+        )}
+      </View>
+
+      <Pressable
+        style={({ pressed }) => [styles.closeBtn, pressed && { opacity: 0.7 }, cancelling && { opacity: 0.5 }]}
+        onPress={handleCancel}
+        disabled={cancelling}
+      >
+        {cancelling ? (
+          <ActivityIndicator size="small" color={C.text} />
+        ) : (
+          <>
+            <Feather name="x-circle" size={14} color={C.textSecondary} />
+            <Text style={styles.closeBtnText}>Cancel Order</Text>
+          </>
+        )}
+      </Pressable>
+    </View>
+  );
+}
+
 export default function PositionsScreen() {
   const insets = useSafeAreaInsets();
-  const { positions, status, refreshPositions, closePosition, accountInfo } = useTrading();
+  const { positions, pendingOrders, status, refreshPositions, closePosition, cancelOrder, accountInfo } = useTrading();
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
 
@@ -126,6 +202,33 @@ export default function PositionsScreen() {
     await refreshPositions();
     setRefreshing(false);
   }, [refreshPositions]);
+
+  const handleCancelOrder = useCallback(
+    async (order: PendingOrder) => {
+      Alert.alert(
+        "Cancel Order",
+        `Cancel ${order.type.includes("BUY") ? "BUY" : "SELL"} LIMIT @ ${formatPrice(order.openPrice)} (${order.volume} lots)?`,
+        [
+          { text: "Keep", style: "cancel" },
+          {
+            text: "Cancel Order",
+            style: "destructive",
+            onPress: async () => {
+              setBusyId(order.id);
+              const result = await cancelOrder(order.id);
+              setBusyId(null);
+              if (!result.success) {
+                Alert.alert("Error", result.message);
+              } else {
+                await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+              }
+            },
+          },
+        ]
+      );
+    },
+    [cancelOrder]
+  );
 
   const handleClose = useCallback(
     async (pos: Position) => {
@@ -156,6 +259,7 @@ export default function PositionsScreen() {
 
   const totalPL = positions.reduce((sum, p) => sum + p.profit, 0);
   const webTopPad = Platform.OS === "web" ? 67 : 0;
+  const hasAnything = positions.length > 0 || pendingOrders.length > 0;
 
   return (
     <View style={[styles.container, { paddingTop: insets.top + webTopPad }]}>
@@ -206,21 +310,42 @@ export default function PositionsScreen() {
             <Text style={styles.emptyTitle}>Not Connected</Text>
             <Text style={styles.emptyText}>Connect your MetaAPI account in Settings to see positions</Text>
           </View>
-        ) : positions.length === 0 ? (
+        ) : !hasAnything ? (
           <View style={styles.emptyState}>
             <Feather name="inbox" size={40} color={C.textMuted} />
             <Text style={styles.emptyTitle}>No Open Positions</Text>
             <Text style={styles.emptyText}>Head to the Trade tab to place your first XAUUSD trade</Text>
           </View>
         ) : (
-          positions.map((pos) => (
-            <PositionCard
-              key={pos.id}
-              pos={pos}
-              isBusy={busyId === pos.id}
-              onClose={() => handleClose(pos)}
-            />
-          ))
+          <>
+            {positions.length > 0 && (
+              <>
+                <Text style={styles.sectionLabel}>OPEN  ·  {positions.length}</Text>
+                {positions.map((pos) => (
+                  <PositionCard
+                    key={pos.id}
+                    pos={pos}
+                    isBusy={busyId === pos.id}
+                    onClose={() => handleClose(pos)}
+                  />
+                ))}
+              </>
+            )}
+            {pendingOrders.length > 0 && (
+              <>
+                <Text style={[styles.sectionLabel, { marginTop: positions.length > 0 ? 20 : 0 }]}>
+                  PENDING  ·  {pendingOrders.length}
+                </Text>
+                {pendingOrders.map((order) => (
+                  <PendingOrderCard
+                    key={order.id}
+                    order={order}
+                    onCancel={() => handleCancelOrder(order)}
+                  />
+                ))}
+              </>
+            )}
+          </>
         )}
       </ScrollView>
     </View>
@@ -409,5 +534,31 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontFamily: "Inter_600SemiBold",
     color: C.textSecondary,
+  },
+  sectionLabel: {
+    fontSize: 10,
+    fontFamily: "Inter_700Bold",
+    color: C.textMuted,
+    letterSpacing: 1.2,
+    marginBottom: 4,
+  },
+  pendingCard: {
+    borderStyle: "dashed",
+    borderColor: C.gold,
+    opacity: 0.9,
+  },
+  pendingBadge: {
+    backgroundColor: "rgba(201,168,76,0.15)",
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "rgba(201,168,76,0.4)",
+  },
+  pendingBadgeText: {
+    fontSize: 9,
+    fontFamily: "Inter_700Bold",
+    color: C.gold,
+    letterSpacing: 1,
   },
 });

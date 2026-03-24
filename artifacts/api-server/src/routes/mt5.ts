@@ -371,6 +371,49 @@ router.get("/mt5/account/:accountId/positions", async (req: Request, res: Respon
   }
 });
 
+// GET /api/mt5/account/:accountId/orders?region=london  (pending orders)
+router.get("/mt5/account/:accountId/orders", async (req: Request, res: Response) => {
+  try {
+    const token = getToken();
+    const region = qstr(req.query.region) || DEFAULT_REGION;
+    const ordRes = await fetch(
+      `${clientBase(region)}/users/current/accounts/${req.params.accountId}/orders`,
+      { headers: authHeaders(token) }
+    );
+    if (!ordRes.ok) return res.status(ordRes.status).json({ error: "Orders fetch failed" });
+    return res.json(await ordRes.json());
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
+  }
+});
+
+// DELETE /api/mt5/account/:accountId/order/:orderId?region=london  (cancel pending order)
+router.delete("/mt5/account/:accountId/order/:orderId", async (req: Request, res: Response) => {
+  try {
+    const token = getToken();
+    const region = qstr(req.query.region) || DEFAULT_REGION;
+    const tradeRes = await fetch(
+      `${clientBase(region)}/users/current/accounts/${req.params.accountId}/trade`,
+      {
+        method: "POST",
+        headers: authHeaders(token),
+        body: JSON.stringify({ actionType: "ORDER_CANCEL", orderId: req.params.orderId }),
+      }
+    );
+    const data = await tradeRes.json() as { numericCode?: number; message?: string };
+    const code = data.numericCode ?? 0;
+    const success = TRADE_SUCCESS_CODES.has(code);
+    console.log(`[cancel-order] orderId=${req.params.orderId} code=${code} success=${success}`);
+    return res.status(tradeRes.ok ? 200 : tradeRes.status).json({
+      success,
+      code,
+      message: success ? "Order cancelled" : (TRADE_ERROR_MESSAGES[code] ?? data.message ?? `Cancel failed (code ${code})`),
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, code: 0, message: err instanceof Error ? err.message : "Cancel failed" });
+  }
+});
+
 // MT5 trade return code map
 const TRADE_SUCCESS_CODES = new Set([10008, 10009, 10010]);
 const TRADE_ERROR_MESSAGES: Record<number, string> = {

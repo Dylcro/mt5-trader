@@ -35,6 +35,18 @@ export interface Position {
   comment?: string;
 }
 
+export interface PendingOrder {
+  id: string;
+  symbol: string;
+  type: "ORDER_TYPE_BUY_LIMIT" | "ORDER_TYPE_SELL_LIMIT" | "ORDER_TYPE_BUY_STOP" | "ORDER_TYPE_SELL_STOP" | string;
+  volume: number;
+  openPrice: number;
+  stopLoss?: number;
+  takeProfit?: number;
+  comment?: string;
+  time: string;
+}
+
 export interface Price {
   bid: number;
   ask: number;
@@ -58,6 +70,7 @@ interface TradingContextValue {
   errorMsg: string;
   accountInfo: AccountInfo | null;
   positions: Position[];
+  pendingOrders: PendingOrder[];
   price: Price | null;
   priceError: boolean;
   connect: (creds?: Mt5Credentials) => Promise<void>;
@@ -65,6 +78,7 @@ interface TradingContextValue {
   placeTrade: (params: PlaceTradeParams) => Promise<{ success: boolean; message: string }>;
   placeCascadeOrders: (params: CascadeOrderParams) => Promise<{ success: boolean; placed: number; failed: number; message: string }>;
   closePosition: (positionId: string) => Promise<{ success: boolean; message: string }>;
+  cancelOrder: (orderId: string) => Promise<{ success: boolean; message: string }>;
   refreshPositions: () => Promise<void>;
   refreshPrice: () => Promise<void>;
   refreshAccountInfo: () => Promise<void>;
@@ -121,6 +135,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const [errorMsg, setErrorMsg] = useState("");
   const [accountInfo, setAccountInfo] = useState<AccountInfo | null>(null);
   const [positions, setPositions] = useState<Position[]>([]);
+  const [pendingOrders, setPendingOrders] = useState<PendingOrder[]>([]);
   const [price, setPrice] = useState<Price | null>(null);
   const [priceError, setPriceError] = useState(false);
 
@@ -288,6 +303,26 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
+  const fetchPendingOrdersData = useCallback(async (accId: string, accRegion: string): Promise<PendingOrder[]> => {
+    const res = await fetch(`${API_BASE}/mt5/account/${accId}/orders?region=${accRegion}`);
+    if (!res.ok) throw new Error(`Orders fetch failed: ${res.status}`);
+    const data = await res.json() as unknown[];
+    return (Array.isArray(data) ? data : []).map((o) => {
+      const ord = o as Record<string, unknown>;
+      return {
+        id: String(ord.id ?? ""),
+        symbol: String(ord.symbol ?? ""),
+        type: String(ord.type ?? ""),
+        volume: Number(ord.volume ?? ord.currentVolume ?? 0),
+        openPrice: Number(ord.openPrice ?? 0),
+        stopLoss: ord.stopLoss != null ? Number(ord.stopLoss) : undefined,
+        takeProfit: ord.takeProfit != null ? Number(ord.takeProfit) : undefined,
+        comment: ord.comment != null ? String(ord.comment) : undefined,
+        time: String(ord.time ?? ord.updateTime ?? ""),
+      };
+    });
+  }, []);
+
   const startPolling = useCallback(
     (accId: string, accRegion: string) => {
       if (priceIntervalRef.current) clearInterval(priceIntervalRef.current);
@@ -303,14 +338,18 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
             if (priceFailCountRef.current >= 3) setPriceError(true);
           });
 
-      const pollPositions = () => fetchPositionsData(accId, accRegion).then(setPositions).catch(() => {});
+      const pollPositions = () =>
+        Promise.all([
+          fetchPositionsData(accId, accRegion).then(setPositions).catch(() => {}),
+          fetchPendingOrdersData(accId, accRegion).then(setPendingOrders).catch(() => {}),
+        ]);
 
       pollPrice();
       pollPositions();
       priceIntervalRef.current = setInterval(pollPrice, 5000);
       positionsIntervalRef.current = setInterval(pollPositions, 10000);
     },
-    [fetchPriceData, fetchPositionsData]
+    [fetchPriceData, fetchPositionsData, fetchPendingOrdersData]
   );
 
   // Keep the ref in sync so pollUntilConnected (declared before startPolling) can access it
@@ -415,6 +454,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     setStatus("disconnected");
     setAccountInfo(null);
     setPositions([]);
+    setPendingOrders([]);
     setPrice(null);
     setErrorMsg("");
   }, [accountId, stopPolling]);
@@ -432,6 +472,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     if (status !== "connected" || !accountId) return;
     try { setPositions(await fetchPositionsData(accountId, region)); } catch {}
   }, [status, accountId, region, fetchPositionsData]);
+
+  const refreshPendingOrders = useCallback(async () => {
+    if (status !== "connected" || !accountId) return;
+    try { setPendingOrders(await fetchPendingOrdersData(accountId, region)); } catch {}
+  }, [status, accountId, region, fetchPendingOrdersData]);
 
   const refreshAccountInfo = useCallback(async () => {
     if (status !== "connected" || !accountId) return;
@@ -466,14 +511,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         if (!res.ok || data.success === false) {
           return { success: false, message: data.message ?? `Trade failed (code ${data.code ?? res.status})` };
         }
-        await refreshPositions();
-        await refreshAccountInfo();
+        await Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
         return { success: true, message: data.message ?? "Trade placed successfully" };
       } catch (err) {
         return { success: false, message: err instanceof Error ? err.message : "Trade failed" };
       }
     },
-    [status, accountId, region, refreshPositions, refreshAccountInfo]
+    [status, accountId, region, refreshPositions, refreshPendingOrders, refreshAccountInfo]
   );
 
   const placeCascadeOrders = useCallback(
@@ -526,14 +570,31 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         });
         const data = await res.json() as { success?: boolean; code?: number; message?: string };
         if (!res.ok || data.success === false) return { success: false, message: data.message ?? `Close failed (code ${data.code ?? res.status})` };
-        await refreshPositions();
-        await refreshAccountInfo();
+        await Promise.all([refreshPositions(), refreshAccountInfo()]);
         return { success: true, message: "Position closed" };
       } catch (err) {
         return { success: false, message: err instanceof Error ? err.message : "Close failed" };
       }
     },
     [status, accountId, region, refreshPositions, refreshAccountInfo]
+  );
+
+  const cancelOrder = useCallback(
+    async (orderId: string): Promise<{ success: boolean; message: string }> => {
+      if (status !== "connected") return { success: false, message: "Not connected" };
+      try {
+        const res = await fetch(`${API_BASE}/mt5/account/${accountId}/order/${orderId}?region=${region}`, {
+          method: "DELETE",
+        });
+        const data = await res.json() as { success?: boolean; message?: string };
+        if (!res.ok || data.success === false) return { success: false, message: data.message ?? `Cancel failed` };
+        await Promise.all([refreshPendingOrders(), refreshAccountInfo()]);
+        return { success: true, message: "Order cancelled" };
+      } catch (err) {
+        return { success: false, message: err instanceof Error ? err.message : "Cancel failed" };
+      }
+    },
+    [status, accountId, region, refreshPendingOrders, refreshAccountInfo]
   );
 
   return (
@@ -546,6 +607,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         errorMsg,
         accountInfo,
         positions,
+        pendingOrders,
         price,
         priceError,
         connect,
@@ -553,6 +615,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         placeTrade,
         placeCascadeOrders,
         closePosition,
+        cancelOrder,
         refreshPositions,
         refreshPrice,
         refreshAccountInfo,
