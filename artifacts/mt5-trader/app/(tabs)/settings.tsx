@@ -526,7 +526,7 @@ export default function SettingsScreen() {
                 <View style={styles.cascadeDivider} />
                 <PillSelector
                   label="Pip trigger from 1st entry"
-                  hint={`Delete remaining limits when +${cs.autoCloseLimitsPips} pips ($${(cs.autoCloseLimitsPips * 0.10).toFixed(2)}) from 1st entry`}
+                  hint={`Delete remaining limits when +${cs.autoCloseLimitsPips} pips (£${(cs.autoCloseLimitsPips * 0.10).toFixed(2)}) from 1st entry`}
                   options={[5, 10, 15, 20, 25, 30, 40, 50]}
                   value={cs.autoCloseLimitsPips}
                   onChange={(v) => updateSettings({ autoCloseLimitsPips: v })}
