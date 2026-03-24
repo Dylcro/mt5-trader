@@ -401,6 +401,24 @@ router.get("/mt5/account/:accountId/info", async (req: Request, res: Response) =
   }
 });
 
+// GET /api/mt5/account/:accountId/candles?region=london&timeframe=5m&limit=150
+router.get("/mt5/account/:accountId/candles", async (req: Request, res: Response) => {
+  try {
+    const token = getToken();
+    const region = qstr(req.query.region) || DEFAULT_REGION;
+    const timeframe = qstr(req.query.timeframe) || "5m";
+    const limit = Math.min(parseInt(qstr(req.query.limit) || "150", 10) || 150, 500);
+    const candleRes = await fetch(
+      `${clientBase(region)}/users/current/accounts/${req.params.accountId}/historical-market-data/symbols/XAUUSD/timeframes/${timeframe}/candles?limit=${limit}`,
+      { headers: authHeaders(token) }
+    );
+    if (!candleRes.ok) return res.status(candleRes.status).json({ error: "Candles fetch failed" });
+    return res.json(await candleRes.json());
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
+  }
+});
+
 // GET /api/mt5/account/:accountId/price?region=london
 router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) => {
   try {

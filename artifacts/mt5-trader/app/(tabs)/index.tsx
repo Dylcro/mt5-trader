@@ -269,7 +269,7 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect } = useTrading();
+  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region } = useTrading();
   const { settings: cascadeSettings } = useCascadeSettings();
 
   const [toast, setToast] = useState<ToastState>(null);
@@ -440,10 +440,16 @@ export default function TradeScreen() {
         </Pressable>
       </View>
 
-      {/* Live TradingView Chart */}
-      {status === "connected" && (
+      {/* Live Chart */}
+      {status === "connected" && accountId && (
         <View style={{ paddingHorizontal: 12 }}>
-          <TradingViewChart height={200} />
+          <TradingViewChart
+            height={215}
+            apiBase={apiBase}
+            accountId={accountId}
+            region={region}
+            liveBid={price?.bid}
+          />
         </View>
       )}
 

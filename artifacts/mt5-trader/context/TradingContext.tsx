@@ -64,6 +64,8 @@ export interface Mt5Credentials {
 
 interface TradingContextValue {
   accountId: string;
+  apiBase: string;
+  region: string;
   credentials: Mt5Credentials;
   setCredentials: (c: Mt5Credentials) => void;
   status: ConnectionStatus;
@@ -645,6 +647,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     <TradingContext.Provider
       value={{
         accountId,
+        apiBase: API_BASE,
+        region,
         credentials,
         setCredentials,
         status,
