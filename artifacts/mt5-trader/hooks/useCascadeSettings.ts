@@ -7,6 +7,8 @@ export interface CascadeSettings {
   slPips: number;
   autoCloseLimitsEnabled: boolean;
   autoCloseLimitsPips: number;
+  takeProfitEnabled: boolean;
+  takeProfitPips: number;
 }
 
 const DEFAULTS: CascadeSettings = {
@@ -15,6 +17,8 @@ const DEFAULTS: CascadeSettings = {
   slPips: 100,
   autoCloseLimitsEnabled: false,
   autoCloseLimitsPips: 10,
+  takeProfitEnabled: false,
+  takeProfitPips: 30,
 };
 
 const KEYS = {
@@ -23,6 +27,8 @@ const KEYS = {
   slPips: "cascade_sl_pips",
   autoCloseLimitsEnabled: "cascade_auto_close_enabled",
   autoCloseLimitsPips: "cascade_auto_close_pips",
+  takeProfitEnabled: "cascade_tp_enabled",
+  takeProfitPips: "cascade_tp_pips",
 };
 
 interface CascadeSettingsContextValue {
@@ -37,13 +43,15 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
 
   useEffect(() => {
     AsyncStorage.multiGet(Object.values(KEYS)).then((pairs) => {
-      const [num, between, sl, autoClose, autoClosePips] = pairs.map((p) => p[1]);
+      const [num, between, sl, autoClose, autoClosePips, tpEnabled, tpPips] = pairs.map((p) => p[1]);
       setSettings({
         numPositions: num ? parseFloat(num) : DEFAULTS.numPositions,
         pipsBetween: between ? parseFloat(between) : DEFAULTS.pipsBetween,
         slPips: sl ? parseFloat(sl) : DEFAULTS.slPips,
         autoCloseLimitsEnabled: autoClose === "true",
         autoCloseLimitsPips: autoClosePips ? parseFloat(autoClosePips) : DEFAULTS.autoCloseLimitsPips,
+        takeProfitEnabled: tpEnabled === "true",
+        takeProfitPips: tpPips ? parseFloat(tpPips) : DEFAULTS.takeProfitPips,
       });
     });
   }, []);
@@ -57,6 +65,8 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         [KEYS.slPips, String(next.slPips)],
         [KEYS.autoCloseLimitsEnabled, String(next.autoCloseLimitsEnabled)],
         [KEYS.autoCloseLimitsPips, String(next.autoCloseLimitsPips)],
+        [KEYS.takeProfitEnabled, String(next.takeProfitEnabled)],
+        [KEYS.takeProfitPips, String(next.takeProfitPips)],
       ]);
       return next;
     });

@@ -269,7 +269,7 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders } = useTrading();
+  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition } = useTrading();
   const { settings: cascadeSettings } = useCascadeSettings();
   const cascadeSettingsRef = useRef(cascadeSettings);
   useEffect(() => { cascadeSettingsRef.current = cascadeSettings; }, [cascadeSettings]);
@@ -311,8 +311,14 @@ export default function TradeScreen() {
 
   const [isPlacing, setIsPlacing] = useState(false);
 
-  // Watcher: cancels remaining limits when 1st entry hits pip target in profit
+  // Watchers: limits-delete watcher and take-profit watcher
   const watcherRef = useRef<{
+    entryPrice: number;
+    direction: "buy" | "sell";
+    pipsTarget: number;
+    readyAt: number;
+  } | null>(null);
+  const tpWatcherRef = useRef<{
     entryPrice: number;
     direction: "buy" | "sell";
     pipsTarget: number;
@@ -320,25 +326,58 @@ export default function TradeScreen() {
   } | null>(null);
 
   useEffect(() => {
+    if (!price) return;
+    const now = Date.now();
+
+    // — Take profit watcher (close all positions + cancel all limits) —
+    const tp = tpWatcherRef.current;
+    if (tp && now >= tp.readyAt) {
+      const dist = tp.pipsTarget * 0.10;
+      const hit = tp.direction === "buy" ? price.bid >= tp.entryPrice + dist : price.ask <= tp.entryPrice - dist;
+      if (hit) {
+        tpWatcherRef.current = null;
+        watcherRef.current = null; // TP supersedes limits watcher
+        const toClose = positions;
+        const toCancel = pendingOrders;
+        console.log(`[tp-watcher] +${tp.pipsTarget}pip hit — closing ${toClose.length} position(s), cancelling ${toCancel.length} limit(s)`);
+        void Promise.all([
+          ...toClose.map((p) => closePosition(p.id)),
+          ...toCancel.map((o) => cancelOrder(o.id)),
+        ]).then(() => {
+          void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+          showToast(
+            `TP hit +${tp.pipsTarget}pip — closed ${toClose.length} position${toClose.length !== 1 ? "s" : ""}${toCancel.length > 0 ? `, deleted ${toCancel.length} limit${toCancel.length !== 1 ? "s" : ""}` : ""}`,
+            "success",
+            true
+          );
+          void refreshPendingOrders();
+        });
+        return;
+      }
+    }
+
+    // — Delete limits watcher —
     const w = watcherRef.current;
-    if (!price || !w || Date.now() < w.readyAt) return;
-    const dist = w.pipsTarget * 0.10;
-    const hit = w.direction === "buy" ? price.bid >= w.entryPrice + dist : price.ask <= w.entryPrice - dist;
-    if (!hit) return;
-    watcherRef.current = null;
-    const toCancel = pendingOrders;
-    if (toCancel.length === 0) return;
-    console.log(`[watcher] +${w.pipsTarget}pip hit — cancelling ${toCancel.length} remaining limit(s)`);
-    void Promise.all(toCancel.map((o) => cancelOrder(o.id))).then(() => {
-      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      showToast(
-        `Deleted ${toCancel.length} remaining limit${toCancel.length !== 1 ? "s" : ""} at +${w.pipsTarget}pip`,
-        "success",
-        true
-      );
-      void refreshPendingOrders();
-    });
-  }, [price, pendingOrders, cancelOrder, refreshPendingOrders, showToast]);
+    if (w && now >= w.readyAt) {
+      const dist = w.pipsTarget * 0.10;
+      const hit = w.direction === "buy" ? price.bid >= w.entryPrice + dist : price.ask <= w.entryPrice - dist;
+      if (hit) {
+        watcherRef.current = null;
+        const toCancel = pendingOrders;
+        if (toCancel.length === 0) return;
+        console.log(`[watcher] +${w.pipsTarget}pip hit — cancelling ${toCancel.length} remaining limit(s)`);
+        void Promise.all(toCancel.map((o) => cancelOrder(o.id))).then(() => {
+          void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+          showToast(
+            `Deleted ${toCancel.length} remaining limit${toCancel.length !== 1 ? "s" : ""} at +${w.pipsTarget}pip`,
+            "success",
+            true
+          );
+          void refreshPendingOrders();
+        });
+      }
+    }
+  }, [price, pendingOrders, positions, cancelOrder, closePosition, refreshPendingOrders, showToast]);
 
   // Safety valve: if isPlacing somehow gets stuck, auto-reset after 90 seconds
   useEffect(() => {
@@ -436,6 +475,15 @@ export default function TradeScreen() {
             entryPrice: mktPrice,
             direction: dir,
             pipsTarget: cs.autoCloseLimitsPips,
+            readyAt: Date.now() + 3000,
+          };
+        }
+        if (cs.takeProfitEnabled && cs.takeProfitPips > 0) {
+          console.log(`[tp-watcher] arming +${cs.takeProfitPips}pip from entry ${mktPrice}`);
+          tpWatcherRef.current = {
+            entryPrice: mktPrice,
+            direction: dir,
+            pipsTarget: cs.takeProfitPips,
             readyAt: Date.now() + 3000,
           };
         }
