@@ -1034,7 +1034,7 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
   },
   priceLabel: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: C.textSecondary, letterSpacing: 1 },
-  priceValue: { fontSize: 26, fontFamily: "Inter_700Bold", letterSpacing: 0.5, fontVariant: ["tabular-nums"] },
+  priceValue: { fontSize: 26, fontFamily: "Inter_700Bold", letterSpacing: 0.5 },
   priceSublabel: { fontSize: 10, fontFamily: "Inter_400Regular", color: C.textSecondary, textAlign: "right", marginTop: 1 },
   divider: { height: 1, backgroundColor: C.border },
   noPrice: { alignItems: "center", paddingVertical: 20, gap: 8 },
@@ -1104,7 +1104,7 @@ const styles = StyleSheet.create({
     letterSpacing: 0.8,
     textTransform: "uppercase",
   },
-  sectionHint: { fontSize: 12, fontFamily: "Inter_500Medium", color: C.textSecondary, fontVariant: ["tabular-nums"] },
+  sectionHint: { fontSize: 12, fontFamily: "Inter_500Medium", color: C.textSecondary },
   useMarketBtn: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: C.gold },
   priceInputWrap: {
     flexDirection: "row",
@@ -1159,7 +1159,7 @@ const styles = StyleSheet.create({
   slModeLabel: { fontSize: 11, fontFamily: "Inter_600SemiBold", color: C.textSecondary },
   slModeLabelActive: { color: C.gold },
   slInputArea: { gap: 8 },
-  slNote: { fontSize: 12, fontFamily: "Inter_400Regular", color: C.textSecondary, textAlign: "center", fontVariant: ["tabular-nums"] },
+  slNote: { fontSize: 12, fontFamily: "Inter_400Regular", color: C.textSecondary, textAlign: "center" },
   manualInput: {
     backgroundColor: C.surface,
     borderRadius: 12,
@@ -1221,8 +1221,8 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   riskRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  riskLabel: { fontSize: 15, fontFamily: "Inter_400Regular", color: C.textSecondary, flex: 1 },
-  riskValue: { fontSize: 17, fontFamily: "Inter_600SemiBold", color: C.text, minWidth: 130, textAlign: "right", fontVariant: ["tabular-nums"] },
+  riskLabel: { fontSize: 13, fontFamily: "Inter_400Regular", color: C.textSecondary },
+  riskValue: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: C.text },
   tradeBtn: {
     flexDirection: "row",
     alignItems: "center",
