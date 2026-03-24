@@ -274,6 +274,13 @@ export default function TradeScreen() {
   const cascadeSettingsRef = useRef(cascadeSettings);
   useEffect(() => { cascadeSettingsRef.current = cascadeSettings; }, [cascadeSettings]);
 
+  // Refs for rapidly-changing values so trade callbacks are stable (never recreate on price ticks)
+  const priceRef = useRef(price);
+  useEffect(() => { priceRef.current = price; }, [price]);
+  const isPlacingRef = useRef(false);
+  const statusRef = useRef(status);
+  useEffect(() => { statusRef.current = status; }, [status]);
+
   const [toast, setToast] = useState<ToastState>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -358,6 +365,8 @@ export default function TradeScreen() {
   const balance = accountInfo?.balance ?? 10000;
   const sl = computeSL(slMode, direction, marketEntry, slPips, slPercent, slManual, lotSize, balance);
   const riskDollars = computeRiskDollars(slMode, direction, marketEntry, slPips, slPercent, slManual, lotSize, balance);
+  const slRef = useRef(sl);
+  useEffect(() => { slRef.current = sl; }, [sl]);
 
   // Cascade levels — built from live market price (ask for buy, bid for sell)
   const cascadeMarketPrice = cascadeDirection === "buy" ? (price?.ask ?? 0) : (price?.bid ?? 0);
@@ -366,14 +375,16 @@ export default function TradeScreen() {
     : null;
 
   const handleSingleTrade = useCallback(async () => {
-    if (isPlacing) return;
-    if (status !== "connected") {
+    if (isPlacingRef.current) return;
+    if (statusRef.current !== "connected") {
       Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
       return;
     }
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    isPlacingRef.current = true;
     setIsPlacing(true);
-    const result = await placeTrade({ direction, volume: lotSize, stopLoss: sl });
+    const result = await placeTrade({ direction, volume: lotSize, stopLoss: slRef.current });
+    isPlacingRef.current = false;
     setIsPlacing(false);
     if (result.success) {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -382,28 +393,30 @@ export default function TradeScreen() {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       showToast(result.message, "error");
     }
-  }, [isPlacing, status, direction, lotSize, sl, placeTrade, showToast]);
+  }, [direction, lotSize, placeTrade, showToast]);
 
   const handleCascadeTrade = useCallback(async (dir: Direction) => {
-    console.log("[cascade] btn pressed dir=" + dir + " isPlacing=" + String(isPlacing) + " status=" + status + " ask=" + String(price?.ask) + " bid=" + String(price?.bid));
-    if (isPlacing) {
+    const p = priceRef.current;
+    console.log("[cascade] btn pressed dir=" + dir + " isPlacing=" + String(isPlacingRef.current) + " status=" + statusRef.current + " ask=" + String(p?.ask) + " bid=" + String(p?.bid));
+    if (isPlacingRef.current) {
       Alert.alert("Please Wait", "An order is already being placed. Please wait for it to complete.");
       return;
     }
-    if (status !== "connected") {
+    if (statusRef.current !== "connected") {
       Alert.alert("Not Connected", "Please connect your MT5 account in Settings first, then return here to trade.");
       return;
     }
-    const mktPrice = dir === "buy" ? (price?.ask ?? 0) : (price?.bid ?? 0);
-    if (!price || mktPrice <= 0) {
+    const mktPrice = dir === "buy" ? (p?.ask ?? 0) : (p?.bid ?? 0);
+    if (!p || mktPrice <= 0) {
       Alert.alert("No Price Yet", "Waiting for a live price from your broker. Please wait a moment, then try again.\n\nTip: tap ↻ in the top-right to force a refresh.");
       return;
     }
-    // Compute levels fresh — no stale closure dependency
-    const levels = buildCascadeLevels(mktPrice, dir, cascadeSettings);
+    const cs = cascadeSettingsRef.current;
+    const levels = buildCascadeLevels(mktPrice, dir, cs);
     const total = 1 + levels.limitEntries.length;
     console.log("[cascade] placing dir=" + dir + " vol=" + String(cascadeLotSize) + " entries=[" + levels.limitEntries.join(",") + "] sl=" + String(levels.stopLoss));
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    isPlacingRef.current = true;
     setIsPlacing(true);
     try {
       const result = await placeCascadeOrders({
@@ -417,7 +430,6 @@ export default function TradeScreen() {
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         const failNote = result.failed > 0 ? ` (${result.failed} limit${result.failed > 1 ? "s" : ""} failed)` : "";
         showToast(`${result.placed}/${total} ${dir.toUpperCase()} orders placed ✓${failNote}`, "success", true);
-        const cs = cascadeSettingsRef.current;
         if (cs.autoCloseLimitsEnabled && cs.autoCloseLimitsPips > 0) {
           console.log(`[watcher] arming +${cs.autoCloseLimitsPips}pip from entry ${mktPrice}`);
           watcherRef.current = {
@@ -435,9 +447,10 @@ export default function TradeScreen() {
       console.log("[cascade] exception: " + String(err));
       showToast(err instanceof Error ? err.message : "Cascade failed", "error");
     } finally {
+      isPlacingRef.current = false;
       setIsPlacing(false);
     }
-  }, [isPlacing, status, price, cascadeSettings, cascadeLotSize, placeCascadeOrders, showToast]);
+  }, [cascadeLotSize, placeCascadeOrders, showToast]);
 
   const webTopPad = Platform.OS === "web" ? 67 : 0;
 
