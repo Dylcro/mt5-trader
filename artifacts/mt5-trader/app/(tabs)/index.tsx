@@ -311,71 +311,94 @@ export default function TradeScreen() {
 
   const [isPlacing, setIsPlacing] = useState(false);
 
-  // Watchers: limits-delete watcher and take-profit watcher
-  const watcherRef = useRef<{
+  // Per-cascade watcher entry — each cascade gets its own entry so they never interfere
+  type WatcherEntry = {
+    id: string; // unique per cascade placement
     entryPrice: number;
     direction: "buy" | "sell";
     pipsTarget: number;
     readyAt: number;
-  } | null>(null);
-  const tpWatcherRef = useRef<{
-    entryPrice: number;
-    direction: "buy" | "sell";
-    pipsTarget: number;
-    readyAt: number;
-  } | null>(null);
+    marketPositionId?: string;
+    limitOrderIds?: string[];
+    limitPrices?: number[]; // to find filled limits that became positions
+  };
+
+  const watchersRef = useRef<WatcherEntry[]>([]); // delete-limits queue
+  const tpWatchersRef = useRef<WatcherEntry[]>([]); // take-profit queue
 
   useEffect(() => {
     if (!price) return;
     const now = Date.now();
+    const pendingOrderIds = new Set(pendingOrders.map((o) => o.id));
+    const positionIds = new Set(positions.map((p) => p.id));
 
-    // — Take profit watcher (close all positions + cancel all limits) —
-    const tp = tpWatcherRef.current;
-    if (tp && now >= tp.readyAt) {
+    // — Take profit queue —
+    const firedTpIds = new Set<string>();
+    for (const tp of tpWatchersRef.current) {
+      if (now < tp.readyAt) continue;
       const dist = tp.pipsTarget * 0.10;
       const hit = tp.direction === "buy" ? price.bid >= tp.entryPrice + dist : price.ask <= tp.entryPrice - dist;
-      if (hit) {
-        tpWatcherRef.current = null;
-        watcherRef.current = null; // TP supersedes limits watcher
-        const toClose = positions;
-        const toCancel = pendingOrders;
-        console.log(`[tp-watcher] +${tp.pipsTarget}pip hit — closing ${toClose.length} position(s), cancelling ${toCancel.length} limit(s)`);
-        void Promise.all([
-          ...toClose.map((p) => closePosition(p.id)),
-          ...toCancel.map((o) => cancelOrder(o.id)),
-        ]).then(() => {
-          void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-          showToast(
-            `TP hit +${tp.pipsTarget}pip — closed ${toClose.length} position${toClose.length !== 1 ? "s" : ""}${toCancel.length > 0 ? `, deleted ${toCancel.length} limit${toCancel.length !== 1 ? "s" : ""}` : ""}`,
-            "success",
-            true
-          );
-          void refreshPendingOrders();
-        });
-        return;
+      if (!hit) continue;
+      firedTpIds.add(tp.id);
+
+      // Positions: the market position + any filled limits (identified by limit price match)
+      const positionsToClose: string[] = [];
+      if (tp.marketPositionId && positionIds.has(tp.marketPositionId)) positionsToClose.push(tp.marketPositionId);
+      if (tp.limitPrices && tp.limitPrices.length > 0) {
+        for (const pos of positions) {
+          if (positionsToClose.includes(pos.id)) continue;
+          if (tp.limitPrices.some((lp) => Math.abs(pos.openPrice - lp) < 0.10)) positionsToClose.push(pos.id);
+        }
       }
+      // Pending orders still in queue
+      const ordersToCancel = (tp.limitOrderIds ?? []).filter((id) => pendingOrderIds.has(id));
+
+      console.log(`[tp-watcher id=${tp.id}] +${tp.pipsTarget}pip hit — closing ${positionsToClose.length} pos, cancelling ${ordersToCancel.length} limits`);
+      void Promise.all([
+        ...positionsToClose.map((id) => closePosition(id)),
+        ...ordersToCancel.map((id) => cancelOrder(id)),
+      ]).then(() => {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        const closedCount = positionsToClose.length;
+        const cancelledCount = ordersToCancel.length;
+        showToast(
+          `TP +${tp.pipsTarget}pip — closed ${closedCount} position${closedCount !== 1 ? "s" : ""}${cancelledCount > 0 ? `, deleted ${cancelledCount} limit${cancelledCount !== 1 ? "s" : ""}` : ""}`,
+          "success",
+          true
+        );
+        void refreshPendingOrders();
+      });
+    }
+    if (firedTpIds.size > 0) {
+      // Remove fired TP entries and their matching limits-delete entries
+      tpWatchersRef.current = tpWatchersRef.current.filter((tp) => !firedTpIds.has(tp.id));
+      watchersRef.current = watchersRef.current.filter((w) => !firedTpIds.has(w.id));
     }
 
-    // — Delete limits watcher —
-    const w = watcherRef.current;
-    if (w && now >= w.readyAt) {
+    // — Delete-limits queue —
+    const firedLimitIds = new Set<string>();
+    for (const w of watchersRef.current) {
+      if (now < w.readyAt) continue;
       const dist = w.pipsTarget * 0.10;
       const hit = w.direction === "buy" ? price.bid >= w.entryPrice + dist : price.ask <= w.entryPrice - dist;
-      if (hit) {
-        watcherRef.current = null;
-        const toCancel = pendingOrders;
-        if (toCancel.length === 0) return;
-        console.log(`[watcher] +${w.pipsTarget}pip hit — cancelling ${toCancel.length} remaining limit(s)`);
-        void Promise.all(toCancel.map((o) => cancelOrder(o.id))).then(() => {
-          void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-          showToast(
-            `Deleted ${toCancel.length} remaining limit${toCancel.length !== 1 ? "s" : ""} at +${w.pipsTarget}pip`,
-            "success",
-            true
-          );
-          void refreshPendingOrders();
-        });
-      }
+      if (!hit) continue;
+      firedLimitIds.add(w.id);
+
+      const ordersToCancel = (w.limitOrderIds ?? []).filter((id) => pendingOrderIds.has(id));
+      if (ordersToCancel.length === 0) continue;
+      console.log(`[watcher id=${w.id}] +${w.pipsTarget}pip hit — cancelling ${ordersToCancel.length} limit(s)`);
+      void Promise.all(ordersToCancel.map((id) => cancelOrder(id))).then(() => {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        showToast(
+          `Deleted ${ordersToCancel.length} limit${ordersToCancel.length !== 1 ? "s" : ""} at +${w.pipsTarget}pip`,
+          "success",
+          true
+        );
+        void refreshPendingOrders();
+      });
+    }
+    if (firedLimitIds.size > 0) {
+      watchersRef.current = watchersRef.current.filter((w) => !firedLimitIds.has(w.id));
     }
   }, [price, pendingOrders, positions, cancelOrder, closePosition, refreshPendingOrders, showToast]);
 
@@ -469,23 +492,34 @@ export default function TradeScreen() {
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         const failNote = result.failed > 0 ? ` (${result.failed} limit${result.failed > 1 ? "s" : ""} failed)` : "";
         showToast(`${result.placed}/${total} ${dir.toUpperCase()} orders placed ✓${failNote}`, "success", true);
+        const cascadeId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+        const limitPrices = levels.limitEntries;
+        const readyAt = Date.now() + 3000;
         if (cs.autoCloseLimitsEnabled && cs.autoCloseLimitsPips > 0) {
-          console.log(`[watcher] arming +${cs.autoCloseLimitsPips}pip from entry ${mktPrice}`);
-          watcherRef.current = {
+          console.log(`[watcher id=${cascadeId}] arming +${cs.autoCloseLimitsPips}pip from entry ${mktPrice} limitOrderIds=${JSON.stringify(result.limitOrderIds)}`);
+          watchersRef.current.push({
+            id: cascadeId,
             entryPrice: mktPrice,
             direction: dir,
             pipsTarget: cs.autoCloseLimitsPips,
-            readyAt: Date.now() + 3000,
-          };
+            readyAt,
+            marketPositionId: result.marketPositionId,
+            limitOrderIds: result.limitOrderIds,
+            limitPrices,
+          });
         }
         if (cs.takeProfitEnabled && cs.takeProfitPips > 0) {
-          console.log(`[tp-watcher] arming +${cs.takeProfitPips}pip from entry ${mktPrice}`);
-          tpWatcherRef.current = {
+          console.log(`[tp-watcher id=${cascadeId}] arming +${cs.takeProfitPips}pip from entry ${mktPrice} posId=${result.marketPositionId} limitIds=${JSON.stringify(result.limitOrderIds)}`);
+          tpWatchersRef.current.push({
+            id: cascadeId,
             entryPrice: mktPrice,
             direction: dir,
             pipsTarget: cs.takeProfitPips,
-            readyAt: Date.now() + 3000,
-          };
+            readyAt,
+            marketPositionId: result.marketPositionId,
+            limitOrderIds: result.limitOrderIds,
+            limitPrices,
+          });
         }
       } else {
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);

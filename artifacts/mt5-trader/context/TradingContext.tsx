@@ -78,7 +78,7 @@ interface TradingContextValue {
   connect: (creds?: Mt5Credentials) => Promise<void>;
   disconnect: () => Promise<void>;
   placeTrade: (params: PlaceTradeParams) => Promise<{ success: boolean; message: string }>;
-  placeCascadeOrders: (params: CascadeOrderParams) => Promise<{ success: boolean; placed: number; failed: number; message: string }>;
+  placeCascadeOrders: (params: CascadeOrderParams) => Promise<{ success: boolean; placed: number; failed: number; message: string; marketPositionId?: string; limitOrderIds?: string[] }>;
   closePosition: (positionId: string) => Promise<{ success: boolean; message: string }>;
   cancelOrder: (orderId: string) => Promise<{ success: boolean; message: string }>;
   refreshPositions: () => Promise<void>;
@@ -503,7 +503,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
   // Raw order submission — no side-effect refreshes. Used by both placeTrade and placeCascadeOrders.
   const submitOrderRaw = useCallback(
-    async (params: PlaceTradeParams): Promise<{ success: boolean; message: string }> => {
+    async (params: PlaceTradeParams): Promise<{ success: boolean; message: string; positionId?: string; orderId?: string }> => {
       let actionType: string;
       if (params.limitPrice != null) {
         actionType = params.direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT";
@@ -525,12 +525,12 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      const data = await res.json() as { success?: boolean; code?: number; message?: string };
+      const data = await res.json() as { success?: boolean; code?: number; message?: string; positionId?: string; orderId?: string };
       console.log("[submitOrderRaw] ←", actionType, "httpStatus=" + String(res.status), "success=" + String(data.success) + " code=" + String(data.code) + " msg=" + String(data.message));
       if (!res.ok || data.success === false) {
         return { success: false, message: data.message ?? `Trade failed (code ${data.code ?? res.status})` };
       }
-      return { success: true, message: data.message ?? "Trade placed successfully" };
+      return { success: true, message: data.message ?? "Trade placed successfully", positionId: data.positionId, orderId: data.orderId };
     },
     [accountId, region]
   );
@@ -553,12 +553,14 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   );
 
   const placeCascadeOrders = useCallback(
-    async (params: CascadeOrderParams): Promise<{ success: boolean; placed: number; failed: number; message: string }> => {
+    async (params: CascadeOrderParams): Promise<{ success: boolean; placed: number; failed: number; message: string; marketPositionId?: string; limitOrderIds?: string[] }> => {
       if (status !== "connected") return { success: false, placed: 0, failed: 0, message: "Not connected" };
       let placed = 0;
       let failed = 0;
       const errors: string[] = [];
       const total = 1 + params.limitEntries.length;
+      let marketPositionId: string | undefined;
+      const limitOrderIds: string[] = [];
 
       try {
         // 1. Market order first — must land before limits to guarantee fill order
@@ -568,8 +570,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           stopLoss: params.stopLoss,
           comment: `Cascade 1/${total}`,
         });
-        if (marketResult.success) placed++;
-        else { failed++; errors.push(`Market: ${marketResult.message}`); }
+        if (marketResult.success) {
+          placed++;
+          if (marketResult.positionId) marketPositionId = marketResult.positionId;
+        } else {
+          failed++;
+          errors.push(`Market: ${marketResult.message}`);
+        }
 
         // 2. All limit orders in parallel — no sequential delay needed
         if (params.limitEntries.length > 0) {
@@ -585,8 +592,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
             )
           );
           for (const r of limitResults) {
-            if (r.success) placed++;
-            else { failed++; errors.push(`Limit: ${r.message}`); }
+            if (r.success) {
+              placed++;
+              if (r.orderId) limitOrderIds.push(r.orderId);
+            } else {
+              failed++;
+              errors.push(`Limit: ${r.message}`);
+            }
           }
         }
       } catch (err) {
@@ -600,9 +612,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         return { success: false, placed, failed, message: errors[0] ?? "All orders failed to place" };
       }
       if (failed > 0) {
-        return { success: true, placed, failed, message: `${placed}/${total} placed. Failed: ${errors.join("; ")}` };
+        return { success: true, placed, failed, message: `${placed}/${total} placed. Failed: ${errors.join("; ")}`, marketPositionId, limitOrderIds };
       }
-      return { success: true, placed, failed, message: `${placed} orders placed — 1 market + ${params.limitEntries.length} limit` };
+      return { success: true, placed, failed, message: `${placed} orders placed — 1 market + ${params.limitEntries.length} limit`, marketPositionId, limitOrderIds };
     },
     [status, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo]
   );
