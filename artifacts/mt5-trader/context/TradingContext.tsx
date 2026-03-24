@@ -143,6 +143,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const positionsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const priceFailCountRef = useRef(0);
   const startPollingRef = useRef<((accId: string, accRegion: string) => void) | null>(null);
+  const reconnectInProgressRef = useRef(false);
 
   // Load saved credentials + accountId on startup and auto-reconnect
   useEffect(() => {
@@ -155,8 +156,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       if (savedAccountId) {
         setAccountIdState(savedAccountId);
         setRegionState(savedRegion);
-        // Auto-reconnect silently
-        reconnectSaved(savedAccountId);
+        // Auto-reconnect silently — guard prevents double-fire from React StrictMode
+        if (!reconnectInProgressRef.current) {
+          reconnectInProgressRef.current = true;
+          reconnectSaved(savedAccountId).finally(() => { reconnectInProgressRef.current = false; });
+        }
       }
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -216,6 +220,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         accountId?: string;
         region?: string;
       } & Partial<AccountInfo>;
+      // 404 = account deleted on MetaAPI side — must re-register
+      if (res.status === 404) {
+        setStatus("disconnected");
+        setAccountIdState("");
+        await AsyncStorage.removeItem("mt5_account_id");
+        return;
+      }
       if (!res.ok || data.error) throw new Error(data.error ?? "Reconnect failed");
 
       const accId = data.accountId ?? savedId;
@@ -237,10 +248,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         // status === "deploying" — poll
         await pollUntilConnected(accId, accRegion);
       }
-    } catch {
+    } catch (err) {
+      // Transient error (network blip, timeout) — leave accountId intact so
+      // the user can retry without re-entering credentials.
+      console.warn("[reconnect] failed:", String(err));
       setStatus("disconnected");
-      setAccountIdState("");
-      await AsyncStorage.removeItem("mt5_account_id");
     }
   };
 

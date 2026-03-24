@@ -268,7 +268,7 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice } = useTrading();
+  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect } = useTrading();
   const { settings: cascadeSettings } = useCascadeSettings();
 
   const [toast, setToast] = useState<ToastState>(null);
@@ -419,10 +419,19 @@ export default function TradeScreen() {
       <View style={styles.header}>
         <View style={styles.headerLeft}>
           <Text style={styles.symbol}>XAUUSD</Text>
-          <View style={styles.liveDot}>
-            <Animated.View style={[styles.dot, { opacity: status === "connected" ? blinkAnim : 0.2 }]} />
-            <Text style={styles.liveLabel}>{status === "connected" ? "LIVE" : status.toUpperCase()}</Text>
-          </View>
+          <Pressable
+            onPress={() => {
+              if (status === "disconnected") connect();
+            }}
+            hitSlop={12}
+          >
+            <View style={styles.liveDot}>
+              <Animated.View style={[styles.dot, { opacity: status === "connected" ? blinkAnim : 0.2, backgroundColor: status === "connected" ? C.buy : status === "connecting" ? C.gold : C.sell }]} />
+              <Text style={[styles.liveLabel, status === "disconnected" && { color: C.sell }]}>
+                {status === "connected" ? "LIVE" : status === "disconnected" ? "TAP TO RECONNECT" : status.toUpperCase()}
+              </Text>
+            </View>
+          </Pressable>
         </View>
         <Pressable onPress={refreshPrice} hitSlop={12}>
           <Feather name="refresh-cw" size={18} color={C.textSecondary} />
@@ -565,11 +574,10 @@ export default function TradeScreen() {
               style={({ pressed }) => [
                 styles.tradeBtn,
                 cascadeDirection === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
-                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
+                pressed && !isPlacing && { opacity: 0.85, transform: [{ scale: 0.98 }] },
                 (status !== "connected" || isPlacing) && { opacity: 0.45 },
               ]}
               onPress={() => handleCascadeTrade(cascadeDirection)}
-              disabled={status !== "connected" || isPlacing}
             >
               {isPlacing ? (
                 <ActivityIndicator color={cascadeDirection === "buy" ? "#000" : "#fff"} />
