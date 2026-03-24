@@ -65,7 +65,7 @@ function buildHtml(apiBase: string, accountId: string, region: string): string {
       window.addEventListener("resize", resize);
       resize();
       load(tf);
-      timer = setInterval(function() { load(tf); }, 30000);
+      timer = setInterval(function() { load(tf); }, 8000);
     }
 
     function resize() {
@@ -78,7 +78,12 @@ function buildHtml(apiBase: string, accountId: string, region: string): string {
         var r = await fetch(API + "/mt5/account/" + ACC + "/candles?region=" + REG + "&timeframe=" + t + "&limit=150");
         if (!r.ok) throw new Error("bad response");
         var data = await r.json();
-        if (!Array.isArray(data) || data.length === 0) throw new Error("empty");
+        if (!Array.isArray(data)) throw new Error("invalid");
+        if (data.length === 0) {
+          document.getElementById("msg").textContent = "Building chart \u2014 prices accumulate every 5s\u2026";
+          document.getElementById("msg").style.display = "flex";
+          return;
+        }
         var candles = data.map(function(c) {
           return {
             time: Math.floor(new Date(c.time).getTime() / 1000),
@@ -104,7 +109,7 @@ function buildHtml(apiBase: string, accountId: string, region: string): string {
         document.getElementById("msg").textContent = "Loading\u2026";
         document.getElementById("msg").style.display = "flex";
         load(tf);
-        timer = setInterval(function() { load(tf); }, 30000);
+        timer = setInterval(function() { load(tf); }, 8000);
       });
     });
 

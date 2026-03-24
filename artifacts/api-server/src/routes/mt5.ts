@@ -2,6 +2,47 @@ import { Router, type IRouter, type Request, type Response } from "express";
 
 const router: IRouter = Router();
 
+// ── In-memory tick store ────────────────────────────────────────────────────
+// Every price poll is stored here; candles are aggregated on demand.
+interface PriceTick { time: number; bid: number; ask: number; }
+interface OhlcCandle { time: string; open: number; high: number; low: number; close: number; }
+
+const tickStore = new Map<string, PriceTick[]>(); // accountId → ticks
+const MAX_TICKS = 3000; // ~4 hours of 5-second ticks
+
+function storeTick(accountId: string, bid: number, ask: number) {
+  if (!tickStore.has(accountId)) tickStore.set(accountId, []);
+  const ticks = tickStore.get(accountId)!;
+  ticks.push({ time: Date.now(), bid, ask });
+  if (ticks.length > MAX_TICKS) ticks.splice(0, ticks.length - MAX_TICKS);
+}
+
+const TF_MS: Record<string, number> = {
+  "1m": 60_000, "5m": 300_000, "15m": 900_000,
+  "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000,
+};
+
+function buildCandles(accountId: string, timeframe: string, limit: number): OhlcCandle[] {
+  const ticks = tickStore.get(accountId) ?? [];
+  const msPerBar = TF_MS[timeframe] ?? 300_000;
+  const map = new Map<number, OhlcCandle>();
+  for (const t of ticks) {
+    const barStart = Math.floor(t.time / msPerBar) * msPerBar;
+    const mid = parseFloat(((t.bid + t.ask) / 2).toFixed(2));
+    const existing = map.get(barStart);
+    if (existing) {
+      existing.high  = parseFloat(Math.max(existing.high, mid).toFixed(2));
+      existing.low   = parseFloat(Math.min(existing.low,  mid).toFixed(2));
+      existing.close = mid;
+    } else {
+      map.set(barStart, { time: new Date(barStart).toISOString(), open: mid, high: mid, low: mid, close: mid });
+    }
+  }
+  return Array.from(map.values())
+    .sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime())
+    .slice(-limit);
+}
+
 const PROVISIONING_BASE = "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai";
 const CLIENT_DOMAIN = "agiliumtrade.ai";
 const DEFAULT_REGION = "london";
@@ -402,21 +443,12 @@ router.get("/mt5/account/:accountId/info", async (req: Request, res: Response) =
 });
 
 // GET /api/mt5/account/:accountId/candles?region=london&timeframe=5m&limit=150
-router.get("/mt5/account/:accountId/candles", async (req: Request, res: Response) => {
-  try {
-    const token = getToken();
-    const region = qstr(req.query.region) || DEFAULT_REGION;
-    const timeframe = qstr(req.query.timeframe) || "5m";
-    const limit = Math.min(parseInt(qstr(req.query.limit) || "150", 10) || 150, 500);
-    const candleRes = await fetch(
-      `${clientBase(region)}/users/current/accounts/${req.params.accountId}/historical-market-data/symbols/XAUUSD/timeframes/${timeframe}/candles?limit=${limit}`,
-      { headers: authHeaders(token) }
-    );
-    if (!candleRes.ok) return res.status(candleRes.status).json({ error: "Candles fetch failed" });
-    return res.json(await candleRes.json());
-  } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
-  }
+// Candles are built from live price ticks accumulated by the /price endpoint.
+router.get("/mt5/account/:accountId/candles", (req: Request, res: Response) => {
+  const timeframe = qstr(req.query.timeframe) || "5m";
+  const limit = Math.min(parseInt(qstr(req.query.limit) || "150", 10) || 150, 500);
+  const candles = buildCandles(req.params.accountId, timeframe, limit);
+  return res.json(candles);
 });
 
 // GET /api/mt5/account/:accountId/price?region=london
@@ -429,7 +461,10 @@ router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) 
       { headers: authHeaders(token) }
     );
     if (!priceRes.ok) return res.status(priceRes.status).json({ error: "Price fetch failed" });
-    return res.json(await priceRes.json());
+    const priceData = await priceRes.json() as { bid?: number; ask?: number };
+    // Accumulate tick for chart history
+    if (priceData.bid && priceData.ask) storeTick(req.params.accountId, priceData.bid, priceData.ask);
+    return res.json(priceData);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
   }
