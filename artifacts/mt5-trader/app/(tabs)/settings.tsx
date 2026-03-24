@@ -540,24 +540,31 @@ export default function SettingsScreen() {
             <View style={styles.cascadeDivider} />
 
             {/* Take Profit */}
-            <PillSelector
-              label="Take profit"
-              hint={
-                cs.takeProfitEnabled
-                  ? `Close all positions at +${cs.takeProfitPips} pips (£${(cs.takeProfitPips * 0.10).toFixed(2)}) from 1st entry`
-                  : "Disabled — no automatic close on profit"
-              }
-              options={[0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]}
-              value={cs.takeProfitEnabled ? cs.takeProfitPips : 0}
-              labels={{ 0: "Off" }}
-              onChange={(v) => {
-                if (v === 0) {
-                  updateSettings({ takeProfitEnabled: false });
-                } else {
-                  updateSettings({ takeProfitEnabled: true, takeProfitPips: v });
-                }
-              }}
-            />
+            <View style={styles.settingRow}>
+              <Switch
+                value={cs.takeProfitEnabled}
+                onValueChange={(v) => {
+                  void Haptics.selectionAsync();
+                  updateSettings({ takeProfitEnabled: v });
+                }}
+                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
+                thumbColor={cs.takeProfitEnabled ? C.gold : C.textMuted}
+              />
+              <Text style={[styles.settingLabel, { marginLeft: 10, flex: 1 }]}>Take profit level</Text>
+            </View>
+
+            {cs.takeProfitEnabled && (
+              <>
+                <View style={styles.cascadeDivider} />
+                <PillSelector
+                  label="Take profit"
+                  hint={`Close all positions at +${cs.takeProfitPips} pips (£${(cs.takeProfitPips * 0.10).toFixed(2)}) from 1st entry`}
+                  options={[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]}
+                  value={cs.takeProfitPips}
+                  onChange={(v) => updateSettings({ takeProfitPips: v })}
+                />
+              </>
+            )}
 
             <View style={styles.cascadePreviewBox}>
               <Text style={styles.cascadePreviewTitle}>Preview with current settings (buy example)</Text>
