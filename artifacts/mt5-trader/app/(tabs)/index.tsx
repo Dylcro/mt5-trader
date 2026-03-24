@@ -957,6 +957,7 @@ export default function TradeScreen() {
                 direction === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
                 pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
                 isPlacing && { opacity: 0.6 },
+                { flexDirection: "column", gap: 2 },
               ]}
               onPress={handleSingleTrade}
               disabled={isPlacing}
@@ -965,14 +966,26 @@ export default function TradeScreen() {
                 <ActivityIndicator color={direction === "buy" ? "#000" : "#fff"} />
               ) : (
                 <>
-                  <Feather
-                    name={direction === "buy" ? "trending-up" : "trending-down"}
-                    size={20}
-                    color={direction === "buy" ? "#000" : "#fff"}
-                  />
-                  <Text style={[styles.tradeBtnText, direction === "buy" ? { color: "#000" } : { color: "#fff" }]}>
-                    {direction === "buy" ? "BUY XAUUSD" : "SELL XAUUSD"}
-                  </Text>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                    <Feather
+                      name={direction === "buy" ? "trending-up" : "trending-down"}
+                      size={20}
+                      color={direction === "buy" ? "#000" : "#fff"}
+                    />
+                    <Text style={[styles.tradeBtnText, direction === "buy" ? { color: "#000" } : { color: "#fff" }]}>
+                      {direction === "buy" ? "BUY XAUUSD" : "SELL XAUUSD"}
+                    </Text>
+                  </View>
+                  {price != null && (
+                    <Text style={{
+                      fontSize: 18,
+                      fontFamily: "Inter_700Bold",
+                      color: direction === "buy" ? "rgba(0,0,0,0.75)" : "rgba(255,255,255,0.75)",
+                      letterSpacing: 0.5,
+                    }}>
+                      {formatPrice(direction === "buy" ? price.ask : price.bid)}
+                    </Text>
+                  )}
                 </>
               )}
             </Pressable>
@@ -1221,8 +1234,8 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   riskRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  riskLabel: { fontSize: 13, fontFamily: "Inter_400Regular", color: C.textSecondary },
-  riskValue: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: C.text },
+  riskLabel: { fontSize: 15, fontFamily: "Inter_400Regular", color: C.textSecondary },
+  riskValue: { fontSize: 17, fontFamily: "Inter_600SemiBold", color: C.text },
   tradeBtn: {
     flexDirection: "row",
     alignItems: "center",
