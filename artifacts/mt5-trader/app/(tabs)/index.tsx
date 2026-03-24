@@ -976,16 +976,19 @@ export default function TradeScreen() {
                       {direction === "buy" ? "BUY XAUUSD" : "SELL XAUUSD"}
                     </Text>
                   </View>
-                  {price != null && (
-                    <Text style={{
-                      fontSize: 18,
-                      fontFamily: "Inter_700Bold",
-                      color: direction === "buy" ? "rgba(0,0,0,0.75)" : "rgba(255,255,255,0.75)",
-                      letterSpacing: 0.5,
-                    }}>
-                      {formatPrice(direction === "buy" ? price.ask : price.bid)}
-                    </Text>
-                  )}
+                  <Text style={{
+                    fontSize: 18,
+                    fontFamily: "Inter_700Bold",
+                    color: price != null
+                      ? (direction === "buy" ? "rgba(0,0,0,0.75)" : "rgba(255,255,255,0.75)")
+                      : "transparent",
+                    letterSpacing: 0.5,
+                    fontVariant: ["tabular-nums"],
+                  }}>
+                    {price != null
+                      ? formatPrice(direction === "buy" ? price.ask : price.bid)
+                      : "0000.00"}
+                  </Text>
                 </>
               )}
             </Pressable>
@@ -1047,7 +1050,7 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
   },
   priceLabel: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: C.textSecondary, letterSpacing: 1 },
-  priceValue: { fontSize: 26, fontFamily: "Inter_700Bold", letterSpacing: 0.5 },
+  priceValue: { fontSize: 26, fontFamily: "Inter_700Bold", letterSpacing: 0.5, fontVariant: ["tabular-nums"] },
   priceSublabel: { fontSize: 10, fontFamily: "Inter_400Regular", color: C.textSecondary, textAlign: "right", marginTop: 1 },
   divider: { height: 1, backgroundColor: C.border },
   noPrice: { alignItems: "center", paddingVertical: 20, gap: 8 },
@@ -1117,7 +1120,7 @@ const styles = StyleSheet.create({
     letterSpacing: 0.8,
     textTransform: "uppercase",
   },
-  sectionHint: { fontSize: 12, fontFamily: "Inter_500Medium", color: C.textSecondary },
+  sectionHint: { fontSize: 12, fontFamily: "Inter_500Medium", color: C.textSecondary, fontVariant: ["tabular-nums"] },
   useMarketBtn: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: C.gold },
   priceInputWrap: {
     flexDirection: "row",
@@ -1172,7 +1175,7 @@ const styles = StyleSheet.create({
   slModeLabel: { fontSize: 11, fontFamily: "Inter_600SemiBold", color: C.textSecondary },
   slModeLabelActive: { color: C.gold },
   slInputArea: { gap: 8 },
-  slNote: { fontSize: 12, fontFamily: "Inter_400Regular", color: C.textSecondary, textAlign: "center" },
+  slNote: { fontSize: 12, fontFamily: "Inter_400Regular", color: C.textSecondary, textAlign: "center", fontVariant: ["tabular-nums"] },
   manualInput: {
     backgroundColor: C.surface,
     borderRadius: 12,
@@ -1234,8 +1237,8 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   riskRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  riskLabel: { fontSize: 15, fontFamily: "Inter_400Regular", color: C.textSecondary },
-  riskValue: { fontSize: 17, fontFamily: "Inter_600SemiBold", color: C.text },
+  riskLabel: { fontSize: 15, fontFamily: "Inter_400Regular", color: C.textSecondary, flex: 1 },
+  riskValue: { fontSize: 17, fontFamily: "Inter_600SemiBold", color: C.text, minWidth: 130, textAlign: "right", fontVariant: ["tabular-nums"] },
   tradeBtn: {
     flexDirection: "row",
     alignItems: "center",
