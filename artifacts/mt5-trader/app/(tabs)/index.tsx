@@ -618,6 +618,37 @@ export default function TradeScreen() {
               <PriceRow label="ASK" value={formatPrice(price.ask)} color={C.buy} sublabel="Buy at" />
               <View style={styles.divider} />
               <PriceRow label="SPREAD" value={`${price.spread} pips`} color={C.textSecondary} />
+              {tradeMode === "single" && (
+                <>
+                  <View style={styles.divider} />
+                  <Pressable
+                    style={({ pressed }) => [
+                      styles.tradeBtn,
+                      direction === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
+                      { marginTop: 4, marginBottom: 0 },
+                      pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
+                      isPlacing && { opacity: 0.6 },
+                    ]}
+                    onPress={handleSingleTrade}
+                    disabled={isPlacing}
+                  >
+                    {isPlacing ? (
+                      <ActivityIndicator color={direction === "buy" ? "#000" : "#fff"} />
+                    ) : (
+                      <>
+                        <Feather
+                          name={direction === "buy" ? "trending-up" : "trending-down"}
+                          size={20}
+                          color={direction === "buy" ? "#000" : "#fff"}
+                        />
+                        <Text style={[styles.tradeBtnText, direction === "buy" ? { color: "#000" } : { color: "#fff" }]}>
+                          {direction === "buy" ? "BUY XAUUSD" : "SELL XAUUSD"}
+                        </Text>
+                      </>
+                    )}
+                  </Pressable>
+                </>
+              )}
               {priceError && (
                 <View style={styles.priceErrorBanner}>
                   <Feather name="wifi-off" size={12} color={C.sell} />
@@ -805,7 +836,16 @@ export default function TradeScreen() {
               </View>
             )}
 
-            {/* Direction Toggle */}
+            {/* Lot Size */}
+            <View style={styles.sectionCard}>
+              <View style={styles.sectionHeader}>
+                <Text style={styles.sectionTitle}>Lot Size</Text>
+                <Text style={styles.sectionHint}>1 lot = 100 oz gold</Text>
+              </View>
+              <StepInput value={lotSize} onChange={setLotSize} step={0.01} min={0.01} max={100} decimals={2} />
+            </View>
+
+            {/* Direction Toggle — sits below lot size */}
             <View style={styles.directionRow}>
               <Pressable
                 style={[styles.dirBtn, direction === "buy" && styles.dirBtnBuyActive]}
@@ -825,15 +865,6 @@ export default function TradeScreen() {
                   SELL
                 </Text>
               </Pressable>
-            </View>
-
-            {/* Lot Size */}
-            <View style={styles.sectionCard}>
-              <View style={styles.sectionHeader}>
-                <Text style={styles.sectionTitle}>Lot Size</Text>
-                <Text style={styles.sectionHint}>1 lot = 100 oz gold</Text>
-              </View>
-              <StepInput value={lotSize} onChange={setLotSize} step={0.01} min={0.01} max={100} decimals={2} />
             </View>
 
             {/* Stop Loss */}
@@ -947,32 +978,6 @@ export default function TradeScreen() {
               </View>
             )}
 
-            {/* Trade Button */}
-            <Pressable
-              style={({ pressed }) => [
-                styles.tradeBtn,
-                direction === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
-                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
-                isPlacing && { opacity: 0.6 },
-              ]}
-              onPress={handleSingleTrade}
-              disabled={isPlacing}
-            >
-              {isPlacing ? (
-                <ActivityIndicator color={direction === "buy" ? "#000" : "#fff"} />
-              ) : (
-                <>
-                  <Feather
-                    name={direction === "buy" ? "trending-up" : "trending-down"}
-                    size={20}
-                    color={direction === "buy" ? "#000" : "#fff"}
-                  />
-                  <Text style={[styles.tradeBtnText, direction === "buy" ? { color: "#000" } : { color: "#fff" }]}>
-                    {direction === "buy" ? "BUY XAUUSD" : "SELL XAUUSD"}
-                  </Text>
-                </>
-              )}
-            </Pressable>
           </>
         )}
       </ScrollView>
