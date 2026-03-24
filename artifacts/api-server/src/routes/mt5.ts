@@ -67,22 +67,26 @@ const pricePollTimers = new Map<string, ReturnType<typeof setInterval>>();
 function startPricePoller(accountId: string, region: string, token: string) {
   const key = `${accountId}:${region}`;
   if (pricePollTimers.has(key)) return; // already running
+  let inFlight = false;
   const run = async () => {
+    if (inFlight) return; // skip interval if previous fetch still in progress
+    inFlight = true;
     try {
       const r = await fetch(
         `${clientBase(region)}/users/current/accounts/${accountId}/symbols/XAUUSD/current-price`,
-        { headers: authHeaders(token), signal: AbortSignal.timeout(3000) }
+        { headers: authHeaders(token), signal: AbortSignal.timeout(2000) }
       );
-      if (!r.ok) return;
+      if (!r.ok) { inFlight = false; return; }
       const d = await r.json() as { bid?: number; ask?: number };
       if (d.bid && d.ask) {
         priceCache.set(key, { bid: d.bid, ask: d.ask, fetchedAt: Date.now() });
         storeTick(accountId, d.bid, d.ask);
       }
     } catch { /* ignore transient errors */ }
+    inFlight = false;
   };
   void run(); // immediate first fetch
-  pricePollTimers.set(key, setInterval(run, 100));
+  pricePollTimers.set(key, setInterval(run, 200));
 }
 
 function stopPricePoller(accountId: string, region: string) {
@@ -499,9 +503,9 @@ router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) 
     // Start background poller on first request for this account (idempotent)
     startPricePoller(accountId, region, token);
 
-    // Return from cache if fresh (≤ 200ms old) — avoids MetaAPI RTT on hot path
+    // Return from cache if fresh (≤ 400ms old) — avoids MetaAPI RTT on hot path
     const cached = priceCache.get(key);
-    if (cached && Date.now() - cached.fetchedAt <= 200) {
+    if (cached && Date.now() - cached.fetchedAt <= 400) {
       return res.json({ bid: cached.bid, ask: cached.ask });
     }
 

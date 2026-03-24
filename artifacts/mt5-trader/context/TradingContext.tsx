@@ -271,7 +271,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const fetchPriceData = useCallback(async (accId: string, accRegion: string): Promise<Price> => {
-    const res = await fetch(`${API_BASE}/mt5/account/${accId}/price?region=${accRegion}`);
+    const res = await fetch(`${API_BASE}/mt5/account/${accId}/price?region=${accRegion}`, {
+      signal: AbortSignal.timeout(3000),
+    });
     if (!res.ok) throw new Error(`Price fetch failed: ${res.status}`);
     const data = await res.json() as { bid?: number; ask?: number; time?: string };
     const bid = data.bid ?? 0;
@@ -353,7 +355,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           .then((p) => { priceFailCountRef.current = 0; setPriceError(false); setPrice(p); })
           .catch(() => {
             priceFailCountRef.current += 1;
-            if (priceFailCountRef.current >= 3) setPriceError(true);
+            if (priceFailCountRef.current >= 10) setPriceError(true);
           });
 
       const pollPositions = () =>
