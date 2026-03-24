@@ -5,24 +5,18 @@ export interface CascadeSettings {
   numPositions: number;
   pipsBetween: number;
   slPips: number;
-  autoCloseLimitsEnabled: boolean;
-  autoCloseLimitsPips: number;
 }
 
 const DEFAULTS: CascadeSettings = {
   numPositions: 3,
   pipsBetween: 50,
   slPips: 100,
-  autoCloseLimitsEnabled: false,
-  autoCloseLimitsPips: 10,
 };
 
 const KEYS = {
   numPositions: "cascade_num_positions",
   pipsBetween: "cascade_pips_between",
   slPips: "cascade_sl_pips",
-  autoCloseLimitsEnabled: "cascade_auto_close_enabled",
-  autoCloseLimitsPips: "cascade_auto_close_pips",
 };
 
 interface CascadeSettingsContextValue {
@@ -37,13 +31,11 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
 
   useEffect(() => {
     AsyncStorage.multiGet(Object.values(KEYS)).then((pairs) => {
-      const [num, between, sl, autoClose, autoClosePips] = pairs.map((p) => p[1]);
+      const [num, between, sl] = pairs.map((p) => p[1]);
       setSettings({
         numPositions: num ? parseFloat(num) : DEFAULTS.numPositions,
         pipsBetween: between ? parseFloat(between) : DEFAULTS.pipsBetween,
         slPips: sl ? parseFloat(sl) : DEFAULTS.slPips,
-        autoCloseLimitsEnabled: autoClose === "true",
-        autoCloseLimitsPips: autoClosePips ? parseFloat(autoClosePips) : DEFAULTS.autoCloseLimitsPips,
       });
     });
   }, []);
@@ -55,8 +47,6 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         [KEYS.numPositions, String(next.numPositions)],
         [KEYS.pipsBetween, String(next.pipsBetween)],
         [KEYS.slPips, String(next.slPips)],
-        [KEYS.autoCloseLimitsEnabled, String(next.autoCloseLimitsEnabled)],
-        [KEYS.autoCloseLimitsPips, String(next.autoCloseLimitsPips)],
       ]);
       return next;
     });
