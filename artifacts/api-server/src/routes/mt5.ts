@@ -322,6 +322,16 @@ router.get("/mt5/account/:accountId/status", async (req: Request, res: Response)
       return res.status(503).json({ connectionStatus: "DEPLOY_FAILED", error: "Deployment failed. Check your credentials and server." });
     }
 
+    // If the account is UNDEPLOYED (e.g. after a server restart or MetaAPI idle timeout),
+    // re-trigger deployment so the client doesn't get stuck polling forever.
+    if (acct.state === "UNDEPLOYED") {
+      console.log(`[status] account ${accountId} is UNDEPLOYED — re-triggering deploy`);
+      await deployAccount(token, accountId).catch((e) =>
+        console.warn(`[status] re-deploy failed:`, (e as Error).message)
+      );
+      return res.json({ connectionStatus: "DEPLOYING", state: "DEPLOYING" });
+    }
+
     return res.json({ connectionStatus: acct.connectionStatus ?? "DEPLOYING", state: acct.state });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Status check failed" });
