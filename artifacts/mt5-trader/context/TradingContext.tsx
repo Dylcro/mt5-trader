@@ -81,7 +81,6 @@ interface TradingContextValue {
   placeCascadeOrders: (params: CascadeOrderParams) => Promise<{ success: boolean; placed: number; failed: number; message: string; marketPositionId?: string; limitOrderIds?: string[] }>;
   closePosition: (positionId: string) => Promise<{ success: boolean; message: string }>;
   cancelOrder: (orderId: string) => Promise<{ success: boolean; message: string }>;
-  modifyPosition: (positionId: string, stopLoss: number, takeProfit?: number) => Promise<{ success: boolean; message: string }>;
   refreshPositions: () => Promise<void>;
   refreshPendingOrders: () => Promise<void>;
   refreshPrice: () => Promise<void>;
@@ -553,28 +552,6 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     [accountId, region]
   );
 
-  const modifyPosition = useCallback(
-    async (positionId: string, stopLoss: number, takeProfit?: number): Promise<{ success: boolean; message: string }> => {
-      if (status !== "connected") return { success: false, message: "Not connected" };
-      try {
-        const body: Record<string, unknown> = { actionType: "POSITION_MODIFY", positionId, stopLoss };
-        if (takeProfit != null) body.takeProfit = takeProfit;
-        const res = await fetch(`${API_BASE}/mt5/account/${accountId}/trade?region=${region}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        const data = await res.json() as { success?: boolean; message?: string };
-        console.log(`[modifyPosition] posId=${positionId} sl=${stopLoss} http=${res.status} success=${String(data.success)} msg=${String(data.message)}`);
-        if (res.ok && data.success !== false) return { success: true, message: "SL updated" };
-        return { success: false, message: data.message ?? "Modify failed" };
-      } catch (err) {
-        return { success: false, message: err instanceof Error ? err.message : "Modify failed" };
-      }
-    },
-    [accountId, region, status]
-  );
-
   const placeTrade = useCallback(
     async (params: PlaceTradeParams): Promise<{ success: boolean; message: string }> => {
       if (status !== "connected") return { success: false, message: "Not connected" };
@@ -723,7 +700,6 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         placeCascadeOrders,
         closePosition,
         cancelOrder,
-        modifyPosition,
         refreshPositions,
         refreshPendingOrders,
         refreshPrice,
