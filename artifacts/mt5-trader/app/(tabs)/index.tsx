@@ -488,11 +488,13 @@ export default function TradeScreen() {
         const cascadeId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
         const limitPrices = levels.limitEntries;
         const readyAt = Date.now() + 3000;
+        // Use bid for BUY watcher, ask for SELL — so trigger fires at exactly N pips of market movement
+        const watcherEntryPrice = dir === "buy" ? (p?.bid ?? mktPrice) : (p?.ask ?? mktPrice);
         if (cs.autoCloseLimitsEnabled && cs.autoCloseLimitsPips > 0) {
-          console.log(`[watcher id=${cascadeId}] arming +${cs.autoCloseLimitsPips}pip from entry ${mktPrice} limitOrderIds=${JSON.stringify(result.limitOrderIds)}`);
+          console.log(`[watcher id=${cascadeId}] arming +${cs.autoCloseLimitsPips}pip from entry ${watcherEntryPrice} (${dir}) limitOrderIds=${JSON.stringify(result.limitOrderIds)}`);
           watchersRef.current.push({
             id: cascadeId,
-            entryPrice: mktPrice,
+            entryPrice: watcherEntryPrice,
             direction: dir,
             pipsTarget: cs.autoCloseLimitsPips,
             readyAt,
@@ -502,10 +504,10 @@ export default function TradeScreen() {
           });
         }
         if (cs.takeProfitEnabled && cs.takeProfitPips > 0) {
-          console.log(`[tp-watcher id=${cascadeId}] arming +${cs.takeProfitPips}pip from entry ${mktPrice} posId=${result.marketPositionId} limitIds=${JSON.stringify(result.limitOrderIds)}`);
+          console.log(`[tp-watcher id=${cascadeId}] arming +${cs.takeProfitPips}pip from entry ${watcherEntryPrice} (${dir}) posId=${result.marketPositionId} limitIds=${JSON.stringify(result.limitOrderIds)}`);
           tpWatchersRef.current.push({
             id: cascadeId,
-            entryPrice: mktPrice,
+            entryPrice: watcherEntryPrice,
             direction: dir,
             pipsTarget: cs.takeProfitPips,
             readyAt,
