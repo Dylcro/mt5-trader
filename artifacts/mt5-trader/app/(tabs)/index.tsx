@@ -269,7 +269,7 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region } = useTrading();
+  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders } = useTrading();
   const { settings: cascadeSettings } = useCascadeSettings();
 
   const [toast, setToast] = useState<ToastState>(null);
@@ -301,6 +301,35 @@ export default function TradeScreen() {
   const [cascadeLotSize, setCascadeLotSize] = useState(0.01);
 
   const [isPlacing, setIsPlacing] = useState(false);
+
+  // Watcher: cancels remaining limits when 1st entry hits pip target in profit
+  const watcherRef = useRef<{
+    entryPrice: number;
+    direction: "buy" | "sell";
+    pipsTarget: number;
+    readyAt: number;
+  } | null>(null);
+
+  useEffect(() => {
+    const w = watcherRef.current;
+    if (!price || !w || Date.now() < w.readyAt) return;
+    const dist = w.pipsTarget * 0.10;
+    const hit = w.direction === "buy" ? price.bid >= w.entryPrice + dist : price.ask <= w.entryPrice - dist;
+    if (!hit) return;
+    watcherRef.current = null;
+    const toCancel = pendingOrders;
+    if (toCancel.length === 0) return;
+    console.log(`[watcher] +${w.pipsTarget}pip hit — cancelling ${toCancel.length} remaining limit(s)`);
+    void Promise.all(toCancel.map((o) => cancelOrder(o.id))).then(() => {
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      showToast(
+        `Deleted ${toCancel.length} remaining limit${toCancel.length !== 1 ? "s" : ""} at +${w.pipsTarget}pip`,
+        "success",
+        true
+      );
+      void refreshPendingOrders();
+    });
+  }, [price, pendingOrders, cancelOrder, refreshPendingOrders, showToast]);
 
   // Safety valve: if isPlacing somehow gets stuck, auto-reset after 90 seconds
   useEffect(() => {
@@ -386,6 +415,14 @@ export default function TradeScreen() {
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         const failNote = result.failed > 0 ? ` (${result.failed} limit${result.failed > 1 ? "s" : ""} failed)` : "";
         showToast(`${result.placed}/${total} ${dir.toUpperCase()} orders placed ✓${failNote}`, "success", true);
+        if (cascadeSettings.autoCloseLimitsEnabled && cascadeSettings.autoCloseLimitsPips > 0) {
+          watcherRef.current = {
+            entryPrice: mktPrice,
+            direction: dir,
+            pipsTarget: cascadeSettings.autoCloseLimitsPips,
+            readyAt: Date.now() + 3000,
+          };
+        }
       } else {
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
         showToast(result.message, "error");

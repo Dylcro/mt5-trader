@@ -82,6 +82,7 @@ interface TradingContextValue {
   closePosition: (positionId: string) => Promise<{ success: boolean; message: string }>;
   cancelOrder: (orderId: string) => Promise<{ success: boolean; message: string }>;
   refreshPositions: () => Promise<void>;
+  refreshPendingOrders: () => Promise<void>;
   refreshPrice: () => Promise<void>;
   refreshAccountInfo: () => Promise<void>;
 }
@@ -666,6 +667,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         closePosition,
         cancelOrder,
         refreshPositions,
+        refreshPendingOrders,
         refreshPrice,
         refreshAccountInfo,
       }}

@@ -500,6 +500,40 @@ export default function SettingsScreen() {
               hint={`${(cs.slPips * 0.10).toFixed(2)} below market entry — shared by all orders`}
             />
 
+            <View style={styles.cascadeDivider} />
+
+            {/* Delete remaining limits at profit target */}
+            <View style={styles.settingRow}>
+              <View style={styles.settingRowLeft}>
+                <Text style={styles.settingLabel}>Delete limits at profit target</Text>
+                <Text style={styles.settingHint}>
+                  Cancels any remaining limit orders when the 1st entry is X pips in profit
+                </Text>
+              </View>
+              <Switch
+                value={cs.autoCloseLimitsEnabled}
+                onValueChange={(v) => {
+                  void Haptics.selectionAsync();
+                  updateSettings({ autoCloseLimitsEnabled: v });
+                }}
+                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
+                thumbColor={cs.autoCloseLimitsEnabled ? C.gold : C.textMuted}
+              />
+            </View>
+
+            {cs.autoCloseLimitsEnabled && (
+              <>
+                <View style={styles.cascadeDivider} />
+                <PillSelector
+                  label="Pip trigger from 1st entry"
+                  hint={`Delete remaining limits when +${cs.autoCloseLimitsPips} pips ($${(cs.autoCloseLimitsPips * 0.10).toFixed(2)}) from 1st entry`}
+                  options={[5, 10, 15, 20, 25, 30, 40, 50]}
+                  value={cs.autoCloseLimitsPips}
+                  onChange={(v) => updateSettings({ autoCloseLimitsPips: v })}
+                />
+              </>
+            )}
+
             <View style={styles.cascadePreviewBox}>
               <Text style={styles.cascadePreviewTitle}>Preview with current settings (buy example)</Text>
               <Text style={styles.cascadePreviewText}>
