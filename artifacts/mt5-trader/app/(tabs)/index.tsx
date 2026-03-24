@@ -330,7 +330,6 @@ export default function TradeScreen() {
     if (!price) return;
     const now = Date.now();
     const pendingOrderIds = new Set(pendingOrders.map((o) => o.id));
-    const positionIds = new Set(positions.map((p) => p.id));
 
     // — Take profit queue —
     const firedTpIds = new Set<string>();
@@ -341,28 +340,21 @@ export default function TradeScreen() {
       if (!hit) continue;
       firedTpIds.add(tp.id);
 
-      // Positions: the market position + any filled limits (identified by limit price match)
+      // Close only the specific market position from this cascade (by stored positionId)
       const positionsToClose: string[] = [];
-      if (tp.marketPositionId && positionIds.has(tp.marketPositionId)) positionsToClose.push(tp.marketPositionId);
-      if (tp.limitPrices && tp.limitPrices.length > 0) {
-        for (const pos of positions) {
-          if (positionsToClose.includes(pos.id)) continue;
-          if (tp.limitPrices.some((lp) => Math.abs(pos.openPrice - lp) < 0.10)) positionsToClose.push(pos.id);
-        }
-      }
-      // Pending orders still in queue
+      if (tp.marketPositionId) positionsToClose.push(tp.marketPositionId);
+
+      // Cancel only the specific limit order IDs from this cascade that are still pending
       const ordersToCancel = (tp.limitOrderIds ?? []).filter((id) => pendingOrderIds.has(id));
 
-      console.log(`[tp-watcher id=${tp.id}] +${tp.pipsTarget}pip hit — closing ${positionsToClose.length} pos, cancelling ${ordersToCancel.length} limits`);
+      console.log(`[tp-watcher id=${tp.id}] +${tp.pipsTarget}pip hit — closing posId=${tp.marketPositionId}, cancelling ${ordersToCancel.length} limits`);
       void Promise.all([
         ...positionsToClose.map((id) => closePosition(id)),
         ...ordersToCancel.map((id) => cancelOrder(id)),
       ]).then(() => {
         void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        const closedCount = positionsToClose.length;
-        const cancelledCount = ordersToCancel.length;
         showToast(
-          `TP +${tp.pipsTarget}pip — closed ${closedCount} position${closedCount !== 1 ? "s" : ""}${cancelledCount > 0 ? `, deleted ${cancelledCount} limit${cancelledCount !== 1 ? "s" : ""}` : ""}`,
+          `TP +${tp.pipsTarget}pip hit`,
           "success",
           true
         );
@@ -400,7 +392,7 @@ export default function TradeScreen() {
     if (firedLimitIds.size > 0) {
       watchersRef.current = watchersRef.current.filter((w) => !firedLimitIds.has(w.id));
     }
-  }, [price, pendingOrders, positions, cancelOrder, closePosition, refreshPendingOrders, showToast]);
+  }, [price, pendingOrders, cancelOrder, closePosition, refreshPendingOrders, showToast]);
 
   // Safety valve: if isPlacing somehow gets stuck, auto-reset after 90 seconds
   useEffect(() => {
