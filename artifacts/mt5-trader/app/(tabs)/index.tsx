@@ -353,6 +353,7 @@ export default function TradeScreen() {
   }, [isPlacing, status, direction, lotSize, sl, placeTrade, showToast]);
 
   const handleCascadeTrade = useCallback(async (dir: Direction) => {
+    console.log("[cascade] btn pressed dir=" + dir + " isPlacing=" + String(isPlacing) + " status=" + status + " ask=" + String(price?.ask) + " bid=" + String(price?.bid));
     if (isPlacing) {
       Alert.alert("Order in Progress", "Please wait for the current order to complete.");
       return;
@@ -366,6 +367,7 @@ export default function TradeScreen() {
       Alert.alert("Price Unavailable", "Waiting for live price data. Please wait a moment and try again.");
       return;
     }
+    console.log("[cascade] showing dialog mktPrice=" + String(mktPrice));
     // Compute levels fresh from the pressed direction — no stale state dependency
     const levels = buildCascadeLevels(mktPrice, dir, cascadeSettings);
     const total = 1 + levels.limitEntries.length;
@@ -378,6 +380,7 @@ export default function TradeScreen() {
         {
           text: "Confirm",
           onPress: async () => {
+            console.log("[cascade] confirmed, placing orders dir=" + dir + " vol=" + String(cascadeLotSize) + " entries=" + levels.limitEntries.join(",") + " sl=" + String(levels.stopLoss));
             await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
             setIsPlacing(true);
             try {
@@ -387,6 +390,7 @@ export default function TradeScreen() {
                 limitEntries: levels.limitEntries,
                 stopLoss: levels.stopLoss,
               });
+              console.log("[cascade] result success=" + String(result.success) + " placed=" + String(result.placed) + " msg=" + result.message);
               if (result.success) {
                 await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
                 showToast(`${result.placed} ${dir.toUpperCase()} orders placed ✓`, "success", true);
@@ -395,6 +399,7 @@ export default function TradeScreen() {
                 showToast(result.message, "error");
               }
             } catch (err) {
+              console.log("[cascade] exception: " + String(err));
               showToast(err instanceof Error ? err.message : "Cascade failed", "error");
             } finally {
               setIsPlacing(false);
@@ -486,6 +491,23 @@ export default function TradeScreen() {
         {/* ═══ CASCADE MODE ═══════════════════════════════════════════════════ */}
         {tradeMode === "cascade" && (
           <>
+            {/* Direction */}
+            <View style={styles.directionRow}>
+              <Pressable
+                style={[styles.dirBtn, cascadeDirection === "buy" && styles.dirBtnBuyActive]}
+                onPress={() => { setCascadeDirection("buy"); void Haptics.selectionAsync(); }}
+              >
+                <Feather name="trending-up" size={18} color={cascadeDirection === "buy" ? "#000" : C.buy} />
+                <Text style={[styles.dirLabel, cascadeDirection === "buy" ? styles.dirLabelActiveBuy : { color: C.buy }]}>BUY</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.dirBtn, cascadeDirection === "sell" && styles.dirBtnSellActive]}
+                onPress={() => { setCascadeDirection("sell"); void Haptics.selectionAsync(); }}
+              >
+                <Feather name="trending-down" size={18} color={cascadeDirection === "sell" ? "#fff" : C.sell} />
+                <Text style={[styles.dirLabel, cascadeDirection === "sell" ? styles.dirLabelActiveSell : { color: C.sell }]}>SELL</Text>
+              </Pressable>
+            </View>
 
             {/* Live price info card */}
             <View style={styles.sectionCard}>
@@ -538,53 +560,28 @@ export default function TradeScreen() {
               </View>
             )}
 
-            {/* Cascade BUY / SELL action buttons */}
-            <View style={styles.tradeBtnRow}>
-              <Pressable
-                style={({ pressed }) => [
-                  styles.tradeBtn,
-                  styles.tradeBtnBuy,
-                  styles.tradeBtnHalf,
-                  pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
-                  (status !== "connected" || isPlacing) && { opacity: 0.45 },
-                ]}
-                onPress={() => { setCascadeDirection("buy"); handleCascadeTrade("buy"); }}
-                disabled={status !== "connected" || isPlacing}
-              >
-                {isPlacing ? (
-                  <ActivityIndicator color="#000" />
-                ) : (
-                  <>
-                    <Feather name="trending-up" size={20} color="#000" />
-                    <Text style={[styles.tradeBtnText, { color: "#000" }]}>
-                      {`BUY  ×${cascadeSettings.numPositions}`}
-                    </Text>
-                  </>
-                )}
-              </Pressable>
-              <Pressable
-                style={({ pressed }) => [
-                  styles.tradeBtn,
-                  styles.tradeBtnSell,
-                  styles.tradeBtnHalf,
-                  pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
-                  (status !== "connected" || isPlacing) && { opacity: 0.45 },
-                ]}
-                onPress={() => { setCascadeDirection("sell"); handleCascadeTrade("sell"); }}
-                disabled={status !== "connected" || isPlacing}
-              >
-                {isPlacing ? (
-                  <ActivityIndicator color="#fff" />
-                ) : (
-                  <>
-                    <Feather name="trending-down" size={20} color="#fff" />
-                    <Text style={[styles.tradeBtnText, { color: "#fff" }]}>
-                      {`SELL  ×${cascadeSettings.numPositions}`}
-                    </Text>
-                  </>
-                )}
-              </Pressable>
-            </View>
+            {/* Place cascade button */}
+            <Pressable
+              style={({ pressed }) => [
+                styles.tradeBtn,
+                cascadeDirection === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
+                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
+                (status !== "connected" || isPlacing) && { opacity: 0.45 },
+              ]}
+              onPress={() => handleCascadeTrade(cascadeDirection)}
+              disabled={status !== "connected" || isPlacing}
+            >
+              {isPlacing ? (
+                <ActivityIndicator color={cascadeDirection === "buy" ? "#000" : "#fff"} />
+              ) : (
+                <>
+                  <Feather name="layers" size={20} color={cascadeDirection === "buy" ? "#000" : "#fff"} />
+                  <Text style={[styles.tradeBtnText, cascadeDirection === "buy" ? { color: "#000" } : { color: "#fff" }]}>
+                    {`Place ${cascadeSettings.numPositions} ${cascadeDirection.toUpperCase()} Orders`}
+                  </Text>
+                </>
+              )}
+            </Pressable>
           </>
         )}
 
