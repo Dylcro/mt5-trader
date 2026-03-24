@@ -272,7 +272,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
   const fetchPriceData = useCallback(async (accId: string, accRegion: string): Promise<Price> => {
     const res = await fetch(`${API_BASE}/mt5/account/${accId}/price?region=${accRegion}`, {
-      signal: AbortSignal.timeout(3000),
+      signal: AbortSignal.timeout(8000),
     });
     if (!res.ok) throw new Error(`Price fetch failed: ${res.status}`);
     const data = await res.json() as { bid?: number; ask?: number; time?: string };

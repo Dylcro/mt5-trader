@@ -519,7 +519,7 @@ router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) 
     // Fetch fresh price from MetaAPI
     const priceRes = await fetch(
       `${clientBase(region)}/users/current/accounts/${accountId}/symbols/XAUUSD/current-price`,
-      { headers: authHeaders(token), signal: AbortSignal.timeout(4000) }
+      { headers: authHeaders(token), signal: AbortSignal.timeout(2000) }
     );
 
     if (priceRes.status === 429) {
