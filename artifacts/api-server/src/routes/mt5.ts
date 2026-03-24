@@ -61,9 +61,26 @@ function authHeaders(token: string) {
 // Caches the last successful price per account. Served instantly on repeat
 // client polls so we don't hit MetaAPI on every request.
 // MetaAPI rate limit: ~3,600 req/hr (1/s) — client must poll no faster than 1s.
+// Fallback: Swissquote public XAU/USD feed (no auth needed) when MetaAPI is rate-limited.
 interface PriceCacheEntry { bid: number; ask: number; fetchedAt: number; }
 const priceCache = new Map<string, PriceCacheEntry>(); // key = `${accountId}:${region}`
 const priceRateLimitUntil = new Map<string, number>();  // key → epoch ms when quota resets
+
+async function fetchFallbackPrice(): Promise<{ bid: number; ask: number } | null> {
+  try {
+    const r = await fetch(
+      "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD",
+      { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(4000) }
+    );
+    if (!r.ok) return null;
+    const data = await r.json() as Array<{ spreadProfilePrices?: Array<{ spreadProfile: string; bid: number; ask: number }> }>;
+    const standard = data[0]?.spreadProfilePrices?.find((p) => p.spreadProfile === "standard");
+    if (standard?.bid && standard?.ask) return { bid: standard.bid, ask: standard.ask };
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 // Normalise whatever MetaAPI returns as "region" to the short subdomain form (e.g. "london").
 // MetaAPI may return the full host like "mt-client-api-v1.london.agiliumtrade.ai".
@@ -471,11 +488,24 @@ router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) 
     const key = `${accountId}:${region}`;
     const now = Date.now();
 
-    // If rate-limited, serve cached price (stale is better than failing)
+    // If rate-limited, serve cached price or fallback source (never fail the client)
     const rateLimitedUntil = priceRateLimitUntil.get(key) ?? 0;
     const cached = priceCache.get(key);
     if (now < rateLimitedUntil) {
-      if (cached) return res.json({ bid: cached.bid, ask: cached.ask, stale: true });
+      // Refresh fallback if cache is missing or >5 s old
+      const needsFallback = !cached || now - cached.fetchedAt > 5000;
+      if (needsFallback) {
+        const fallback = await fetchFallbackPrice();
+        if (fallback) {
+          priceCache.set(key, { ...fallback, fetchedAt: Date.now() });
+          console.log(`[price] Rate limited — serving Swissquote fallback bid=${fallback.bid}`);
+          return res.json({ bid: fallback.bid, ask: fallback.ask, stale: true });
+        }
+      }
+      if (cached) {
+        console.log(`[price] Rate limited until ${new Date(rateLimitedUntil).toISOString()} — serving cached price`);
+        return res.json({ bid: cached.bid, ask: cached.ask, stale: true });
+      }
       return res.status(429).json({ error: "Rate limited by MetaAPI — please wait" });
     }
 
