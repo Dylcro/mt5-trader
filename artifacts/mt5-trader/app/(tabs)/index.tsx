@@ -355,16 +355,16 @@ export default function TradeScreen() {
   const handleCascadeTrade = useCallback(async (dir: Direction) => {
     console.log("[cascade] btn pressed dir=" + dir + " isPlacing=" + String(isPlacing) + " status=" + status + " ask=" + String(price?.ask) + " bid=" + String(price?.bid));
     if (isPlacing) {
-      showToast("Order already in progress — please wait.", "error");
+      Alert.alert("Please Wait", "An order is already being placed. Please wait for it to complete.");
       return;
     }
     if (status !== "connected") {
-      showToast("Not connected. Go to Settings to connect your MT5 account.", "error");
+      Alert.alert("Not Connected", "Please connect your MT5 account in Settings first, then return here to trade.");
       return;
     }
     const mktPrice = dir === "buy" ? (price?.ask ?? 0) : (price?.bid ?? 0);
     if (!price || mktPrice <= 0) {
-      showToast("Waiting for live price — tap ↻ to refresh.", "error");
+      Alert.alert("No Price Yet", "Waiting for a live price from your broker. Please wait a moment, then try again.\n\nTip: tap ↻ in the top-right to force a refresh.");
       return;
     }
     // Compute levels fresh — no stale closure dependency
