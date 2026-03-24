@@ -6,6 +6,7 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  Linking,
   Platform,
   Pressable,
   ScrollView,
@@ -269,7 +270,7 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition } = useTrading();
+  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, modifyPosition } = useTrading();
   const { settings: cascadeSettings } = useCascadeSettings();
   const cascadeSettingsRef = useRef(cascadeSettings);
   useEffect(() => { cascadeSettingsRef.current = cascadeSettings; }, [cascadeSettings]);
@@ -305,12 +306,18 @@ export default function TradeScreen() {
   const [slManual, setSlManual] = useState(0);
   const [slManualText, setSlManualText] = useState("");
 
-  // Shared SL session (single order mode)
+  // Shared SL session (single order mode — trades placed inside this app)
   type SharedSLSession = { direction: Direction; stopLoss: number; anchorEntry: number };
   const [sharedSLSession, setSharedSLSession] = useState<SharedSLSession | null>(null);
   const sharedSLSessionRef = useRef<SharedSLSession | null>(null);
   useEffect(() => { sharedSLSessionRef.current = sharedSLSession; }, [sharedSLSession]);
   const sharedSLHasHadPositionRef = useRef(false);
+
+  // MT5 monitor session — watches for trades placed in the MT5 app and auto-applies SL
+  type MT5MonitorSession = { direction: Direction; stopLoss: number; anchorEntry: number | null };
+  const [mt5MonitorSession, setMT5MonitorSession] = useState<MT5MonitorSession | null>(null);
+  const mt5PatchedIdsRef = useRef<Set<string>>(new Set());
+  const mt5HasHadPositionRef = useRef(false);
 
   // Cascade state
   const [cascadeDirection, setCascadeDirection] = useState<Direction>("buy");
@@ -425,6 +432,58 @@ export default function TradeScreen() {
     }
   }, [positions, sharedSLSession, showToast]);
 
+  // MT5 monitor: on each positions poll, patch SL on new matching positions
+  useEffect(() => {
+    const session = mt5MonitorSession;
+    if (!session) { mt5HasHadPositionRef.current = false; return; }
+    const posType = session.direction === "buy" ? "POSITION_TYPE_BUY" : "POSITION_TYPE_SELL";
+
+    // Positions matching this session's direction + range (range is open until first anchor is set)
+    const sessionPositions = positions.filter((p) => {
+      if (p.type !== posType) return false;
+      if (session.anchorEntry == null) return true; // before anchor: accept all matching direction
+      const [lo, hi] = session.direction === "buy"
+        ? [session.stopLoss - 0.01, session.anchorEntry + 0.01]
+        : [session.anchorEntry - 0.01, session.stopLoss + 0.01];
+      return p.openPrice >= lo && p.openPrice <= hi;
+    });
+
+    const newPositions = sessionPositions.filter((p) => !mt5PatchedIdsRef.current.has(p.id));
+
+    if (newPositions.length > 0) {
+      // Set anchor from the first new position if not yet set
+      if (session.anchorEntry == null) {
+        const anchor = newPositions[0].openPrice;
+        setMT5MonitorSession((s) => s ? { ...s, anchorEntry: anchor } : s);
+        console.log(`[mt5-monitor] anchor set to ${anchor}`);
+      }
+      // Patch SL on all new positions
+      for (const pos of newPositions) {
+        mt5PatchedIdsRef.current.add(pos.id);
+        const posSl = session.stopLoss;
+        console.log(`[mt5-monitor] patching posId=${pos.id} openPrice=${pos.openPrice} → SL ${posSl}`);
+        void modifyPosition(pos.id, posSl).then((result) => {
+          if (result.success) {
+            void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+            showToast(`SL ${formatPrice(posSl)} auto-applied to MT5 ${session.direction.toUpperCase()} @ ${formatPrice(pos.openPrice)}`, "success", true);
+          } else {
+            console.warn(`[mt5-monitor] modifyPosition failed: ${result.message}`);
+            showToast(`SL patch failed: ${result.message}`, "error");
+          }
+        });
+      }
+      mt5HasHadPositionRef.current = true;
+    }
+
+    // Auto-reset once all monitored positions are gone
+    if (session.anchorEntry != null && sessionPositions.length === 0 && mt5HasHadPositionRef.current) {
+      setMT5MonitorSession(null);
+      mt5PatchedIdsRef.current.clear();
+      mt5HasHadPositionRef.current = false;
+      showToast("MT5 monitor session reset — all positions closed", "success");
+    }
+  }, [positions, mt5MonitorSession, modifyPosition, showToast]);
+
   // Safety valve: if isPlacing somehow gets stuck, auto-reset after 90 seconds
   useEffect(() => {
     if (!isPlacing) return;
@@ -521,6 +580,33 @@ export default function TradeScreen() {
       showToast(result.message, "error");
     }
   }, [direction, lotSize, placeTrade, showToast]);
+
+  const openMT5AndMonitor = useCallback(async () => {
+    if (statusRef.current !== "connected") {
+      Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
+      return;
+    }
+    if (slRef.current == null) {
+      Alert.alert("No Stop Loss Set", "Please set a stop loss before starting the MT5 monitor session.");
+      return;
+    }
+    // Start session then open MT5
+    setMT5MonitorSession({ direction, stopLoss: slRef.current, anchorEntry: null });
+    mt5PatchedIdsRef.current.clear();
+    mt5HasHadPositionRef.current = false;
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    showToast(`Monitoring MT5 ${direction.toUpperCase()} trades — SL ${formatPrice(slRef.current)} will auto-apply`, "success", true);
+    try {
+      const canOpen = await Linking.canOpenURL("metatrader5://");
+      if (canOpen) {
+        await Linking.openURL("metatrader5://");
+      } else {
+        showToast("MT5 app not found — please open it manually", "error");
+      }
+    } catch {
+      showToast("Could not open MT5 — please open it manually", "error");
+    }
+  }, [direction, showToast]);
 
   const handleCascadeTrade = useCallback(async (dir: Direction) => {
     const p = priceRef.current;
@@ -809,6 +895,37 @@ export default function TradeScreen() {
         {/* ═══ SINGLE MODE ════════════════════════════════════════════════════ */}
         {tradeMode === "single" && (
           <>
+            {/* MT5 Monitor Session Banner */}
+            {mt5MonitorSession && (
+              <View style={[styles.sectionCard, { borderColor: "#4A90E2", borderWidth: 1 }]}>
+                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                    <Feather name="eye" size={14} color="#4A90E2" />
+                    <Text style={{ color: "#4A90E2", fontWeight: "700", fontSize: 13 }}>
+                      MT5 Monitor — {mt5MonitorSession.direction.toUpperCase()} Active
+                    </Text>
+                  </View>
+                  <Pressable
+                    onPress={() => { setMT5MonitorSession(null); mt5PatchedIdsRef.current.clear(); mt5HasHadPositionRef.current = false; void Haptics.selectionAsync(); }}
+                    hitSlop={8}
+                  >
+                    <Feather name="x" size={16} color={C.textSecondary} />
+                  </Pressable>
+                </View>
+                <View style={{ marginTop: 8, gap: 4 }}>
+                  <Text style={{ color: C.textSecondary, fontSize: 12 }}>
+                    Auto-SL: <Text style={{ color: C.sell, fontWeight: "600" }}>{formatPrice(mt5MonitorSession.stopLoss)}</Text>
+                    {mt5MonitorSession.anchorEntry != null
+                      ? <Text>{"   "}Anchor: <Text style={{ color: C.text }}>{formatPrice(mt5MonitorSession.anchorEntry)}</Text></Text>
+                      : <Text style={{ color: C.textMuted }}> — waiting for first trade…</Text>}
+                  </Text>
+                  <Text style={{ color: C.textMuted, fontSize: 11 }}>
+                    Place a {mt5MonitorSession.direction} in MT5 — SL will be applied within ~10s
+                  </Text>
+                </View>
+              </View>
+            )}
+
             {/* Shared SL Session Banner */}
             {sharedSLSession && (
               <View style={[styles.sectionCard, { borderColor: C.gold, borderWidth: 1 }]}>
@@ -1007,6 +1124,29 @@ export default function TradeScreen() {
                   </Text>
                 </>
               )}
+            </Pressable>
+
+            {/* Trade in MT5 Button */}
+            <Pressable
+              style={({ pressed }) => [
+                styles.tradeBtn,
+                {
+                  backgroundColor: mt5MonitorSession ? "#1a2a40" : "#121a28",
+                  borderWidth: 1,
+                  borderColor: mt5MonitorSession ? "#4A90E2" : "#2a3a50",
+                  marginTop: 8,
+                },
+                pressed && { opacity: 0.8 },
+              ]}
+              onPress={mt5MonitorSession
+                ? () => { setMT5MonitorSession(null); mt5PatchedIdsRef.current.clear(); mt5HasHadPositionRef.current = false; void Haptics.selectionAsync(); }
+                : openMT5AndMonitor
+              }
+            >
+              <Feather name={mt5MonitorSession ? "eye-off" : "external-link"} size={18} color="#4A90E2" />
+              <Text style={[styles.tradeBtnText, { color: "#4A90E2" }]}>
+                {mt5MonitorSession ? "Stop MT5 Monitor" : "Trade in MT5 App"}
+              </Text>
             </Pressable>
           </>
         )}
