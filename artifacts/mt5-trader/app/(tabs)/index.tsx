@@ -329,7 +329,6 @@ export default function TradeScreen() {
   useEffect(() => {
     if (!price) return;
     const now = Date.now();
-    const pendingOrderIds = new Set(pendingOrders.map((o) => o.id));
 
     // — Take profit queue —
     const firedTpIds = new Set<string>();
@@ -344,8 +343,9 @@ export default function TradeScreen() {
       const positionsToClose: string[] = [];
       if (tp.marketPositionId) positionsToClose.push(tp.marketPositionId);
 
-      // Cancel only the specific limit order IDs from this cascade that are still pending
-      const ordersToCancel = (tp.limitOrderIds ?? []).filter((id) => pendingOrderIds.has(id));
+      // Cancel all limit order IDs from this cascade — don't filter against pendingOrders because
+      // the 10s poll may not have run yet. The API returns 4754 gracefully for already-gone orders.
+      const ordersToCancel = tp.limitOrderIds ?? [];
 
       console.log(`[tp-watcher id=${tp.id}] +${tp.pipsTarget}pip hit — closing posId=${tp.marketPositionId}, cancelling ${ordersToCancel.length} limits`);
       void Promise.all([
@@ -376,7 +376,9 @@ export default function TradeScreen() {
       if (!hit) continue;
       firedLimitIds.add(w.id);
 
-      const ordersToCancel = (w.limitOrderIds ?? []).filter((id) => pendingOrderIds.has(id));
+      // Use all limitOrderIds directly — don't filter against pendingOrders (poll may be stale).
+      // The API returns 4754 gracefully for already-gone orders.
+      const ordersToCancel = w.limitOrderIds ?? [];
       if (ordersToCancel.length === 0) continue;
       console.log(`[watcher id=${w.id}] +${w.pipsTarget}pip hit — cancelling ${ordersToCancel.length} limit(s)`);
       void Promise.all(ordersToCancel.map((id) => cancelOrder(id))).then(() => {
@@ -392,7 +394,7 @@ export default function TradeScreen() {
     if (firedLimitIds.size > 0) {
       watchersRef.current = watchersRef.current.filter((w) => !firedLimitIds.has(w.id));
     }
-  }, [price, pendingOrders, cancelOrder, closePosition, refreshPendingOrders, showToast]);
+  }, [price, cancelOrder, closePosition, refreshPendingOrders, showToast]);
 
   // Safety valve: if isPlacing somehow gets stuck, auto-reset after 90 seconds
   useEffect(() => {
