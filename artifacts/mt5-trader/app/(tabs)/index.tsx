@@ -271,6 +271,8 @@ export default function TradeScreen() {
   const router = useRouter();
   const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders } = useTrading();
   const { settings: cascadeSettings } = useCascadeSettings();
+  const cascadeSettingsRef = useRef(cascadeSettings);
+  useEffect(() => { cascadeSettingsRef.current = cascadeSettings; }, [cascadeSettings]);
 
   const [toast, setToast] = useState<ToastState>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -415,11 +417,13 @@ export default function TradeScreen() {
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         const failNote = result.failed > 0 ? ` (${result.failed} limit${result.failed > 1 ? "s" : ""} failed)` : "";
         showToast(`${result.placed}/${total} ${dir.toUpperCase()} orders placed ✓${failNote}`, "success", true);
-        if (cascadeSettings.autoCloseLimitsEnabled && cascadeSettings.autoCloseLimitsPips > 0) {
+        const cs = cascadeSettingsRef.current;
+        if (cs.autoCloseLimitsEnabled && cs.autoCloseLimitsPips > 0) {
+          console.log(`[watcher] arming +${cs.autoCloseLimitsPips}pip from entry ${mktPrice}`);
           watcherRef.current = {
             entryPrice: mktPrice,
             direction: dir,
-            pipsTarget: cascadeSettings.autoCloseLimitsPips,
+            pipsTarget: cs.autoCloseLimitsPips,
             readyAt: Date.now() + 3000,
           };
         }
