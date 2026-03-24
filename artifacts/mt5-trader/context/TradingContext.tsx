@@ -536,8 +536,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       if (status !== "connected") return { success: false, message: "Not connected" };
       try {
         const result = await submitOrderRaw(params);
+        // Refresh in background — don't block the success toast
         if (result.success) {
-          await Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
+          void Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
         }
         return result;
       } catch (err) {
@@ -556,7 +557,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       const total = 1 + params.limitEntries.length;
 
       try {
-        // 1. Market order first — instant fill
+        // 1. Market order first — must land before limits to guarantee fill order
         const marketResult = await submitOrderRaw({
           direction: params.direction,
           volume: params.volume,
@@ -566,25 +567,30 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         if (marketResult.success) placed++;
         else { failed++; errors.push(`Market: ${marketResult.message}`); }
 
-        // 2. Limit orders — one at a time, small delay between each to avoid rate limits
-        for (let i = 0; i < params.limitEntries.length; i++) {
-          await new Promise((r) => setTimeout(r, 300));
-          const result = await submitOrderRaw({
-            direction: params.direction,
-            volume: params.volume,
-            limitPrice: params.limitEntries[i],
-            stopLoss: params.stopLoss,
-            comment: `Cascade ${i + 2}/${total}`,
-          });
-          if (result.success) placed++;
-          else { failed++; errors.push(`Limit ${i + 1}: ${result.message}`); }
+        // 2. All limit orders in parallel — no sequential delay needed
+        if (params.limitEntries.length > 0) {
+          const limitResults = await Promise.all(
+            params.limitEntries.map((limitPrice, i) =>
+              submitOrderRaw({
+                direction: params.direction,
+                volume: params.volume,
+                limitPrice,
+                stopLoss: params.stopLoss,
+                comment: `Cascade ${i + 2}/${total}`,
+              })
+            )
+          );
+          for (const r of limitResults) {
+            if (r.success) placed++;
+            else { failed++; errors.push(`Limit: ${r.message}`); }
+          }
         }
       } catch (err) {
         errors.push(err instanceof Error ? err.message : "Unknown error");
       }
 
-      // Single refresh at the end
-      await Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
+      // Refresh in background — don't delay success feedback
+      void Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
 
       if (placed === 0) {
         return { success: false, placed, failed, message: errors[0] ?? "All orders failed to place" };
