@@ -458,7 +458,7 @@ router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) 
     const region = qstr(req.query.region) || DEFAULT_REGION;
     const priceRes = await fetch(
       `${clientBase(region)}/users/current/accounts/${req.params.accountId}/symbols/XAUUSD/current-price`,
-      { headers: authHeaders(token) }
+      { headers: authHeaders(token), signal: AbortSignal.timeout(3000) }
     );
     if (!priceRes.ok) return res.status(priceRes.status).json({ error: "Price fetch failed" });
     const priceData = await priceRes.json() as { bid?: number; ask?: number };

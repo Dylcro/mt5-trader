@@ -271,7 +271,10 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const fetchPriceData = useCallback(async (accId: string, accRegion: string): Promise<Price> => {
-    const res = await fetch(`${API_BASE}/mt5/account/${accId}/price?region=${accRegion}`);
+    const res = await fetch(
+      `${API_BASE}/mt5/account/${accId}/price?region=${accRegion}`,
+      { signal: AbortSignal.timeout(3500) },
+    );
     if (!res.ok) throw new Error(`Price fetch failed: ${res.status}`);
     const data = await res.json() as { bid?: number; ask?: number; time?: string };
     const bid = data.bid ?? 0;
@@ -343,18 +346,30 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
   const startPolling = useCallback(
     (accId: string, accRegion: string) => {
-      if (priceIntervalRef.current) clearInterval(priceIntervalRef.current);
+      if (priceIntervalRef.current) clearTimeout(priceIntervalRef.current);
       if (positionsIntervalRef.current) clearInterval(positionsIntervalRef.current);
       priceFailCountRef.current = 0;
       setPriceError(false);
 
-      const pollPrice = () =>
+      // Sequential loop: next request only fires after the previous one settles.
+      // Prevents in-flight request pile-up when MetaAPI is slow or the network hiccups.
+      let active = true;
+      const loop = () => {
+        if (!active) return;
         fetchPriceData(accId, accRegion)
-          .then((p) => { priceFailCountRef.current = 0; setPriceError(false); setPrice(p); })
+          .then((p) => {
+            priceFailCountRef.current = 0;
+            setPriceError(false);
+            setPrice(p);
+          })
           .catch(() => {
             priceFailCountRef.current += 1;
             if (priceFailCountRef.current >= 3) setPriceError(true);
+          })
+          .finally(() => {
+            if (active) priceIntervalRef.current = setTimeout(loop, 500);
           });
+      };
 
       const pollPositions = () =>
         Promise.all([
@@ -362,10 +377,12 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           fetchPendingOrdersData(accId, accRegion).then(setPendingOrders).catch(() => {}),
         ]);
 
-      pollPrice();
+      loop();
       pollPositions();
-      priceIntervalRef.current = setInterval(pollPrice, 500);
       positionsIntervalRef.current = setInterval(pollPositions, 10000);
+
+      // Return cleanup so the ref-sync effect can stop the loop
+      return () => { active = false; if (priceIntervalRef.current) clearTimeout(priceIntervalRef.current); };
     },
     [fetchPriceData, fetchPositionsData, fetchPendingOrdersData]
   );
@@ -374,7 +391,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => { startPollingRef.current = startPolling; }, [startPolling]);
 
   const stopPolling = useCallback(() => {
-    if (priceIntervalRef.current) clearInterval(priceIntervalRef.current);
+    if (priceIntervalRef.current) clearTimeout(priceIntervalRef.current);
     if (positionsIntervalRef.current) clearInterval(positionsIntervalRef.current);
   }, []);
 
