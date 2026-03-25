@@ -592,9 +592,9 @@ export default function TradeScreen() {
             hitSlop={12}
           >
             <View style={styles.liveDot}>
-              <Animated.View style={[styles.dot, { opacity: status === "connected" ? blinkAnim : 0.2, backgroundColor: status === "connected" ? C.buy : status === "connecting" ? C.gold : C.sell }]} />
-              <Text style={[styles.liveLabel, status === "disconnected" && { color: C.sell }]}>
-                {status === "connected" ? "LIVE" : status === "disconnected" ? "TAP TO RECONNECT" : status.toUpperCase()}
+              <Animated.View style={[styles.dot, { opacity: status === "connected" ? blinkAnim : 0.2, backgroundColor: status === "connected" ? (price?.stale ? C.gold : C.buy) : status === "connecting" ? C.gold : C.sell }]} />
+              <Text style={[styles.liveLabel, status === "disconnected" && { color: C.sell }, price?.stale && { color: C.gold }]}>
+                {status === "connected" ? (price?.stale ? "CACHED" : "LIVE") : status === "disconnected" ? "TAP TO RECONNECT" : status.toUpperCase()}
               </Text>
             </View>
           </Pressable>

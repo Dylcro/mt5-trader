@@ -70,6 +70,7 @@ export interface Price {
   ask: number;
   spread: number;
   time: string;
+  stale?: boolean; // true when price comes from server-side cache (MetaAPI momentarily slow)
 }
 
 export type SLMode = "points" | "percent" | "manual";
@@ -327,10 +328,10 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const fetchPriceData = useCallback(async (accId: string, accRegion: string): Promise<Price> => {
     const res = await fetch(
       `${API_BASE}/mt5/account/${accId}/price?region=${accRegion}`,
-      { signal: AbortSignal.timeout(3500) },
+      { signal: AbortSignal.timeout(9000) },
     );
     if (!res.ok) throw new Error(`Price fetch failed: ${res.status}`);
-    const data = await res.json() as { bid?: number; ask?: number; time?: string };
+    const data = await res.json() as { bid?: number; ask?: number; time?: string; stale?: boolean };
     const bid = data.bid ?? 0;
     const ask = data.ask ?? 0;
     return {
@@ -338,6 +339,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       ask,
       spread: Math.round((ask - bid) * 10),
       time: data.time ?? new Date().toISOString(),
+      stale: data.stale ?? false,
     };
   }, []);
 
@@ -413,8 +415,12 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         if (!active) return;
         fetchPriceData(accId, accRegion)
           .then((p) => {
-            priceFailCountRef.current = 0;
-            setPriceError(false);
+            // Stale prices don't reset the fail counter but they DO keep the feed alive —
+            // don't increment failures and don't clear error state until we get a fresh price.
+            if (!p.stale) {
+              priceFailCountRef.current = 0;
+              setPriceError(false);
+            }
             setPrice(p);
           })
           .catch(() => {

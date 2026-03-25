@@ -10,6 +10,16 @@ interface OhlcCandle { time: string; open: number; high: number; low: number; cl
 const tickStore = new Map<string, PriceTick[]>(); // accountId → ticks
 const MAX_TICKS = 3000; // ~4 hours of 5-second ticks
 
+// ── Last-known price cache ───────────────────────────────────────────────────
+// When MetaAPI's current-price endpoint is slow/times out, return the most
+// recent successful price instead of a 500 error (keeps the feed alive).
+interface CachedPrice { bid: number; ask: number; time: string; cachedAt: number; }
+const priceCache = new Map<string, CachedPrice>();
+
+// Consecutive timeout counter per account — used to trigger a redeploy if
+// MetaAPI's price stream appears stuck.
+const priceTimeoutCount = new Map<string, number>();
+
 function storeTick(accountId: string, bid: number, ask: number) {
   if (!tickStore.has(accountId)) tickStore.set(accountId, []);
   const ticks = tickStore.get(accountId)!;
@@ -504,29 +514,65 @@ router.get("/mt5/account/:accountId/candles", async (req: Request, res: Response
 
 // GET /api/mt5/account/:accountId/price?region=london
 router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) => {
+  const accountId = req.params.accountId;
   try {
     const token = getToken();
     const region = qstr(req.query.region) || DEFAULT_REGION;
     const priceRes = await fetch(
-      `${clientBase(region)}/users/current/accounts/${req.params.accountId}/symbols/XAUUSD/current-price`,
-      { headers: authHeaders(token), signal: AbortSignal.timeout(3000) }
+      `${clientBase(region)}/users/current/accounts/${accountId}/symbols/XAUUSD/current-price`,
+      { headers: authHeaders(token), signal: AbortSignal.timeout(7000) }
     );
     if (!priceRes.ok) {
       const errText = await priceRes.text().catch(() => "");
       console.error(`[price] MetaAPI returned HTTP ${priceRes.status}: ${errText.slice(0, 200)}`);
+      // Try stale cache before giving up
+      const cached = priceCache.get(accountId);
+      if (cached && Date.now() - cached.cachedAt < 30_000) {
+        return res.json({ bid: cached.bid, ask: cached.ask, time: cached.time, stale: true });
+      }
       return res.status(priceRes.status).json({ error: `Price fetch failed (${priceRes.status})`, detail: errText.slice(0, 200) });
     }
-    const priceData = await priceRes.json() as { bid?: number; ask?: number };
-    if (!priceData.bid || !priceData.ask) {
-      console.warn(`[price] MetaAPI returned empty price: ${JSON.stringify(priceData)}`);
+    const priceData = await priceRes.json() as Record<string, unknown>;
+    const bid = priceData.bid as number | undefined;
+    const ask = priceData.ask as number | undefined;
+    if (!bid || !ask) {
+      console.warn(`[price] MetaAPI returned empty price: ${JSON.stringify(priceData).slice(0, 100)}`);
+      const cached = priceCache.get(accountId);
+      if (cached && Date.now() - cached.cachedAt < 30_000) {
+        return res.json({ bid: cached.bid, ask: cached.ask, time: cached.time, stale: true });
+      }
       return res.status(503).json({ error: "No price data available yet — broker may still be connecting." });
     }
-    // Accumulate tick for chart history
-    storeTick(req.params.accountId, priceData.bid, priceData.ask);
+    // Successful fetch — reset timeout counter and update cache
+    priceTimeoutCount.set(accountId, 0);
+    const priceTime = (priceData.time as string | undefined) ?? new Date().toISOString();
+    priceCache.set(accountId, { bid, ask, time: priceTime, cachedAt: Date.now() });
+    storeTick(accountId, bid, ask);
     return res.json(priceData);
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Failed";
-    console.error(`[price] fetch error: ${msg}`);
+    const isTimeout = msg.toLowerCase().includes("timeout") || msg.toLowerCase().includes("abort");
+    if (isTimeout) {
+      const count = (priceTimeoutCount.get(accountId) ?? 0) + 1;
+      priceTimeoutCount.set(accountId, count);
+      console.error(`[price] timeout #${count} for ${accountId}`);
+      // Return stale cache if available (keeps the client feed alive through blips)
+      const cached = priceCache.get(accountId);
+      if (cached && Date.now() - cached.cachedAt < 30_000) {
+        return res.json({ bid: cached.bid, ask: cached.ask, time: cached.time, stale: true });
+      }
+      // After 10 consecutive timeouts with no cache, auto-redeploy the account
+      if (count >= 10) {
+        priceTimeoutCount.set(accountId, 0);
+        console.log(`[price] auto-redeploying ${accountId} after ${count} timeouts`);
+        try {
+          const token = getToken();
+          await deployAccount(token, accountId);
+        } catch { /* best-effort */ }
+      }
+    } else {
+      console.error(`[price] fetch error: ${msg}`);
+    }
     return res.status(500).json({ error: msg });
   }
 });
