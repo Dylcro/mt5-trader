@@ -20,7 +20,6 @@ import Colors from "@/constants/colors";
 
 import { useTrading, type SLMode } from "@/context/TradingContext";
 import { buildCascadeLevels, useCascadeSettings } from "@/hooks/useCascadeSettings";
-import { TradingViewChart } from "@/components/TradingViewChart";
 
 const C = Colors.dark;
 
@@ -270,7 +269,7 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, redeployAccount } = useTrading();
+  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition } = useTrading();
   const { settings: cascadeSettings } = useCascadeSettings();
   const cascadeSettingsRef = useRef(cascadeSettings);
   useEffect(() => { cascadeSettingsRef.current = cascadeSettings; }, [cascadeSettings]);
@@ -305,15 +304,6 @@ export default function TradeScreen() {
   const [slPercent, setSlPercent] = useState(1);
   const [slManual, setSlManual] = useState(0);
   const [slManualText, setSlManualText] = useState("");
-
-  // Shared SL session (single order mode): first trade sets the anchor SL;
-  // every subsequent same-direction trade uses it automatically.
-  // Resets when all positions are closed.
-  type SharedSLSession = { direction: Direction; stopLoss: number };
-  const [sharedSLSession, setSharedSLSession] = useState<SharedSLSession | null>(null);
-  const sharedSLSessionRef = useRef<SharedSLSession | null>(null);
-  useEffect(() => { sharedSLSessionRef.current = sharedSLSession; }, [sharedSLSession]);
-  const sharedSLHasHadPositionRef = useRef(false);
 
   // Cascade state
   const [cascadeDirection, setCascadeDirection] = useState<Direction>("buy");
@@ -408,18 +398,6 @@ export default function TradeScreen() {
     }
   }, [price, cancelOrder, closePosition, refreshPendingOrders, showToast]);
 
-  // Auto-reset shared SL session when ALL positions are closed
-  useEffect(() => {
-    if (!sharedSLSession) { sharedSLHasHadPositionRef.current = false; return; }
-    if (positions.length > 0) {
-      sharedSLHasHadPositionRef.current = true;
-    } else if (sharedSLHasHadPositionRef.current) {
-      setSharedSLSession(null);
-      sharedSLHasHadPositionRef.current = false;
-      showToast("SL session reset — all positions closed", "success");
-    }
-  }, [positions, sharedSLSession, showToast]);
-
   // Safety valve: if isPlacing somehow gets stuck, auto-reset after 90 seconds
   useEffect(() => {
     if (!isPlacing) return;
@@ -454,40 +432,21 @@ export default function TradeScreen() {
     ? buildCascadeLevels(cascadeMarketPrice, cascadeDirection, cascadeSettings)
     : null;
 
-  // Session-aware SL for single order mode
-  const sessionActive = sharedSLSession !== null && sharedSLSession.direction === direction;
-  const effectiveDisplaySL = sessionActive ? sharedSLSession!.stopLoss : sl;
-
   const handleSingleTrade = useCallback(async () => {
     if (isPlacingRef.current) return;
     if (statusRef.current !== "connected") {
       Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
       return;
     }
-    const session = sharedSLSessionRef.current;
-
-    // Session active + same direction → always use the session SL
-    const isSessionTrade = session !== null && session.direction === direction;
-    const effectiveSL: number | undefined = isSessionTrade ? session!.stopLoss : slRef.current;
-
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     isPlacingRef.current = true;
     setIsPlacing(true);
-    const result = await placeTrade({ direction, volume: lotSize, stopLoss: effectiveSL });
+    const result = await placeTrade({ direction, volume: lotSize, stopLoss: slRef.current });
     isPlacingRef.current = false;
     setIsPlacing(false);
-
     if (result.success) {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      if (!session && effectiveSL != null) {
-        // First trade — start a new session
-        setSharedSLSession({ direction, stopLoss: effectiveSL });
-        showToast(`${direction.toUpperCase()} ✓ — SL session started @ ${formatPrice(effectiveSL)}`, "success", true);
-      } else if (isSessionTrade) {
-        showToast(`${direction.toUpperCase()} ✓ — shared SL ${formatPrice(effectiveSL!)}`, "success", true);
-      } else {
-        showToast(`${direction.toUpperCase()} order placed ✓  ${lotSize} lot`, "success", true);
-      }
+      showToast(`${direction.toUpperCase()} order placed ✓  ${lotSize} lot XAUUSD`, "success", true);
     } else {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       showToast(result.message, "error");
@@ -592,9 +551,9 @@ export default function TradeScreen() {
             hitSlop={12}
           >
             <View style={styles.liveDot}>
-              <Animated.View style={[styles.dot, { opacity: status === "connected" ? blinkAnim : 0.2, backgroundColor: status === "connected" ? (price?.stale ? C.gold : C.buy) : status === "connecting" ? C.gold : C.sell }]} />
-              <Text style={[styles.liveLabel, status === "disconnected" && { color: C.sell }, price?.stale && { color: C.gold }]}>
-                {status === "connected" ? (price?.stale ? "CACHED" : "LIVE") : status === "disconnected" ? "TAP TO RECONNECT" : status.toUpperCase()}
+              <Animated.View style={[styles.dot, { opacity: status === "connected" ? blinkAnim : 0.2, backgroundColor: status === "connected" ? C.buy : status === "connecting" ? C.gold : C.sell }]} />
+              <Text style={[styles.liveLabel, status === "disconnected" && { color: C.sell }]}>
+                {status === "connected" ? "LIVE" : status === "disconnected" ? "TAP TO RECONNECT" : status.toUpperCase()}
               </Text>
             </View>
           </Pressable>
@@ -619,48 +578,12 @@ export default function TradeScreen() {
               <PriceRow label="ASK" value={formatPrice(price.ask)} color={C.buy} sublabel="Buy at" />
               <View style={styles.divider} />
               <PriceRow label="SPREAD" value={`${price.spread} pips`} color={C.textSecondary} />
-              {tradeMode === "single" && (
-                <>
-                  <View style={styles.divider} />
-                  <Pressable
-                    style={({ pressed }) => [
-                      styles.tradeBtn,
-                      direction === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
-                      { marginTop: 4, marginBottom: 0 },
-                      pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
-                      isPlacing && { opacity: 0.6 },
-                    ]}
-                    onPress={handleSingleTrade}
-                    disabled={isPlacing}
-                  >
-                    {isPlacing ? (
-                      <ActivityIndicator color={direction === "buy" ? "#000" : "#fff"} />
-                    ) : (
-                      <>
-                        <Feather
-                          name={direction === "buy" ? "trending-up" : "trending-down"}
-                          size={20}
-                          color={direction === "buy" ? "#000" : "#fff"}
-                        />
-                        <Text style={[styles.tradeBtnText, direction === "buy" ? { color: "#000" } : { color: "#fff" }]}>
-                          {direction === "buy" ? "BUY XAUUSD" : "SELL XAUUSD"}
-                        </Text>
-                      </>
-                    )}
-                  </Pressable>
-                </>
-              )}
               {priceError && (
                 <View style={styles.priceErrorBanner}>
                   <Feather name="wifi-off" size={12} color={C.sell} />
-                  <Text style={styles.priceErrorText}>Price feed interrupted</Text>
-                  <Pressable
-                    onPress={() => { void redeployAccount(); void Haptics.selectionAsync(); }}
-                    style={{ marginLeft: "auto", backgroundColor: C.gold, borderRadius: 6, paddingHorizontal: 10, paddingVertical: 4 }}
-                    hitSlop={8}
-                  >
-                    <Text style={{ color: "#000", fontSize: 12, fontWeight: "700" }}>Reconnect</Text>
-                  </Pressable>
+                  <Text style={styles.priceErrorText}>Price feed interrupted — tap{" "}
+                    <Text style={{ color: C.textSecondary }} onPress={refreshPrice}>↻</Text> to retry
+                  </Text>
                 </View>
               )}
             </>
@@ -669,32 +592,14 @@ export default function TradeScreen() {
               <MaterialCommunityIcons name="chart-line" size={28} color={C.textMuted} />
               <Text style={styles.noPriceText}>
                 {priceError
-                  ? "Price feed failed"
+                  ? "Price feed failed — tap ↻ to retry"
                   : status === "connecting"
-                    ? "Connecting to broker..."
+                    ? "Fetching price..."
                     : "Connect account to see live price"}
               </Text>
-              {priceError && accountId ? (
-                <Pressable
-                  onPress={() => { void redeployAccount(); void Haptics.selectionAsync(); }}
-                  style={{ marginTop: 12, backgroundColor: C.gold, borderRadius: 8, paddingHorizontal: 20, paddingVertical: 8 }}
-                >
-                  <Text style={{ color: "#000", fontWeight: "700", fontSize: 14 }}>Reconnect</Text>
-                </Pressable>
-              ) : null}
             </View>
           )}
         </View>
-
-        {/* Live Chart — only when connected and account is known */}
-        {status === "connected" && accountId ? (
-          <TradingViewChart
-            apiBase={apiBase}
-            accountId={accountId}
-            region={region}
-            liveBid={price?.bid}
-          />
-        ) : null}
 
         {/* Mode Toggle */}
         <View style={styles.modeToggle}>
@@ -835,41 +740,7 @@ export default function TradeScreen() {
         {/* ═══ SINGLE MODE ════════════════════════════════════════════════════ */}
         {tradeMode === "single" && (
           <>
-            {/* Shared SL Session Banner */}
-            {sharedSLSession && (
-              <View style={[styles.sectionCard, { borderColor: C.gold, borderWidth: 1, gap: 0 }]}>
-                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
-                  <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-                    <Feather name="shield" size={14} color={C.gold} />
-                    <Text style={{ color: C.gold, fontWeight: "700", fontSize: 13 }}>
-                      {sharedSLSession.direction.toUpperCase()} Session Active
-                    </Text>
-                  </View>
-                  <Pressable
-                    onPress={() => { setSharedSLSession(null); sharedSLHasHadPositionRef.current = false; void Haptics.selectionAsync(); }}
-                    hitSlop={8}
-                  >
-                    <Feather name="x" size={16} color={C.textSecondary} />
-                  </Pressable>
-                </View>
-                <Text style={{ color: C.textSecondary, fontSize: 12, marginTop: 6 }}>
-                  All {sharedSLSession.direction.toUpperCase()} trades use SL{" "}
-                  <Text style={{ color: C.sell, fontWeight: "700" }}>{formatPrice(sharedSLSession.stopLoss)}</Text>
-                  {" "}until all positions are closed
-                </Text>
-              </View>
-            )}
-
-            {/* Lot Size */}
-            <View style={styles.sectionCard}>
-              <View style={styles.sectionHeader}>
-                <Text style={styles.sectionTitle}>Lot Size</Text>
-                <Text style={styles.sectionHint}>1 lot = 100 oz gold</Text>
-              </View>
-              <StepInput value={lotSize} onChange={setLotSize} step={0.01} min={0.01} max={100} decimals={2} />
-            </View>
-
-            {/* Direction Toggle — sits below lot size */}
+            {/* Direction Toggle */}
             <View style={styles.directionRow}>
               <Pressable
                 style={[styles.dirBtn, direction === "buy" && styles.dirBtnBuyActive]}
@@ -891,87 +762,80 @@ export default function TradeScreen() {
               </Pressable>
             </View>
 
+            {/* Lot Size */}
+            <View style={styles.sectionCard}>
+              <View style={styles.sectionHeader}>
+                <Text style={styles.sectionTitle}>Lot Size</Text>
+                <Text style={styles.sectionHint}>1 lot = 100 oz gold</Text>
+              </View>
+              <StepInput value={lotSize} onChange={setLotSize} step={0.01} min={0.01} max={100} decimals={2} />
+            </View>
+
             {/* Stop Loss */}
             <View style={styles.sectionCard}>
               <View style={styles.sectionHeader}>
                 <Text style={styles.sectionTitle}>Stop Loss</Text>
                 <Text style={[styles.sectionHint, { color: C.sell }]}>
-                  {effectiveDisplaySL != null ? `SL: ${formatPrice(effectiveDisplaySL)}` : "No SL set"}
+                  {sl != null ? `SL: ${formatPrice(sl)}` : "No SL set"}
                 </Text>
               </View>
-
-              {sessionActive ? (
-                /* Locked to session SL — no manual controls */
-                <View style={[styles.slInputArea, { alignItems: "center", paddingVertical: 6 }]}>
-                  <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-                    <Feather name="lock" size={14} color={C.gold} />
-                    <Text style={{ color: C.gold, fontWeight: "700", fontSize: 15 }}>
-                      {formatPrice(sharedSLSession!.stopLoss)}
+              <View style={styles.slModeRow}>
+                {SL_OPTIONS.map((opt) => (
+                  <Pressable
+                    key={opt.key}
+                    style={[styles.slModeBtn, slMode === opt.key && styles.slModeBtnActive]}
+                    onPress={() => { setSlMode(opt.key); Haptics.selectionAsync(); }}
+                  >
+                    <Feather name={opt.icon as any} size={12} color={slMode === opt.key ? C.gold : C.textSecondary} />
+                    <Text style={[styles.slModeLabel, slMode === opt.key && styles.slModeLabelActive]}>
+                      {opt.label}
                     </Text>
-                    <Text style={{ color: C.textSecondary, fontSize: 12 }}>shared from session</Text>
-                  </View>
+                  </Pressable>
+                ))}
+              </View>
+
+              {slMode === "points" && (
+                <View style={styles.slInputArea}>
+                  <StepInput value={slPips} onChange={setSlPips} step={5} min={5} max={500} decimals={0} />
+                  <Text style={styles.slNote}>
+                    {marketEntry > 0 && sl != null
+                      ? `Entry ${formatPrice(marketEntry)} → SL ${formatPrice(sl)}  (${slPips} pips = ${(slPips * PIP_SIZE).toFixed(2)})`
+                      : "Connect to see calculated SL"}
+                  </Text>
                 </View>
-              ) : (
-                <>
-                  <View style={styles.slModeRow}>
-                    {SL_OPTIONS.map((opt) => (
-                      <Pressable
-                        key={opt.key}
-                        style={[styles.slModeBtn, slMode === opt.key && styles.slModeBtnActive]}
-                        onPress={() => { setSlMode(opt.key); Haptics.selectionAsync(); }}
-                      >
-                        <Feather name={opt.icon as any} size={12} color={slMode === opt.key ? C.gold : C.textSecondary} />
-                        <Text style={[styles.slModeLabel, slMode === opt.key && styles.slModeLabelActive]}>
-                          {opt.label}
-                        </Text>
-                      </Pressable>
-                    ))}
-                  </View>
+              )}
 
-                  {slMode === "points" && (
-                    <View style={styles.slInputArea}>
-                      <StepInput value={slPips} onChange={setSlPips} step={5} min={5} max={500} decimals={0} />
-                      <Text style={styles.slNote}>
-                        {marketEntry > 0 && sl != null
-                          ? `Entry ${formatPrice(marketEntry)} → SL ${formatPrice(sl)}  (${slPips} pips = ${(slPips * PIP_SIZE).toFixed(2)})`
-                          : "Connect to see calculated SL"}
-                      </Text>
-                    </View>
-                  )}
+              {slMode === "percent" && (
+                <View style={styles.slInputArea}>
+                  <StepInput value={slPercent} onChange={setSlPercent} step={0.1} min={0.1} max={20} decimals={1} />
+                  <Text style={styles.slNote}>
+                    {marketEntry > 0 && sl != null
+                      ? `Risk ${riskDollars.toFixed(2)} → SL ${formatPrice(sl)}`
+                      : "Connect to calculate"}
+                  </Text>
+                </View>
+              )}
 
-                  {slMode === "percent" && (
-                    <View style={styles.slInputArea}>
-                      <StepInput value={slPercent} onChange={setSlPercent} step={0.1} min={0.1} max={20} decimals={1} />
-                      <Text style={styles.slNote}>
-                        {marketEntry > 0 && sl != null
-                          ? `Risk ${riskDollars.toFixed(2)} → SL ${formatPrice(sl)}`
-                          : "Connect to calculate"}
-                      </Text>
-                    </View>
+              {slMode === "manual" && (
+                <View style={styles.slInputArea}>
+                  <TextInput
+                    style={styles.manualInput}
+                    placeholder="Enter exact SL price"
+                    placeholderTextColor={C.textMuted}
+                    keyboardType="decimal-pad"
+                    value={slManualText}
+                    onChangeText={(t) => {
+                      setSlManualText(t);
+                      const n = parseFloat(t);
+                      if (!isNaN(n)) setSlManual(n);
+                    }}
+                  />
+                  {sl != null && marketEntry > 0 && (
+                    <Text style={styles.slNote}>
+                      {`Distance: ${Math.abs(marketEntry - sl).toFixed(2)}  (${(Math.abs(marketEntry - sl) / PIP_SIZE).toFixed(0)} pips)`}
+                    </Text>
                   )}
-
-                  {slMode === "manual" && (
-                    <View style={styles.slInputArea}>
-                      <TextInput
-                        style={styles.manualInput}
-                        placeholder="Enter exact SL price"
-                        placeholderTextColor={C.textMuted}
-                        keyboardType="decimal-pad"
-                        value={slManualText}
-                        onChangeText={(t) => {
-                          setSlManualText(t);
-                          const n = parseFloat(t);
-                          if (!isNaN(n)) setSlManual(n);
-                        }}
-                      />
-                      {sl != null && marketEntry > 0 && (
-                        <Text style={styles.slNote}>
-                          {`Distance: ${Math.abs(marketEntry - sl).toFixed(2)}  (${(Math.abs(marketEntry - sl) / PIP_SIZE).toFixed(0)} pips)`}
-                        </Text>
-                      )}
-                    </View>
-                  )}
-                </>
+                </View>
               )}
             </View>
 
@@ -985,8 +849,7 @@ export default function TradeScreen() {
                 <View style={styles.riskRow}>
                   <Text style={styles.riskLabel}>Stop Loss</Text>
                   <Text style={[styles.riskValue, { color: C.sell }]}>
-                    {effectiveDisplaySL != null ? formatPrice(effectiveDisplaySL) : "None"}
-                    {sessionActive ? <Text style={{ color: C.gold, fontSize: 11 }}> 🔒</Text> : null}
+                    {sl != null ? formatPrice(sl) : "None"}
                   </Text>
                 </View>
                 <View style={styles.riskRow}>
@@ -1002,6 +865,32 @@ export default function TradeScreen() {
               </View>
             )}
 
+            {/* Trade Button */}
+            <Pressable
+              style={({ pressed }) => [
+                styles.tradeBtn,
+                direction === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
+                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
+                isPlacing && { opacity: 0.6 },
+              ]}
+              onPress={handleSingleTrade}
+              disabled={isPlacing}
+            >
+              {isPlacing ? (
+                <ActivityIndicator color={direction === "buy" ? "#000" : "#fff"} />
+              ) : (
+                <>
+                  <Feather
+                    name={direction === "buy" ? "trending-up" : "trending-down"}
+                    size={20}
+                    color={direction === "buy" ? "#000" : "#fff"}
+                  />
+                  <Text style={[styles.tradeBtnText, direction === "buy" ? { color: "#000" } : { color: "#fff" }]}>
+                    {direction === "buy" ? "BUY XAUUSD" : "SELL XAUUSD"}
+                  </Text>
+                </>
+              )}
+            </Pressable>
           </>
         )}
       </ScrollView>

@@ -10,16 +10,6 @@ interface OhlcCandle { time: string; open: number; high: number; low: number; cl
 const tickStore = new Map<string, PriceTick[]>(); // accountId → ticks
 const MAX_TICKS = 3000; // ~4 hours of 5-second ticks
 
-// ── Last-known price cache ───────────────────────────────────────────────────
-// When MetaAPI's current-price endpoint is slow/times out, return the most
-// recent successful price instead of a 500 error (keeps the feed alive).
-interface CachedPrice { bid: number; ask: number; time: string; cachedAt: number; }
-const priceCache = new Map<string, CachedPrice>();
-
-// Consecutive timeout counter per account — used to trigger a redeploy if
-// MetaAPI's price stream appears stuck.
-const priceTimeoutCount = new Map<string, number>();
-
 function storeTick(accountId: string, bid: number, ask: number) {
   if (!tickStore.has(accountId)) tickStore.set(accountId, []);
   const ticks = tickStore.get(accountId)!;
@@ -452,128 +442,31 @@ router.get("/mt5/account/:accountId/info", async (req: Request, res: Response) =
   }
 });
 
-// Map chart timeframe codes to MetaAPI historical-market-data timeframe strings
-const TF_META: Record<string, string> = {
-  "1m":  "1 min",
-  "5m":  "5 mins",
-  "15m": "15 mins",
-  "30m": "30 mins",
-  "1h":  "1 hour",
-  "4h":  "4 hours",
-  "1d":  "1 day",
-};
-
 // GET /api/mt5/account/:accountId/candles?region=london&timeframe=5m&limit=150
-// Fetches real historical candles from MetaAPI, merged with live in-memory ticks.
-router.get("/mt5/account/:accountId/candles", async (req: Request, res: Response) => {
+// Candles are built from live price ticks accumulated by the /price endpoint.
+router.get("/mt5/account/:accountId/candles", (req: Request, res: Response) => {
   const timeframe = qstr(req.query.timeframe) || "5m";
   const limit = Math.min(parseInt(qstr(req.query.limit) || "150", 10) || 150, 500);
-  const region = qstr(req.query.region) || DEFAULT_REGION;
-  const accountId = req.params.accountId;
-
-  try {
-    const token = getToken();
-    const metaTf = TF_META[timeframe] ?? "5 mins";
-    // Fetch ~double the limit so merging with ticks covers any gap
-    const metaLimit = Math.min(limit * 2, 1000);
-    const histUrl = `${clientBase(region)}/users/current/accounts/${accountId}/historical-market-data/symbols/XAUUSD/timeframes/${encodeURIComponent(metaTf)}/candles?limit=${metaLimit}`;
-    const histRes = await fetch(histUrl, {
-      headers: authHeaders(token),
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (histRes.ok) {
-      type MetaCandle = { time?: string; brokerTime?: string; open?: number; high?: number; low?: number; close?: number };
-      const raw = await histRes.json() as MetaCandle[];
-      if (Array.isArray(raw) && raw.length > 0) {
-        // Merge MetaAPI candles with any fresh in-memory ticks (in-memory wins for latest bar)
-        const inMem = buildCandles(accountId, timeframe, 10); // last 10 bars from live ticks
-        const inMemKeys = new Set(inMem.map((c) => c.time));
-        const historical = raw
-          .map((c) => ({
-            time: c.time ?? c.brokerTime ?? "",
-            open: Number(c.open ?? 0),
-            high: Number(c.high ?? 0),
-            low: Number(c.low ?? 0),
-            close: Number(c.close ?? 0),
-          }))
-          .filter((c) => c.time && !inMemKeys.has(c.time));
-        const merged = [...historical, ...inMem]
-          .sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime())
-          .slice(-limit);
-        return res.json(merged);
-      }
-    }
-  } catch {
-    // Fall through to in-memory ticks
-  }
-
-  // Fallback: build candles from live price ticks accumulated by the /price endpoint
-  return res.json(buildCandles(accountId, timeframe, limit));
+  const candles = buildCandles(req.params.accountId, timeframe, limit);
+  return res.json(candles);
 });
 
 // GET /api/mt5/account/:accountId/price?region=london
 router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) => {
-  const accountId = req.params.accountId;
   try {
     const token = getToken();
     const region = qstr(req.query.region) || DEFAULT_REGION;
     const priceRes = await fetch(
-      `${clientBase(region)}/users/current/accounts/${accountId}/symbols/XAUUSD/current-price`,
-      { headers: authHeaders(token), signal: AbortSignal.timeout(7000) }
+      `${clientBase(region)}/users/current/accounts/${req.params.accountId}/symbols/XAUUSD/current-price`,
+      { headers: authHeaders(token) }
     );
-    if (!priceRes.ok) {
-      const errText = await priceRes.text().catch(() => "");
-      console.error(`[price] MetaAPI returned HTTP ${priceRes.status}: ${errText.slice(0, 200)}`);
-      // Try stale cache before giving up
-      const cached = priceCache.get(accountId);
-      if (cached && Date.now() - cached.cachedAt < 30_000) {
-        return res.json({ bid: cached.bid, ask: cached.ask, time: cached.time, stale: true });
-      }
-      return res.status(priceRes.status).json({ error: `Price fetch failed (${priceRes.status})`, detail: errText.slice(0, 200) });
-    }
-    const priceData = await priceRes.json() as Record<string, unknown>;
-    const bid = priceData.bid as number | undefined;
-    const ask = priceData.ask as number | undefined;
-    if (!bid || !ask) {
-      console.warn(`[price] MetaAPI returned empty price: ${JSON.stringify(priceData).slice(0, 100)}`);
-      const cached = priceCache.get(accountId);
-      if (cached && Date.now() - cached.cachedAt < 30_000) {
-        return res.json({ bid: cached.bid, ask: cached.ask, time: cached.time, stale: true });
-      }
-      return res.status(503).json({ error: "No price data available yet — broker may still be connecting." });
-    }
-    // Successful fetch — reset timeout counter and update cache
-    priceTimeoutCount.set(accountId, 0);
-    const priceTime = (priceData.time as string | undefined) ?? new Date().toISOString();
-    priceCache.set(accountId, { bid, ask, time: priceTime, cachedAt: Date.now() });
-    storeTick(accountId, bid, ask);
+    if (!priceRes.ok) return res.status(priceRes.status).json({ error: "Price fetch failed" });
+    const priceData = await priceRes.json() as { bid?: number; ask?: number };
+    // Accumulate tick for chart history
+    if (priceData.bid && priceData.ask) storeTick(req.params.accountId, priceData.bid, priceData.ask);
     return res.json(priceData);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "Failed";
-    const isTimeout = msg.toLowerCase().includes("timeout") || msg.toLowerCase().includes("abort");
-    if (isTimeout) {
-      const count = (priceTimeoutCount.get(accountId) ?? 0) + 1;
-      priceTimeoutCount.set(accountId, count);
-      console.error(`[price] timeout #${count} for ${accountId}`);
-      // Return stale cache if available (keeps the client feed alive through blips)
-      const cached = priceCache.get(accountId);
-      if (cached && Date.now() - cached.cachedAt < 30_000) {
-        return res.json({ bid: cached.bid, ask: cached.ask, time: cached.time, stale: true });
-      }
-      // After 10 consecutive timeouts with no cache, auto-redeploy the account
-      if (count >= 10) {
-        priceTimeoutCount.set(accountId, 0);
-        console.log(`[price] auto-redeploying ${accountId} after ${count} timeouts`);
-        try {
-          const token = getToken();
-          await deployAccount(token, accountId);
-        } catch { /* best-effort */ }
-      }
-    } else {
-      console.error(`[price] fetch error: ${msg}`);
-    }
-    return res.status(500).json({ error: msg });
+    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
   }
 });
 

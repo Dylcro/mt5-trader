@@ -9,24 +9,6 @@ import React, {
   useState,
 } from "react";
 
-// Parse JSON safely — throws a user-readable error instead of a raw SyntaxError
-// when the server returns HTML, a blank body, or any other non-JSON response.
-async function safeJson<T>(res: Response, context = "Server"): Promise<T> {
-  const text = await res.text().catch(() => "");
-  // HTML response means the proxy/server isn't ready — give a clearer message
-  if (text.trimStart().startsWith("<")) {
-    throw new Error(`${context}: server not ready (HTTP ${res.status}). Please try again.`);
-  }
-  try {
-    return JSON.parse(text) as T;
-  } catch {
-    const preview = text.slice(0, 120).replace(/\s+/g, " ").trim();
-    throw new Error(
-      `${context} returned an unexpected response (HTTP ${res.status})${preview ? `: ${preview}` : ""}. Please try again.`
-    );
-  }
-}
-
 export type ConnectionStatus = "disconnected" | "connecting" | "connected" | "error";
 
 export interface AccountInfo {
@@ -70,7 +52,6 @@ export interface Price {
   ask: number;
   spread: number;
   time: string;
-  stale?: boolean; // true when price comes from server-side cache (MetaAPI momentarily slow)
 }
 
 export type SLMode = "points" | "percent" | "manual";
@@ -104,7 +85,6 @@ interface TradingContextValue {
   refreshPendingOrders: () => Promise<void>;
   refreshPrice: () => Promise<void>;
   refreshAccountInfo: () => Promise<void>;
-  redeployAccount: () => Promise<void>;
 }
 
 export interface PlaceTradeParams {
@@ -197,12 +177,12 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       await new Promise((r) => setTimeout(r, 5000));
       try {
         const r = await fetch(`${API_BASE}/mt5/account/${accId}/status?region=${accRegion}`);
-        const d = await safeJson<{
+        const d = await r.json() as {
           connectionStatus?: string;
           error?: string;
           accountId?: string;
           region?: string;
-        } & Partial<AccountInfo>>(r, "Status endpoint");
+        } & Partial<AccountInfo>;
         if (!r.ok && d.error) throw new Error(d.error);
         if (d.connectionStatus === "CONNECTED") {
           const finalRegion = d.region ?? accRegion;
@@ -232,88 +212,53 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
   const reconnectSaved = async (savedId: string) => {
     setStatus("connecting");
-
-    // Retry up to 3× — handles the race where the API server is still starting
-    // when the app opens (proxy returns HTML 404 for a brief moment).
-    const MAX_ATTEMPTS = 3;
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      try {
-        // Small backoff between retries so the server has time to finish starting
-        if (attempt > 1) await new Promise((r) => setTimeout(r, 2000 * attempt));
-
-        const res = await fetch(`${API_BASE}/mt5/connect`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ accountId: savedId }),
-          signal: AbortSignal.timeout(15000),
-        });
-
-        // If the proxy returned HTML (server not ready yet), treat as transient
-        const contentType = res.headers.get("content-type") ?? "";
-        if (!contentType.includes("application/json")) {
-          const preview = (await res.text()).slice(0, 60);
-          console.warn(`[reconnect] attempt ${attempt}: non-JSON response (${res.status}): ${preview}`);
-          if (attempt < MAX_ATTEMPTS) continue;
-          // All retries exhausted and the server is unreachable — go to
-          // disconnected so the user can connect manually without an error banner.
-          console.warn("[reconnect] giving up after non-JSON response — falling back to disconnected");
-          setStatus("disconnected");
-          return;
-        }
-
-        const data = await safeJson<{
-          status?: string;
-          error?: string;
-          accountId?: string;
-          region?: string;
-        } & Partial<AccountInfo>>(res, "Connect endpoint");
-
-        // 404 JSON = account deleted on MetaAPI side — clear storage, let user log in fresh
-        if (res.status === 404) {
-          setStatus("disconnected");
-          setAccountIdState("");
-          await AsyncStorage.removeItem("mt5_account_id");
-          return;
-        }
-        if (!res.ok || data.error) throw new Error(data.error ?? "Reconnect failed");
-
-        const accId = data.accountId ?? savedId;
-        const accRegion = data.region ?? DEFAULT_REGION;
-
-        if (data.status === "connected") {
-          setAccountIdState(accId);
-          setRegionState(accRegion);
-          await AsyncStorage.setItem("mt5_region", accRegion);
-          setAccountInfo({
-            balance: data.balance ?? 0, equity: data.equity ?? 0,
-            margin: data.margin ?? 0, freeMargin: data.freeMargin ?? 0,
-            currency: data.currency ?? "USD", leverage: data.leverage ?? 100,
-            name: data.name ?? "Account",
-          });
-          setStatus("connected");
-          startPolling(accId, accRegion);
-        } else {
-          // status === "deploying" — poll
-          await pollUntilConnected(accId, accRegion);
-        }
-        return; // success — exit retry loop
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : "Reconnect failed";
-        console.warn(`[reconnect] attempt ${attempt} error: ${msg}`);
-        if (attempt === MAX_ATTEMPTS) {
-          // All retries failed. Fall back to disconnected silently — the user
-          // can tap Connect manually. Only show a real error if the API gave
-          // us a meaningful message (not a generic network/HTML error).
-          const isNetworkError = msg.includes("server not ready") || msg.includes("Network") || msg.includes("unexpected response");
-          if (isNetworkError) {
-            console.warn("[reconnect] network error on all attempts — falling back to disconnected");
-            setStatus("disconnected");
-          } else {
-            setErrorMsg(msg);
-            setStatus("error");
-          }
-        }
+    try {
+      const res = await fetch(`${API_BASE}/mt5/connect`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accountId: savedId }),
+      });
+      const data = await res.json() as {
+        status?: string;
+        error?: string;
+        accountId?: string;
+        region?: string;
+      } & Partial<AccountInfo>;
+      // 404 = account deleted on MetaAPI side — must re-register
+      if (res.status === 404) {
+        setStatus("disconnected");
+        setAccountIdState("");
+        await AsyncStorage.removeItem("mt5_account_id");
+        return;
       }
+      if (!res.ok || data.error) throw new Error(data.error ?? "Reconnect failed");
+
+      const accId = data.accountId ?? savedId;
+      const accRegion = data.region ?? DEFAULT_REGION;
+
+      if (data.status === "connected") {
+        setAccountIdState(accId);
+        setRegionState(accRegion);
+        await AsyncStorage.setItem("mt5_region", accRegion);
+        setAccountInfo({
+          balance: data.balance ?? 0, equity: data.equity ?? 0,
+          margin: data.margin ?? 0, freeMargin: data.freeMargin ?? 0,
+          currency: data.currency ?? "USD", leverage: data.leverage ?? 100,
+          name: data.name ?? "Account",
+        });
+        setStatus("connected");
+        startPolling(accId, accRegion);
+      } else {
+        // status === "deploying" — poll
+        await pollUntilConnected(accId, accRegion);
+      }
+    } catch (err) {
+      // Transient error (network blip, timeout) — leave accountId intact so
+      // the user can retry without re-entering credentials.
+      const msg = err instanceof Error ? err.message : "Reconnect failed";
+      console.warn("[reconnect] failed:", msg);
+      setErrorMsg(msg);
+      setStatus("error");
     }
   };
 
@@ -326,12 +271,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const fetchPriceData = useCallback(async (accId: string, accRegion: string): Promise<Price> => {
-    const res = await fetch(
-      `${API_BASE}/mt5/account/${accId}/price?region=${accRegion}`,
-      { signal: AbortSignal.timeout(9000) },
-    );
+    const res = await fetch(`${API_BASE}/mt5/account/${accId}/price?region=${accRegion}`);
     if (!res.ok) throw new Error(`Price fetch failed: ${res.status}`);
-    const data = await res.json() as { bid?: number; ask?: number; time?: string; stale?: boolean };
+    const data = await res.json() as { bid?: number; ask?: number; time?: string };
     const bid = data.bid ?? 0;
     const ask = data.ask ?? 0;
     return {
@@ -339,7 +281,6 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       ask,
       spread: Math.round((ask - bid) * 10),
       time: data.time ?? new Date().toISOString(),
-      stale: data.stale ?? false,
     };
   }, []);
 
@@ -402,48 +343,18 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
   const startPolling = useCallback(
     (accId: string, accRegion: string) => {
-      if (priceIntervalRef.current) clearTimeout(priceIntervalRef.current);
+      if (priceIntervalRef.current) clearInterval(priceIntervalRef.current);
       if (positionsIntervalRef.current) clearInterval(positionsIntervalRef.current);
       priceFailCountRef.current = 0;
       setPriceError(false);
 
-      // Sequential loop: next request only fires after the previous one settles.
-      // Prevents in-flight request pile-up when MetaAPI is slow or the network hiccups.
-      let active = true;
-      let autoReconnectAt = 0; // timestamp of last auto-reconnect attempt
-      const loop = () => {
-        if (!active) return;
+      const pollPrice = () =>
         fetchPriceData(accId, accRegion)
-          .then((p) => {
-            // Stale prices don't reset the fail counter but they DO keep the feed alive —
-            // don't increment failures and don't clear error state until we get a fresh price.
-            if (!p.stale) {
-              priceFailCountRef.current = 0;
-              setPriceError(false);
-            }
-            setPrice(p);
-          })
+          .then((p) => { priceFailCountRef.current = 0; setPriceError(false); setPrice(p); })
           .catch(() => {
             priceFailCountRef.current += 1;
             if (priceFailCountRef.current >= 3) setPriceError(true);
-            // Auto-reconnect: if price has been failing for ~15s, try re-deploying
-            // the MetaAPI account (handles broker disconnect after idle time).
-            // Limit to once every 90 seconds to avoid hammering the API.
-            if (priceFailCountRef.current >= 30 && Date.now() - autoReconnectAt > 90_000) {
-              autoReconnectAt = Date.now();
-              priceFailCountRef.current = 0;
-              console.log("[price-poll] auto-reconnect triggered after sustained failures");
-              fetch(`${API_BASE}/mt5/connect`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ accountId: accId }),
-              }).catch(() => {});
-            }
-          })
-          .finally(() => {
-            if (active) priceIntervalRef.current = setTimeout(loop, 500);
           });
-      };
 
       const pollPositions = () =>
         Promise.all([
@@ -451,12 +362,10 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           fetchPendingOrdersData(accId, accRegion).then(setPendingOrders).catch(() => {}),
         ]);
 
-      loop();
+      pollPrice();
       pollPositions();
+      priceIntervalRef.current = setInterval(pollPrice, 500);
       positionsIntervalRef.current = setInterval(pollPositions, 10000);
-
-      // Return cleanup so the ref-sync effect can stop the loop
-      return () => { active = false; if (priceIntervalRef.current) clearTimeout(priceIntervalRef.current); };
     },
     [fetchPriceData, fetchPositionsData, fetchPendingOrdersData]
   );
@@ -465,7 +374,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => { startPollingRef.current = startPolling; }, [startPolling]);
 
   const stopPolling = useCallback(() => {
-    if (priceIntervalRef.current) clearTimeout(priceIntervalRef.current);
+    if (priceIntervalRef.current) clearInterval(priceIntervalRef.current);
     if (positionsIntervalRef.current) clearInterval(positionsIntervalRef.current);
   }, []);
 
@@ -498,13 +407,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           throw new Error(`Cannot reach server. Check your connection. (${netErr instanceof Error ? netErr.message : netErr})`);
         }
 
-        const data = await safeJson<{
+        const data = await res.json() as {
           status?: string;
           error?: string;
           accountId?: string;
           region?: string;
           retryAfterMs?: number;
-        } & Partial<AccountInfo>>(res, "Connect endpoint");
+        } & Partial<AccountInfo>;
 
         if (!res.ok || data.error) throw new Error(data.error ?? "Connection failed");
 
@@ -576,44 +485,6 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       setPriceError(false);
     } catch {}
   }, [status, accountId, region, fetchPriceData]);
-
-  // Force-redeploy the MetaAPI account and restart polling — used when price feed
-  // is stuck failing (e.g. broker disconnected after idle time).
-  const redeployAccount = useCallback(async () => {
-    if (!accountId) return;
-    try {
-      setStatus("connecting");
-      setPriceError(false);
-      priceFailCountRef.current = 0;
-      const res = await fetch(`${API_BASE}/mt5/connect`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ accountId }),
-      });
-      const data = await safeJson<{ status?: string; region?: string; error?: string } & Partial<AccountInfo>>(res, "Reconnect");
-      if (!res.ok || data.error) throw new Error(data.error ?? "Reconnect failed");
-      const accRegion = data.region ?? region;
-      setRegionState(accRegion);
-      if (data.status === "connected") {
-        if (data.balance != null) {
-          setAccountInfo({
-            balance: data.balance, equity: data.equity ?? 0,
-            margin: data.margin ?? 0, freeMargin: data.freeMargin ?? 0,
-            currency: data.currency ?? "USD", leverage: data.leverage ?? 100,
-            name: data.name ?? "Account",
-          });
-        }
-        setStatus("connected");
-        startPolling(accountId, accRegion);
-      } else {
-        // deploying — poll until connected
-        await pollUntilConnected(accountId, accRegion);
-      }
-    } catch (err) {
-      setStatus("error");
-      setErrorMsg(err instanceof Error ? err.message : "Reconnect failed");
-    }
-  }, [accountId, region, startPolling, pollUntilConnected]);
 
   const refreshPositions = useCallback(async () => {
     if (status !== "connected" || !accountId) return;
@@ -833,7 +704,6 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         refreshPendingOrders,
         refreshPrice,
         refreshAccountInfo,
-        redeployAccount,
       }}
     >
       {children}
