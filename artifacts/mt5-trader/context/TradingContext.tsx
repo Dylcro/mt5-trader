@@ -99,6 +99,7 @@ interface TradingContextValue {
   refreshPendingOrders: () => Promise<void>;
   refreshPrice: () => Promise<void>;
   refreshAccountInfo: () => Promise<void>;
+  redeployAccount: () => Promise<void>;
 }
 
 export interface PlaceTradeParams {
@@ -368,6 +369,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       // Sequential loop: next request only fires after the previous one settles.
       // Prevents in-flight request pile-up when MetaAPI is slow or the network hiccups.
       let active = true;
+      let autoReconnectAt = 0; // timestamp of last auto-reconnect attempt
       const loop = () => {
         if (!active) return;
         fetchPriceData(accId, accRegion)
@@ -379,6 +381,19 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           .catch(() => {
             priceFailCountRef.current += 1;
             if (priceFailCountRef.current >= 3) setPriceError(true);
+            // Auto-reconnect: if price has been failing for ~15s, try re-deploying
+            // the MetaAPI account (handles broker disconnect after idle time).
+            // Limit to once every 90 seconds to avoid hammering the API.
+            if (priceFailCountRef.current >= 30 && Date.now() - autoReconnectAt > 90_000) {
+              autoReconnectAt = Date.now();
+              priceFailCountRef.current = 0;
+              console.log("[price-poll] auto-reconnect triggered after sustained failures");
+              fetch(`${API_BASE}/mt5/connect`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ accountId: accId }),
+              }).catch(() => {});
+            }
           })
           .finally(() => {
             if (active) priceIntervalRef.current = setTimeout(loop, 500);
@@ -516,6 +531,44 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       setPriceError(false);
     } catch {}
   }, [status, accountId, region, fetchPriceData]);
+
+  // Force-redeploy the MetaAPI account and restart polling — used when price feed
+  // is stuck failing (e.g. broker disconnected after idle time).
+  const redeployAccount = useCallback(async () => {
+    if (!accountId) return;
+    try {
+      setStatus("connecting");
+      setPriceError(false);
+      priceFailCountRef.current = 0;
+      const res = await fetch(`${API_BASE}/mt5/connect`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accountId }),
+      });
+      const data = await safeJson<{ status?: string; region?: string; error?: string } & Partial<AccountInfo>>(res, "Reconnect");
+      if (!res.ok || data.error) throw new Error(data.error ?? "Reconnect failed");
+      const accRegion = data.region ?? region;
+      setRegionState(accRegion);
+      if (data.status === "connected") {
+        if (data.balance != null) {
+          setAccountInfo({
+            balance: data.balance, equity: data.equity ?? 0,
+            margin: data.margin ?? 0, freeMargin: data.freeMargin ?? 0,
+            currency: data.currency ?? "USD", leverage: data.leverage ?? 100,
+            name: data.name ?? "Account",
+          });
+        }
+        setStatus("connected");
+        startPolling(accountId, accRegion);
+      } else {
+        // deploying — poll until connected
+        await pollUntilConnected(accountId, accRegion);
+      }
+    } catch (err) {
+      setStatus("error");
+      setErrorMsg(err instanceof Error ? err.message : "Reconnect failed");
+    }
+  }, [accountId, region, startPolling, pollUntilConnected]);
 
   const refreshPositions = useCallback(async () => {
     if (status !== "connected" || !accountId) return;
@@ -735,6 +788,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         refreshPendingOrders,
         refreshPrice,
         refreshAccountInfo,
+        redeployAccount,
       }}
     >
       {children}

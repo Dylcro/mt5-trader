@@ -511,13 +511,23 @@ router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) 
       `${clientBase(region)}/users/current/accounts/${req.params.accountId}/symbols/XAUUSD/current-price`,
       { headers: authHeaders(token), signal: AbortSignal.timeout(3000) }
     );
-    if (!priceRes.ok) return res.status(priceRes.status).json({ error: "Price fetch failed" });
+    if (!priceRes.ok) {
+      const errText = await priceRes.text().catch(() => "");
+      console.error(`[price] MetaAPI returned HTTP ${priceRes.status}: ${errText.slice(0, 200)}`);
+      return res.status(priceRes.status).json({ error: `Price fetch failed (${priceRes.status})`, detail: errText.slice(0, 200) });
+    }
     const priceData = await priceRes.json() as { bid?: number; ask?: number };
+    if (!priceData.bid || !priceData.ask) {
+      console.warn(`[price] MetaAPI returned empty price: ${JSON.stringify(priceData)}`);
+      return res.status(503).json({ error: "No price data available yet — broker may still be connecting." });
+    }
     // Accumulate tick for chart history
-    if (priceData.bid && priceData.ask) storeTick(req.params.accountId, priceData.bid, priceData.ask);
+    storeTick(req.params.accountId, priceData.bid, priceData.ask);
     return res.json(priceData);
   } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
+    const msg = err instanceof Error ? err.message : "Failed";
+    console.error(`[price] fetch error: ${msg}`);
+    return res.status(500).json({ error: msg });
   }
 });
 

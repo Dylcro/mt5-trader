@@ -270,7 +270,7 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition } = useTrading();
+  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, redeployAccount } = useTrading();
   const { settings: cascadeSettings } = useCascadeSettings();
   const cascadeSettingsRef = useRef(cascadeSettings);
   useEffect(() => { cascadeSettingsRef.current = cascadeSettings; }, [cascadeSettings]);
@@ -653,9 +653,14 @@ export default function TradeScreen() {
               {priceError && (
                 <View style={styles.priceErrorBanner}>
                   <Feather name="wifi-off" size={12} color={C.sell} />
-                  <Text style={styles.priceErrorText}>Price feed interrupted — tap{" "}
-                    <Text style={{ color: C.textSecondary }} onPress={refreshPrice}>↻</Text> to retry
-                  </Text>
+                  <Text style={styles.priceErrorText}>Price feed interrupted</Text>
+                  <Pressable
+                    onPress={() => { void redeployAccount(); void Haptics.selectionAsync(); }}
+                    style={{ marginLeft: "auto", backgroundColor: C.gold, borderRadius: 6, paddingHorizontal: 10, paddingVertical: 4 }}
+                    hitSlop={8}
+                  >
+                    <Text style={{ color: "#000", fontSize: 12, fontWeight: "700" }}>Reconnect</Text>
+                  </Pressable>
                 </View>
               )}
             </>
@@ -664,11 +669,19 @@ export default function TradeScreen() {
               <MaterialCommunityIcons name="chart-line" size={28} color={C.textMuted} />
               <Text style={styles.noPriceText}>
                 {priceError
-                  ? "Price feed failed — tap ↻ to retry"
+                  ? "Price feed failed"
                   : status === "connecting"
-                    ? "Fetching price..."
+                    ? "Connecting to broker..."
                     : "Connect account to see live price"}
               </Text>
+              {priceError && accountId ? (
+                <Pressable
+                  onPress={() => { void redeployAccount(); void Haptics.selectionAsync(); }}
+                  style={{ marginTop: 12, backgroundColor: C.gold, borderRadius: 8, paddingHorizontal: 20, paddingVertical: 8 }}
+                >
+                  <Text style={{ color: "#000", fontWeight: "700", fontSize: 14 }}>Reconnect</Text>
+                </Pressable>
+              ) : null}
             </View>
           )}
         </View>
