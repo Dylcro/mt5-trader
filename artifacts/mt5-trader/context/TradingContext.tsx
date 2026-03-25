@@ -13,6 +13,10 @@ import React, {
 // when the server returns HTML, a blank body, or any other non-JSON response.
 async function safeJson<T>(res: Response, context = "Server"): Promise<T> {
   const text = await res.text().catch(() => "");
+  // HTML response means the proxy/server isn't ready — give a clearer message
+  if (text.trimStart().startsWith("<")) {
+    throw new Error(`${context}: server not ready (HTTP ${res.status}). Please try again.`);
+  }
   try {
     return JSON.parse(text) as T;
   } catch {
@@ -227,53 +231,88 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
   const reconnectSaved = async (savedId: string) => {
     setStatus("connecting");
-    try {
-      const res = await fetch(`${API_BASE}/mt5/connect`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ accountId: savedId }),
-      });
-      const data = await safeJson<{
-        status?: string;
-        error?: string;
-        accountId?: string;
-        region?: string;
-      } & Partial<AccountInfo>>(res, "Connect endpoint");
-      // 404 = account deleted on MetaAPI side — must re-register
-      if (res.status === 404) {
-        setStatus("disconnected");
-        setAccountIdState("");
-        await AsyncStorage.removeItem("mt5_account_id");
-        return;
-      }
-      if (!res.ok || data.error) throw new Error(data.error ?? "Reconnect failed");
 
-      const accId = data.accountId ?? savedId;
-      const accRegion = data.region ?? DEFAULT_REGION;
+    // Retry up to 3× — handles the race where the API server is still starting
+    // when the app opens (proxy returns HTML 404 for a brief moment).
+    const MAX_ATTEMPTS = 3;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        // Small backoff between retries so the server has time to finish starting
+        if (attempt > 1) await new Promise((r) => setTimeout(r, 2000 * attempt));
 
-      if (data.status === "connected") {
-        setAccountIdState(accId);
-        setRegionState(accRegion);
-        await AsyncStorage.setItem("mt5_region", accRegion);
-        setAccountInfo({
-          balance: data.balance ?? 0, equity: data.equity ?? 0,
-          margin: data.margin ?? 0, freeMargin: data.freeMargin ?? 0,
-          currency: data.currency ?? "USD", leverage: data.leverage ?? 100,
-          name: data.name ?? "Account",
+        const res = await fetch(`${API_BASE}/mt5/connect`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ accountId: savedId }),
+          signal: AbortSignal.timeout(15000),
         });
-        setStatus("connected");
-        startPolling(accId, accRegion);
-      } else {
-        // status === "deploying" — poll
-        await pollUntilConnected(accId, accRegion);
+
+        // If the proxy returned HTML (server not ready yet), treat as transient
+        const contentType = res.headers.get("content-type") ?? "";
+        if (!contentType.includes("application/json")) {
+          const preview = (await res.text()).slice(0, 60);
+          console.warn(`[reconnect] attempt ${attempt}: non-JSON response (${res.status}): ${preview}`);
+          if (attempt < MAX_ATTEMPTS) continue;
+          // All retries exhausted and the server is unreachable — go to
+          // disconnected so the user can connect manually without an error banner.
+          console.warn("[reconnect] giving up after non-JSON response — falling back to disconnected");
+          setStatus("disconnected");
+          return;
+        }
+
+        const data = await safeJson<{
+          status?: string;
+          error?: string;
+          accountId?: string;
+          region?: string;
+        } & Partial<AccountInfo>>(res, "Connect endpoint");
+
+        // 404 JSON = account deleted on MetaAPI side — clear storage, let user log in fresh
+        if (res.status === 404) {
+          setStatus("disconnected");
+          setAccountIdState("");
+          await AsyncStorage.removeItem("mt5_account_id");
+          return;
+        }
+        if (!res.ok || data.error) throw new Error(data.error ?? "Reconnect failed");
+
+        const accId = data.accountId ?? savedId;
+        const accRegion = data.region ?? DEFAULT_REGION;
+
+        if (data.status === "connected") {
+          setAccountIdState(accId);
+          setRegionState(accRegion);
+          await AsyncStorage.setItem("mt5_region", accRegion);
+          setAccountInfo({
+            balance: data.balance ?? 0, equity: data.equity ?? 0,
+            margin: data.margin ?? 0, freeMargin: data.freeMargin ?? 0,
+            currency: data.currency ?? "USD", leverage: data.leverage ?? 100,
+            name: data.name ?? "Account",
+          });
+          setStatus("connected");
+          startPolling(accId, accRegion);
+        } else {
+          // status === "deploying" — poll
+          await pollUntilConnected(accId, accRegion);
+        }
+        return; // success — exit retry loop
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Reconnect failed";
+        console.warn(`[reconnect] attempt ${attempt} error: ${msg}`);
+        if (attempt === MAX_ATTEMPTS) {
+          // All retries failed. Fall back to disconnected silently — the user
+          // can tap Connect manually. Only show a real error if the API gave
+          // us a meaningful message (not a generic network/HTML error).
+          const isNetworkError = msg.includes("server not ready") || msg.includes("Network") || msg.includes("unexpected response");
+          if (isNetworkError) {
+            console.warn("[reconnect] network error on all attempts — falling back to disconnected");
+            setStatus("disconnected");
+          } else {
+            setErrorMsg(msg);
+            setStatus("error");
+          }
+        }
       }
-    } catch (err) {
-      // Transient error (network blip, timeout) — leave accountId intact so
-      // the user can retry without re-entering credentials.
-      const msg = err instanceof Error ? err.message : "Reconnect failed";
-      console.warn("[reconnect] failed:", msg);
-      setErrorMsg(msg);
-      setStatus("error");
     }
   };
 
