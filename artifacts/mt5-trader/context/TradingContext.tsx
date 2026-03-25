@@ -9,6 +9,20 @@ import React, {
   useState,
 } from "react";
 
+// Parse JSON safely — throws a user-readable error instead of a raw SyntaxError
+// when the server returns HTML, a blank body, or any other non-JSON response.
+async function safeJson<T>(res: Response, context = "Server"): Promise<T> {
+  const text = await res.text().catch(() => "");
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    const preview = text.slice(0, 120).replace(/\s+/g, " ").trim();
+    throw new Error(
+      `${context} returned an unexpected response (HTTP ${res.status})${preview ? `: ${preview}` : ""}. Please try again.`
+    );
+  }
+}
+
 export type ConnectionStatus = "disconnected" | "connecting" | "connected" | "error";
 
 export interface AccountInfo {
@@ -177,12 +191,12 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       await new Promise((r) => setTimeout(r, 5000));
       try {
         const r = await fetch(`${API_BASE}/mt5/account/${accId}/status?region=${accRegion}`);
-        const d = await r.json() as {
+        const d = await safeJson<{
           connectionStatus?: string;
           error?: string;
           accountId?: string;
           region?: string;
-        } & Partial<AccountInfo>;
+        } & Partial<AccountInfo>>(r, "Status endpoint");
         if (!r.ok && d.error) throw new Error(d.error);
         if (d.connectionStatus === "CONNECTED") {
           const finalRegion = d.region ?? accRegion;
@@ -218,12 +232,12 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ accountId: savedId }),
       });
-      const data = await res.json() as {
+      const data = await safeJson<{
         status?: string;
         error?: string;
         accountId?: string;
         region?: string;
-      } & Partial<AccountInfo>;
+      } & Partial<AccountInfo>>(res, "Connect endpoint");
       // 404 = account deleted on MetaAPI side — must re-register
       if (res.status === 404) {
         setStatus("disconnected");
@@ -424,13 +438,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           throw new Error(`Cannot reach server. Check your connection. (${netErr instanceof Error ? netErr.message : netErr})`);
         }
 
-        const data = await res.json() as {
+        const data = await safeJson<{
           status?: string;
           error?: string;
           accountId?: string;
           region?: string;
           retryAfterMs?: number;
-        } & Partial<AccountInfo>;
+        } & Partial<AccountInfo>>(res, "Connect endpoint");
 
         if (!res.ok || data.error) throw new Error(data.error ?? "Connection failed");
 
