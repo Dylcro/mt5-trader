@@ -442,13 +442,64 @@ router.get("/mt5/account/:accountId/info", async (req: Request, res: Response) =
   }
 });
 
+// Map chart timeframe codes to MetaAPI historical-market-data timeframe strings
+const TF_META: Record<string, string> = {
+  "1m":  "1 min",
+  "5m":  "5 mins",
+  "15m": "15 mins",
+  "30m": "30 mins",
+  "1h":  "1 hour",
+  "4h":  "4 hours",
+  "1d":  "1 day",
+};
+
 // GET /api/mt5/account/:accountId/candles?region=london&timeframe=5m&limit=150
-// Candles are built from live price ticks accumulated by the /price endpoint.
-router.get("/mt5/account/:accountId/candles", (req: Request, res: Response) => {
+// Fetches real historical candles from MetaAPI, merged with live in-memory ticks.
+router.get("/mt5/account/:accountId/candles", async (req: Request, res: Response) => {
   const timeframe = qstr(req.query.timeframe) || "5m";
   const limit = Math.min(parseInt(qstr(req.query.limit) || "150", 10) || 150, 500);
-  const candles = buildCandles(req.params.accountId, timeframe, limit);
-  return res.json(candles);
+  const region = qstr(req.query.region) || DEFAULT_REGION;
+  const accountId = req.params.accountId;
+
+  try {
+    const token = getToken();
+    const metaTf = TF_META[timeframe] ?? "5 mins";
+    // Fetch ~double the limit so merging with ticks covers any gap
+    const metaLimit = Math.min(limit * 2, 1000);
+    const histUrl = `${clientBase(region)}/users/current/accounts/${accountId}/historical-market-data/symbols/XAUUSD/timeframes/${encodeURIComponent(metaTf)}/candles?limit=${metaLimit}`;
+    const histRes = await fetch(histUrl, {
+      headers: authHeaders(token),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (histRes.ok) {
+      type MetaCandle = { time?: string; brokerTime?: string; open?: number; high?: number; low?: number; close?: number };
+      const raw = await histRes.json() as MetaCandle[];
+      if (Array.isArray(raw) && raw.length > 0) {
+        // Merge MetaAPI candles with any fresh in-memory ticks (in-memory wins for latest bar)
+        const inMem = buildCandles(accountId, timeframe, 10); // last 10 bars from live ticks
+        const inMemKeys = new Set(inMem.map((c) => c.time));
+        const historical = raw
+          .map((c) => ({
+            time: c.time ?? c.brokerTime ?? "",
+            open: Number(c.open ?? 0),
+            high: Number(c.high ?? 0),
+            low: Number(c.low ?? 0),
+            close: Number(c.close ?? 0),
+          }))
+          .filter((c) => c.time && !inMemKeys.has(c.time));
+        const merged = [...historical, ...inMem]
+          .sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime())
+          .slice(-limit);
+        return res.json(merged);
+      }
+    }
+  } catch {
+    // Fall through to in-memory ticks
+  }
+
+  // Fallback: build candles from live price ticks accumulated by the /price endpoint
+  return res.json(buildCandles(accountId, timeframe, limit));
 });
 
 // GET /api/mt5/account/:accountId/price?region=london

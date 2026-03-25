@@ -20,6 +20,7 @@ import Colors from "@/constants/colors";
 
 import { useTrading, type SLMode } from "@/context/TradingContext";
 import { buildCascadeLevels, useCascadeSettings } from "@/hooks/useCascadeSettings";
+import { TradingViewChart } from "@/components/TradingViewChart";
 
 const C = Colors.dark;
 
@@ -671,6 +672,16 @@ export default function TradeScreen() {
             </View>
           )}
         </View>
+
+        {/* Live Chart — only when connected and account is known */}
+        {status === "connected" && accountId ? (
+          <TradingViewChart
+            apiBase={apiBase}
+            accountId={accountId}
+            region={region}
+            liveBid={price?.bid}
+          />
+        ) : null}
 
         {/* Mode Toggle */}
         <View style={styles.modeToggle}>
