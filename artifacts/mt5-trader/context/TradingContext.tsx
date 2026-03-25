@@ -122,6 +122,20 @@ function resolveApiBase(): string {
 const API_BASE = resolveApiBase();
 console.log("[API] base:", API_BASE);
 
+// Safely parse a fetch Response as JSON. If the body is HTML (server not ready yet
+// or proxy error), throws a human-readable message instead of a raw parse error.
+async function safeJson<T = Record<string, unknown>>(res: Response): Promise<T> {
+  const text = await res.text();
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    if (text.trim().startsWith("<")) {
+      throw new Error("Server not ready — please wait a moment and try again");
+    }
+    throw new Error("Unexpected server response — please try again");
+  }
+}
+
 const DEFAULT_REGION = "london";
 
 const TradingContext = createContext<TradingContextValue | null>(null);
@@ -177,12 +191,12 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       await new Promise((r) => setTimeout(r, 5000));
       try {
         const r = await fetch(`${API_BASE}/mt5/account/${accId}/status?region=${accRegion}`);
-        const d = await r.json() as {
+        const d = await safeJson<{
           connectionStatus?: string;
           error?: string;
           accountId?: string;
           region?: string;
-        } & Partial<AccountInfo>;
+        } & Partial<AccountInfo>>(r);
         if (!r.ok && d.error) throw new Error(d.error);
         if (d.connectionStatus === "CONNECTED") {
           const finalRegion = d.region ?? accRegion;
@@ -213,17 +227,30 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const reconnectSaved = async (savedId: string) => {
     setStatus("connecting");
     try {
-      const res = await fetch(`${API_BASE}/mt5/connect`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ accountId: savedId }),
-      });
-      const data = await res.json() as {
-        status?: string;
-        error?: string;
-        accountId?: string;
-        region?: string;
-      } & Partial<AccountInfo>;
+      // Retry up to 3 times — on first app launch the API server may still be warming up
+      let res: Response | null = null;
+      let data: ({ status?: string; error?: string; accountId?: string; region?: string } & Partial<AccountInfo>) | null = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          res = await fetch(`${API_BASE}/mt5/connect`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ accountId: savedId }),
+          });
+          data = await safeJson<{ status?: string; error?: string; accountId?: string; region?: string } & Partial<AccountInfo>>(res);
+          break; // success — exit retry loop
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : "";
+          if (attempt < 3 && msg.includes("not ready")) {
+            console.warn(`[reconnect] attempt ${attempt} failed (server not ready) — retrying in 2s`);
+            await new Promise((r) => setTimeout(r, 2000));
+          } else {
+            throw err;
+          }
+        }
+      }
+      if (!res || !data) throw new Error("Reconnect failed");
+
       // 404 = account deleted on MetaAPI side — must re-register
       if (res.status === 404) {
         setStatus("disconnected");
@@ -273,7 +300,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const fetchPriceData = useCallback(async (accId: string, accRegion: string): Promise<Price> => {
     const res = await fetch(`${API_BASE}/mt5/account/${accId}/price?region=${accRegion}`);
     if (!res.ok) throw new Error(`Price fetch failed: ${res.status}`);
-    const data = await res.json() as { bid?: number; ask?: number; time?: string };
+    const data = await safeJson<{ bid?: number; ask?: number; time?: string }>(res);
     const bid = data.bid ?? 0;
     const ask = data.ask ?? 0;
     return {
@@ -287,7 +314,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const fetchPositionsData = useCallback(async (accId: string, accRegion: string): Promise<Position[]> => {
     const res = await fetch(`${API_BASE}/mt5/account/${accId}/positions?region=${accRegion}`);
     if (!res.ok) throw new Error(`Positions fetch failed: ${res.status}`);
-    const data = await res.json() as unknown[];
+    const data = await safeJson<unknown[]>(res);
     return (Array.isArray(data) ? data : []).map((p) => {
       const pos = p as Record<string, unknown>;
       return {
@@ -309,7 +336,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const fetchAccountInfoData = useCallback(async (accId: string, accRegion: string): Promise<AccountInfo> => {
     const res = await fetch(`${API_BASE}/mt5/account/${accId}/info?region=${accRegion}`);
     if (!res.ok) throw new Error(`Account info failed: ${res.status}`);
-    const data = await res.json() as Record<string, unknown>;
+    const data = await safeJson(res);
     return {
       balance: Number(data.balance ?? 0),
       equity: Number(data.equity ?? 0),
@@ -324,7 +351,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const fetchPendingOrdersData = useCallback(async (accId: string, accRegion: string): Promise<PendingOrder[]> => {
     const res = await fetch(`${API_BASE}/mt5/account/${accId}/orders?region=${accRegion}`);
     if (!res.ok) throw new Error(`Orders fetch failed: ${res.status}`);
-    const data = await res.json() as unknown[];
+    const data = await safeJson<unknown[]>(res);
     return (Array.isArray(data) ? data : []).map((o) => {
       const ord = o as Record<string, unknown>;
       return {
@@ -407,13 +434,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           throw new Error(`Cannot reach server. Check your connection. (${netErr instanceof Error ? netErr.message : netErr})`);
         }
 
-        const data = await res.json() as {
+        const data = await safeJson<{
           status?: string;
           error?: string;
           accountId?: string;
           region?: string;
           retryAfterMs?: number;
-        } & Partial<AccountInfo>;
+        } & Partial<AccountInfo>>(res);
 
         if (!res.ok || data.error) throw new Error(data.error ?? "Connection failed");
 
@@ -534,7 +561,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
-        const data = await res.json() as { success?: boolean; code?: number; message?: string; positionId?: string; orderId?: string };
+        const data = await safeJson<{ success?: boolean; code?: number; message?: string; positionId?: string; orderId?: string }>(res);
         console.log("[submitOrderRaw] ←", actionType, "httpStatus=" + String(res.status), "success=" + String(data.success) + " code=" + String(data.code) + " msg=" + String(data.message));
         if (res.ok && data.success !== false) {
           return { success: true, message: data.message ?? "Trade placed successfully", positionId: data.positionId, orderId: data.orderId };
@@ -650,7 +677,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ actionType: "POSITION_CLOSE_ID", positionId }),
         });
-        const data = await res.json() as { success?: boolean; code?: number; message?: string };
+        const data = await safeJson<{ success?: boolean; code?: number; message?: string }>(res);
         if (!res.ok || data.success === false) return { success: false, message: data.message ?? `Close failed (code ${data.code ?? res.status})` };
         await Promise.all([refreshPositions(), refreshAccountInfo()]);
         return { success: true, message: "Position closed" };
@@ -668,7 +695,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         const res = await fetch(`${API_BASE}/mt5/account/${accountId}/order/${orderId}?region=${region}`, {
           method: "DELETE",
         });
-        const data = await res.json() as { success?: boolean; message?: string };
+        const data = await safeJson<{ success?: boolean; message?: string }>(res);
         if (!res.ok || data.success === false) return { success: false, message: data.message ?? `Cancel failed` };
         await Promise.all([refreshPendingOrders(), refreshAccountInfo()]);
         return { success: true, message: "Order cancelled" };
