@@ -756,46 +756,29 @@ export default function TradeScreen() {
         {/* ═══ CASCADE MODE ═══════════════════════════════════════════════════ */}
         {tradeMode === "cascade" && (
           <>
-            {/* Direction */}
-            <View style={styles.directionRow}>
-              <Pressable
-                style={[styles.dirBtn, cascadeDirection === "buy" && styles.dirBtnBuyActive]}
-                onPress={() => { setCascadeDirection("buy"); void Haptics.selectionAsync(); }}
-              >
-                <Feather name="trending-up" size={18} color={cascadeDirection === "buy" ? "#000" : C.buy} />
-                <Text style={[styles.dirLabel, cascadeDirection === "buy" ? styles.dirLabelActiveBuy : { color: C.buy }]}>BUY</Text>
-              </Pressable>
-              <Pressable
-                style={[styles.dirBtn, cascadeDirection === "sell" && styles.dirBtnSellActive]}
-                onPress={() => { setCascadeDirection("sell"); void Haptics.selectionAsync(); }}
-              >
-                <Feather name="trending-down" size={18} color={cascadeDirection === "sell" ? "#fff" : C.sell} />
-                <Text style={[styles.dirLabel, cascadeDirection === "sell" ? styles.dirLabelActiveSell : { color: C.sell }]}>SELL</Text>
-              </Pressable>
-            </View>
-
-            {/* Live price info card */}
-            <View style={styles.sectionCard}>
-              <View style={styles.sectionHeader}>
-                <Text style={styles.sectionTitle}>Market Entry</Text>
-                <Pressable onPress={refreshPrice} hitSlop={8}>
-                  <Text style={styles.useMarketBtn}>Refresh</Text>
-                </Pressable>
+            {/* Cascade summary strip — orders / spacing / SL at a glance */}
+            <View style={styles.cascadeSummaryRow}>
+              <View style={styles.cascadeSummaryItem}>
+                <Text style={styles.cascadeSummaryValue}>{cascadeSettings.numPositions}</Text>
+                <Text style={styles.cascadeSummaryLabel}>ORDERS</Text>
               </View>
-              {cascadeMarketPrice > 0 ? (
-                <>
-                  <Text style={[styles.liveEntryPrice, { color: cascadeDirection === "buy" ? C.buy : C.sell }]}>
-                    {formatPrice(cascadeMarketPrice)}
-                  </Text>
-                  <Text style={styles.priceInputNote}>
-                    {cascadeDirection === "buy"
-                      ? `Order #1 buys instantly at this price. ${cascadeSettings.numPositions - 1} limit order${cascadeSettings.numPositions - 1 !== 1 ? "s" : ""} placed ${cascadeSettings.pipsBetween} pips apart below.`
-                      : `Order #1 sells instantly at this price. ${cascadeSettings.numPositions - 1} limit order${cascadeSettings.numPositions - 1 !== 1 ? "s" : ""} placed ${cascadeSettings.pipsBetween} pips apart above.`}
-                  </Text>
-                </>
-              ) : (
-                <Text style={styles.priceInputNote}>Connect your MT5 account to see the live price.</Text>
-              )}
+              <View style={styles.cascadeSummaryDivider} />
+              <View style={styles.cascadeSummaryItem}>
+                <Text style={styles.cascadeSummaryValue}>{cascadeSettings.pipsBetween}</Text>
+                <Text style={styles.cascadeSummaryLabel}>PIP STEP</Text>
+              </View>
+              <View style={styles.cascadeSummaryDivider} />
+              <View style={styles.cascadeSummaryItem}>
+                <Text style={[styles.cascadeSummaryValue, { color: C.sell }]}>{cascadeSettings.slPips}</Text>
+                <Text style={styles.cascadeSummaryLabel}>SL PIPS</Text>
+              </View>
+              <View style={styles.cascadeSummaryDivider} />
+              <View style={styles.cascadeSummaryItem}>
+                <Text style={styles.cascadeSummaryValue}>
+                  {cascadeLevels ? formatPrice(cascadeLevels.stopLoss) : "—"}
+                </Text>
+                <Text style={[styles.cascadeSummaryLabel, { color: C.sell }]}>SL PRICE</Text>
+              </View>
             </View>
 
             {/* Lot Size */}
@@ -807,7 +790,7 @@ export default function TradeScreen() {
               <StepInput value={cascadeLotSize} onChange={setCascadeLotSize} step={0.01} min={0.01} max={100} decimals={2} />
             </View>
 
-            {/* Cascade Ladder Preview */}
+            {/* Cascade Ladder Preview — updates direction based on last button pressed */}
             {cascadeLevels && cascadeMarketPrice > 0 ? (
               <CascadeLadder
                 marketPrice={cascadeMarketPrice}
@@ -825,45 +808,78 @@ export default function TradeScreen() {
               </View>
             )}
 
-            {/* Place cascade button */}
+            {/* BUY / SELL execution buttons — tap executes cascade immediately */}
             {(() => {
               const cascadeReady = status === "connected" && !!price && cascadeMarketPrice > 0;
-              const cascadeBtnLabel = isPlacing
-                ? ""
-                : status !== "connected"
-                ? "Connect Account in Settings"
-                : !price || cascadeMarketPrice <= 0
-                ? "Waiting for Price..."
-                : `Place ${cascadeSettings.numPositions} ${cascadeDirection.toUpperCase()} Orders`;
-              const cascadeBtnColor = cascadeDirection === "buy" ? "#000" : "#fff";
               return (
-                <Pressable
-                  style={({ pressed }) => [
-                    styles.tradeBtn,
-                    cascadeDirection === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
-                    !cascadeReady && !isPlacing && { opacity: 0.55 },
-                    pressed && { opacity: 0.8, transform: [{ scale: 0.98 }] },
-                    isPlacing && { opacity: 0.6 },
-                  ]}
-                  onPress={() => handleCascadeTrade(cascadeDirection)}
-                >
-                  {isPlacing ? (
-                    <ActivityIndicator color={cascadeBtnColor} />
-                  ) : (
-                    <>
-                      <Feather
-                        name={cascadeReady ? "layers" : status !== "connected" ? "wifi-off" : "clock"}
-                        size={20}
-                        color={cascadeBtnColor}
-                      />
-                      <Text style={[styles.tradeBtnText, { color: cascadeBtnColor }]}>
-                        {cascadeBtnLabel}
-                      </Text>
-                    </>
-                  )}
-                </Pressable>
+                <View style={styles.cascadeExecRow}>
+                  <Pressable
+                    style={({ pressed }) => [
+                      styles.cascadeExecBtn,
+                      styles.cascadeExecBtnBuy,
+                      !cascadeReady && !isPlacing && { opacity: 0.5 },
+                      pressed && { opacity: 0.8, transform: [{ scale: 0.97 }] },
+                      isPlacing && { opacity: 0.6 },
+                    ]}
+                    onPress={() => {
+                      setCascadeDirection("buy");
+                      void handleCascadeTrade("buy");
+                    }}
+                    disabled={isPlacing}
+                  >
+                    {isPlacing && cascadeDirection === "buy" ? (
+                      <ActivityIndicator color="#000" />
+                    ) : (
+                      <>
+                        <Feather name="trending-up" size={20} color="#000" />
+                        <Text style={[styles.cascadeExecLabel, { color: "#000" }]}>BUY</Text>
+                        {price && (
+                          <Text style={[styles.cascadeExecPrice, { color: "#000" }]}>
+                            {formatPrice(price.ask)}
+                          </Text>
+                        )}
+                      </>
+                    )}
+                  </Pressable>
+
+                  <Pressable
+                    style={({ pressed }) => [
+                      styles.cascadeExecBtn,
+                      styles.cascadeExecBtnSell,
+                      !cascadeReady && !isPlacing && { opacity: 0.5 },
+                      pressed && { opacity: 0.8, transform: [{ scale: 0.97 }] },
+                      isPlacing && { opacity: 0.6 },
+                    ]}
+                    onPress={() => {
+                      setCascadeDirection("sell");
+                      void handleCascadeTrade("sell");
+                    }}
+                    disabled={isPlacing}
+                  >
+                    {isPlacing && cascadeDirection === "sell" ? (
+                      <ActivityIndicator color="#fff" />
+                    ) : (
+                      <>
+                        <Feather name="trending-down" size={20} color="#fff" />
+                        <Text style={[styles.cascadeExecLabel, { color: "#fff" }]}>SELL</Text>
+                        {price && (
+                          <Text style={[styles.cascadeExecPrice, { color: "#fff" }]}>
+                            {formatPrice(price.bid)}
+                          </Text>
+                        )}
+                      </>
+                    )}
+                  </Pressable>
+                </View>
               );
             })()}
+
+            {/* Status hint below buttons */}
+            {status !== "connected" && (
+              <Text style={styles.cascadeStatusHint}>
+                Connect your MT5 account in Settings to trade
+              </Text>
+            )}
           </>
         )}
 
@@ -1282,4 +1298,40 @@ const styles = StyleSheet.create({
   tradeBtnBuy: { backgroundColor: C.buy },
   tradeBtnSell: { backgroundColor: C.sell },
   tradeBtnText: { fontSize: 17, fontFamily: "Inter_700Bold", letterSpacing: 1.5 },
+  cascadeSummaryRow: {
+    flexDirection: "row",
+    backgroundColor: C.card,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: C.border,
+    paddingVertical: 12,
+    paddingHorizontal: 8,
+    alignItems: "center",
+    justifyContent: "space-around",
+  },
+  cascadeSummaryItem: { alignItems: "center", flex: 1 },
+  cascadeSummaryValue: { fontSize: 15, fontFamily: "Inter_700Bold", color: C.text },
+  cascadeSummaryLabel: { fontSize: 10, fontFamily: "Inter_400Regular", color: C.textMuted, marginTop: 2, letterSpacing: 0.5 },
+  cascadeSummaryDivider: { width: 1, height: 28, backgroundColor: C.border },
+  cascadeExecRow: { flexDirection: "row", gap: 10, marginTop: 4 },
+  cascadeExecBtn: {
+    flex: 1,
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 4,
+    paddingVertical: 18,
+    borderRadius: 16,
+  },
+  cascadeExecBtnBuy: { backgroundColor: C.buy },
+  cascadeExecBtnSell: { backgroundColor: C.sell },
+  cascadeExecLabel: { fontSize: 18, fontFamily: "Inter_700Bold", letterSpacing: 1.5 },
+  cascadeExecPrice: { fontSize: 12, fontFamily: "Inter_400Regular", opacity: 0.75 },
+  cascadeStatusHint: {
+    textAlign: "center",
+    fontSize: 12,
+    fontFamily: "Inter_400Regular",
+    color: C.textMuted,
+    marginTop: 8,
+  },
 });
