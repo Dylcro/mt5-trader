@@ -368,7 +368,6 @@ export default function TradeScreen() {
       volume: cascadeLotSizeRef.current,
       limitEntries: levels.limitEntries,
       stopLoss: levels.stopLoss,
-      takeProfit: levels.takeProfit,
       existingPositionId: posId,
     });
 
@@ -623,7 +622,6 @@ export default function TradeScreen() {
         volume: cascadeLotSize,
         limitEntries: levels.limitEntries,
         stopLoss: levels.stopLoss,
-        takeProfit: levels.takeProfit,
       });
       console.log("[cascade] done placed=" + String(result.placed) + " failed=" + String(result.failed) + " success=" + String(result.success) + " msg=" + result.message);
       if (result.success) {

@@ -15,11 +15,11 @@ export interface CascadeSettings {
 const DEFAULTS: CascadeSettings = {
   numPositions: 3,
   pipsBetween: 50,
-  slPips: 40,
+  slPips: 100,
   autoCloseLimitsEnabled: false,
   autoCloseLimitsPips: 10,
-  takeProfitEnabled: true,
-  takeProfitPips: 40,
+  takeProfitEnabled: false,
+  takeProfitPips: 30,
   autoTriggerEnabled: false,
 };
 
@@ -96,11 +96,10 @@ export function buildCascadeLevels(
   marketPrice: number,
   direction: "buy" | "sell",
   settings: CascadeSettings
-): { limitEntries: number[]; stopLoss: number; takeProfit?: number } {
-  const { numPositions, pipsBetween, slPips, takeProfitEnabled, takeProfitPips } = settings;
+): { limitEntries: number[]; stopLoss: number } {
+  const { numPositions, pipsBetween, slPips } = settings;
   const step = pipsBetween * PIP;
   const slDist = slPips * PIP;
-  const tpDist = takeProfitPips * PIP;
 
   const limitEntries: number[] = [];
   for (let i = 1; i < numPositions; i++) {
@@ -114,12 +113,5 @@ export function buildCascadeLevels(
     ? parseFloat((marketPrice - slDist).toFixed(2))
     : parseFloat((marketPrice + slDist).toFixed(2));
 
-  // TP is the same absolute price for all orders in the cascade (shared target)
-  const takeProfit = takeProfitEnabled && takeProfitPips > 0
-    ? (direction === "buy"
-        ? parseFloat((marketPrice + tpDist).toFixed(2))
-        : parseFloat((marketPrice - tpDist).toFixed(2)))
-    : undefined;
-
-  return { limitEntries, stopLoss, takeProfit };
+  return { limitEntries, stopLoss };
 }
