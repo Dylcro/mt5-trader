@@ -30,6 +30,8 @@ interface DealEvent {
 
 const dealStore = new Map<string, DealEvent[]>(); // accountId → recent deals
 const activeStreams = new Set<string>();           // accountIds with live connections
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const activeConnections = new Map<string, any>(); // accountId → StreamingMetaApiConnectionInstance (for SDK trades)
 let sdkInstance: InstanceType<typeof MetaApi> | null = null;
 
 function getSdk(token: string): InstanceType<typeof MetaApi> {
@@ -100,11 +102,48 @@ async function startStreaming(token: string, accountId: string): Promise<void> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (conn as any).addSynchronizationListener(makeDealListener(accountId));
     await conn.connect();
-    console.log(`[stream ${accountId}] streaming connection established`);
+    // Store connection so the trade endpoint can reuse this WebSocket
+    // instead of making new HTTP calls to MetaAPI REST for every order.
+    activeConnections.set(accountId, conn);
+    console.log(`[stream ${accountId}] streaming connection established — SDK trade path armed`);
   } catch (err) {
     activeStreams.delete(accountId); // allow retry on next poll
+    activeConnections.delete(accountId);
     console.error(`[stream ${accountId}] streaming start failed:`, (err as Error).message);
   }
+}
+
+// ── SDK connection-based trade execution ─────────────────────────────────────
+// Uses the already-open streaming WebSocket instead of making new HTTP requests
+// to MetaAPI REST for every order. Falls back to REST if connection unavailable.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function tradeViaConnection(conn: any, body: Record<string, unknown>): Promise<{
+  numericCode: number; message?: string; orderId?: string; positionId?: string;
+}> {
+  const { actionType, symbol, volume, stopLoss, takeProfit, openPrice, comment, orderId } = body;
+  const opts = { comment: comment as string | undefined };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let resp: any;
+  switch (actionType) {
+    case "ORDER_TYPE_BUY":
+      resp = await conn.createMarketBuyOrder(symbol, volume, stopLoss ?? undefined, takeProfit ?? undefined, opts);
+      break;
+    case "ORDER_TYPE_SELL":
+      resp = await conn.createMarketSellOrder(symbol, volume, stopLoss ?? undefined, takeProfit ?? undefined, opts);
+      break;
+    case "ORDER_TYPE_BUY_LIMIT":
+      resp = await conn.createLimitBuyOrder(symbol, volume, openPrice, stopLoss ?? undefined, takeProfit ?? undefined, opts);
+      break;
+    case "ORDER_TYPE_SELL_LIMIT":
+      resp = await conn.createLimitSellOrder(symbol, volume, openPrice, stopLoss ?? undefined, takeProfit ?? undefined, opts);
+      break;
+    case "ORDER_CANCEL":
+      resp = await conn.cancelOrder(orderId as string);
+      break;
+    default:
+      throw new Error(`Unknown actionType: ${String(actionType)}`);
+  }
+  return { numericCode: resp?.numericCode ?? 0, message: resp?.message, orderId: resp?.orderId, positionId: resp?.positionId };
 }
 
 // ── In-memory tick store ────────────────────────────────────────────────────
@@ -677,28 +716,53 @@ const TRADE_ERROR_MESSAGES: Record<number, string> = {
 };
 
 // POST /api/mt5/account/:accountId/trade?region=london
+// Tries the SDK WebSocket path first (reuses existing stream connection → no new TCP/TLS to MetaAPI).
+// Falls back to REST if the connection is unavailable or the SDK call throws.
 router.post("/mt5/account/:accountId/trade", async (req: Request, res: Response) => {
   try {
     const token = getToken();
     const region = qstr(req.query.region) || DEFAULT_REGION;
-    const tradeRes = await fetch(
-      `${clientBase(region)}/users/current/accounts/${req.params.accountId}/trade`,
-      {
-        method: "POST",
-        headers: authHeaders(token),
-        body: JSON.stringify(req.body),
+    const body = req.body as Record<string, unknown>;
+    const { accountId } = req.params;
+    let code: number;
+    let data: { numericCode?: number; message?: string; orderId?: string; positionId?: string };
+    let httpStatus = 200;
+
+    const conn = activeConnections.get(accountId);
+    if (conn) {
+      try {
+        const sdkResp = await tradeViaConnection(conn, body);
+        code = sdkResp.numericCode;
+        data = sdkResp;
+        console.log(`[trade/sdk] accountId=${accountId} action=${body.actionType} code=${code}`);
+      } catch (sdkErr) {
+        // SDK path failed (connection dropped, method error, etc.) — try REST
+        console.log(`[trade/sdk→rest] SDK trade failed (${(sdkErr as Error).message}), falling back to REST`);
+        const tradeRes = await fetch(
+          `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
+          { method: "POST", headers: authHeaders(token), body: JSON.stringify(body) }
+        );
+        httpStatus = tradeRes.ok ? 200 : tradeRes.status;
+        data = await tradeRes.json() as typeof data;
+        code = data.numericCode ?? 0;
+        console.log(`[trade/rest-fallback] accountId=${accountId} action=${body.actionType} code=${code}`);
       }
-    );
-    const data = await tradeRes.json() as { numericCode?: number; message?: string; orderId?: string; positionId?: string };
-    const code = data.numericCode ?? 0;
+    } else {
+      // No streaming connection established yet — use REST directly
+      const tradeRes = await fetch(
+        `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
+        { method: "POST", headers: authHeaders(token), body: JSON.stringify(body) }
+      );
+      httpStatus = tradeRes.ok ? 200 : tradeRes.status;
+      data = await tradeRes.json() as typeof data;
+      code = data.numericCode ?? 0;
+      console.log(`[trade/rest] accountId=${accountId} action=${body.actionType} code=${code}`);
+    }
+
     const success = TRADE_SUCCESS_CODES.has(code);
-    const errorMessage = success
-      ? undefined
-      : (TRADE_ERROR_MESSAGES[code] ?? data.message ?? `Trade failed (code ${code})`);
-
-    console.log(`[trade] accountId=${req.params.accountId} action=${(req.body as Record<string,unknown>).actionType} volume=${(req.body as Record<string,unknown>).volume} code=${code} success=${success}${!success ? ` msg="${errorMessage}"` : ""}`);
-
-    return res.status(tradeRes.ok ? 200 : tradeRes.status).json({
+    const errorMessage = success ? undefined : (TRADE_ERROR_MESSAGES[code] ?? data.message ?? `Trade failed (code ${code})`);
+    if (!success) console.log(`[trade] FAILED action=${body.actionType} code=${code} msg="${errorMessage}"`);
+    return res.status(httpStatus).json({
       success,
       code,
       message: success ? "Trade executed successfully" : errorMessage,
