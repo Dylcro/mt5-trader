@@ -9,6 +9,7 @@ export interface CascadeSettings {
   autoCloseLimitsPips: number;
   takeProfitEnabled: boolean;
   takeProfitPips: number;
+  autoTriggerEnabled: boolean;
 }
 
 const DEFAULTS: CascadeSettings = {
@@ -19,6 +20,7 @@ const DEFAULTS: CascadeSettings = {
   autoCloseLimitsPips: 10,
   takeProfitEnabled: false,
   takeProfitPips: 30,
+  autoTriggerEnabled: false,
 };
 
 const KEYS = {
@@ -29,6 +31,7 @@ const KEYS = {
   autoCloseLimitsPips: "cascade_auto_close_pips",
   takeProfitEnabled: "cascade_tp_enabled",
   takeProfitPips: "cascade_tp_pips",
+  autoTriggerEnabled: "cascade_auto_trigger",
 };
 
 interface CascadeSettingsContextValue {
@@ -43,7 +46,7 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
 
   useEffect(() => {
     AsyncStorage.multiGet(Object.values(KEYS)).then((pairs) => {
-      const [num, between, sl, autoClose, autoClosePips, tpEnabled, tpPips] = pairs.map((p) => p[1]);
+      const [num, between, sl, autoClose, autoClosePips, tpEnabled, tpPips, autoTrigger] = pairs.map((p) => p[1]);
       setSettings({
         numPositions: num ? parseFloat(num) : DEFAULTS.numPositions,
         pipsBetween: between ? parseFloat(between) : DEFAULTS.pipsBetween,
@@ -52,6 +55,7 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         autoCloseLimitsPips: autoClosePips ? parseFloat(autoClosePips) : DEFAULTS.autoCloseLimitsPips,
         takeProfitEnabled: tpEnabled === "true",
         takeProfitPips: tpPips ? parseFloat(tpPips) : DEFAULTS.takeProfitPips,
+        autoTriggerEnabled: autoTrigger === "true",
       });
     });
   }, []);
@@ -67,6 +71,7 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         [KEYS.autoCloseLimitsPips, String(next.autoCloseLimitsPips)],
         [KEYS.takeProfitEnabled, String(next.takeProfitEnabled)],
         [KEYS.takeProfitPips, String(next.takeProfitPips)],
+        [KEYS.autoTriggerEnabled, String(next.autoTriggerEnabled)],
       ]);
       return next;
     });

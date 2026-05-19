@@ -101,6 +101,8 @@ export interface CascadeOrderParams {
   volume: number;
   limitEntries: number[];
   stopLoss: number;
+  /** If set, skip the market order and use this position ID as the market leg */
+  existingPositionId?: string;
 }
 
 // Determine the API base URL.
@@ -607,47 +609,73 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       const limitOrderIds: string[] = [];
 
       try {
-        // Fire market + all limits in parallel — one round-trip instead of two
-        const [marketResult, ...limitResults] = await Promise.all([
-          submitOrderRaw({
-            direction: params.direction,
-            volume: params.volume,
-            stopLoss: params.stopLoss,
-            comment: `Cascade 1/${total}`,
-          }),
-          ...params.limitEntries.map((limitPrice, i) =>
+        if (params.existingPositionId) {
+          // Auto-trigger path: market position already exists in MT5 — only place limit orders
+          marketPositionId = params.existingPositionId;
+          placed = 1; // count the existing market position
+          const limitResults = await Promise.all(
+            params.limitEntries.map((limitPrice, i) =>
+              submitOrderRaw({
+                direction: params.direction,
+                volume: params.volume,
+                limitPrice,
+                stopLoss: params.stopLoss,
+                comment: `Cascade ${i + 2}/${total}`,
+              })
+            )
+          );
+          for (const r of limitResults) {
+            if (r.success) {
+              placed++;
+              if (r.orderId) limitOrderIds.push(r.orderId);
+            } else {
+              failed++;
+              errors.push(`Limit: ${r.message}`);
+            }
+          }
+        } else {
+          // Normal path: fire market + all limits in parallel — one round-trip instead of two
+          const [marketResult, ...limitResults] = await Promise.all([
             submitOrderRaw({
               direction: params.direction,
               volume: params.volume,
-              limitPrice,
               stopLoss: params.stopLoss,
-              comment: `Cascade ${i + 2}/${total}`,
-            })
-          ),
-        ]);
+              comment: `Cascade 1/${total}`,
+            }),
+            ...params.limitEntries.map((limitPrice, i) =>
+              submitOrderRaw({
+                direction: params.direction,
+                volume: params.volume,
+                limitPrice,
+                stopLoss: params.stopLoss,
+                comment: `Cascade ${i + 2}/${total}`,
+              })
+            ),
+          ]);
 
-        if (marketResult.success) {
-          placed++;
-          if (marketResult.positionId) marketPositionId = marketResult.positionId;
-        } else {
-          failed++;
-          errors.push(`Market: ${marketResult.message}`);
-          // Market failed — cancel any limits that succeeded to avoid dangling orders
-          const toCancel = limitResults.filter((r) => r.success && r.orderId).map((r) => r.orderId!);
-          if (toCancel.length > 0) {
-            void Promise.all(toCancel.map((id) =>
-              fetch(`${API_BASE}/mt5/account/${accountId}/cancel-order/${id}?region=${region}`, { method: "POST" })
-            ));
-          }
-        }
-
-        for (const r of limitResults) {
-          if (r.success) {
+          if (marketResult.success) {
             placed++;
-            if (r.orderId) limitOrderIds.push(r.orderId);
+            if (marketResult.positionId) marketPositionId = marketResult.positionId;
           } else {
             failed++;
-            errors.push(`Limit: ${r.message}`);
+            errors.push(`Market: ${marketResult.message}`);
+            // Market failed — cancel any limits that succeeded to avoid dangling orders
+            const toCancel = limitResults.filter((r) => r.success && r.orderId).map((r) => r.orderId!);
+            if (toCancel.length > 0) {
+              void Promise.all(toCancel.map((id) =>
+                fetch(`${API_BASE}/mt5/account/${accountId}/cancel-order/${id}?region=${region}`, { method: "POST" })
+              ));
+            }
+          }
+
+          for (const r of limitResults) {
+            if (r.success) {
+              placed++;
+              if (r.orderId) limitOrderIds.push(r.orderId);
+            } else {
+              failed++;
+              errors.push(`Limit: ${r.message}`);
+            }
           }
         }
       } catch (err) {

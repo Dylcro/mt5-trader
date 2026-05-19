@@ -326,6 +326,93 @@ export default function TradeScreen() {
   const watchersRef = useRef<WatcherEntry[]>([]); // delete-limits queue
   const tpWatchersRef = useRef<WatcherEntry[]>([]); // take-profit queue
 
+  // Auto-trigger: detect new MT5 positions and apply cascade settings automatically
+  const cascadeLotSizeRef = useRef(cascadeLotSize);
+  useEffect(() => { cascadeLotSizeRef.current = cascadeLotSize; }, [cascadeLotSize]);
+
+  const positionsSeedDoneRef = useRef(false);
+  const knownPositionIdsRef = useRef<Set<string>>(new Set());
+  const autoTriggeredIdsRef = useRef<Set<string>>(new Set());
+
+  // Reset tracking when connection status changes (connect/disconnect/account switch)
+  useEffect(() => {
+    positionsSeedDoneRef.current = false;
+    knownPositionIdsRef.current.clear();
+    autoTriggeredIdsRef.current.clear();
+  }, [status]);
+
+  const handleAutoTrigger = useCallback(async (posId: string, openPrice: number, posDir: "buy" | "sell") => {
+    const cs = cascadeSettingsRef.current;
+    if (!cs.autoTriggerEnabled) return;
+    const numLimits = cs.numPositions - 1;
+    if (numLimits <= 0) {
+      console.log(`[auto-trigger id=${posId}] numPositions=1 → no limits to place`);
+      return;
+    }
+    const p = priceRef.current;
+    const levels = buildCascadeLevels(openPrice, posDir, cs);
+    console.log(`[auto-trigger] NEW MT5 ${posDir} position id=${posId} openPrice=${openPrice} → placing ${levels.limitEntries.length} limits at [${levels.limitEntries.join(",")}] sl=${levels.stopLoss}`);
+    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+
+    const result = await placeCascadeOrders({
+      direction: posDir,
+      volume: cascadeLotSizeRef.current,
+      limitEntries: levels.limitEntries,
+      stopLoss: levels.stopLoss,
+      existingPositionId: posId,
+    });
+
+    if (result.success) {
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      const n = result.placed - 1;
+      showToast(`Auto-cascade: ${n} limit${n !== 1 ? "s" : ""} placed for MT5 ${posDir.toUpperCase()} ✓`, "success", true);
+      const cascadeId = `auto-${posId}`;
+      const watcherEntryPrice = p?.bid ?? openPrice;
+      const readyAt = Date.now() + 3000;
+      if (cs.autoCloseLimitsEnabled && cs.autoCloseLimitsPips > 0) {
+        const trigger = posDir === "buy" ? watcherEntryPrice + cs.autoCloseLimitsPips * 0.10 : watcherEntryPrice - cs.autoCloseLimitsPips * 0.10;
+        console.log(`[auto-trigger watcher id=${cascadeId}] arming delete-limits +${cs.autoCloseLimitsPips}pip entry=${watcherEntryPrice} trigger=${trigger}`);
+        watchersRef.current.push({ id: cascadeId, entryPrice: watcherEntryPrice, direction: posDir, pipsTarget: cs.autoCloseLimitsPips, readyAt, marketPositionId: posId, limitOrderIds: result.limitOrderIds, limitPrices: levels.limitEntries });
+      }
+      if (cs.takeProfitEnabled && cs.takeProfitPips > 0) {
+        const trigger = posDir === "buy" ? watcherEntryPrice + cs.takeProfitPips * 0.10 : watcherEntryPrice - cs.takeProfitPips * 0.10;
+        console.log(`[auto-trigger tp-watcher id=${cascadeId}] arming TP +${cs.takeProfitPips}pip entry=${watcherEntryPrice} trigger=${trigger}`);
+        tpWatchersRef.current.push({ id: cascadeId, entryPrice: watcherEntryPrice, direction: posDir, pipsTarget: cs.takeProfitPips, readyAt, marketPositionId: posId, limitOrderIds: result.limitOrderIds, limitPrices: levels.limitEntries });
+      }
+    } else {
+      showToast(`Auto-cascade failed: ${result.message}`, "error");
+    }
+  }, [placeCascadeOrders, showToast]);
+
+  useEffect(() => {
+    if (!positionsSeedDoneRef.current) {
+      // First positions update after connect: seed all existing positions so we don't cascade them
+      for (const pos of positions) {
+        knownPositionIdsRef.current.add(pos.id);
+      }
+      positionsSeedDoneRef.current = true;
+      return;
+    }
+    // Subsequent updates: check for genuinely new positions
+    const cs = cascadeSettingsRef.current;
+    for (const pos of positions) {
+      if (knownPositionIdsRef.current.has(pos.id)) continue;
+      knownPositionIdsRef.current.add(pos.id);
+      if (
+        cs.autoTriggerEnabled &&
+        !autoTriggeredIdsRef.current.has(pos.id) &&
+        pos.symbol === "XAUUSD" &&
+        pos.comment !== "XAUUSD Trader App" &&
+        !pos.comment?.startsWith("Cascade")
+      ) {
+        const posDir = pos.type === "POSITION_TYPE_BUY" ? "buy" : "sell";
+        autoTriggeredIdsRef.current.add(pos.id);
+        console.log(`[auto-trigger] detected new MT5 ${posDir} pos id=${pos.id} comment="${pos.comment ?? ""}"`);
+        void handleAutoTrigger(pos.id, pos.openPrice, posDir);
+      }
+    }
+  }, [positions, handleAutoTrigger]);
+
   useEffect(() => {
     if (!price) return;
     const now = Date.now();

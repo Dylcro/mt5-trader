@@ -566,6 +566,27 @@ export default function SettingsScreen() {
               </>
             )}
 
+            <View style={styles.cascadeDivider} />
+
+            {/* Auto-trigger from MT5 */}
+            <View style={styles.settingRow}>
+              <Switch
+                value={cs.autoTriggerEnabled}
+                onValueChange={(v) => {
+                  void Haptics.selectionAsync();
+                  updateSettings({ autoTriggerEnabled: v });
+                }}
+                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
+                thumbColor={cs.autoTriggerEnabled ? C.gold : C.textMuted}
+              />
+              <View style={{ marginLeft: 10, flex: 1 }}>
+                <Text style={styles.settingLabel}>Auto-cascade from MT5 trades</Text>
+                <Text style={[styles.settingHint, { marginTop: 2 }]}>
+                  When you click buy/sell directly in MT5, the app will detect the new position (within ~10s) and automatically place the cascade limits + arm all watchers below.
+                </Text>
+              </View>
+            </View>
+
             <View style={styles.cascadePreviewBox}>
               <Text style={styles.cascadePreviewTitle}>Preview with current settings (buy example)</Text>
               <Text style={styles.cascadePreviewText}>
