@@ -577,9 +577,10 @@ export default function TradeScreen() {
       Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
       return;
     }
-    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    // Lock button and fire haptics simultaneously — don't await haptics before locking
     isPlacingRef.current = true;
     setIsPlacing(true);
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     const result = await placeTrade({ direction, volume: lotSize, stopLoss: slRef.current });
     isPlacingRef.current = false;
     setIsPlacing(false);
