@@ -413,6 +413,49 @@ export default function TradeScreen() {
     }
   }, [positions, handleAutoTrigger]);
 
+  // Fast event polling — 2-second interval, replaces the 10s position-poll delay
+  // when autoTriggerEnabled. Kicks off MetaAPI streaming on the backend too.
+  type DealEvent = {
+    dealId: string; positionId: string; symbol: string;
+    type: string; entryType: string; openPrice: number;
+    volume: number; comment?: string; time: number;
+  };
+  const lastEventTimeRef = useRef(Date.now());
+  useEffect(() => {
+    if (status !== "connected" || !cascadeSettings.autoTriggerEnabled) return;
+    if (!accountId || !apiBase) return;
+
+    const poll = async () => {
+      try {
+        const since = lastEventTimeRef.current;
+        const res = await fetch(
+          `${apiBase}/mt5/events/${accountId}?since=${since}&region=${region ?? "london"}`
+        );
+        if (!res.ok) return;
+        const text = await res.text();
+        if (text.trimStart().startsWith("<")) return; // HTML error page — server not ready
+        const data = JSON.parse(text) as { events: DealEvent[]; serverTime: number };
+        if (data.serverTime) lastEventTimeRef.current = data.serverTime;
+        for (const evt of data.events ?? []) {
+          if (!evt.positionId) continue;
+          if (evt.symbol !== "XAUUSD") continue;
+          if (evt.comment === "XAUUSD Trader App" || evt.comment?.startsWith("Cascade")) continue;
+          if (autoTriggeredIdsRef.current.has(evt.positionId)) continue;
+          autoTriggeredIdsRef.current.add(evt.positionId);
+          const dir = evt.type === "DEAL_TYPE_BUY" ? "buy" as const : "sell" as const;
+          console.log(`[event-poll] MT5 ${dir} trade detected dealId=${evt.dealId} posId=${evt.positionId} price=${evt.openPrice}`);
+          void handleAutoTrigger(evt.positionId, evt.openPrice, dir);
+        }
+      } catch (err) {
+        console.log("[event-poll] error:", String(err));
+      }
+    };
+
+    void poll();
+    const interval = setInterval(() => { void poll(); }, 2000);
+    return () => clearInterval(interval);
+  }, [status, cascadeSettings.autoTriggerEnabled, accountId, apiBase, region, handleAutoTrigger]);
+
   useEffect(() => {
     if (!price) return;
     const now = Date.now();

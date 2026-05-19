@@ -1,6 +1,89 @@
 import { Router, type IRouter, type Request, type Response } from "express";
+import { createRequire } from "module";
+const _require = createRequire(import.meta.url);
+// Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const _MetaApiCjs = _require("metaapi.cloud-sdk") as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const MetaApi: any = _MetaApiCjs.default ?? _MetaApiCjs;
 
 const router: IRouter = Router();
+
+// ── MetaAPI Streaming Manager ────────────────────────────────────────────────
+// Maintains one SDK streaming connection per account and stores incoming deal
+// events in a short-TTL ring buffer so the app can poll for them.
+
+interface DealEvent {
+  dealId: string;
+  positionId: string;
+  symbol: string;
+  type: string;       // "DEAL_TYPE_BUY" | "DEAL_TYPE_SELL"
+  entryType: string;  // "DEAL_ENTRY_IN" for new positions
+  openPrice: number;
+  volume: number;
+  comment?: string;
+  time: number;       // ms epoch when we received it
+}
+
+const dealStore = new Map<string, DealEvent[]>(); // accountId → recent deals
+const activeStreams = new Set<string>();           // accountIds with live connections
+let sdkInstance: InstanceType<typeof MetaApi> | null = null;
+
+function getSdk(token: string): InstanceType<typeof MetaApi> {
+  if (!sdkInstance) sdkInstance = new MetaApi(token);
+  return sdkInstance;
+}
+
+function storeDealEvent(accountId: string, evt: DealEvent) {
+  const cutoff = Date.now() - 60_000;
+  const arr = (dealStore.get(accountId) ?? []).filter(e => e.time > cutoff);
+  arr.push(evt);
+  dealStore.set(accountId, arr.slice(-100));
+}
+
+function getEventsSince(accountId: string, since: number): DealEvent[] {
+  return (dealStore.get(accountId) ?? []).filter(e => e.time > since);
+}
+
+function makeDealListener(accountId: string) {
+  return {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    async onDealAdded(_instanceIndex: string, deal: any): Promise<void> {
+      if (deal?.entryType !== "DEAL_ENTRY_IN") return;
+      if (!deal?.symbol) return;
+      const evt: DealEvent = {
+        dealId:     deal.id         ?? String(Date.now()),
+        positionId: deal.positionId ?? "",
+        symbol:     deal.symbol,
+        type:       deal.type       ?? "",
+        entryType:  deal.entryType,
+        openPrice:  deal.openPrice  ?? 0,
+        volume:     deal.volume     ?? 0,
+        comment:    deal.comment,
+        time:       Date.now(),
+      };
+      console.log(`[stream ${accountId}] deal dealId=${evt.dealId} posId=${evt.positionId} type=${evt.type} sym=${evt.symbol} price=${evt.openPrice} comment="${evt.comment ?? ""}"`);
+      storeDealEvent(accountId, evt);
+    },
+  };
+}
+
+async function startStreaming(token: string, accountId: string): Promise<void> {
+  if (activeStreams.has(accountId)) return;
+  activeStreams.add(accountId);
+  try {
+    const sdk = getSdk(token);
+    const account = await sdk.metatraderAccountApi.getAccount(accountId);
+    const conn = account.getStreamingConnection();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).addSynchronizationListener(makeDealListener(accountId));
+    await conn.connect();
+    console.log(`[stream ${accountId}] streaming connection established`);
+  } catch (err) {
+    activeStreams.delete(accountId); // allow retry on next poll
+    console.error(`[stream ${accountId}] streaming start failed:`, (err as Error).message);
+  }
+}
 
 // ── In-memory tick store ────────────────────────────────────────────────────
 // Every price poll is stored here; candles are aggregated on demand.
@@ -447,7 +530,7 @@ router.get("/mt5/account/:accountId/info", async (req: Request, res: Response) =
 router.get("/mt5/account/:accountId/candles", (req: Request, res: Response) => {
   const timeframe = qstr(req.query.timeframe) || "5m";
   const limit = Math.min(parseInt(qstr(req.query.limit) || "150", 10) || 150, 500);
-  const candles = buildCandles(req.params.accountId, timeframe, limit);
+  const candles = buildCandles(req.params.accountId as string, timeframe, limit);
   return res.json(candles);
 });
 
@@ -463,7 +546,7 @@ router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) 
     if (!priceRes.ok) return res.status(priceRes.status).json({ error: "Price fetch failed" });
     const priceData = await priceRes.json() as { bid?: number; ask?: number };
     // Accumulate tick for chart history
-    if (priceData.bid && priceData.ask) storeTick(req.params.accountId, priceData.bid, priceData.ask);
+    if (priceData.bid && priceData.ask) storeTick(req.params.accountId as string, priceData.bid, priceData.ask);
     return res.json(priceData);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
@@ -602,6 +685,25 @@ router.post("/mt5/account/:accountId/trade", async (req: Request, res: Response)
     });
   } catch (err) {
     return res.status(500).json({ success: false, code: 0, message: err instanceof Error ? err.message : "Trade failed" });
+  }
+});
+
+// GET /api/mt5/events/:accountId?since=<ms>
+// Returns new DEAL_ENTRY_IN events since `since` (ms epoch).
+// Also kicks off the streaming connection for this account if not already running.
+router.get("/mt5/events/:accountId", async (req: Request, res: Response) => {
+  try {
+    const token = getToken();
+    const { accountId } = req.params as { accountId: string };
+    const since = parseInt(qstr(req.query.since) ?? "0", 10) || 0;
+
+    // Start streaming connection in the background (idempotent — safe to call repeatedly)
+    void startStreaming(token, accountId);
+
+    const events = getEventsSince(accountId, since);
+    return res.json({ events, serverTime: Date.now() });
+  } catch (err) {
+    return res.status(500).json({ error: (err as Error).message });
   }
 });
 
