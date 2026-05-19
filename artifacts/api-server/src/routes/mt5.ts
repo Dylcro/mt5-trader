@@ -60,13 +60,6 @@ function makeDealListener(accountId: string) {
     async onDealAdded(_instanceIndex: string, deal: any): Promise<void> {
       if (deal?.entryType !== "DEAL_ENTRY_IN") return;
       if (!deal?.symbol) return;
-      // Drop any deal that the app itself placed — magic 47182 is stamped on every
-      // order submitted through this server, so this is a reliable server-side filter
-      // that works even when the broker omits or truncates the comment field.
-      if (deal?.magic === 47182) {
-        console.log(`[stream ${accountId}] skipping own-app deal dealId=${deal.id ?? ""} magic=47182`);
-        return;
-      }
       // MetaAPI streaming deal events expose the execution price as `deal.price`
       // (the tick price at fill time). `deal.openPrice` may be 0 or absent in
       // the streaming payload — always prefer whichever field is non-zero.

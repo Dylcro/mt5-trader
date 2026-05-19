@@ -625,12 +625,6 @@ export default function TradeScreen() {
       });
       console.log("[cascade] done placed=" + String(result.placed) + " failed=" + String(result.failed) + " success=" + String(result.success) + " msg=" + result.message);
       if (result.success) {
-        // Immediately guard the new position so the event-poll loop can never
-        // re-trigger auto-cascade on an order this app just placed itself.
-        if (result.marketPositionId) {
-          autoTriggeredIdsRef.current.add(result.marketPositionId);
-          knownPositionIdsRef.current.add(result.marketPositionId);
-        }
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         const failNote = result.failed > 0 ? ` (${result.failed} limit${result.failed > 1 ? "s" : ""} failed)` : "";
         showToast(`${result.placed}/${total} ${dir.toUpperCase()} orders placed ✓${failNote}`, "success", true);
