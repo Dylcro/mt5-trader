@@ -1,7 +1,11 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import { createRequire } from "module";
-const _require = createRequire(import.meta.url);
+import { resolve } from "path";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle
+// __dirname is provided by esbuild in CJS output; use it so module resolution
+// finds metaapi.cloud-sdk in the api-server's own node_modules subtree.
+declare const __dirname: string;
+const _require = createRequire(resolve(__dirname, "package.json"));
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const _MetaApiCjs = _require("metaapi.cloud-sdk") as any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
