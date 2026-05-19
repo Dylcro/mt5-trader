@@ -350,7 +350,16 @@ export default function TradeScreen() {
       return;
     }
     const p = priceRef.current;
-    const levels = buildCascadeLevels(openPrice, posDir, cs);
+    // If the streaming event didn't carry a price (openPrice=0), fall back to
+    // the current live market price so cascade levels are built correctly.
+    const entryPrice = openPrice > 0
+      ? openPrice
+      : (posDir === "buy" ? (p?.ask ?? 0) : (p?.bid ?? 0));
+    if (entryPrice <= 0) {
+      console.log(`[auto-trigger id=${posId}] no valid price available (openPrice=${openPrice}, live=${String(p?.bid)}) — skipping`);
+      return;
+    }
+    const levels = buildCascadeLevels(entryPrice, posDir, cs);
     console.log(`[auto-trigger] NEW MT5 ${posDir} position id=${posId} openPrice=${openPrice} → placing ${levels.limitEntries.length} limits at [${levels.limitEntries.join(",")}] sl=${levels.stopLoss}`);
     void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
 

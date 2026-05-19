@@ -40,6 +40,8 @@ function getSdk(token: string): InstanceType<typeof MetaApi> {
 function storeDealEvent(accountId: string, evt: DealEvent) {
   const cutoff = Date.now() - 60_000;
   const arr = (dealStore.get(accountId) ?? []).filter(e => e.time > cutoff);
+  // Dedup: MetaAPI may fire the same deal from multiple streaming instances
+  if (arr.some(e => e.dealId === evt.dealId)) return;
   arr.push(evt);
   dealStore.set(accountId, arr.slice(-100));
 }
@@ -49,24 +51,26 @@ function getEventsSince(accountId: string, since: number): DealEvent[] {
 }
 
 function makeDealListener(accountId: string) {
-  // The MetaAPI SDK calls every method on every registered listener.
-  // Any method that doesn't exist throws, causing the SDK to abort the whole
-  // synchronization packet — including deal events. We must stub ALL methods.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const noop = (): Promise<void> => Promise.resolve();
-  return {
-    // ── The only method we care about ─────────────────────────────────────
+  // The MetaAPI SDK calls many methods on every registered listener and throws
+  // if any of them is missing — aborting the entire synchronization packet.
+  // Rather than enumerating every possible method name, we use a Proxy to
+  // silently no-op any method the SDK calls that we haven't explicitly defined.
+  const handler = {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async onDealAdded(_instanceIndex: string, deal: any): Promise<void> {
       if (deal?.entryType !== "DEAL_ENTRY_IN") return;
       if (!deal?.symbol) return;
+      // MetaAPI streaming deal events expose the execution price as `deal.price`
+      // (the tick price at fill time). `deal.openPrice` may be 0 or absent in
+      // the streaming payload — always prefer whichever field is non-zero.
+      const price = deal.price || deal.openPrice || 0;
       const evt: DealEvent = {
         dealId:     deal.id         ?? String(Date.now()),
         positionId: deal.positionId ?? "",
         symbol:     deal.symbol,
         type:       deal.type       ?? "",
         entryType:  deal.entryType,
-        openPrice:  deal.openPrice  ?? 0,
+        openPrice:  price,
         volume:     deal.volume     ?? 0,
         comment:    deal.comment,
         time:       Date.now(),
@@ -74,32 +78,16 @@ function makeDealListener(accountId: string) {
       console.log(`[stream ${accountId}] deal dealId=${evt.dealId} posId=${evt.positionId} type=${evt.type} sym=${evt.symbol} price=${evt.openPrice} comment="${evt.comment ?? ""}"`);
       storeDealEvent(accountId, evt);
     },
-    // ── Required no-op stubs (SDK calls these on every listener) ──────────
-    onConnected: noop,
-    onDisconnected: noop,
-    onBrokerConnectionStatusChanged: noop,
-    onSynchronizationStarted: noop,
-    onAccountInformationUpdated: noop,
-    onPositionsReplaced: noop,
-    onPositionUpdated: noop,
-    onPositionsSynchronized: noop,
-    onOrdersReplaced: noop,
-    onOrderUpdated: noop,
-    onOrderCompleted: noop,
-    onHistoryOrderAdded: noop,
-    onDealsSynchronized: noop,
-    onPendingOrdersReplaced: noop,
-    onPendingOrderUpdated: noop,
-    onPendingOrderCompleted: noop,
-    onSymbolPricesUpdated: noop,   // ← was missing — caused packet abort on every tick
-    onSymbolPriceUpdated: noop,    // ← was missing — caused packet abort on every tick
-    onCandlesUpdated: noop,
-    onTicksUpdated: noop,
-    onBooksUpdated: noop,
-    onHealthStatus: noop,
-    onReconnected: noop,
-    onStreamClosed: noop,
   };
+
+  // Proxy: any property access that isn't `onDealAdded` returns a silent no-op.
+  return new Proxy(handler, {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    get(target: any, prop: string) {
+      if (prop in target) return target[prop];
+      return () => Promise.resolve();
+    },
+  });
 }
 
 async function startStreaming(token: string, accountId: string): Promise<void> {
