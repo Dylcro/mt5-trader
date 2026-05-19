@@ -62,6 +62,14 @@ async function buildAll() {
     outfile: path.resolve(distDir, "index.cjs"),
     define: {
       "process.env.NODE_ENV": '"production"',
+      // In ESM source, import.meta.url is a real file URL.
+      // esbuild's CJS output doesn't transform it reliably, so we inject a
+      // banner that creates __importMetaUrl from __filename (available in CJS),
+      // then replace every import.meta.url reference with that variable.
+      "import.meta.url": "__importMetaUrl",
+    },
+    banner: {
+      js: 'var __importMetaUrl = require("url").pathToFileURL(__filename).href;',
     },
     minify: true,
     external: externals,

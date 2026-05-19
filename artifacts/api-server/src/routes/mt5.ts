@@ -1,11 +1,10 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import { createRequire } from "module";
-import { resolve } from "path";
-// Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle
-// __dirname is provided by esbuild in CJS output; use it so module resolution
-// finds metaapi.cloud-sdk in the api-server's own node_modules subtree.
-declare const __dirname: string;
-const _require = createRequire(resolve(__dirname, "package.json"));
+// Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
+// In dev (tsx/ESM) import.meta.url is the real file URL.
+// In production (esbuild CJS) build.ts injects a __importMetaUrl banner and
+// defines import.meta.url → __importMetaUrl so this line still resolves correctly.
+const _require = createRequire(import.meta.url);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const _MetaApiCjs = _require("metaapi.cloud-sdk") as any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -50,7 +49,13 @@ function getEventsSince(accountId: string, since: number): DealEvent[] {
 }
 
 function makeDealListener(accountId: string) {
+  // The MetaAPI SDK calls every method on every registered listener.
+  // Any method that doesn't exist throws, causing the SDK to abort the whole
+  // synchronization packet — including deal events. We must stub ALL methods.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const noop = (): Promise<void> => Promise.resolve();
   return {
+    // ── The only method we care about ─────────────────────────────────────
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async onDealAdded(_instanceIndex: string, deal: any): Promise<void> {
       if (deal?.entryType !== "DEAL_ENTRY_IN") return;
@@ -69,6 +74,31 @@ function makeDealListener(accountId: string) {
       console.log(`[stream ${accountId}] deal dealId=${evt.dealId} posId=${evt.positionId} type=${evt.type} sym=${evt.symbol} price=${evt.openPrice} comment="${evt.comment ?? ""}"`);
       storeDealEvent(accountId, evt);
     },
+    // ── Required no-op stubs (SDK calls these on every listener) ──────────
+    onConnected: noop,
+    onDisconnected: noop,
+    onBrokerConnectionStatusChanged: noop,
+    onSynchronizationStarted: noop,
+    onAccountInformationUpdated: noop,
+    onPositionsReplaced: noop,
+    onPositionUpdated: noop,
+    onPositionsSynchronized: noop,
+    onOrdersReplaced: noop,
+    onOrderUpdated: noop,
+    onOrderCompleted: noop,
+    onHistoryOrderAdded: noop,
+    onDealsSynchronized: noop,
+    onPendingOrdersReplaced: noop,
+    onPendingOrderUpdated: noop,
+    onPendingOrderCompleted: noop,
+    onSymbolPricesUpdated: noop,   // ← was missing — caused packet abort on every tick
+    onSymbolPriceUpdated: noop,    // ← was missing — caused packet abort on every tick
+    onCandlesUpdated: noop,
+    onTicksUpdated: noop,
+    onBooksUpdated: noop,
+    onHealthStatus: noop,
+    onReconnected: noop,
+    onStreamClosed: noop,
   };
 }
 
