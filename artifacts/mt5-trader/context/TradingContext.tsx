@@ -101,6 +101,7 @@ export interface CascadeOrderParams {
   volume: number;
   limitEntries: number[];
   stopLoss: number;
+  takeProfit?: number;
   /** If set, skip the market order and use this position ID as the market leg */
   existingPositionId?: string;
 }
@@ -620,6 +621,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
                 volume: params.volume,
                 limitPrice,
                 stopLoss: params.stopLoss,
+                takeProfit: params.takeProfit,
                 comment: `Cascade ${i + 2}/${total}`,
               })
             )
@@ -640,6 +642,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
               direction: params.direction,
               volume: params.volume,
               stopLoss: params.stopLoss,
+              takeProfit: params.takeProfit,
               comment: `Cascade 1/${total}`,
             }),
             ...params.limitEntries.map((limitPrice, i) =>
@@ -648,6 +651,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
                 volume: params.volume,
                 limitPrice,
                 stopLoss: params.stopLoss,
+                takeProfit: params.takeProfit,
                 comment: `Cascade ${i + 2}/${total}`,
               })
             ),
