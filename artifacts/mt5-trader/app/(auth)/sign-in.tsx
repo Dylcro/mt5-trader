@@ -1,6 +1,6 @@
 import { useAuth, useSignIn } from "@clerk/expo";
 import { Link, useRouter } from "expo-router";
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -45,11 +45,6 @@ export default function SignInScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
 
-  const signInRef = useRef(signIn);
-  const setActiveRef = useRef(setActive);
-  useEffect(() => { signInRef.current = signIn; }, [signIn]);
-  useEffect(() => { setActiveRef.current = setActive; }, [setActive]);
-
   const [step, setStep] = useState<Step>("credentials");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -66,31 +61,19 @@ export default function SignInScreen() {
     if (!email.trim()) { setError("Please enter your email address."); return; }
     if (!password) { setError("Please enter a password."); return; }
 
-    setLoading(true);
-    setError("");
-
-    // Poll refs until Clerk is ready (handles autofill race on slow connections).
-    // Closure values are frozen at button-press time, so refs must be used.
-    let waited = 0;
-    while (!signInRef.current || !setActiveRef.current) {
-      if (waited >= 20000) break;
-      await new Promise((r) => setTimeout(r, 300));
-      waited += 300;
-    }
-
-    const activeSignIn = signInRef.current;
-    const activeSetActive = setActiveRef.current;
-
-    if (!activeSignIn || !activeSetActive) {
-      setError("Sign-in timed out — please check your internet connection and try again.");
-      setLoading(false);
+    // Clerk not ready yet (autofill race) — ask user to try once more
+    if (!isLoaded || !signIn) {
+      setError("Almost ready — please tap Sign In once more.");
       return;
     }
+
+    setLoading(true);
+    setError("");
     try {
-      const result = await activeSignIn.create({ identifier: email.trim(), password });
+      const result = await signIn.create({ identifier: email.trim(), password });
 
       if (result.status === "complete") {
-        await activeSetActive({ session: result.createdSessionId });
+        await setActive!({ session: result.createdSessionId });
         router.replace("/" as never);
         return;
       }
@@ -98,25 +81,28 @@ export default function SignInScreen() {
       if (result.status === "needs_first_factor") {
         const factors = result.supportedFirstFactors as Array<Record<string, unknown>> | undefined;
 
-        // Password is the first factor — attempt it explicitly
+        // Password strategy — attempt it explicitly
         const pwFactor = factors?.find((f) => f["strategy"] === "password");
         if (pwFactor) {
-          const pwResult = await activeSignIn.attemptFirstFactor({ strategy: "password", password } as never);
+          const pwResult = await signIn.attemptFirstFactor({
+            strategy: "password",
+            password,
+          } as never);
           if (pwResult.status === "complete") {
-            await activeSetActive({ session: pwResult.createdSessionId });
+            await setActive!({ session: pwResult.createdSessionId });
             router.replace("/" as never);
             return;
           }
           if (pwResult.status === "needs_second_factor") {
-            setError("Two-factor authentication required. Please disable 2FA in your account settings or contact support.");
+            setError("Two-factor auth is required. Please disable 2FA in your account settings.");
             return;
           }
         }
 
-        // Email code is the first factor — send the code
+        // Email code strategy — send OTP
         const emailFactor = factors?.find((f) => f["strategy"] === "email_code");
         if (emailFactor && typeof emailFactor["emailAddressId"] === "string") {
-          await activeSignIn.prepareFirstFactor({
+          await signIn.prepareFirstFactor({
             strategy: "email_code",
             emailAddressId: emailFactor["emailAddressId"] as string,
           });
@@ -125,16 +111,16 @@ export default function SignInScreen() {
         }
 
         const strategies = factors?.map((f) => f["strategy"]).join(", ") || "none";
-        setError(`Sign-in requires a method not yet supported (${strategies}). Please contact support.`);
+        setError(`Unsupported sign-in method (${strategies}). Please contact support.`);
         return;
       }
 
       if (result.status === "needs_second_factor") {
-        setError("Two-factor authentication required. Please disable 2FA in your account settings or contact support.");
+        setError("Two-factor auth is required. Please disable 2FA in your account settings.");
         return;
       }
 
-      setError(`Unable to complete sign in (${result.status ?? "unknown"}). Please try again.`);
+      setError(`Sign-in returned unexpected status: ${result.status ?? "unknown"}. Please try again.`);
     } catch (err: unknown) {
       const msg = clerkError(err);
       if (msg.toLowerCase().includes("already signed in")) {
@@ -151,9 +137,8 @@ export default function SignInScreen() {
     if (!signIn) return;
     setError("");
     try {
-      const emailFactor = signIn.supportedFirstFactors?.find(
-        (f: Record<string, unknown>) => f["strategy"] === "email_code"
-      ) as Record<string, unknown> | undefined;
+      const factors = signIn.supportedFirstFactors as Array<Record<string, unknown>> | undefined;
+      const emailFactor = factors?.find((f) => f["strategy"] === "email_code");
       if (emailFactor && typeof emailFactor["emailAddressId"] === "string") {
         await signIn.prepareFirstFactor({
           strategy: "email_code",
@@ -174,13 +159,11 @@ export default function SignInScreen() {
         strategy: "email_code",
         code: verifyCode.trim(),
       });
-
       if (result.status === "complete") {
         await setActive({ session: result.createdSessionId });
         router.replace("/" as never);
         return;
       }
-
       setError("Verification failed. Please try again.");
     } catch (err) {
       setError(clerkError(err));
@@ -292,7 +275,9 @@ export default function SignInScreen() {
           >
             {loading
               ? <ActivityIndicator color="#000" />
-              : <Text style={styles.btnText}>Sign In</Text>}
+              : !isLoaded
+                ? <Text style={styles.btnText}>Connecting…</Text>
+                : <Text style={styles.btnText}>Sign In</Text>}
           </Pressable>
 
           <View style={styles.footer}>
