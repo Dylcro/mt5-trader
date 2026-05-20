@@ -1,0 +1,14 @@
+uploads = []
+outputs = []
+
+[[generated]]
+id = "ysJl4cM6XYHX8BjRqabnS"
+uri = "file://artifacts/mt5-trader/assets/images/icon.png"
+type = "image"
+title = "gold-bar-trading-icon"
+
+[[generated]]
+id = "T8mKEVBP7aTOlc4DZIPMs"
+uri = "file://artifacts/mt5-trader/assets/images/splash-icon.png"
+type = "image"
+title = "gold-bar-splash-screen"

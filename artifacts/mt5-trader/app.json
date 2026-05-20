@@ -3,21 +3,36 @@
     "name": "XAUUSD Trader",
     "slug": "mt5-trader",
     "version": "1.0.0",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "mt5-trader",
+    "scheme": "mt5trader",
     "userInterfaceStyle": "dark",
     "newArchEnabled": true,
+    "privacy": "unlisted",
     "splash": {
       "image": "./assets/images/splash-icon.png",
       "resizeMode": "contain",
       "backgroundColor": "#0A0A0A"
     },
     "ios": {
-      "supportsTablet": false
+      "supportsTablet": false,
+      "bundleIdentifier": "com.xauusdtrader.app",
+      "buildNumber": "1",
+      "infoPlist": {
+        "NSPrivacyAccessedAPITypes": []
+      }
     },
     "android": {
-      "backgroundColor": "#0A0A0A"
+      "backgroundColor": "#0A0A0A",
+      "package": "com.xauusdtrader.app",
+      "versionCode": 1,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/icon.png",
+        "backgroundColor": "#0A0A0A"
+      }
     },
     "web": {
       "favicon": "./assets/images/icon.png"
@@ -35,6 +50,12 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "privacyPolicyUrl": "https://meta-trader-link.replit.app/privacy",
+      "eas": {
+        "projectId": "PLACEHOLDER_EAS_PROJECT_ID"
+      }
     }
   }
 }
