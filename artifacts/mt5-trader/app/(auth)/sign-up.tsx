@@ -39,8 +39,13 @@ function clerkError(err: unknown): string {
   return "Something went wrong. Please try again.";
 }
 
+function clerkResultError(result: { error: unknown } | null | undefined): string | null {
+  if (!result?.error) return null;
+  return clerkError(result.error);
+}
+
 export default function SignUpScreen() {
-  const { signUp, setActive, isLoaded } = useSignUp();
+  const { signUp, errors, fetchStatus } = useSignUp() as any;
   const { isSignedIn } = useAuth();
   const router = useRouter();
   const insets = useSafeAreaInsets();
@@ -60,12 +65,19 @@ export default function SignUpScreen() {
   const handleSignUp = async () => {
     if (!email.trim()) { setError("Please enter your email address."); return; }
     if (!password) { setError("Please enter a password."); return; }
+    if (!signUp) { setError("Auth not initialised — please refresh the page."); return; }
 
     setLoading(true);
     setError("");
     try {
-      await signUp.create({ emailAddress: email.trim(), password });
-      await signUp.prepareEmailAddressVerification({ strategy: "email_code" });
+      const createResult = await signUp.create({ emailAddress: email.trim(), password });
+      const createErr = clerkResultError(createResult);
+      if (createErr) { setError(createErr); return; }
+
+      const sendResult = await signUp.sendEmailCode();
+      const sendErr = clerkResultError(sendResult);
+      if (sendErr) { setError(sendErr); return; }
+
       setStep("code");
     } catch (err: unknown) {
       setError(clerkError(err));
@@ -78,26 +90,30 @@ export default function SignUpScreen() {
     if (!signUp) return;
     setError("");
     try {
-      await signUp.prepareEmailAddressVerification({ strategy: "email_code" });
+      const result = await signUp.sendEmailCode();
+      const err = clerkResultError(result);
+      if (err) setError(err);
     } catch (err) {
       setError(clerkError(err));
     }
   };
 
   const handleVerifyCode = async () => {
-    if (!signUp || !setActive) return;
+    if (!signUp) return;
     setLoading(true);
     setError("");
     try {
-      const result = await signUp.attemptEmailAddressVerification({ code: verifyCode.trim() });
+      const result = await signUp.verifyEmailCode({ code: verifyCode.trim() });
+      const err = clerkResultError(result);
+      if (err) { setError(err); return; }
 
-      if (result.status === "complete") {
-        await setActive({ session: result.createdSessionId });
+      const status: string = signUp.status;
+      if (status === "complete") {
+        await signUp.finalize();
         router.replace("/" as never);
         return;
       }
-
-      setError("Verification failed. Please try again.");
+      setError(`Verification failed (status: ${status}). Please try again.`);
     } catch (err) {
       setError(clerkError(err));
     } finally {

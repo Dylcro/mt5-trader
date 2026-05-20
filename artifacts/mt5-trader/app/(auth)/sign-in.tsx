@@ -39,8 +39,13 @@ function clerkError(err: unknown): string {
   return "Something went wrong. Please try again.";
 }
 
+function clerkResultError(result: { error: unknown } | null | undefined): string | null {
+  if (!result?.error) return null;
+  return clerkError(result.error);
+}
+
 export default function SignInScreen() {
-  const { signIn, setActive, isLoaded } = useSignIn();
+  const { signIn, errors, fetchStatus } = useSignIn() as any;
   const { isSignedIn, signOut } = useAuth();
   const router = useRouter();
   const insets = useSafeAreaInsets();
@@ -60,33 +65,38 @@ export default function SignInScreen() {
   const handleSignIn = async () => {
     if (!email.trim()) { setError("Please enter your email address."); return; }
     if (!password) { setError("Please enter a password."); return; }
+    if (!signIn) { setError("Auth not initialised — please refresh the page."); return; }
 
     setLoading(true);
     setError("");
     try {
-      if (!signIn) throw new Error("Auth not initialised — please refresh the page and try again.");
+      // Step 1: identify the account
+      const createResult = await signIn.create({ identifier: email.trim() });
+      const createErr = clerkResultError(createResult);
+      if (createErr) { setError(createErr); return; }
 
-      // Step 1: identify the account. In Clerk v6, create() mutates signIn in place —
-      // read status from signIn directly after the call, not from the return value.
-      await signIn.create({ identifier: email.trim() });
-
-      const status = (signIn as any).status as string | null | undefined;
-      const supportedFirstFactors = (signIn as any).supportedFirstFactors as Array<Record<string, unknown>> | undefined;
+      const status: string = signIn.status;
+      const supportedFirstFactors: Array<{ strategy: string; emailAddressId?: string }> =
+        signIn.supportedFirstFactors ?? [];
 
       if (status === "complete") {
-        await setActive!({ session: (signIn as any).createdSessionId });
+        await signIn.finalize();
         router.replace("/" as never);
         return;
       }
 
       if (status === "needs_first_factor") {
-        // Password factor — attempt it with the entered password
-        const pwFactor = supportedFirstFactors?.find((f) => f["strategy"] === "password");
-        if (pwFactor) {
-          await signIn.attemptFirstFactor({ strategy: "password", password } as never);
-          const pwStatus = (signIn as any).status as string | null | undefined;
+        const hasPassword = supportedFirstFactors.some((f) => f.strategy === "password");
+        const emailFactor = supportedFirstFactors.find((f) => f.strategy === "email_code");
+
+        if (hasPassword) {
+          const pwResult = await signIn.password({ password });
+          const pwErr = clerkResultError(pwResult);
+          if (pwErr) { setError(pwErr); return; }
+
+          const pwStatus: string = signIn.status;
           if (pwStatus === "complete") {
-            await setActive!({ session: (signIn as any).createdSessionId });
+            await signIn.finalize();
             router.replace("/" as never);
             return;
           }
@@ -94,22 +104,19 @@ export default function SignInScreen() {
             setError("Two-factor auth is required. Please disable 2FA in your account settings.");
             return;
           }
-          setError(`Unexpected status after password attempt: ${pwStatus ?? "unknown"}`);
+          setError(`Unexpected status after password: ${pwStatus}`);
           return;
         }
 
-        // Email OTP factor — send a verification code
-        const emailFactor = supportedFirstFactors?.find((f) => f["strategy"] === "email_code");
-        if (emailFactor && typeof emailFactor["emailAddressId"] === "string") {
-          await signIn.prepareFirstFactor({
-            strategy: "email_code",
-            emailAddressId: emailFactor["emailAddressId"] as string,
-          });
+        if (emailFactor) {
+          const sendResult = await signIn.emailCode.sendCode();
+          const sendErr = clerkResultError(sendResult);
+          if (sendErr) { setError(sendErr); return; }
           setStep("code");
           return;
         }
 
-        const strategies = supportedFirstFactors?.map((f) => f["strategy"]).join(", ") || "none";
+        const strategies = supportedFirstFactors.map((f) => f.strategy).join(", ") || "none";
         setError(`No supported sign-in method found (available: ${strategies}). Please contact support.`);
         return;
       }
@@ -136,34 +143,30 @@ export default function SignInScreen() {
     if (!signIn) return;
     setError("");
     try {
-      const factors = signIn.supportedFirstFactors as Array<Record<string, unknown>> | undefined;
-      const emailFactor = factors?.find((f) => f["strategy"] === "email_code");
-      if (emailFactor && typeof emailFactor["emailAddressId"] === "string") {
-        await signIn.prepareFirstFactor({
-          strategy: "email_code",
-          emailAddressId: emailFactor["emailAddressId"] as string,
-        });
-      }
+      const result = await signIn.emailCode.sendCode();
+      const err = clerkResultError(result);
+      if (err) setError(err);
     } catch (err) {
       setError(clerkError(err));
     }
   };
 
   const handleVerifyCode = async () => {
-    if (!signIn || !setActive) return;
+    if (!signIn) return;
     setLoading(true);
     setError("");
     try {
-      const result = await signIn.attemptFirstFactor({
-        strategy: "email_code",
-        code: verifyCode.trim(),
-      });
-      if (result.status === "complete") {
-        await setActive({ session: result.createdSessionId });
+      const result = await signIn.emailCode.verifyCode({ code: verifyCode.trim() });
+      const err = clerkResultError(result);
+      if (err) { setError(err); return; }
+
+      const status: string = signIn.status;
+      if (status === "complete") {
+        await signIn.finalize();
         router.replace("/" as never);
         return;
       }
-      setError("Verification failed. Please try again.");
+      setError(`Verification failed (status: ${status}). Please try again.`);
     } catch (err) {
       setError(clerkError(err));
     } finally {
