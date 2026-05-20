@@ -66,40 +66,40 @@ export default function SignInScreen() {
     try {
       if (!signIn) throw new Error("Auth not initialised — please refresh the page and try again.");
 
-      // Step 1: identify the account (do NOT pass password here — Clerk v6 rejects it)
-      const attempt = await signIn.create({ identifier: email.trim() });
+      // Step 1: identify the account. In Clerk v6, create() mutates signIn in place —
+      // read status from signIn directly after the call, not from the return value.
+      await signIn.create({ identifier: email.trim() });
 
-      if (attempt.status === "complete") {
-        await setActive!({ session: attempt.createdSessionId });
+      const status = (signIn as any).status as string | null | undefined;
+      const supportedFirstFactors = (signIn as any).supportedFirstFactors as Array<Record<string, unknown>> | undefined;
+
+      if (status === "complete") {
+        await setActive!({ session: (signIn as any).createdSessionId });
         router.replace("/" as never);
         return;
       }
 
-      if (attempt.status === "needs_first_factor") {
-        const factors = attempt.supportedFirstFactors as Array<Record<string, unknown>> | undefined;
-
-        // Password is a supported first factor — attempt it now
-        const pwFactor = factors?.find((f) => f["strategy"] === "password");
+      if (status === "needs_first_factor") {
+        // Password factor — attempt it with the entered password
+        const pwFactor = supportedFirstFactors?.find((f) => f["strategy"] === "password");
         if (pwFactor) {
-          const pwResult = await signIn.attemptFirstFactor({
-            strategy: "password",
-            password,
-          } as never);
-          if (pwResult.status === "complete") {
-            await setActive!({ session: pwResult.createdSessionId });
+          await signIn.attemptFirstFactor({ strategy: "password", password } as never);
+          const pwStatus = (signIn as any).status as string | null | undefined;
+          if (pwStatus === "complete") {
+            await setActive!({ session: (signIn as any).createdSessionId });
             router.replace("/" as never);
             return;
           }
-          if (pwResult.status === "needs_second_factor") {
+          if (pwStatus === "needs_second_factor") {
             setError("Two-factor auth is required. Please disable 2FA in your account settings.");
             return;
           }
-          setError(`Unexpected status after password attempt: ${pwResult.status ?? "unknown"}`);
+          setError(`Unexpected status after password attempt: ${pwStatus ?? "unknown"}`);
           return;
         }
 
-        // Email OTP is a supported first factor — send the code
-        const emailFactor = factors?.find((f) => f["strategy"] === "email_code");
+        // Email OTP factor — send a verification code
+        const emailFactor = supportedFirstFactors?.find((f) => f["strategy"] === "email_code");
         if (emailFactor && typeof emailFactor["emailAddressId"] === "string") {
           await signIn.prepareFirstFactor({
             strategy: "email_code",
@@ -109,17 +109,17 @@ export default function SignInScreen() {
           return;
         }
 
-        const strategies = factors?.map((f) => f["strategy"]).join(", ") || "none";
+        const strategies = supportedFirstFactors?.map((f) => f["strategy"]).join(", ") || "none";
         setError(`No supported sign-in method found (available: ${strategies}). Please contact support.`);
         return;
       }
 
-      if (attempt.status === "needs_second_factor") {
+      if (status === "needs_second_factor") {
         setError("Two-factor auth is required. Please disable 2FA in your account settings.");
         return;
       }
 
-      setError(`Unexpected sign-in status: ${attempt.status ?? "unknown"}. Please try again.`);
+      setError(`Unexpected sign-in status: ${status ?? "unknown"}. Please try again.`);
     } catch (err: unknown) {
       const msg = clerkError(err);
       if (msg.toLowerCase().includes("already signed in")) {
