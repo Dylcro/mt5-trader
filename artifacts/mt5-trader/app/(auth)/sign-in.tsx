@@ -69,22 +69,20 @@ export default function SignInScreen() {
     setLoading(true);
     setError("");
 
-    // Wait up to 5 s for Clerk to finish loading (handles autofill race).
-    // Must poll refs — closure values are frozen at button-press time.
-    if (!signInRef.current || !setActiveRef.current) {
-      let waited = 0;
-      while (waited < 5000) {
-        await new Promise((r) => setTimeout(r, 200));
-        waited += 200;
-        if (signInRef.current && setActiveRef.current) break;
-      }
+    // Poll refs until Clerk is ready (handles autofill race on slow connections).
+    // Closure values are frozen at button-press time, so refs must be used.
+    let waited = 0;
+    while (!signInRef.current || !setActiveRef.current) {
+      if (waited >= 20000) break;
+      await new Promise((r) => setTimeout(r, 300));
+      waited += 300;
     }
 
     const activeSignIn = signInRef.current;
     const activeSetActive = setActiveRef.current;
 
     if (!activeSignIn || !activeSetActive) {
-      setError("Could not connect to auth service. Please check your connection and try again.");
+      setError("Sign-in timed out — please check your internet connection and try again.");
       setLoading(false);
       return;
     }
