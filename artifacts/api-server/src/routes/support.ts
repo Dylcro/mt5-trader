@@ -4,9 +4,9 @@ import { db, supportTicketsTable } from "@workspace/db";
 const router: IRouter = Router();
 
 router.post("/support", async (req: Request, res: Response) => {
-  const { name, accountNumber, query } = req.body as {
+  const { name, email, query } = req.body as {
     name?: string;
-    accountNumber?: string;
+    email?: string;
     query?: string;
   };
 
@@ -22,7 +22,7 @@ router.post("/support", async (req: Request, res: Response) => {
   try {
     await db.insert(supportTicketsTable).values({
       name: name.trim(),
-      accountNumber: accountNumber?.trim() || null,
+      email: email?.trim() || null,
       query: query.trim(),
       createdAt: Date.now(),
     });

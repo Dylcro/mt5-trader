@@ -27,7 +27,7 @@ export default function SupportScreen() {
   const insets = useSafeAreaInsets();
 
   const [name, setName] = useState("");
-  const [accountNumber, setAccountNumber] = useState("");
+  const [email, setEmail] = useState("");
   const [query, setQuery] = useState("");
   const [submitState, setSubmitState] = useState<SubmitState>("idle");
   const [errorMsg, setErrorMsg] = useState("");
@@ -51,7 +51,7 @@ export default function SupportScreen() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: name.trim(),
-          accountNumber: accountNumber.trim() || undefined,
+          email: email.trim() || undefined,
           query: query.trim(),
         }),
       });
@@ -99,7 +99,7 @@ export default function SupportScreen() {
             </Text>
             <Pressable
               style={styles.doneBtn}
-              onPress={() => router.back()}
+              onPress={() => router.replace("/(tabs)/settings" as never)}
             >
               <Text style={styles.doneBtnText}>Back to Settings</Text>
             </Pressable>
@@ -124,15 +124,16 @@ export default function SupportScreen() {
             </View>
 
             <View style={styles.fieldGroup}>
-              <Text style={styles.label}>MT5 Account Number</Text>
-              <Text style={styles.fieldHint}>Optional — helps us look up your account faster</Text>
+              <Text style={styles.label}>Email Address</Text>
+              <Text style={styles.fieldHint}>Optional — so we can reply to you directly</Text>
               <TextInput
                 style={styles.input}
-                placeholder="e.g. 12345678"
+                placeholder="you@example.com"
                 placeholderTextColor={C.textMuted}
-                value={accountNumber}
-                onChangeText={setAccountNumber}
-                keyboardType="numeric"
+                value={email}
+                onChangeText={setEmail}
+                keyboardType="email-address"
+                autoCapitalize="none"
                 returnKeyType="next"
               />
             </View>

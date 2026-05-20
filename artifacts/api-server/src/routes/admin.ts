@@ -83,8 +83,8 @@ router.get("/", async (req: Request, res: Response) => {
       ? `<tr><td colspan="4" class="empty">No support requests yet</td></tr>`
       : tickets.map(t => `
         <tr>
-          <td>${t.name}</td>
-          <td class="mono">${t.accountNumber ?? "—"}</td>
+          <td>${escapeHtml(t.name)}</td>
+          <td class="mono muted">${t.email ?? "—"}</td>
           <td class="query">${escapeHtml(t.query)}</td>
           <td class="muted">${formatDate(t.createdAt)}</td>
         </tr>`).join("");
