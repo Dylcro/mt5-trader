@@ -334,20 +334,22 @@ function makeDealListener(accountId: string) {
       storeDealEvent(accountId, evt);
 
       // ── Auto-cascade: place limit orders for trades opened directly in MT5 ──
-      // Guard 1: only fire on live deals — not history replay during initial sync.
-      // Guard 2: skip any positionId we've already cascaded — prevents double-cascade
-      //          when MetaAPI re-delivers a missed deal after a reconnect.
       const acctCascadeCfg = getCascadeConfig(accountId);
-      if (
-        syncReady.has(accountId) &&
-        acctCascadeCfg.enabled &&
-        evt.symbol === "XAUUSD" &&
-        evt.openPrice > 0 &&
-        !hasBeenCascaded(accountId, evt.positionId)
-      ) {
+
+      // Layer 1: sync guard — never cascade historical deals replayed on connect
+      if (!syncReady.has(accountId)) { /* skip — historical replay */ }
+      // Layer 2: feature enabled + correct symbol + valid price
+      else if (!acctCascadeCfg.enabled || evt.symbol !== "XAUUSD" || evt.openPrice <= 0) { /* skip — disabled or irrelevant */ }
+      // Layer 3: positionId already cascaded (covers app-placed market orders pre-marked above)
+      else if (hasBeenCascaded(accountId, evt.positionId)) {
+        console.log(`[auto-cascade] SKIP posId=${evt.positionId} — already cascaded`);
+      }
+      else {
         const comment = evt.comment ?? "";
         const isFromApp = comment.startsWith("Cascade") || comment === "XAUUSD Trader App";
-        if (!isFromApp) {
+        if (isFromApp) {
+          console.log(`[auto-cascade] SKIP posId=${evt.positionId} — app-placed trade (comment="${comment}")`);
+        } else {
           markCascaded(accountId, evt.positionId);
           void (async () => {
             const direction: "buy" | "sell" = evt.type === "DEAL_TYPE_BUY" ? "buy" : "sell";
@@ -1203,6 +1205,28 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
     const success = TRADE_SUCCESS_CODES.has(code);
     const errorMessage = success ? undefined : (TRADE_ERROR_MESSAGES[code] ?? data.message ?? `Trade failed (code ${code})`);
     if (!success) console.log(`[trade] FAILED action=${body.actionType} code=${code} msg="${errorMessage}"`);
+
+    if (success) {
+      const actionType = String(body.actionType ?? "");
+      const comment   = String(body.comment ?? "");
+      const isAppTrade = comment.startsWith("Cascade") || comment === "XAUUSD Trader App";
+      if (isAppTrade) {
+        // Limit order placed by the app: track its orderId so that when it fills
+        // in a volatile market, onDealAdded skips re-cascading it — even if the
+        // broker has stripped the comment by fill time.
+        if (actionType.endsWith("_LIMIT") && data.orderId) {
+          trackCascadeOrder(data.orderId);
+          console.log(`[trade] tracked cascade limit orderId=${data.orderId}`);
+        }
+        // Market order placed by the app: mark its positionId immediately so the
+        // hasBeenCascaded guard blocks it even if the comment is later stripped.
+        if (!actionType.endsWith("_LIMIT") && data.positionId) {
+          markCascaded(accountId, data.positionId);
+          console.log(`[trade] pre-marked cascade market positionId=${data.positionId}`);
+        }
+      }
+    }
+
     return res.status(httpStatus).json({
       success,
       code,
