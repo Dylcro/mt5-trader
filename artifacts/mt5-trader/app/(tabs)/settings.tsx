@@ -1,3 +1,4 @@
+import { useClerk } from "@clerk/expo";
 import { Feather } from "@expo/vector-icons";
 import Slider from "@react-native-community/slider";
 import * as Haptics from "expo-haptics";
@@ -201,6 +202,7 @@ function SliderSetting({
 
 export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
+  const { signOut } = useClerk();
   const { credentials, status, errorMsg, accountInfo, connect, disconnect } = useTrading();
   const { settings: cs, updateSettings, saveToServer } = useCascadeSettings();
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
@@ -461,6 +463,15 @@ export default function SettingsScreen() {
               <Text style={[styles.disconnectText, { color: C.textSecondary }]}>Cancel Connection</Text>
             </Pressable>
           )}
+
+          {/* Sign Out */}
+          <Pressable
+            style={({ pressed }) => [styles.disconnectBtn, { borderColor: "#333", marginTop: 6 }, pressed && { opacity: 0.7 }]}
+            onPress={() => signOut()}
+          >
+            <Feather name="log-out" size={16} color={C.textSecondary} />
+            <Text style={[styles.disconnectText, { color: C.textSecondary }]}>Sign Out</Text>
+          </Pressable>
 
           {/* Preferences */}
           <View style={styles.cascadeCard}>

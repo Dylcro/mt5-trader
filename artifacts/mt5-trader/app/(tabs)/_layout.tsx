@@ -1,14 +1,17 @@
+import { useAuth } from "@clerk/expo";
 import { BlurView } from "expo-blur";
 import { isLiquidGlassAvailable } from "expo-glass-effect";
-import { Tabs } from "expo-router";
+import { Redirect, Tabs } from "expo-router";
 import { Icon, Label, NativeTabs } from "expo-router/unstable-native-tabs";
 import { MaterialCommunityIcons, Feather } from "@expo/vector-icons";
 import { SymbolView } from "expo-symbols";
-import React from "react";
-import { Platform, StyleSheet, View } from "react-native";
+import React, { useEffect } from "react";
+import { ActivityIndicator, Platform, StyleSheet, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import Colors from "@/constants/colors";
+import { useTrading } from "@/context/TradingContext";
+import { setAuthTokenGetter } from "@/lib/authToken";
 
 function NativeTabLayout() {
   return (
@@ -109,6 +112,28 @@ function ClassicTabLayout() {
 }
 
 export default function TabLayout() {
+  const { isSignedIn, isLoaded, getToken } = useAuth();
+  const { reconnectFromServer } = useTrading();
+
+  useEffect(() => {
+    if (!isSignedIn) return;
+    setAuthTokenGetter(() => getToken());
+    void reconnectFromServer();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSignedIn]);
+
+  if (!isLoaded) {
+    return (
+      <View style={{ flex: 1, backgroundColor: "#0A0A0F", justifyContent: "center", alignItems: "center" }}>
+        <ActivityIndicator color="#C9A84C" />
+      </View>
+    );
+  }
+
+  if (!isSignedIn) {
+    return <Redirect href="/(auth)/sign-in" />;
+  }
+
   if (isLiquidGlassAvailable()) {
     return <NativeTabLayout />;
   }

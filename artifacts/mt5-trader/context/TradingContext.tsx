@@ -9,6 +9,8 @@ import React, {
   useState,
 } from "react";
 
+import { getAuthToken } from "@/lib/authToken";
+
 export type ConnectionStatus = "disconnected" | "connecting" | "connected" | "error";
 
 export interface AccountInfo {
@@ -84,6 +86,7 @@ interface TradingContextValue {
   clearCascadeNotification: () => void;
   connect: (creds?: Mt5Credentials) => Promise<void>;
   disconnect: () => Promise<void>;
+  reconnectFromServer: () => Promise<void>;
   placeTrade: (params: PlaceTradeParams) => Promise<{ success: boolean; message: string }>;
   placeCascadeOrders: (params: CascadeOrderParams) => Promise<{ success: boolean; placed: number; failed: number; message: string; marketPositionId?: string; limitOrderIds?: string[] }>;
   closePosition: (positionId: string) => Promise<{ success: boolean; message: string }>;
@@ -130,6 +133,16 @@ function resolveApiBase(): string {
 
 const API_BASE = resolveApiBase();
 console.log("[API] base:", API_BASE);
+
+// Auth-aware fetch: attaches the Clerk Bearer token when available.
+async function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
+  const token = await getAuthToken();
+  const headers: Record<string, string> = {
+    ...(options.headers as Record<string, string> ?? {}),
+  };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  return fetch(url, { ...options, headers });
+}
 
 // Safely parse a fetch Response as JSON. If the body is HTML (server not ready yet
 // or proxy error), throws a human-readable message instead of a raw parse error.
@@ -178,7 +191,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const clearCascadeNotification = useCallback(() => setCascadeNotification(null), []);
 
 
-  // Load saved credentials + accountId on startup and auto-reconnect
+  // Load saved credentials + accountId on startup (auth-gated reconnect happens in (tabs)/_layout)
   useEffect(() => {
     AsyncStorage.multiGet(["mt5_login", "mt5_server", "mt5_account_id", "mt5_region"]).then((pairs) => {
       const login = pairs[0][1] ?? "";
@@ -189,11 +202,6 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       if (savedAccountId) {
         setAccountIdState(savedAccountId);
         setRegionState(savedRegion);
-        // Auto-reconnect silently — guard prevents double-fire from React StrictMode
-        if (!reconnectInProgressRef.current) {
-          reconnectInProgressRef.current = true;
-          reconnectSaved(savedAccountId).finally(() => { reconnectInProgressRef.current = false; });
-        }
       }
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -205,7 +213,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 5000));
       try {
-        const r = await fetch(`${API_BASE}/mt5/account/${accId}/status?region=${accRegion}`);
+        const r = await authFetch(`${API_BASE}/mt5/account/${accId}/status?region=${accRegion}`);
         const d = await safeJson<{
           connectionStatus?: string;
           error?: string;
@@ -247,7 +255,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       let data: ({ status?: string; error?: string; accountId?: string; region?: string } & Partial<AccountInfo>) | null = null;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          res = await fetch(`${API_BASE}/mt5/connect`, {
+          res = await authFetch(`${API_BASE}/mt5/connect`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ accountId: savedId }),
@@ -313,7 +321,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const fetchPriceData = useCallback(async (accId: string, accRegion: string): Promise<Price> => {
-    const res = await fetch(`${API_BASE}/mt5/account/${accId}/price?region=${accRegion}`);
+    const res = await authFetch(`${API_BASE}/mt5/account/${accId}/price?region=${accRegion}`);
     if (!res.ok) throw new Error(`Price fetch failed: ${res.status}`);
     const data = await safeJson<{ bid?: number; ask?: number; time?: string }>(res);
     const bid = data.bid ?? 0;
@@ -327,7 +335,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const fetchPositionsData = useCallback(async (accId: string, accRegion: string): Promise<Position[]> => {
-    const res = await fetch(`${API_BASE}/mt5/account/${accId}/positions?region=${accRegion}`);
+    const res = await authFetch(`${API_BASE}/mt5/account/${accId}/positions?region=${accRegion}`);
     if (!res.ok) throw new Error(`Positions fetch failed: ${res.status}`);
     const data = await safeJson<unknown[]>(res);
     return (Array.isArray(data) ? data : []).map((p) => {
@@ -349,7 +357,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const fetchAccountInfoData = useCallback(async (accId: string, accRegion: string): Promise<AccountInfo> => {
-    const res = await fetch(`${API_BASE}/mt5/account/${accId}/info?region=${accRegion}`);
+    const res = await authFetch(`${API_BASE}/mt5/account/${accId}/info?region=${accRegion}`);
     if (!res.ok) throw new Error(`Account info failed: ${res.status}`);
     const data = await safeJson(res);
     return {
@@ -364,7 +372,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const fetchPendingOrdersData = useCallback(async (accId: string, accRegion: string): Promise<PendingOrder[]> => {
-    const res = await fetch(`${API_BASE}/mt5/account/${accId}/orders?region=${accRegion}`);
+    const res = await authFetch(`${API_BASE}/mt5/account/${accId}/orders?region=${accRegion}`);
     if (!res.ok) throw new Error(`Orders fetch failed: ${res.status}`);
     const data = await safeJson<unknown[]>(res);
     return (Array.isArray(data) ? data : []).map((o) => {
@@ -409,7 +417,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       const pollEvents = async () => {
         try {
           const since = lastEventPollTimeRef.current;
-          const res = await fetch(`${API_BASE}/mt5/events/${accId}?since=${since}&region=${accRegion}`);
+          const res = await authFetch(`${API_BASE}/mt5/events/${accId}?since=${since}&region=${accRegion}`);
           if (!res.ok) return;
           const data = await safeJson<{ events?: Array<{ autoCascade?: boolean; autoCascadeCount?: number; time?: number }>; serverTime?: number }>(res);
           lastEventPollTimeRef.current = data.serverTime ?? Date.now();
@@ -463,7 +471,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         // Retry up to 3 times on transient "not ready" errors (server still warming up)
         for (let attempt = 1; attempt <= 3; attempt++) {
           try {
-            res = await fetch(connectUrl, {
+            res = await authFetch(connectUrl, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -536,7 +544,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     stopPolling();
     if (accountId) {
       try {
-        await fetch(`${API_BASE}/mt5/account/${accountId}/disconnect`, { method: "POST" });
+        await authFetch(`${API_BASE}/mt5/account/${accountId}/disconnect`, { method: "POST" });
       } catch {}
     }
     await AsyncStorage.multiRemove(["mt5_account_id", "mt5_region"]);
@@ -549,6 +557,44 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     setPrice(null);
     setErrorMsg("");
   }, [accountId, stopPolling]);
+
+  // Called after Clerk auth is ready. Fetches the user's account from the server
+  // (keyed by userId) so a new device automatically reconnects their MT5 session.
+  // Falls back to the locally-saved accountId if the server has no record.
+  const reconnectFromServer = useCallback(async () => {
+    if (reconnectInProgressRef.current) return;
+    reconnectInProgressRef.current = true;
+    try {
+      let targetAccountId: string | null = null;
+      let targetRegion = DEFAULT_REGION;
+      try {
+        const res = await authFetch(`${API_BASE}/mt5/my-account`);
+        if (res.ok) {
+          const data = await safeJson<{ accountId?: string; region?: string }>(res);
+          if (data.accountId) {
+            targetAccountId = data.accountId;
+            targetRegion = data.region ?? DEFAULT_REGION;
+          }
+        }
+      } catch {}
+
+      // Fall back to AsyncStorage if server has no record yet
+      if (!targetAccountId) {
+        const pairs = await AsyncStorage.multiGet(["mt5_account_id", "mt5_region"]);
+        targetAccountId = pairs[0][1] ?? null;
+        targetRegion = pairs[1][1] ?? DEFAULT_REGION;
+      }
+
+      if (targetAccountId) {
+        setAccountIdState(targetAccountId);
+        setRegionState(targetRegion);
+        await reconnectSaved(targetAccountId);
+      }
+    } finally {
+      reconnectInProgressRef.current = false;
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const refreshPrice = useCallback(async () => {
     if (status !== "connected" || !accountId) return;
@@ -602,7 +648,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       const MAX_ATTEMPTS = 2;
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         console.log("[submitOrderRaw] →", actionType, "vol=" + String(params.volume), params.limitPrice != null ? "openPrice=" + String(params.limitPrice) : "market", "sl=" + String(params.stopLoss ?? "none"), attempt > 1 ? `(attempt ${attempt})` : "");
-        const res = await fetch(`${API_BASE}/mt5/account/${accountId}/trade?region=${region}`, {
+        const res = await authFetch(`${API_BASE}/mt5/account/${accountId}/trade?region=${region}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
@@ -707,7 +753,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
             const toCancel = limitResults.filter((r) => r.success && r.orderId).map((r) => r.orderId!);
             if (toCancel.length > 0) {
               void Promise.all(toCancel.map((id) =>
-                fetch(`${API_BASE}/mt5/account/${accountId}/cancel-order/${id}?region=${region}`, { method: "POST" })
+                authFetch(`${API_BASE}/mt5/account/${accountId}/cancel-order/${id}?region=${region}`, { method: "POST" })
               ));
             }
           }
@@ -744,7 +790,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     async (positionId: string): Promise<{ success: boolean; message: string }> => {
       if (status !== "connected") return { success: false, message: "Not connected" };
       try {
-        const res = await fetch(`${API_BASE}/mt5/account/${accountId}/trade?region=${region}`, {
+        const res = await authFetch(`${API_BASE}/mt5/account/${accountId}/trade?region=${region}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ actionType: "POSITION_CLOSE_ID", positionId }),
@@ -764,7 +810,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     async (orderId: string): Promise<{ success: boolean; message: string }> => {
       if (status !== "connected") return { success: false, message: "Not connected" };
       try {
-        const res = await fetch(`${API_BASE}/mt5/account/${accountId}/order/${orderId}?region=${region}`, {
+        const res = await authFetch(`${API_BASE}/mt5/account/${accountId}/order/${orderId}?region=${region}`, {
           method: "DELETE",
         });
         const data = await safeJson<{ success?: boolean; message?: string }>(res);
@@ -797,6 +843,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         clearCascadeNotification,
         connect,
         disconnect,
+        reconnectFromServer,
         placeTrade,
         placeCascadeOrders,
         closePosition,

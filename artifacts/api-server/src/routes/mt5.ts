@@ -1,4 +1,5 @@
-import { Router, type IRouter, type Request, type Response } from "express";
+import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
+import { getAuth } from "@clerk/express";
 import { createRequire } from "module";
 import { db, cascadeConfigTable, storedAccountsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
@@ -13,6 +14,30 @@ const _MetaApiCjs = _require("metaapi.cloud-sdk") as any;
 const MetaApi: any = _MetaApiCjs.default ?? _MetaApiCjs;
 
 const router: IRouter = Router();
+
+// ── Auth middleware ──────────────────────────────────────────────────────────
+// userId → accountId in-memory ownership cache. Populated on /connect.
+const userAccountCache = new Map<string, string>(); // userId → accountId
+
+function requireAuth(req: Request, res: Response, next: NextFunction): void {
+  const { userId } = getAuth(req);
+  if (!userId) { res.status(401).json({ error: "Unauthorized" }); return; }
+  (req as Record<string, unknown>)["userId"] = userId;
+  next();
+}
+
+function checkOwner(req: Request, res: Response, next: NextFunction): void {
+  const userId = (req as Record<string, unknown>)["userId"] as string;
+  const accountId = req.params["accountId"];
+  if (!accountId || !userId) { next(); return; }
+  const ownedId = userAccountCache.get(userId);
+  if (ownedId !== undefined && ownedId !== accountId) {
+    res.status(403).json({ error: "Forbidden" }); return;
+  }
+  next();
+}
+
+router.use(requireAuth);
 
 // ── MetaAPI Streaming Manager ────────────────────────────────────────────────
 // Maintains one SDK streaming connection per account and stores incoming deal
@@ -594,12 +619,47 @@ async function deployAccount(token: string, accountId: string): Promise<void> {
   }
 }
 
+// GET /api/mt5/my-account — returns the accountId bound to the authenticated user
+router.get("/mt5/my-account", async (req: Request, res: Response) => {
+  const userId = (req as Record<string, unknown>)["userId"] as string;
+  try {
+    const [row] = await db.select().from(storedAccountsTable).where(eq(storedAccountsTable.userId, userId)).limit(1);
+    if (!row) { res.status(404).json({ error: "No account linked" }); return; }
+    res.json({ accountId: row.accountId, region: row.region });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 // POST /api/mt5/connect
 // Body: { login, password, server } — provision and deploy (returns immediately, client polls /status)
 // Body: { accountId } — reconnect stored account
 router.post("/mt5/connect", async (req: Request, res: Response) => {
   try {
     const token = getToken();
+    const userId = (req as Record<string, unknown>)["userId"] as string | undefined;
+
+    // Helper: bind userId → accountId in cache + DB (best-effort, non-blocking)
+    const bindAccount = (accountId: string) => {
+      if (!userId) return;
+      userAccountCache.set(userId, accountId);
+      db.update(storedAccountsTable)
+        .set({ userId })
+        .where(eq(storedAccountsTable.accountId, accountId))
+        .catch(() => {});
+    };
+
+    // Intercept res.json so every successful response with an accountId field automatically
+    // binds the user — no need to call bindAccount at every individual return point.
+    const _origJson = res.json.bind(res);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (res as any).json = (body: unknown) => {
+      if (body && typeof body === "object" && "accountId" in (body as object)) {
+        bindAccount((body as Record<string, unknown>)["accountId"] as string);
+      }
+      return _origJson(body);
+    };
+
     const { login, password, server, accountId: existingId } = req.body as {
       login?: string;
       password?: string;
@@ -607,7 +667,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       accountId?: string;
     };
 
-    console.log(`[connect] login=${login} server=${server} existingId=${existingId}`);
+    console.log(`[connect] userId=${userId} login=${login} server=${server} existingId=${existingId}`);
 
     // ── RECONNECT PATH: existing MetaAPI account ID stored on device ──────────
     if (existingId) {
@@ -814,7 +874,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
 
 // GET /api/mt5/account/:accountId/status?region=
 // Client polls this after getting status="deploying" or "pending_broker_detection"
-router.get("/mt5/account/:accountId/status", async (req: Request, res: Response) => {
+router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
     const accountId = String(req.params.accountId);
@@ -878,7 +938,7 @@ router.get("/mt5/account/:accountId/status", async (req: Request, res: Response)
 });
 
 // POST /api/mt5/account/:accountId/disconnect
-router.post("/mt5/account/:accountId/disconnect", async (req: Request, res: Response) => {
+router.post("/mt5/account/:accountId/disconnect", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
     const { accountId } = req.params;
@@ -893,7 +953,7 @@ router.post("/mt5/account/:accountId/disconnect", async (req: Request, res: Resp
 });
 
 // GET /api/mt5/account/:accountId/info?region=london
-router.get("/mt5/account/:accountId/info", async (req: Request, res: Response) => {
+router.get("/mt5/account/:accountId/info", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
     const region = qstr(req.query.region) || DEFAULT_REGION;
@@ -914,7 +974,7 @@ router.get("/mt5/account/:accountId/candles", (req: Request, res: Response) => {
 });
 
 // GET /api/mt5/account/:accountId/price?region=london
-router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) => {
+router.get("/mt5/account/:accountId/price", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
     const region = qstr(req.query.region) || DEFAULT_REGION;
@@ -933,7 +993,7 @@ router.get("/mt5/account/:accountId/price", async (req: Request, res: Response) 
 });
 
 // GET /api/mt5/account/:accountId/positions?region=london
-router.get("/mt5/account/:accountId/positions", async (req: Request, res: Response) => {
+router.get("/mt5/account/:accountId/positions", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
     const region = qstr(req.query.region) || DEFAULT_REGION;
@@ -949,7 +1009,7 @@ router.get("/mt5/account/:accountId/positions", async (req: Request, res: Respon
 });
 
 // GET /api/mt5/account/:accountId/orders?region=london  (pending orders)
-router.get("/mt5/account/:accountId/orders", async (req: Request, res: Response) => {
+router.get("/mt5/account/:accountId/orders", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
     const region = qstr(req.query.region) || DEFAULT_REGION;
@@ -965,7 +1025,7 @@ router.get("/mt5/account/:accountId/orders", async (req: Request, res: Response)
 });
 
 // DELETE /api/mt5/account/:accountId/order/:orderId?region=london  (cancel pending order)
-router.delete("/mt5/account/:accountId/order/:orderId", async (req: Request, res: Response) => {
+router.delete("/mt5/account/:accountId/order/:orderId", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
     const region = qstr(req.query.region) || DEFAULT_REGION;
@@ -1036,7 +1096,7 @@ const TRADE_ERROR_MESSAGES: Record<number, string> = {
 // POST /api/mt5/account/:accountId/trade?region=london
 // Tries the SDK WebSocket path first (reuses existing stream connection → no new TCP/TLS to MetaAPI).
 // Falls back to REST if the connection is unavailable or the SDK call throws.
-router.post("/mt5/account/:accountId/trade", async (req: Request, res: Response) => {
+router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
     const region = qstr(req.query.region) || DEFAULT_REGION;
@@ -1095,7 +1155,7 @@ router.post("/mt5/account/:accountId/trade", async (req: Request, res: Response)
 // GET /api/mt5/events/:accountId?since=<ms>&region=london
 // Returns new DEAL_ENTRY_IN events since `since` (ms epoch).
 // Also kicks off the streaming connection for this account if not already running.
-router.get("/mt5/events/:accountId", async (req: Request, res: Response) => {
+router.get("/mt5/events/:accountId", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
     const { accountId } = req.params as { accountId: string };
