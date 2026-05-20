@@ -202,6 +202,11 @@ function isDuplicate(dealId: string): boolean {
   return false;
 }
 
+// Tracks which accounts have completed the initial MetaAPI synchronisation.
+// onDealAdded fires for HISTORICAL deals during sync replay — we must NOT
+// auto-cascade those. Only deals that arrive after onSynchronized are live.
+const syncReady = new Set<string>();
+
 function makeDealListener(accountId: string) {
   // The MetaAPI SDK calls many methods on every registered listener and throws
   // if any of them is missing — aborting the entire synchronization packet.
@@ -209,9 +214,18 @@ function makeDealListener(accountId: string) {
   // silently no-op any method the SDK calls that we haven't explicitly defined.
   const handler = {
     async onDisconnected(_instanceIndex: string): Promise<void> {
+      syncReady.delete(accountId); // reset — next reconnect must re-sync before cascading
       activeStreams.delete(accountId);
       activeConnections.delete(accountId);
       console.log(`[stream ${accountId}] WebSocket disconnected — watchdog will reconnect`);
+    },
+    // onDealsSynchronized fires after all historical deals have been replayed.
+    // Any onDealAdded call AFTER this point is a live event — safe to cascade.
+    async onDealsSynchronized(_instanceIndex: string, _synchronizationId: string): Promise<void> {
+      if (!syncReady.has(accountId)) {
+        syncReady.add(accountId);
+        console.log(`[stream ${accountId}] deals sync complete — auto-cascade armed for live deals`);
+      }
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async onDealAdded(_instanceIndex: string, deal: any): Promise<void> {
@@ -237,8 +251,9 @@ function makeDealListener(accountId: string) {
       storeDealEvent(accountId, evt);
 
       // ── Auto-cascade: place limit orders for trades opened directly in MT5 ──
+      // Guard: only fire on live deals — not the history replay during initial sync.
       const acctCascadeCfg = getCascadeConfig(accountId);
-      if (acctCascadeCfg.enabled && evt.symbol === "XAUUSD" && evt.openPrice > 0) {
+      if (syncReady.has(accountId) && acctCascadeCfg.enabled && evt.symbol === "XAUUSD" && evt.openPrice > 0) {
         const comment = evt.comment ?? "";
         const isFromApp = comment.startsWith("Cascade") || comment === "XAUUSD Trader App";
         if (!isFromApp) {
