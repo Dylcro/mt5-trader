@@ -65,18 +65,20 @@ export default function SignInScreen() {
     setError("");
     try {
       if (!signIn) throw new Error("Auth not initialised — please refresh the page and try again.");
-      const result = await signIn.create({ identifier: email.trim(), password });
 
-      if (result.status === "complete") {
-        await setActive!({ session: result.createdSessionId });
+      // Step 1: identify the account (do NOT pass password here — Clerk v6 rejects it)
+      const attempt = await signIn.create({ identifier: email.trim() });
+
+      if (attempt.status === "complete") {
+        await setActive!({ session: attempt.createdSessionId });
         router.replace("/" as never);
         return;
       }
 
-      if (result.status === "needs_first_factor") {
-        const factors = result.supportedFirstFactors as Array<Record<string, unknown>> | undefined;
+      if (attempt.status === "needs_first_factor") {
+        const factors = attempt.supportedFirstFactors as Array<Record<string, unknown>> | undefined;
 
-        // Password strategy — attempt it explicitly
+        // Password is a supported first factor — attempt it now
         const pwFactor = factors?.find((f) => f["strategy"] === "password");
         if (pwFactor) {
           const pwResult = await signIn.attemptFirstFactor({
@@ -92,9 +94,11 @@ export default function SignInScreen() {
             setError("Two-factor auth is required. Please disable 2FA in your account settings.");
             return;
           }
+          setError(`Unexpected status after password attempt: ${pwResult.status ?? "unknown"}`);
+          return;
         }
 
-        // Email code strategy — send OTP
+        // Email OTP is a supported first factor — send the code
         const emailFactor = factors?.find((f) => f["strategy"] === "email_code");
         if (emailFactor && typeof emailFactor["emailAddressId"] === "string") {
           await signIn.prepareFirstFactor({
@@ -106,24 +110,16 @@ export default function SignInScreen() {
         }
 
         const strategies = factors?.map((f) => f["strategy"]).join(", ") || "none";
-        setError(`Unsupported sign-in method (${strategies}). Please contact support.`);
+        setError(`No supported sign-in method found (available: ${strategies}). Please contact support.`);
         return;
       }
 
-      if (result.status === "needs_second_factor") {
+      if (attempt.status === "needs_second_factor") {
         setError("Two-factor auth is required. Please disable 2FA in your account settings.");
         return;
       }
 
-      // Temporary diagnostic — shows exactly what Clerk returned
-      const diag = JSON.stringify({
-        status: result.status,
-        createdSessionId: result.createdSessionId,
-        firstFactors: ((result.supportedFirstFactors ?? []) as Array<Record<string, unknown>>)
-          .map((f) => f["strategy"]),
-        identifier: result.identifier,
-      });
-      setError(`Debug (send screenshot): ${diag}`);
+      setError(`Unexpected sign-in status: ${attempt.status ?? "unknown"}. Please try again.`);
     } catch (err: unknown) {
       const msg = clerkError(err);
       if (msg.toLowerCase().includes("already signed in")) {
