@@ -14,8 +14,12 @@ function makeToken(userId: number, email: string): string {
 }
 
 router.post("/register", async (req: Request, res: Response): Promise<void> => {
-  const { email, password } = req.body ?? {};
+  const { email, password, fullName } = req.body ?? {};
 
+  if (!fullName || typeof fullName !== "string" || fullName.trim().length < 2) {
+    res.status(400).json({ error: "Please enter your full name." });
+    return;
+  }
   if (!email || typeof email !== "string" || !email.includes("@")) {
     res.status(400).json({ error: "A valid email address is required." });
     return;
@@ -38,10 +42,10 @@ router.post("/register", async (req: Request, res: Response): Promise<void> => {
 
     const passwordHash = await bcrypt.hash(password, 12);
     const [user] = await db.insert(usersTable)
-      .values({ email: email.toLowerCase().trim(), passwordHash })
-      .returning({ id: usersTable.id, email: usersTable.email });
+      .values({ fullName: fullName.trim(), email: email.toLowerCase().trim(), passwordHash })
+      .returning({ id: usersTable.id, email: usersTable.email, fullName: usersTable.fullName });
 
-    res.json({ token: makeToken(user.id, user.email), user: { id: user.id, email: user.email } });
+    res.json({ token: makeToken(user.id, user.email), user: { id: user.id, email: user.email, fullName: user.fullName } });
   } catch (err) {
     console.error("[auth/register]", err);
     res.status(500).json({ error: "Registration failed. Please try again." });

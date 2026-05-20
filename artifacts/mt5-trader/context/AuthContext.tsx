@@ -16,7 +16,7 @@ interface AuthContextValue {
   user: AuthUser | null;
   getToken: () => Promise<string | null>;
   signIn: (email: string, password: string) => Promise<{ error?: string }>;
-  signUp: (email: string, password: string) => Promise<{ error?: string }>;
+  signUp: (fullName: string, email: string, password: string) => Promise<{ error?: string }>;
   signOut: () => Promise<void>;
 }
 
@@ -108,12 +108,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  const signUp = useCallback(async (email: string, password: string): Promise<{ error?: string }> => {
+  const signUp = useCallback(async (fullName: string, email: string, password: string): Promise<{ error?: string }> => {
     try {
       const res = await fetch(`${API_BASE}/auth/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({ fullName, email, password }),
       });
       const data = await res.json();
       if (!res.ok) return { error: data.error || "Registration failed." };

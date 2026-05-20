@@ -1,5 +1,5 @@
 import { Router, type IRouter, type Request, type Response } from "express";
-import { db, storedAccountsTable, supportTicketsTable } from "@workspace/db";
+import { db, storedAccountsTable, supportTicketsTable, usersTable } from "@workspace/db";
 import { desc } from "drizzle-orm";
 
 const router: IRouter = Router();
@@ -28,7 +28,8 @@ router.get("/", async (req: Request, res: Response) => {
   if (!requireAdminKey(req, res)) return;
 
   try {
-    const [users, tickets] = await Promise.all([
+    const [registeredUsers, connectedAccounts, tickets] = await Promise.all([
+      db.select().from(usersTable).orderBy(desc(usersTable.createdAt)),
       db.select().from(storedAccountsTable).orderBy(desc(storedAccountsTable.storedAt)),
       db.select().from(supportTicketsTable).orderBy(desc(supportTicketsTable.createdAt)),
     ]);
@@ -52,11 +53,25 @@ router.get("/", async (req: Request, res: Response) => {
       .query { max-width: 480px; line-height: 1.5; white-space: pre-wrap; }
       .empty { color: #6e6e8a; font-style: italic; padding: 20px; text-align: center; }
       .tag { display: inline-block; background: rgba(255,255,255,0.06); border-radius: 6px; padding: 2px 8px; font-size: 11px; color: #a0a0b8; }
+      .green { color: #2ed573; }
     `;
 
-    const usersRows = users.length === 0
-      ? `<tr><td colspan="4" class="empty">No users connected yet</td></tr>`
-      : users.map(u => `
+    const registeredRows = registeredUsers.length === 0
+      ? `<tr><td colspan="4" class="empty">No users registered yet</td></tr>`
+      : registeredUsers.map(u => {
+          const hasMt5 = connectedAccounts.some(a => a.userId === String(u.id));
+          return `
+        <tr>
+          <td><strong>${escapeHtml(u.fullName ?? "—")}</strong></td>
+          <td class="mono muted">${escapeHtml(u.email)}</td>
+          <td>${hasMt5 ? '<span class="green">✓ Connected</span>' : '<span class="muted">Not connected</span>'}</td>
+          <td class="muted">${formatDate(u.createdAt?.getTime())}</td>
+        </tr>`;
+        }).join("");
+
+    const connectedRows = connectedAccounts.length === 0
+      ? `<tr><td colspan="4" class="empty">No MT5 accounts connected yet</td></tr>`
+      : connectedAccounts.map(u => `
         <tr>
           <td class="mono">${u.accountId}</td>
           <td class="mono muted" style="font-size:11px">${u.userId ?? "—"}</td>
@@ -88,10 +103,18 @@ router.get("/", async (req: Request, res: Response) => {
   <p class="subtitle">Admin dashboard &mdash; ${new Date().toUTCString()}</p>
 
   <div class="section">
-    <h2>Active Users <span class="badge">${users.length}</span></h2>
+    <h2>Registered Users <span class="badge">${registeredUsers.length}</span></h2>
     <table>
-      <thead><tr><th>MT5 Account ID</th><th>Clerk User ID</th><th>Region</th><th>Connected</th></tr></thead>
-      <tbody>${usersRows}</tbody>
+      <thead><tr><th>Full Name</th><th>Email</th><th>MT5 Status</th><th>Joined</th></tr></thead>
+      <tbody>${registeredRows}</tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>Connected MT5 Accounts <span class="badge">${connectedAccounts.length}</span></h2>
+    <table>
+      <thead><tr><th>MT5 Account ID</th><th>User ID</th><th>Region</th><th>Connected</th></tr></thead>
+      <tbody>${connectedRows}</tbody>
     </table>
   </div>
 

@@ -28,6 +28,7 @@ export default function SignUpScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
 
+  const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -39,12 +40,13 @@ export default function SignUpScreen() {
   }, [isSignedIn, router]);
 
   const handleSignUp = async () => {
+    if (!fullName.trim() || fullName.trim().length < 2) { setError("Please enter your full name."); return; }
     if (!email.trim()) { setError("Please enter your email address."); return; }
     if (!password || password.length < 8) { setError("Password must be at least 8 characters."); return; }
 
     setLoading(true);
     setError("");
-    const result = await signUp(email.trim(), password);
+    const result = await signUp(fullName.trim(), email.trim(), password);
     setLoading(false);
 
     if (result.error) {
@@ -67,6 +69,18 @@ export default function SignUpScreen() {
           <Text style={styles.logo}>XAUUSD</Text>
           <Text style={styles.title}>Create account</Text>
           <Text style={styles.subtitle}>Connect your MT5 account and start trading</Text>
+
+          <Text style={styles.label}>Full Name</Text>
+          <TextInput
+            style={styles.input}
+            value={fullName}
+            onChangeText={setFullName}
+            placeholder="Your full name"
+            placeholderTextColor={MUTED}
+            autoCapitalize="words"
+            autoCorrect={false}
+            returnKeyType="next"
+          />
 
           <Text style={styles.label}>Email</Text>
           <TextInput
