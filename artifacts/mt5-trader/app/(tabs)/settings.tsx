@@ -524,7 +524,7 @@ export default function SettingsScreen() {
                 <View style={styles.cascadeDivider} />
                 <PillSelector
                   label="Take profit"
-                  hint={`Close all positions at +${cs.takeProfitPips} pips (£${(cs.takeProfitPips * 0.10).toFixed(2)}) from 1st entry`}
+                  hint={`App will close market position & cancel pending limits at +${cs.takeProfitPips} pips from 1st entry price`}
                   options={[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]}
                   value={cs.takeProfitPips}
                   onChange={(v) => updateSettings({ takeProfitPips: v })}
