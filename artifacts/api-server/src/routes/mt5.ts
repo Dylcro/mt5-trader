@@ -2,7 +2,7 @@ import { Router, type IRouter, type Request, type Response, type NextFunction } 
 import { getAuth } from "@clerk/express";
 import { createRequire } from "module";
 import { db, cascadeConfigTable, storedAccountsTable } from "@workspace/db";
-import { eq } from "drizzle-orm";
+import { eq, isNotNull } from "drizzle-orm";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
 // In dev (tsx/ESM) import.meta.url is the real file URL.
 // In production (esbuild CJS) build.ts injects a __importMetaUrl banner and
@@ -448,9 +448,12 @@ async function startStreaming(token: string, accountId: string, region: string =
 export async function startAutoConnect(): Promise<void> {
   try {
     const token = getToken();
-    const rows = await db.select().from(storedAccountsTable);
+    const rows = await db
+      .select()
+      .from(storedAccountsTable)
+      .where(isNotNull(storedAccountsTable.userId));
     if (rows.length === 0) {
-      console.log("[auto-connect] no stored accounts yet — waiting for first app connect");
+      console.log("[auto-connect] no stored accounts with bound users — waiting for first app connect");
       return;
     }
     for (const { accountId, region } of rows) {
@@ -467,7 +470,10 @@ export function startConnectionWatchdog(): void {
   setInterval(async () => {
     try {
       const token = getToken();
-      const rows = await db.select().from(storedAccountsTable);
+      const rows = await db
+        .select()
+        .from(storedAccountsTable)
+        .where(isNotNull(storedAccountsTable.userId));
       for (const { accountId, region } of rows) {
         if (!activeStreams.has(accountId)) {
           console.log(`[watchdog] ${accountId} not streaming — reconnecting`);
