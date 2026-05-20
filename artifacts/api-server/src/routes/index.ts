@@ -5,7 +5,7 @@ import supportRouter from "./support";
 const router: IRouter = Router();
 
 router.use(healthRouter);
-router.use(mt5Router);
 router.use(supportRouter);
+router.use(mt5Router);
 
 export default router;
