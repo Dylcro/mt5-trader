@@ -27,6 +27,8 @@ interface DealEvent {
   volume: number;
   comment?: string;
   time: number;       // ms epoch when we received it
+  autoCascade?: boolean;     // true if auto-cascade placed limits for this deal
+  autoCascadeCount?: number; // number of limit orders placed by auto-cascade
 }
 
 const dealStore = new Map<string, DealEvent[]>(); // accountId → recent deals
@@ -156,6 +158,7 @@ function makeDealListener(accountId: string) {
             const conn = activeConnections.get(accountId);
             const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
             const token = getToken();
+            let placed = 0;
             await Promise.all(
               levels.limitEntries.map(async (limitPrice, i) => {
                 const body: Record<string, unknown> = {
@@ -176,12 +179,28 @@ function makeDealListener(accountId: string) {
                       body: JSON.stringify(body),
                     });
                   }
+                  placed++;
                   console.log(`[auto-cascade] placed limit ${i + 2}/${total} @ ${limitPrice}`);
                 } catch (tradeErr) {
                   console.error(`[auto-cascade] failed limit ${i + 2}/${total} @ ${limitPrice}:`, (tradeErr as Error).message);
                 }
               })
             );
+            // Append a new synthetic event after placement completes so the app can show a notification.
+            // We do NOT mutate the original event in place — that would create a race where a client
+            // poll during placement advances its `since` watermark past the original event's timestamp
+            // and never sees the mutation. A fresh event with time=now() is always after the watermark.
+            if (placed > 0) {
+              const syntheticEvt: DealEvent = {
+                ...evt,
+                dealId: `cascade-${evt.dealId}`, // unique ID — won't dedup with the real deal event
+                time: Date.now(),                 // timestamp after placement; guaranteed > any poll watermark set before now
+                autoCascade: true,
+                autoCascadeCount: placed,
+              };
+              storeDealEvent(accountId, syntheticEvt);
+              console.log(`[auto-cascade] stored synthetic notification event dealId=${syntheticEvt.dealId} autoCascadeCount=${placed}`);
+            }
           })();
         }
       }

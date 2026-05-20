@@ -13,6 +13,7 @@ import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { KeyboardProvider } from "react-native-keyboard-controller";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
+import { CascadeToast } from "@/components/CascadeToast";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { TradingProvider } from "@/context/TradingContext";
 import { CascadeSettingsProvider } from "@/hooks/useCascadeSettings";
@@ -54,6 +55,7 @@ export default function RootLayout() {
               <TradingProvider>
                 <CascadeSettingsProvider>
                   <RootLayoutNav />
+                  <CascadeToast />
                 </CascadeSettingsProvider>
               </TradingProvider>
             </KeyboardProvider>

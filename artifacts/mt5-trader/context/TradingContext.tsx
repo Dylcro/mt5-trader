@@ -62,6 +62,11 @@ export interface Mt5Credentials {
   server: string;
 }
 
+export interface CascadeNotification {
+  count: number;
+  time: number;
+}
+
 interface TradingContextValue {
   accountId: string;
   apiBase: string;
@@ -75,6 +80,8 @@ interface TradingContextValue {
   pendingOrders: PendingOrder[];
   price: Price | null;
   priceError: boolean;
+  cascadeNotification: CascadeNotification | null;
+  clearCascadeNotification: () => void;
   connect: (creds?: Mt5Credentials) => Promise<void>;
   disconnect: () => Promise<void>;
   placeTrade: (params: PlaceTradeParams) => Promise<{ success: boolean; message: string }>;
@@ -158,11 +165,17 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const [price, setPrice] = useState<Price | null>(null);
   const [priceError, setPriceError] = useState(false);
 
+  const [cascadeNotification, setCascadeNotification] = useState<CascadeNotification | null>(null);
+
   const priceIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const positionsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const eventsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const lastEventPollTimeRef = useRef<number>(Date.now());
   const priceFailCountRef = useRef(0);
   const startPollingRef = useRef<((accId: string, accRegion: string) => void) | null>(null);
   const reconnectInProgressRef = useRef(false);
+
+  const clearCascadeNotification = useCallback(() => setCascadeNotification(null), []);
 
 
   // Load saved credentials + accountId on startup and auto-reconnect
@@ -374,7 +387,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     (accId: string, accRegion: string) => {
       if (priceIntervalRef.current) clearInterval(priceIntervalRef.current);
       if (positionsIntervalRef.current) clearInterval(positionsIntervalRef.current);
+      if (eventsIntervalRef.current) clearInterval(eventsIntervalRef.current);
       priceFailCountRef.current = 0;
+      lastEventPollTimeRef.current = Date.now();
       setPriceError(false);
 
       const pollPrice = () =>
@@ -391,10 +406,29 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           fetchPendingOrdersData(accId, accRegion).then(setPendingOrders).catch(() => {}),
         ]);
 
+      const pollEvents = async () => {
+        try {
+          const since = lastEventPollTimeRef.current;
+          const res = await fetch(`${API_BASE}/mt5/events/${accId}?since=${since}&region=${accRegion}`);
+          if (!res.ok) return;
+          const data = await safeJson<{ events?: Array<{ autoCascade?: boolean; autoCascadeCount?: number; time?: number }>; serverTime?: number }>(res);
+          lastEventPollTimeRef.current = data.serverTime ?? Date.now();
+          const cascadeEvents = (data.events ?? []).filter(e => e.autoCascade && (e.autoCascadeCount ?? 0) > 0);
+          if (cascadeEvents.length > 0) {
+            const totalCount = cascadeEvents.reduce((sum, e) => sum + (e.autoCascadeCount ?? 0), 0);
+            setCascadeNotification({ count: totalCount, time: Date.now() });
+          }
+        } catch {
+          // swallow — events polling is best-effort
+        }
+      };
+
       pollPrice();
       pollPositions();
+      void pollEvents();
       priceIntervalRef.current = setInterval(pollPrice, 500);
       positionsIntervalRef.current = setInterval(pollPositions, 10000);
+      eventsIntervalRef.current = setInterval(pollEvents, 5000);
     },
     [fetchPriceData, fetchPositionsData, fetchPendingOrdersData]
   );
@@ -405,6 +439,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const stopPolling = useCallback(() => {
     if (priceIntervalRef.current) clearInterval(priceIntervalRef.current);
     if (positionsIntervalRef.current) clearInterval(positionsIntervalRef.current);
+    if (eventsIntervalRef.current) clearInterval(eventsIntervalRef.current);
   }, []);
 
   const connect = useCallback(
@@ -749,6 +784,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         pendingOrders,
         price,
         priceError,
+        cascadeNotification,
+        clearCascadeNotification,
         connect,
         disconnect,
         placeTrade,
