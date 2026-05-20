@@ -335,7 +335,6 @@ export default function TradeScreen() {
   // Visible watcher state — mirrors tpWatchersRef so the UI can show what's armed
   const [armedWatchers, setArmedWatchers] = useState<Array<{ id: string; trigger: number; dir: Direction; pips: number }>>([]);
 
-  const [isCancellingLimits, setIsCancellingLimits] = useState(false);
 
   // Per-cascade watcher entry — each cascade gets its own entry so they never interfere
   type WatcherEntry = {
@@ -596,59 +595,6 @@ export default function TradeScreen() {
     }
   }, [cascadeLotSize, placeCascadeOrders, showToast]);
 
-  // Manual "Cancel All Limits" — works independently of the automated watcher
-  const handleCancelAllLimits = useCallback(async () => {
-    const accId = accountIdRef.current;
-    const base = apiBaseRef.current;
-    const rgn = regionRef.current;
-    if (!accId || !base) {
-      showToast("Not connected", "error");
-      return;
-    }
-    setIsCancellingLimits(true);
-    try {
-      const res = await fetch(`${base}/mt5/account/${accId}/orders?region=${rgn}`);
-      if (!res.ok) throw new Error(`Orders fetch failed (${res.status})`);
-      const raw = await res.json();
-      const allOrders: Array<Record<string, unknown>> = Array.isArray(raw)
-        ? raw as Array<Record<string, unknown>>
-        : Array.isArray((raw as Record<string, unknown>).orders)
-          ? (raw as { orders: Array<Record<string, unknown>> }).orders
-          : [];
-      const limitOrders = allOrders.filter((o) => {
-        const t = String(o.type ?? "");
-        return t.includes("LIMIT");
-      });
-      if (limitOrders.length === 0) {
-        showToast("No pending limit orders found", "error");
-        return;
-      }
-      const results = await Promise.all(
-        limitOrders.map(async (o) => {
-          const ordId = String(o.id ?? o.orderId ?? "");
-          if (!ordId) return false;
-          try {
-            const r = await fetch(`${base}/mt5/account/${accId}/order/${ordId}?region=${rgn}`, { method: "DELETE" });
-            const d = await r.json() as { success?: boolean };
-            return d.success !== false && r.ok;
-          } catch { return false; }
-        })
-      );
-      const cancelled = results.filter(Boolean).length;
-      const failed = results.length - cancelled;
-      void refreshPendingOrders();
-      if (failed === 0) {
-        showToast(`${cancelled} limit${cancelled !== 1 ? "s" : ""} cancelled`, "success", true);
-      } else {
-        showToast(`${cancelled} cancelled, ${failed} failed`, cancelled > 0 ? "success" : "error");
-      }
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : "Cancel failed", "error");
-    } finally {
-      setIsCancellingLimits(false);
-    }
-  }, [showToast, refreshPendingOrders]);
-
   const webTopPad = Platform.OS === "web" ? 67 : 0;
 
   return (
@@ -880,27 +826,6 @@ export default function TradeScreen() {
               </View>
             ))}
 
-            {/* Manual cancel-all button — always available, no watcher needed */}
-            {status === "connected" && (
-              <Pressable
-                style={({ pressed }) => [
-                  styles.cancelAllBtn,
-                  pressed && { opacity: 0.7 },
-                  isCancellingLimits && { opacity: 0.5 },
-                ]}
-                onPress={() => void handleCancelAllLimits()}
-                disabled={isCancellingLimits}
-              >
-                {isCancellingLimits ? (
-                  <ActivityIndicator size="small" color={C.sell} />
-                ) : (
-                  <Feather name="x-circle" size={14} color={C.sell} />
-                )}
-                <Text style={styles.cancelAllBtnText}>
-                  {isCancellingLimits ? "Cancelling…" : "Cancel All Limits"}
-                </Text>
-              </Pressable>
-            )}
           </>
         )}
 
@@ -1373,23 +1298,5 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_400Regular",
     color: C.gold,
     flexShrink: 1,
-  },
-  cancelAllBtn: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 7,
-    marginTop: 10,
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: "rgba(255,75,75,0.4)",
-    backgroundColor: "rgba(255,75,75,0.08)",
-  },
-  cancelAllBtnText: {
-    fontSize: 13,
-    fontFamily: "Inter_600SemiBold",
-    color: C.sell,
   },
 });
