@@ -209,11 +209,11 @@ export default function SignUpScreen() {
           ) : null}
 
           <Pressable
-            style={[styles.btn, (loading || !isLoaded) && styles.btnDisabled]}
+            style={[styles.btn, loading && styles.btnDisabled]}
             onPress={handleSignUp}
-            disabled={loading || !isLoaded}
+            disabled={loading}
           >
-            {(loading || !isLoaded)
+            {loading
               ? <ActivityIndicator color="#000" />
               : <Text style={styles.btnText}>Create Account</Text>}
           </Pressable>

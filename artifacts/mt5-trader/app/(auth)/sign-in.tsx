@@ -238,11 +238,11 @@ export default function SignInScreen() {
           {error ? <Text style={styles.error}>{error}</Text> : null}
 
           <Pressable
-            style={[styles.btn, (loading || !isLoaded) && styles.btnDisabled]}
+            style={[styles.btn, loading && styles.btnDisabled]}
             onPress={handleSignIn}
-            disabled={loading || !isLoaded}
+            disabled={loading}
           >
-            {(loading || !isLoaded)
+            {loading
               ? <ActivityIndicator color="#000" />
               : <Text style={styles.btnText}>Sign In</Text>}
           </Pressable>
