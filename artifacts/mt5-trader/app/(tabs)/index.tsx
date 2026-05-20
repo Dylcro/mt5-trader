@@ -332,6 +332,9 @@ export default function TradeScreen() {
 
   const [isPlacing, setIsPlacing] = useState(false);
 
+  // Visible watcher state — mirrors tpWatchersRef so the UI can show what's armed
+  const [armedWatchers, setArmedWatchers] = useState<Array<{ id: string; trigger: number; dir: Direction; pips: number }>>([]);
+
   // Per-cascade watcher entry — each cascade gets its own entry so they never interfere
   type WatcherEntry = {
     id: string; // unique per cascade placement
@@ -474,6 +477,7 @@ export default function TradeScreen() {
     }
     if (firedTpIds.size > 0) {
       tpWatchersRef.current = tpWatchersRef.current.filter((tp) => !firedTpIds.has(tp.id));
+      setArmedWatchers((prev) => prev.filter((w) => !firedTpIds.has(w.id)));
     }
   }, [price, showToast, refreshPendingOrders]);
 
@@ -587,6 +591,7 @@ export default function TradeScreen() {
             limitOrderIds: result.limitOrderIds,
             limitPrices,
           });
+          setArmedWatchers((prev) => [...prev, { id: cascadeId, trigger: tpTrigger, dir, pips: cs.takeProfitPips }]);
         }
       } else {
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
@@ -816,6 +821,21 @@ export default function TradeScreen() {
                 Connect your MT5 account in Settings to trade
               </Text>
             )}
+
+            {/* Armed watcher badge — confirms the limit-cancel watcher is active */}
+            {armedWatchers.map((w) => (
+              <View key={w.id} style={styles.watcherBadge}>
+                <Feather name="clock" size={12} color={C.gold} />
+                <Text style={styles.watcherBadgeText}>
+                  {`Cancel limits armed · ${w.dir.toUpperCase()} +${w.pips}pip · trigger @ ${formatPrice(w.trigger)}`}
+                </Text>
+                {price && (
+                  <Text style={[styles.watcherBadgeText, { color: C.textSecondary }]}>
+                    {`(bid ${formatPrice(price.bid)})`}
+                  </Text>
+                )}
+              </View>
+            ))}
           </>
         )}
 
@@ -1269,5 +1289,24 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_400Regular",
     color: C.textMuted,
     marginTop: 8,
+  },
+  watcherBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    marginTop: 10,
+    paddingVertical: 7,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    backgroundColor: "rgba(212,175,55,0.1)",
+    borderWidth: 1,
+    borderColor: "rgba(212,175,55,0.35)",
+    flexWrap: "wrap",
+  },
+  watcherBadgeText: {
+    fontSize: 11,
+    fontFamily: "Inter_400Regular",
+    color: C.gold,
+    flexShrink: 1,
   },
 });
