@@ -1,6 +1,6 @@
-import { useSignUp } from "@clerk/expo";
+import { useAuth, useSignUp } from "@clerk/expo";
 import { Link, useRouter } from "expo-router";
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -36,6 +36,7 @@ function clerkError(err: unknown): string {
 
 export default function SignUpScreen() {
   const { signUp } = useSignUp();
+  const { isSignedIn } = useAuth();
   const router = useRouter();
   const insets = useSafeAreaInsets();
 
@@ -46,6 +47,10 @@ export default function SignUpScreen() {
   const [verifyCode, setVerifyCode] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (isSignedIn) router.replace("/" as never);
+  }, [isSignedIn, router]);
 
   const handleSignUp = async () => {
     if (!signUp) {
@@ -191,7 +196,19 @@ export default function SignUpScreen() {
             </Pressable>
           </View>
 
-          {error ? <Text style={styles.error}>{error}</Text> : null}
+          {error ? (
+            <View>
+              <Text style={styles.error}>{error}</Text>
+              {(error.toLowerCase().includes("already") || error.toLowerCase().includes("taken") || error.toLowerCase().includes("exists")) && (
+                <View style={{ flexDirection: "row", justifyContent: "center", marginTop: 8 }}>
+                  <Text style={{ color: MUTED, fontSize: 12 }}>Have an account? </Text>
+                  <Link href="/(auth)/sign-in">
+                    <Text style={[styles.link, { fontSize: 12 }]}>Sign in instead</Text>
+                  </Link>
+                </View>
+              )}
+            </View>
+          ) : null}
 
           <Pressable
             style={[styles.btn, loading && styles.btnDisabled]}

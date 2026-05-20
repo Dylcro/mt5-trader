@@ -390,7 +390,7 @@ export default function SettingsScreen() {
 
               {isConnecting && (
                 <Text style={styles.connectingNote}>
-                  This may take up to 60 seconds while we establish a connection with your broker.
+                  This may take up to 2 minutes while MetaAPI establishes a connection with your broker.
                 </Text>
               )}
             </View>

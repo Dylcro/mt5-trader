@@ -530,7 +530,7 @@ export async function startAutoConnect(): Promise<void> {
 }
 
 export function startConnectionWatchdog(): void {
-  const INTERVAL_MS = 60_000;
+  const INTERVAL_MS = 30_000;
   setInterval(async () => {
     try {
       const token = getToken();
