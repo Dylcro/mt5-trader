@@ -40,7 +40,8 @@ const activeRegions = new Map<string, string>();  // accountId → region (used 
 let sdkInstance: InstanceType<typeof MetaApi> | null = null;
 
 // ── Cascade Config ────────────────────────────────────────────────────────────
-// Persisted to disk so settings survive server restarts.
+// Persisted to DB, keyed per trading account.
+// The empty-string key "" represents the global (account-agnostic) config.
 // The app syncs these whenever the user changes settings.
 
 interface CascadeConfig {
@@ -52,26 +53,34 @@ interface CascadeConfig {
 
 const CASCADE_DEFAULTS: CascadeConfig = { enabled: false, numPositions: 3, pipsBetween: 50, slPips: 100 };
 
-let cascadeConfig: CascadeConfig = { ...CASCADE_DEFAULTS };
+// In-memory cache: accountId (or "" for global) → config.
+const cascadeConfigs = new Map<string, CascadeConfig>();
+
+function getCascadeConfig(accountId: string): CascadeConfig {
+  return cascadeConfigs.get(accountId) ?? cascadeConfigs.get("") ?? { ...CASCADE_DEFAULTS };
+}
 
 // Exported so index.ts can await it before the server begins accepting requests,
 // eliminating the startup race where GET /cascade-config returns defaults.
 export async function loadCascadeConfig(): Promise<void> {
   try {
-    const rows = await db.select().from(cascadeConfigTable).where(eq(cascadeConfigTable.id, 1)).limit(1);
+    const rows = await db.select().from(cascadeConfigTable);
     if (rows.length > 0) {
-      const row = rows[0];
-      cascadeConfig = {
-        enabled:      row.enabled,
-        numPositions: row.numPositions,
-        pipsBetween:  row.pipsBetween,
-        slPips:       row.slPips,
-      };
-      console.log("[cascade-config] loaded from db:", JSON.stringify(cascadeConfig));
+      for (const row of rows) {
+        const key = row.accountId ?? "";
+        cascadeConfigs.set(key, {
+          enabled:      row.enabled,
+          numPositions: row.numPositions,
+          pipsBetween:  row.pipsBetween,
+          slPips:       row.slPips,
+        });
+      }
+      console.log(`[cascade-config] loaded ${rows.length} row(s) from db`);
     } else {
-      // Seed the singleton row with defaults so future upserts work correctly.
-      await db.insert(cascadeConfigTable).values({ id: 1, ...CASCADE_DEFAULTS }).onConflictDoNothing();
-      console.log("[cascade-config] seeded defaults into db");
+      // Seed the global default row so future upserts work correctly.
+      await db.insert(cascadeConfigTable).values({ accountId: "", ...CASCADE_DEFAULTS }).onConflictDoNothing();
+      cascadeConfigs.set("", { ...CASCADE_DEFAULTS });
+      console.log("[cascade-config] seeded global defaults into db");
     }
   } catch (err) {
     console.warn("[cascade-config] failed to load from db, using defaults:", (err as Error).message);
@@ -79,12 +88,13 @@ export async function loadCascadeConfig(): Promise<void> {
 }
 
 // Returns true on success, false on DB failure.
-async function saveCascadeConfig(config: CascadeConfig): Promise<boolean> {
+// accountId="" means the global (fallback) config.
+async function saveCascadeConfig(config: CascadeConfig, accountId: string): Promise<boolean> {
   try {
     await db.insert(cascadeConfigTable)
-      .values({ id: 1, ...config })
+      .values({ accountId, ...config })
       .onConflictDoUpdate({
-        target: cascadeConfigTable.id,
+        target: cascadeConfigTable.accountId,
         set: {
           enabled:      config.enabled,
           numPositions: config.numPositions,
@@ -192,13 +202,14 @@ function makeDealListener(accountId: string) {
       storeDealEvent(accountId, evt);
 
       // ── Auto-cascade: place limit orders for trades opened directly in MT5 ──
-      if (cascadeConfig.enabled && evt.symbol === "XAUUSD" && evt.openPrice > 0) {
+      const acctCascadeCfg = getCascadeConfig(accountId);
+      if (acctCascadeCfg.enabled && evt.symbol === "XAUUSD" && evt.openPrice > 0) {
         const comment = evt.comment ?? "";
         const isFromApp = comment.startsWith("Cascade") || comment === "XAUUSD Trader App";
         if (!isFromApp) {
           void (async () => {
             const direction: "buy" | "sell" = evt.type === "DEAL_TYPE_BUY" ? "buy" : "sell";
-            const levels = buildCascadeLevels(evt.openPrice, direction, cascadeConfig);
+            const levels = buildCascadeLevels(evt.openPrice, direction, acctCascadeCfg);
             const total = 1 + levels.limitEntries.length;
             console.log(`[auto-cascade] posId=${evt.positionId} dir=${direction} price=${evt.openPrice} limits=[${levels.limitEntries.join(",")}] limitSLs=[${levels.limitStopLosses.join(",")}]`);
             const conn = activeConnections.get(accountId);
@@ -969,32 +980,37 @@ router.get("/mt5/events/:accountId", async (req: Request, res: Response) => {
   }
 });
 
-// GET /api/cascade-config
-// Returns the current cascade auto-trigger configuration.
-router.get("/cascade-config", (_req: Request, res: Response) => {
-  return res.json(cascadeConfig);
+// GET /api/cascade-config?accountId=<id>
+// Returns the cascade config for the given account, falling back to the global config.
+// Omit accountId (or pass "") to get the global config.
+router.get("/cascade-config", (req: Request, res: Response) => {
+  const accountId = typeof req.query.accountId === "string" ? req.query.accountId.trim() : "";
+  return res.json(getCascadeConfig(accountId));
 });
 
-// PUT /api/cascade-config
+// PUT /api/cascade-config?accountId=<id>
 // Body: { enabled?, numPositions?, pipsBetween?, slPips? }
-// Updates and persists cascade auto-trigger settings synced from the app.
+// Updates and persists cascade auto-trigger settings for the given account.
+// Omit accountId (or pass "") to update the global (fallback) config.
 router.put("/cascade-config", async (req: Request, res: Response) => {
+  const accountId = typeof req.query.accountId === "string" ? req.query.accountId.trim() : "";
   const body = req.body as Partial<CascadeConfig>;
+  const current = getCascadeConfig(accountId);
   // Build the candidate config without mutating in-memory state yet.
   const nextConfig: CascadeConfig = {
-    enabled:      typeof body.enabled      === "boolean" ? body.enabled      : cascadeConfig.enabled,
-    numPositions: typeof body.numPositions === "number"  ? body.numPositions : cascadeConfig.numPositions,
-    pipsBetween:  typeof body.pipsBetween  === "number"  ? body.pipsBetween  : cascadeConfig.pipsBetween,
-    slPips:       typeof body.slPips       === "number"  ? body.slPips       : cascadeConfig.slPips,
+    enabled:      typeof body.enabled      === "boolean" ? body.enabled      : current.enabled,
+    numPositions: typeof body.numPositions === "number"  ? body.numPositions : current.numPositions,
+    pipsBetween:  typeof body.pipsBetween  === "number"  ? body.pipsBetween  : current.pipsBetween,
+    slPips:       typeof body.slPips       === "number"  ? body.slPips       : current.slPips,
   };
   // Persist first — only commit to in-memory state when DB write succeeds.
-  const saved = await saveCascadeConfig(nextConfig);
+  const saved = await saveCascadeConfig(nextConfig, accountId);
   if (!saved) {
     return res.status(500).json({ error: "Failed to persist cascade config to database" });
   }
-  cascadeConfig = nextConfig;
-  console.log("[cascade-config] updated:", JSON.stringify(cascadeConfig));
-  return res.json(cascadeConfig);
+  cascadeConfigs.set(accountId, nextConfig);
+  console.log(`[cascade-config] updated accountId="${accountId}":`, JSON.stringify(nextConfig));
+  return res.json(nextConfig);
 });
 
 export default router;

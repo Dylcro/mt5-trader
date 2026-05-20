@@ -1,6 +1,8 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import React, { createContext, useCallback, useContext, useEffect, useState } from "react";
 
+import { useTrading } from "@/context/TradingContext";
+
 const API_BASE = process.env.EXPO_PUBLIC_API_URL ?? "";
 
 export interface CascadeSettings {
@@ -21,14 +23,17 @@ const DEFAULTS: CascadeSettings = {
   autoCascadeEnabled: false,
 };
 
-const KEYS = {
-  numPositions: "cascade_num_positions",
-  pipsBetween: "cascade_pips_between",
-  slPips: "cascade_sl_pips",
-  takeProfitEnabled: "cascade_tp_enabled",
-  takeProfitPips: "cascade_tp_pips",
-  autoCascadeEnabled: "cascade_auto_enabled",
-};
+function storageKeys(accountId: string) {
+  const prefix = accountId ? `cascade_${accountId}_` : "cascade_";
+  return {
+    numPositions:       `${prefix}num_positions`,
+    pipsBetween:        `${prefix}pips_between`,
+    slPips:             `${prefix}sl_pips`,
+    takeProfitEnabled:  `${prefix}tp_enabled`,
+    takeProfitPips:     `${prefix}tp_pips`,
+    autoCascadeEnabled: `${prefix}auto_enabled`,
+  };
+}
 
 interface CascadeSettingsContextValue {
   settings: CascadeSettings;
@@ -37,10 +42,13 @@ interface CascadeSettingsContextValue {
 
 const CascadeSettingsContext = createContext<CascadeSettingsContextValue | null>(null);
 
-async function pushToServer(s: CascadeSettings): Promise<void> {
+async function pushToServer(s: CascadeSettings, accountId: string): Promise<void> {
   if (!API_BASE) return;
+  const url = accountId
+    ? `${API_BASE}/cascade-config?accountId=${encodeURIComponent(accountId)}`
+    : `${API_BASE}/cascade-config`;
   try {
-    await fetch(`${API_BASE}/cascade-config`, {
+    await fetch(url, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -56,11 +64,13 @@ async function pushToServer(s: CascadeSettings): Promise<void> {
 }
 
 export function CascadeSettingsProvider({ children }: { children: React.ReactNode }) {
+  const { accountId } = useTrading();
   const [settings, setSettings] = useState<CascadeSettings>(DEFAULTS);
 
   useEffect(() => {
+    const keys = storageKeys(accountId);
     // Load from AsyncStorage first for instant display, then reconcile with server
-    AsyncStorage.multiGet(Object.values(KEYS)).then((pairs) => {
+    AsyncStorage.multiGet(Object.values(keys)).then((pairs) => {
       const [num, between, sl, tpEnabled, tpPips, autoEnabled] = pairs.map((p) => p[1]);
       const local: CascadeSettings = {
         numPositions: num ? parseFloat(num) : DEFAULTS.numPositions,
@@ -74,25 +84,26 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
 
       // Push local settings to server so the server always has the latest config
       // (server config is lost when /tmp is cleared on restart — local is source of truth).
-      void pushToServer(local);
+      void pushToServer(local, accountId);
     });
-  }, []);
+  }, [accountId]);
 
   const updateSettings = useCallback((partial: Partial<CascadeSettings>) => {
     setSettings((prev) => {
       const next = { ...prev, ...partial };
+      const keys = storageKeys(accountId);
       AsyncStorage.multiSet([
-        [KEYS.numPositions, String(next.numPositions)],
-        [KEYS.pipsBetween, String(next.pipsBetween)],
-        [KEYS.slPips, String(next.slPips)],
-        [KEYS.takeProfitEnabled, String(next.takeProfitEnabled)],
-        [KEYS.takeProfitPips, String(next.takeProfitPips)],
-        [KEYS.autoCascadeEnabled, String(next.autoCascadeEnabled)],
+        [keys.numPositions, String(next.numPositions)],
+        [keys.pipsBetween, String(next.pipsBetween)],
+        [keys.slPips, String(next.slPips)],
+        [keys.takeProfitEnabled, String(next.takeProfitEnabled)],
+        [keys.takeProfitPips, String(next.takeProfitPips)],
+        [keys.autoCascadeEnabled, String(next.autoCascadeEnabled)],
       ]);
-      void pushToServer(next);
+      void pushToServer(next, accountId);
       return next;
     });
-  }, []);
+  }, [accountId]);
 
   return React.createElement(
     CascadeSettingsContext.Provider,
