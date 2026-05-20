@@ -162,8 +162,14 @@ const server = http.createServer((req, res) => {
   // Session reset — clears all localStorage (Clerk tokens etc.) and redirects to root.
   // Useful when a stored dev-environment session blocks sign-in on the live app.
   if (pathname === "/reset") {
+    // Expire all cookies on the domain so Clerk session cookies are cleared too
+    res.setHeader("Set-Cookie", [
+      "__client_uat=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax",
+      "__session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax",
+      "__clerk_db_jwt=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax",
+    ]);
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    res.end(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Signing out…</title><style>body{background:#0A0A0F;color:#F0EFE7;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}</style></head><body><p>Clearing session…</p><script>try{localStorage.clear();}catch(e){}setTimeout(function(){window.location.replace("/");},800);</script></body></html>`);
+    res.end(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Signing out…</title><style>body{background:#0A0A0F;color:#F0EFE7;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;}</style></head><body><p>Clearing session…</p><script>try{localStorage.clear();sessionStorage.clear();}catch(e){}try{document.cookie.split(";").forEach(function(c){document.cookie=c.replace(/^ +/,"").replace(/=.*/,"=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/");});}catch(e){}setTimeout(function(){window.location.replace("/");},800);</script></body></html>`);
     return;
   }
 

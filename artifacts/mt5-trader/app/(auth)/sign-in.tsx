@@ -1,6 +1,6 @@
-import { useSignIn } from "@clerk/expo";
+import { useAuth, useSignIn } from "@clerk/expo";
 import { Link, useRouter } from "expo-router";
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -36,6 +36,7 @@ function clerkError(err: unknown): string {
 
 export default function SignInScreen() {
   const { signIn } = useSignIn();
+  const { isSignedIn, signOut } = useAuth();
   const router = useRouter();
   const insets = useSafeAreaInsets();
 
@@ -46,6 +47,11 @@ export default function SignInScreen() {
   const [verifyCode, setVerifyCode] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  // If already signed in (e.g. session persisted from a previous visit), go straight to the app.
+  useEffect(() => {
+    if (isSignedIn) router.replace("/" as never);
+  }, [isSignedIn, router]);
 
   const handleSignIn = async () => {
     if (!signIn) {
@@ -77,10 +83,21 @@ export default function SignInScreen() {
 
       setError("Unable to complete sign in. Please try again.");
     } catch (err: unknown) {
-      setError(clerkError(err));
+      const msg = clerkError(err);
+      // Already signed in — just go to the app instead of showing an error.
+      if (msg.toLowerCase().includes("already signed in")) {
+        router.replace("/" as never);
+        return;
+      }
+      setError(msg);
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleSignOut = async () => {
+    try { await signOut(); } catch {}
+    router.replace("/sign-in" as never);
   };
 
   const handleResendCode = async () => {
@@ -220,6 +237,9 @@ export default function SignInScreen() {
               <Text style={styles.link}>Create one</Text>
             </Link>
           </View>
+          <Pressable onPress={handleSignOut} style={styles.linkBtn}>
+            <Text style={[styles.link, { color: MUTED, fontSize: 12 }]}>Sign out of existing session</Text>
+          </Pressable>
         </View>
       </ScrollView>
     </KeyboardAvoidingView>
