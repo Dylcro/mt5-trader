@@ -58,10 +58,6 @@ export default function SignInScreen() {
   }, [isSignedIn, router]);
 
   const handleSignIn = async () => {
-    if (!isLoaded || !signIn || !setActive) {
-      setError("Auth is still initialising — please wait a moment and try again.");
-      return;
-    }
     if (!email.trim()) { setError("Please enter your email address."); return; }
     if (!password) { setError("Please enter a password."); return; }
 
@@ -242,11 +238,11 @@ export default function SignInScreen() {
           {error ? <Text style={styles.error}>{error}</Text> : null}
 
           <Pressable
-            style={[styles.btn, loading && styles.btnDisabled]}
+            style={[styles.btn, (loading || !isLoaded) && styles.btnDisabled]}
             onPress={handleSignIn}
-            disabled={loading}
+            disabled={loading || !isLoaded}
           >
-            {loading
+            {(loading || !isLoaded)
               ? <ActivityIndicator color="#000" />
               : <Text style={styles.btnText}>Sign In</Text>}
           </Pressable>

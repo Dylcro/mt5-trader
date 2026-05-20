@@ -58,10 +58,6 @@ export default function SignUpScreen() {
   }, [isSignedIn, router]);
 
   const handleSignUp = async () => {
-    if (!isLoaded || !signUp || !setActive) {
-      setError("Auth is still initialising — please wait a moment and try again.");
-      return;
-    }
     if (!email.trim()) { setError("Please enter your email address."); return; }
     if (!password) { setError("Please enter a password."); return; }
 
@@ -213,11 +209,11 @@ export default function SignUpScreen() {
           ) : null}
 
           <Pressable
-            style={[styles.btn, loading && styles.btnDisabled]}
+            style={[styles.btn, (loading || !isLoaded) && styles.btnDisabled]}
             onPress={handleSignUp}
-            disabled={loading}
+            disabled={loading || !isLoaded}
           >
-            {loading
+            {(loading || !isLoaded)
               ? <ActivityIndicator color="#000" />
               : <Text style={styles.btnText}>Create Account</Text>}
           </Pressable>
