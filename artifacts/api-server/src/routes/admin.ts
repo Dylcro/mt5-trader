@@ -1,6 +1,6 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import { db, storedAccountsTable, supportTicketsTable, usersTable } from "@workspace/db";
-import { desc } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
 
 const router: IRouter = Router();
 
@@ -130,6 +130,22 @@ router.get("/", async (req: Request, res: Response) => {
   } catch (err) {
     console.error("[admin] error:", (err as Error).message);
     res.status(500).send("Internal server error");
+  }
+});
+
+router.patch("/users", async (req: Request, res: Response) => {
+  if (!requireAdminKey(req, res)) return;
+  const { email, fullName } = req.body ?? {};
+  if (!email || !fullName) { res.status(400).json({ error: "email and fullName required" }); return; }
+  try {
+    const [updated] = await db.update(usersTable)
+      .set({ fullName })
+      .where(eq(usersTable.email, email.toLowerCase().trim()))
+      .returning({ id: usersTable.id, email: usersTable.email, fullName: usersTable.fullName });
+    if (!updated) { res.status(404).json({ error: "User not found" }); return; }
+    res.json({ ok: true, user: updated });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
   }
 });
 
