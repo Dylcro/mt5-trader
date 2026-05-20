@@ -398,6 +398,9 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       if (acct.connectionStatus === "CONNECTED") {
         // Already connected — fetch info and return immediately.
         // If the client API isn't warm yet (just redeployed), fall back to polling.
+        // Kick off streaming in background so deal events (and auto-cascade) work
+        // even though the app never polls the /events endpoint directly.
+        void startStreaming(token, existingId, region);
         try {
           const info = await getAccountInfo(token, existingId, region) as Record<string, unknown>;
           return res.json({

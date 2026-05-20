@@ -72,22 +72,9 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
       };
       setSettings(local);
 
-      // Then fetch server config and update the auto-cascade toggle + cascade params
-      if (API_BASE) {
-        fetch(`${API_BASE}/cascade-config`)
-          .then((r) => r.ok ? r.json() : null)
-          .then((remote: { enabled?: boolean; numPositions?: number; pipsBetween?: number; slPips?: number } | null) => {
-            if (!remote) return;
-            setSettings((prev) => ({
-              ...prev,
-              autoCascadeEnabled: remote.enabled ?? prev.autoCascadeEnabled,
-              numPositions: remote.numPositions ?? prev.numPositions,
-              pipsBetween: remote.pipsBetween ?? prev.pipsBetween,
-              slPips: remote.slPips ?? prev.slPips,
-            }));
-          })
-          .catch(() => {});
-      }
+      // Push local settings to server so the server always has the latest config
+      // (server config is lost when /tmp is cleared on restart — local is source of truth).
+      void pushToServer(local);
     });
   }, []);
 
