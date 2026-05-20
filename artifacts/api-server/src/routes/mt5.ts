@@ -236,6 +236,19 @@ function getEventsSince(accountId: string, since: number): DealEvent[] {
   return (dealStore.get(accountId) ?? []).filter(e => e.time > since);
 }
 
+// Tracks orderIds of limit orders placed by our cascade logic.
+// When those orders fill (volatile market), their deals arrive with deal.orderId set.
+// We must NOT re-cascade those fills — even if the broker stripped the comment.
+const cascadePlacedOrderIds = new Set<string>();
+function trackCascadeOrder(orderId: string | undefined): void {
+  if (!orderId) return;
+  cascadePlacedOrderIds.add(orderId);
+  if (cascadePlacedOrderIds.size > 2000) {
+    const first = cascadePlacedOrderIds.values().next().value;
+    if (first !== undefined) cascadePlacedOrderIds.delete(first);
+  }
+}
+
 // Deduplication: MetaAPI connects to two server nodes (london-a and london-b)
 // so every deal event arrives twice. Track recently seen deal IDs and drop duplicates.
 const seenDealIds = new Set<string>();
@@ -299,6 +312,9 @@ function makeDealListener(accountId: string) {
       if (deal?.entryType !== "DEAL_ENTRY_IN") return;
       if (!deal?.symbol) return;
       if (isDuplicate(String(deal.id ?? ""))) return;
+      // Guard: if this deal was created by filling one of our cascade limit orders,
+      // never re-cascade it — even if the broker stripped the comment.
+      if (deal.orderId && cascadePlacedOrderIds.has(String(deal.orderId))) return;
       // MetaAPI streaming deal events expose the execution price as `deal.price`
       // (the tick price at fill time). `deal.openPrice` may be 0 or absent in
       // the streaming payload — always prefer whichever field is non-zero.
@@ -354,13 +370,16 @@ function makeDealListener(accountId: string) {
                 };
                 try {
                   if (conn) {
-                    await tradeViaConnection(conn, body);
+                    const resp = await tradeViaConnection(conn, body);
+                    trackCascadeOrder(resp.orderId);
                   } else {
-                    await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
+                    const resp = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
                       method: "POST",
                       headers: authHeaders(token),
                       body: JSON.stringify(body),
                     });
+                    const data = await resp.json() as { orderId?: string };
+                    trackCascadeOrder(data.orderId);
                   }
                   placed++;
                   console.log(`[auto-cascade] placed limit ${i + 2}/${total} @ ${limitPrice}`);
