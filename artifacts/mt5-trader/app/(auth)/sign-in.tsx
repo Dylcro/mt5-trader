@@ -61,6 +61,11 @@ export default function SignInScreen() {
     if (!email.trim()) { setError("Please enter your email address."); return; }
     if (!password) { setError("Please enter a password."); return; }
 
+    if (!signIn || !setActive) {
+      setError("Auth not ready — please wait a moment and try again.");
+      return;
+    }
+
     setLoading(true);
     setError("");
     try {
@@ -73,9 +78,25 @@ export default function SignInScreen() {
       }
 
       if (result.status === "needs_first_factor") {
-        const emailFactor = result.supportedFirstFactors?.find(
-          (f: Record<string, unknown>) => f["strategy"] === "email_code"
-        ) as Record<string, unknown> | undefined;
+        const factors = result.supportedFirstFactors as Array<Record<string, unknown>> | undefined;
+
+        // Password is the first factor — attempt it explicitly
+        const pwFactor = factors?.find((f) => f["strategy"] === "password");
+        if (pwFactor) {
+          const pwResult = await signIn.attemptFirstFactor({ strategy: "password", password } as never);
+          if (pwResult.status === "complete") {
+            await setActive({ session: pwResult.createdSessionId });
+            router.replace("/" as never);
+            return;
+          }
+          if (pwResult.status === "needs_second_factor") {
+            setError("Two-factor authentication required. Please disable 2FA in your account settings or contact support.");
+            return;
+          }
+        }
+
+        // Email code is the first factor — send the code
+        const emailFactor = factors?.find((f) => f["strategy"] === "email_code");
         if (emailFactor && typeof emailFactor["emailAddressId"] === "string") {
           await signIn.prepareFirstFactor({
             strategy: "email_code",
@@ -84,9 +105,18 @@ export default function SignInScreen() {
           setStep("code");
           return;
         }
+
+        const strategies = factors?.map((f) => f["strategy"]).join(", ") || "none";
+        setError(`Sign-in requires a method not yet supported (${strategies}). Please contact support.`);
+        return;
       }
 
-      setError("Unable to complete sign in. Please try again.");
+      if (result.status === "needs_second_factor") {
+        setError("Two-factor authentication required. Please disable 2FA in your account settings or contact support.");
+        return;
+      }
+
+      setError(`Unable to complete sign in (${result.status ?? "unknown"}). Please try again.`);
     } catch (err: unknown) {
       const msg = clerkError(err);
       if (msg.toLowerCase().includes("already signed in")) {
