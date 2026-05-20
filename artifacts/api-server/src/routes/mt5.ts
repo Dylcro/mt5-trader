@@ -60,30 +60,69 @@ function getCascadeConfig(accountId: string): CascadeConfig {
   return cascadeConfigs.get(accountId) ?? cascadeConfigs.get("") ?? { ...CASCADE_DEFAULTS };
 }
 
+// Attempt a single load from the database; throws on failure.
+async function attemptLoadCascadeConfig(): Promise<void> {
+  const rows = await db.select().from(cascadeConfigTable);
+  if (rows.length > 0) {
+    for (const row of rows) {
+      const key = row.accountId ?? "";
+      cascadeConfigs.set(key, {
+        enabled:      row.enabled,
+        numPositions: row.numPositions,
+        pipsBetween:  row.pipsBetween,
+        slPips:       row.slPips,
+      });
+    }
+    console.log(`[cascade-config] loaded ${rows.length} row(s) from db`);
+  } else {
+    // Seed the global default row so future upserts work correctly.
+    await db.insert(cascadeConfigTable).values({ accountId: "", ...CASCADE_DEFAULTS }).onConflictDoNothing();
+    cascadeConfigs.set("", { ...CASCADE_DEFAULTS });
+    console.log("[cascade-config] seeded global defaults into db");
+  }
+}
+
 // Exported so index.ts can await it before the server begins accepting requests,
 // eliminating the startup race where GET /cascade-config returns defaults.
+// Retries up to 3 times with exponential back-off before falling back to defaults.
+// If CASCADE_CONFIG_OVERRIDE is set it is used directly, bypassing the database.
 export async function loadCascadeConfig(): Promise<void> {
-  try {
-    const rows = await db.select().from(cascadeConfigTable);
-    if (rows.length > 0) {
-      for (const row of rows) {
-        const key = row.accountId ?? "";
-        cascadeConfigs.set(key, {
-          enabled:      row.enabled,
-          numPositions: row.numPositions,
-          pipsBetween:  row.pipsBetween,
-          slPips:       row.slPips,
-        });
-      }
-      console.log(`[cascade-config] loaded ${rows.length} row(s) from db`);
-    } else {
-      // Seed the global default row so future upserts work correctly.
-      await db.insert(cascadeConfigTable).values({ accountId: "", ...CASCADE_DEFAULTS }).onConflictDoNothing();
-      cascadeConfigs.set("", { ...CASCADE_DEFAULTS });
-      console.log("[cascade-config] seeded global defaults into db");
+  // Environment-variable override: useful for zero-DB-dependency deployments.
+  const override = process.env.CASCADE_CONFIG_OVERRIDE;
+  if (override) {
+    try {
+      const parsed = JSON.parse(override) as Partial<CascadeConfig>;
+      cascadeConfigs.set("", { ...CASCADE_DEFAULTS, ...parsed });
+      console.log("[cascade-config] loaded config from CASCADE_CONFIG_OVERRIDE env var");
+      return;
+    } catch (err) {
+      console.warn("[cascade-config] CASCADE_CONFIG_OVERRIDE is not valid JSON, ignoring:", (err as Error).message);
     }
-  } catch (err) {
-    console.warn("[cascade-config] failed to load from db, using defaults:", (err as Error).message);
+  }
+
+  const MAX_ATTEMPTS = 3;
+  const BASE_DELAY_MS = 500;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      await attemptLoadCascadeConfig();
+      return; // success
+    } catch (err) {
+      const isLastAttempt = attempt === MAX_ATTEMPTS;
+      if (isLastAttempt) {
+        console.warn(
+          `[cascade-config] all ${MAX_ATTEMPTS} attempts to load from db failed, using defaults:`,
+          (err as Error).message,
+        );
+      } else {
+        const delayMs = BASE_DELAY_MS * attempt;
+        console.warn(
+          `[cascade-config] attempt ${attempt}/${MAX_ATTEMPTS} failed, retrying in ${delayMs}ms:`,
+          (err as Error).message,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
   }
 }
 
