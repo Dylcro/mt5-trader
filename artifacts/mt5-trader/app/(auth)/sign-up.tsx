@@ -57,6 +57,7 @@ export default function SignUpScreen() {
       await signUp.prepareEmailAddressVerification({ strategy: "email_code" });
       setStep("code");
     } catch (err) {
+      console.error("[sign-up] error:", JSON.stringify(err, null, 2));
       setError(clerkError(err));
     } finally {
       setLoading(false);
