@@ -2,6 +2,7 @@ import { useClerk } from "@clerk/expo";
 import { Feather } from "@expo/vector-icons";
 import Slider from "@react-native-community/slider";
 import * as Haptics from "expo-haptics";
+import { useRouter } from "expo-router";
 import React, { useState } from "react";
 import {
   ActivityIndicator,
@@ -202,6 +203,7 @@ function SliderSetting({
 
 export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
+  const router = useRouter();
   const { signOut } = useClerk();
   const { credentials, status, errorMsg, accountInfo, connect, disconnect } = useTrading();
   const { settings: cs, updateSettings, saveToServer } = useCascadeSettings();
@@ -617,6 +619,22 @@ export default function SettingsScreen() {
               </Text>
             </Pressable>
           </View>
+
+          {/* Help & Support */}
+          <Pressable
+            style={({ pressed }) => [styles.supportBtn, pressed && { opacity: 0.8 }]}
+            onPress={() => {
+              void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+              router.push("/support");
+            }}
+          >
+            <Feather name="help-circle" size={18} color={C.gold} />
+            <View style={{ flex: 1 }}>
+              <Text style={styles.supportBtnTitle}>Help & Support</Text>
+              <Text style={styles.supportBtnHint}>Get help or report an issue</Text>
+            </View>
+            <Feather name="chevron-right" size={16} color={C.textMuted} />
+          </Pressable>
 
           {/* About */}
           <View style={styles.aboutCard}>
@@ -1054,6 +1072,28 @@ const styles = StyleSheet.create({
   },
   cascadePreviewTitle: { fontSize: 11, fontFamily: "Inter_600SemiBold", color: C.textSecondary, letterSpacing: 0.5 },
   cascadePreviewText: { fontSize: 12, fontFamily: "Inter_400Regular", color: C.textMuted, lineHeight: 20 },
+  supportBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    backgroundColor: C.card,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: C.border,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+  },
+  supportBtnTitle: {
+    fontSize: 14,
+    fontFamily: "Inter_600SemiBold",
+    color: C.text,
+  },
+  supportBtnHint: {
+    fontSize: 12,
+    fontFamily: "Inter_400Regular",
+    color: C.textMuted,
+    marginTop: 1,
+  },
   aboutCard: {
     backgroundColor: C.card,
     borderRadius: 16,

@@ -8,6 +8,7 @@ import {
   getClerkProxyHost,
 } from "./middlewares/clerkProxyMiddleware";
 import router from "./routes";
+import adminRouter from "./routes/admin";
 
 const app: Express = express();
 
@@ -94,5 +95,6 @@ app.get("/privacy", (_req: Request, res: Response) => {
 });
 
 app.use("/api", router);
+app.use(adminRouter);
 
 export default app;

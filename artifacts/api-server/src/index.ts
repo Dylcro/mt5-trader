@@ -1,4 +1,5 @@
 import app from "./app";
+import { pool } from "@workspace/db";
 import { loadCascadeConfig, startAutoConnect, startConnectionWatchdog } from "./routes/mt5";
 
 process.on("uncaughtException", (err) => {
@@ -8,6 +9,18 @@ process.on("uncaughtException", (err) => {
 process.on("unhandledRejection", (reason) => {
   console.error("[unhandledRejection]", reason);
 });
+
+async function ensureTables(): Promise<void> {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS support_tickets (
+      id            SERIAL PRIMARY KEY,
+      name          TEXT    NOT NULL,
+      account_number TEXT,
+      query         TEXT    NOT NULL,
+      created_at    BIGINT  NOT NULL
+    );
+  `);
+}
 
 async function main() {
   const rawPort = process.env["PORT"];
@@ -23,6 +36,8 @@ async function main() {
   if (Number.isNaN(port) || port <= 0) {
     throw new Error(`Invalid PORT value: "${rawPort}"`);
   }
+
+  await ensureTables();
 
   // Load persisted cascade config from the database before accepting requests
   // so that GET /cascade-config never returns stale defaults on a fresh start.
