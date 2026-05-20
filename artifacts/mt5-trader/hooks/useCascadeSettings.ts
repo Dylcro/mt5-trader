@@ -25,15 +25,18 @@ const DEFAULTS: CascadeSettings = {
 
 const VALID_PIPS_BETWEEN = [5, 10, 15, 20];
 
+// autoCascadeEnabled is a device-level toggle — stored under a fixed global key
+// so it is never reset when the accountId changes on first connect.
+const GLOBAL_AUTO_CASCADE_KEY = "cascade_auto_enabled_global";
+
 function storageKeys(accountId: string) {
   const prefix = accountId ? `cascade_${accountId}_` : "cascade_";
   return {
-    numPositions:       `${prefix}num_positions`,
-    pipsBetween:        `${prefix}pips_between`,
-    slPips:             `${prefix}sl_pips`,
-    takeProfitEnabled:  `${prefix}tp_enabled`,
-    takeProfitPips:     `${prefix}tp_pips`,
-    autoCascadeEnabled: `${prefix}auto_enabled`,
+    numPositions:      `${prefix}num_positions`,
+    pipsBetween:       `${prefix}pips_between`,
+    slPips:            `${prefix}sl_pips`,
+    takeProfitEnabled: `${prefix}tp_enabled`,
+    takeProfitPips:    `${prefix}tp_pips`,
   };
 }
 
@@ -71,24 +74,35 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
 
   useEffect(() => {
     const keys = storageKeys(accountId);
-    // Load from AsyncStorage first for instant display, then reconcile with server
-    AsyncStorage.multiGet(Object.values(keys)).then((pairs) => {
+    // Load per-account keys + global autoCascadeEnabled key together
+    const allKeys = [...Object.values(keys), GLOBAL_AUTO_CASCADE_KEY];
+    AsyncStorage.multiGet(allKeys).then((pairs) => {
       const [num, between, sl, tpEnabled, tpPips, autoEnabled] = pairs.map((p) => p[1]);
       const storedPips = between ? parseFloat(between) : DEFAULTS.pipsBetween;
-      const local: CascadeSettings = {
-        numPositions: num ? parseFloat(num) : DEFAULTS.numPositions,
-        // Migrate: if stored value is not one of the valid pill options (e.g. old default of 50), reset to 10
-        pipsBetween: VALID_PIPS_BETWEEN.includes(storedPips) ? storedPips : DEFAULTS.pipsBetween,
-        slPips: sl ? parseFloat(sl) : DEFAULTS.slPips,
-        takeProfitEnabled: tpEnabled === "true",
-        takeProfitPips: tpPips ? parseFloat(tpPips) : DEFAULTS.takeProfitPips,
-        autoCascadeEnabled: autoEnabled === "true",
-      };
-      setSettings(local);
 
-      // Push local settings to server so the server always has the latest config
-      // (server config is lost when /tmp is cleared on restart — local is source of truth).
-      void pushToServer(local, accountId);
+      // Also migrate the old per-account auto_enabled key if the global key is not yet set
+      // so existing users don't lose their toggle state after this update.
+      const legacyAutoKey = accountId ? `cascade_${accountId}_auto_enabled` : "cascade_auto_enabled";
+      const resolveAutoEnabled = async () => {
+        if (autoEnabled !== null) return autoEnabled === "true";
+        const [[, legacy]] = await AsyncStorage.multiGet([legacyAutoKey]);
+        return legacy === "true";
+      };
+
+      void resolveAutoEnabled().then((autoCascadeEnabled) => {
+        const local: CascadeSettings = {
+          numPositions: num ? parseFloat(num) : DEFAULTS.numPositions,
+          // Migrate: if stored value is not one of the valid pill options (e.g. old default of 50), reset to 10
+          pipsBetween: VALID_PIPS_BETWEEN.includes(storedPips) ? storedPips : DEFAULTS.pipsBetween,
+          slPips: sl ? parseFloat(sl) : DEFAULTS.slPips,
+          takeProfitEnabled: tpEnabled === "true",
+          takeProfitPips: tpPips ? parseFloat(tpPips) : DEFAULTS.takeProfitPips,
+          autoCascadeEnabled,
+        };
+        setSettings(local);
+        // Push local settings to server so the server always has the latest config
+        void pushToServer(local, accountId);
+      });
     });
   }, [accountId]);
 
@@ -102,7 +116,8 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         [keys.slPips, String(next.slPips)],
         [keys.takeProfitEnabled, String(next.takeProfitEnabled)],
         [keys.takeProfitPips, String(next.takeProfitPips)],
-        [keys.autoCascadeEnabled, String(next.autoCascadeEnabled)],
+        // autoCascadeEnabled is device-global — always written to the same key
+        [GLOBAL_AUTO_CASCADE_KEY, String(next.autoCascadeEnabled)],
       ]);
       void pushToServer(next, accountId);
       return next;
