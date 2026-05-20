@@ -159,6 +159,14 @@ const server = http.createServer((req, res) => {
     return serveManifest(platform, res);
   }
 
+  // Session reset — clears all localStorage (Clerk tokens etc.) and redirects to root.
+  // Useful when a stored dev-environment session blocks sign-in on the live app.
+  if (pathname === "/reset") {
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Signing out…</title><style>body{background:#0A0A0F;color:#F0EFE7;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}</style></head><body><p>Clearing session…</p><script>try{localStorage.clear();}catch(e){}setTimeout(function(){window.location.replace("/");},800);</script></body></html>`);
+    return;
+  }
+
   // Regular browser — serve the Expo web PWA
   if (hasWebBuild) {
     return serveWebFile(pathname, res);
