@@ -39,11 +39,12 @@ console.log(`Web PWA build: ${hasWebBuild ? WEB_DIST : "NOT FOUND — will show 
 
 // At build time the Clerk publishable key is baked into the JS bundle as the
 // dev key (pk_test_...). In production Replit injects the live key via env var.
-// We swap the baked-in key at serve time so the PWA authenticates against the
-// correct production user store. Cache the patched buffer to avoid re-reading
-// the 3 MB bundle on every request.
+// We inject it into the HTML as window.__CLERK_KEY__ so the app reads the
+// correct production key without touching the 3 MB JS bundle.
 const RUNTIME_CLERK_KEY = process.env.CLERK_PUBLISHABLE_KEY || "";
-const bundleCache = new Map(); // resolved file path → patched Buffer/string
+const CLERK_INJECTION = RUNTIME_CLERK_KEY
+  ? `<script>window.__CLERK_KEY__=${JSON.stringify(RUNTIME_CLERK_KEY)};</script>`
+  : "";
 
 function getAppName() {
   try {
@@ -102,18 +103,15 @@ function serveWebFile(urlPath, res) {
   const ext = path.extname(resolved).toLowerCase();
   const contentType = MIME_TYPES[ext] || "application/octet-stream";
 
-  // JS bundles: swap the baked-in dev Clerk key with the runtime production key.
-  // Result is cached in memory after the first request.
-  if (RUNTIME_CLERK_KEY && ext === ".js") {
-    if (!bundleCache.has(resolved)) {
-      const text = fs.readFileSync(resolved, "utf-8");
-      const patched = text.includes("pk_test_")
-        ? text.replace(/pk_test_[A-Za-z0-9]+/g, RUNTIME_CLERK_KEY)
-        : text;
-      bundleCache.set(resolved, patched);
-    }
+  // For HTML pages: inject the runtime Clerk publishable key so the app uses
+  // the correct production Clerk instance instead of the baked-in dev key.
+  if (CLERK_INJECTION && ext === ".html") {
+    let html = fs.readFileSync(resolved, "utf-8");
+    html = html.includes("</head>")
+      ? html.replace("</head>", `${CLERK_INJECTION}</head>`)
+      : CLERK_INJECTION + html;
     res.writeHead(200, { "content-type": contentType });
-    res.end(bundleCache.get(resolved));
+    res.end(html);
     return;
   }
 

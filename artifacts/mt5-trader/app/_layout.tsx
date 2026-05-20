@@ -25,7 +25,11 @@ SplashScreen.preventAutoHideAsync();
 
 const queryClient = new QueryClient();
 
-const publishableKey = process.env.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY!;
+// In production the server injects window.__CLERK_KEY__ with the live key
+// so we don't rely on the dev key that was baked in at build time.
+const publishableKey =
+  (typeof window !== "undefined" && (window as any).__CLERK_KEY__) ||
+  process.env.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY!;
 const proxyUrl = process.env.EXPO_PUBLIC_CLERK_PROXY_URL || undefined;
 
 function RootLayoutNav() {
