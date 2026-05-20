@@ -323,147 +323,7 @@ export default function TradeScreen() {
     limitPrices?: number[]; // to find filled limits that became positions
   };
 
-  const watchersRef = useRef<WatcherEntry[]>([]); // delete-limits queue
   const tpWatchersRef = useRef<WatcherEntry[]>([]); // take-profit queue
-
-  // Auto-trigger: detect new MT5 positions and apply cascade settings automatically
-  const cascadeLotSizeRef = useRef(cascadeLotSize);
-  useEffect(() => { cascadeLotSizeRef.current = cascadeLotSize; }, [cascadeLotSize]);
-
-  const positionsSeedDoneRef = useRef(false);
-  const knownPositionIdsRef = useRef<Set<string>>(new Set());
-  const autoTriggeredIdsRef = useRef<Set<string>>(new Set());
-
-  // Reset tracking when connection status changes (connect/disconnect/account switch)
-  useEffect(() => {
-    positionsSeedDoneRef.current = false;
-    knownPositionIdsRef.current.clear();
-    autoTriggeredIdsRef.current.clear();
-  }, [status]);
-
-  const handleAutoTrigger = useCallback(async (posId: string, openPrice: number, posDir: "buy" | "sell") => {
-    const cs = cascadeSettingsRef.current;
-    if (!cs.autoTriggerEnabled) return;
-    const numLimits = cs.numPositions - 1;
-    if (numLimits <= 0) {
-      console.log(`[auto-trigger id=${posId}] numPositions=1 → no limits to place`);
-      return;
-    }
-    const p = priceRef.current;
-    // If the streaming event didn't carry a price (openPrice=0), fall back to
-    // the current live market price so cascade levels are built correctly.
-    const entryPrice = openPrice > 0
-      ? openPrice
-      : (posDir === "buy" ? (p?.ask ?? 0) : (p?.bid ?? 0));
-    if (entryPrice <= 0) {
-      console.log(`[auto-trigger id=${posId}] no valid price available (openPrice=${openPrice}, live=${String(p?.bid)}) — skipping`);
-      return;
-    }
-    const levels = buildCascadeLevels(entryPrice, posDir, cs);
-    console.log(`[auto-trigger] NEW MT5 ${posDir} position id=${posId} openPrice=${openPrice} → placing ${levels.limitEntries.length} limits at [${levels.limitEntries.join(",")}] sl=${levels.stopLoss}`);
-    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-
-    const result = await placeCascadeOrders({
-      direction: posDir,
-      volume: cascadeLotSizeRef.current,
-      limitEntries: levels.limitEntries,
-      stopLoss: levels.stopLoss,
-      existingPositionId: posId,
-    });
-
-    if (result.success) {
-      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      const n = result.placed - 1;
-      showToast(`Auto-cascade: ${n} limit${n !== 1 ? "s" : ""} placed for MT5 ${posDir.toUpperCase()} ✓`, "success", true);
-      const cascadeId = `auto-${posId}`;
-      const watcherEntryPrice = p?.bid ?? openPrice;
-      const readyAt = Date.now() + 3000;
-      if (cs.autoCloseLimitsEnabled && cs.autoCloseLimitsPips > 0) {
-        const trigger = posDir === "buy" ? watcherEntryPrice + cs.autoCloseLimitsPips * 0.10 : watcherEntryPrice - cs.autoCloseLimitsPips * 0.10;
-        console.log(`[auto-trigger watcher id=${cascadeId}] arming delete-limits +${cs.autoCloseLimitsPips}pip entry=${watcherEntryPrice} trigger=${trigger}`);
-        watchersRef.current.push({ id: cascadeId, entryPrice: watcherEntryPrice, direction: posDir, pipsTarget: cs.autoCloseLimitsPips, readyAt, marketPositionId: posId, limitOrderIds: result.limitOrderIds, limitPrices: levels.limitEntries });
-      }
-      if (cs.takeProfitEnabled && cs.takeProfitPips > 0) {
-        const trigger = posDir === "buy" ? watcherEntryPrice + cs.takeProfitPips * 0.10 : watcherEntryPrice - cs.takeProfitPips * 0.10;
-        console.log(`[auto-trigger tp-watcher id=${cascadeId}] arming TP +${cs.takeProfitPips}pip entry=${watcherEntryPrice} trigger=${trigger}`);
-        tpWatchersRef.current.push({ id: cascadeId, entryPrice: watcherEntryPrice, direction: posDir, pipsTarget: cs.takeProfitPips, readyAt, marketPositionId: posId, limitOrderIds: result.limitOrderIds, limitPrices: levels.limitEntries });
-      }
-    } else {
-      showToast(`Auto-cascade failed: ${result.message}`, "error");
-    }
-  }, [placeCascadeOrders, showToast]);
-
-  useEffect(() => {
-    if (!positionsSeedDoneRef.current) {
-      // First positions update after connect: seed all existing positions so we don't cascade them
-      for (const pos of positions) {
-        knownPositionIdsRef.current.add(pos.id);
-      }
-      positionsSeedDoneRef.current = true;
-      return;
-    }
-    // Subsequent updates: check for genuinely new positions
-    const cs = cascadeSettingsRef.current;
-    for (const pos of positions) {
-      if (knownPositionIdsRef.current.has(pos.id)) continue;
-      knownPositionIdsRef.current.add(pos.id);
-      if (
-        cs.autoTriggerEnabled &&
-        !autoTriggeredIdsRef.current.has(pos.id) &&
-        pos.symbol === "XAUUSD" &&
-        pos.comment !== "XAUUSD Trader App" &&
-        !pos.comment?.startsWith("Cascade")
-      ) {
-        const posDir = pos.type === "POSITION_TYPE_BUY" ? "buy" : "sell";
-        autoTriggeredIdsRef.current.add(pos.id);
-        console.log(`[auto-trigger] detected new MT5 ${posDir} pos id=${pos.id} comment="${pos.comment ?? ""}"`);
-        void handleAutoTrigger(pos.id, pos.openPrice, posDir);
-      }
-    }
-  }, [positions, handleAutoTrigger]);
-
-  // Fast event polling — 2-second interval, replaces the 10s position-poll delay
-  // when autoTriggerEnabled. Kicks off MetaAPI streaming on the backend too.
-  type DealEvent = {
-    dealId: string; positionId: string; symbol: string;
-    type: string; entryType: string; openPrice: number;
-    volume: number; comment?: string; time: number;
-  };
-  const lastEventTimeRef = useRef(Date.now());
-  useEffect(() => {
-    if (status !== "connected" || !cascadeSettings.autoTriggerEnabled) return;
-    if (!accountId || !apiBase) return;
-
-    const poll = async () => {
-      try {
-        const since = lastEventTimeRef.current;
-        const res = await fetch(
-          `${apiBase}/mt5/events/${accountId}?since=${since}&region=${region ?? "london"}`
-        );
-        if (!res.ok) return;
-        const text = await res.text();
-        if (text.trimStart().startsWith("<")) return; // HTML error page — server not ready
-        const data = JSON.parse(text) as { events: DealEvent[]; serverTime: number };
-        if (data.serverTime) lastEventTimeRef.current = data.serverTime;
-        for (const evt of data.events ?? []) {
-          if (!evt.positionId) continue;
-          if (evt.symbol !== "XAUUSD") continue;
-          if (evt.comment === "XAUUSD Trader App" || evt.comment?.startsWith("Cascade")) continue;
-          if (autoTriggeredIdsRef.current.has(evt.positionId)) continue;
-          autoTriggeredIdsRef.current.add(evt.positionId);
-          const dir = evt.type === "DEAL_TYPE_BUY" ? "buy" as const : "sell" as const;
-          console.log(`[event-poll] MT5 ${dir} trade detected dealId=${evt.dealId} posId=${evt.positionId} price=${evt.openPrice}`);
-          void handleAutoTrigger(evt.positionId, evt.openPrice, dir);
-        }
-      } catch (err) {
-        console.log("[event-poll] error:", String(err));
-      }
-    };
-
-    void poll();
-    const interval = setInterval(() => { void poll(); }, 2000);
-    return () => clearInterval(interval);
-  }, [status, cascadeSettings.autoTriggerEnabled, accountId, apiBase, region, handleAutoTrigger]);
 
   useEffect(() => {
     if (!price) return;
@@ -502,38 +362,7 @@ export default function TradeScreen() {
       });
     }
     if (firedTpIds.size > 0) {
-      // Remove fired TP entries and their matching limits-delete entries
       tpWatchersRef.current = tpWatchersRef.current.filter((tp) => !firedTpIds.has(tp.id));
-      watchersRef.current = watchersRef.current.filter((w) => !firedTpIds.has(w.id));
-    }
-
-    // — Delete-limits queue —
-    const firedLimitIds = new Set<string>();
-    for (const w of watchersRef.current) {
-      if (now < w.readyAt) continue;
-      const dist = w.pipsTarget * 0.10;
-      const hit = w.direction === "buy" ? price.bid >= w.entryPrice + dist : price.bid <= w.entryPrice - dist;
-      if (!hit) continue;
-      firedLimitIds.add(w.id);
-
-      // Use all limitOrderIds directly — don't filter against pendingOrders (poll may be stale).
-      // The API returns 4754 gracefully for already-gone orders.
-      const ordersToCancel = w.limitOrderIds ?? [];
-      if (ordersToCancel.length === 0) continue;
-      const actualPips = ((w.direction === "buy" ? price.bid - w.entryPrice : w.entryPrice - price.bid) / 0.10).toFixed(1);
-      console.log(`[watcher id=${w.id}] FIRE dir=${w.direction} target=+${w.pipsTarget}pip actual=+${actualPips}pip bid=${price.bid} entry=${w.entryPrice} — cancelling ${ordersToCancel.length} limit(s)`);
-      void Promise.all(ordersToCancel.map((id) => cancelOrder(id))).then(() => {
-        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        showToast(
-          `Deleted ${ordersToCancel.length} limit${ordersToCancel.length !== 1 ? "s" : ""} at +${w.pipsTarget}pip`,
-          "success",
-          true
-        );
-        void refreshPendingOrders();
-      });
-    }
-    if (firedLimitIds.size > 0) {
-      watchersRef.current = watchersRef.current.filter((w) => !firedLimitIds.has(w.id));
     }
   }, [price, cancelOrder, closePosition, refreshPendingOrders, showToast]);
 
@@ -634,20 +463,6 @@ export default function TradeScreen() {
         const readyAt = Date.now() + 3000;
         // Always use bid as the reference price for watcher triggers — same price the user sees on the chart
         const watcherEntryPrice = p?.bid ?? mktPrice;
-        if (cs.autoCloseLimitsEnabled && cs.autoCloseLimitsPips > 0) {
-          const lTrigger = dir === "buy" ? watcherEntryPrice + cs.autoCloseLimitsPips * 0.10 : watcherEntryPrice - cs.autoCloseLimitsPips * 0.10;
-          console.log(`[watcher id=${cascadeId}] arming +${cs.autoCloseLimitsPips}pip dir=${dir} entry(bid)=${watcherEntryPrice} trigger=${lTrigger} limitOrderIds=${JSON.stringify(result.limitOrderIds)}`);
-          watchersRef.current.push({
-            id: cascadeId,
-            entryPrice: watcherEntryPrice,
-            direction: dir,
-            pipsTarget: cs.autoCloseLimitsPips,
-            readyAt,
-            marketPositionId: result.marketPositionId,
-            limitOrderIds: result.limitOrderIds,
-            limitPrices,
-          });
-        }
         if (cs.takeProfitEnabled && cs.takeProfitPips > 0) {
           const tpTrigger = dir === "buy" ? watcherEntryPrice + cs.takeProfitPips * 0.10 : watcherEntryPrice - cs.takeProfitPips * 0.10;
           console.log(`[tp-watcher id=${cascadeId}] arming +${cs.takeProfitPips}pip dir=${dir} entry(bid)=${watcherEntryPrice} trigger=${tpTrigger} posId=${result.marketPositionId}`);

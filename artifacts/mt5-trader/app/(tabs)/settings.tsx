@@ -505,40 +505,6 @@ export default function SettingsScreen() {
 
             <View style={styles.cascadeDivider} />
 
-            {/* Delete remaining limits at profit target */}
-            <View style={styles.settingRow}>
-              <View style={styles.settingRowLeft}>
-                <Text style={styles.settingLabel}>Delete limits at profit target</Text>
-                <Text style={styles.settingHint}>
-                  Cancels any remaining limit orders when the 1st entry is X pips in profit
-                </Text>
-              </View>
-              <Switch
-                value={cs.autoCloseLimitsEnabled}
-                onValueChange={(v) => {
-                  void Haptics.selectionAsync();
-                  updateSettings({ autoCloseLimitsEnabled: v });
-                }}
-                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
-                thumbColor={cs.autoCloseLimitsEnabled ? C.gold : C.textMuted}
-              />
-            </View>
-
-            {cs.autoCloseLimitsEnabled && (
-              <>
-                <View style={styles.cascadeDivider} />
-                <PillSelector
-                  label="Pip trigger from 1st entry"
-                  hint={`Delete remaining limits when +${cs.autoCloseLimitsPips} pips (£${(cs.autoCloseLimitsPips * 0.10).toFixed(2)}) from 1st entry`}
-                  options={[5, 10, 15, 20, 25, 30, 40, 50]}
-                  value={cs.autoCloseLimitsPips}
-                  onChange={(v) => updateSettings({ autoCloseLimitsPips: v })}
-                />
-              </>
-            )}
-
-            <View style={styles.cascadeDivider} />
-
             {/* Take Profit */}
             <View style={styles.settingRow}>
               <Switch
@@ -565,27 +531,6 @@ export default function SettingsScreen() {
                 />
               </>
             )}
-
-            <View style={styles.cascadeDivider} />
-
-            {/* Auto-trigger from MT5 */}
-            <View style={styles.settingRow}>
-              <Switch
-                value={cs.autoTriggerEnabled}
-                onValueChange={(v) => {
-                  void Haptics.selectionAsync();
-                  updateSettings({ autoTriggerEnabled: v });
-                }}
-                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
-                thumbColor={cs.autoTriggerEnabled ? C.gold : C.textMuted}
-              />
-              <View style={{ marginLeft: 10, flex: 1 }}>
-                <Text style={styles.settingLabel}>Auto-cascade from MT5 trades</Text>
-                <Text style={[styles.settingHint, { marginTop: 2 }]}>
-                  When you click buy/sell directly in MT5, the app will detect the new position (within ~10s) and automatically place the cascade limits + arm all watchers below.
-                </Text>
-              </View>
-            </View>
 
             <View style={styles.cascadePreviewBox}>
               <Text style={styles.cascadePreviewTitle}>Preview with current settings (buy example)</Text>
