@@ -1,6 +1,6 @@
 import { useAuth, useSignIn } from "@clerk/expo";
 import { Link, useRouter } from "expo-router";
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -45,6 +45,11 @@ export default function SignInScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
 
+  const signInRef = useRef(signIn);
+  const setActiveRef = useRef(setActive);
+  useEffect(() => { signInRef.current = signIn; }, [signIn]);
+  useEffect(() => { setActiveRef.current = setActive; }, [setActive]);
+
   const [step, setStep] = useState<Step>("credentials");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -61,18 +66,33 @@ export default function SignInScreen() {
     if (!email.trim()) { setError("Please enter your email address."); return; }
     if (!password) { setError("Please enter a password."); return; }
 
-    if (!signIn || !setActive) {
-      setError("Auth not ready — please wait a moment and try again.");
-      return;
-    }
-
     setLoading(true);
     setError("");
+
+    // Wait up to 5 s for Clerk to finish loading (handles autofill race).
+    // Must poll refs — closure values are frozen at button-press time.
+    if (!signInRef.current || !setActiveRef.current) {
+      let waited = 0;
+      while (waited < 5000) {
+        await new Promise((r) => setTimeout(r, 200));
+        waited += 200;
+        if (signInRef.current && setActiveRef.current) break;
+      }
+    }
+
+    const activeSignIn = signInRef.current;
+    const activeSetActive = setActiveRef.current;
+
+    if (!activeSignIn || !activeSetActive) {
+      setError("Could not connect to auth service. Please check your connection and try again.");
+      setLoading(false);
+      return;
+    }
     try {
-      const result = await signIn.create({ identifier: email.trim(), password });
+      const result = await activeSignIn.create({ identifier: email.trim(), password });
 
       if (result.status === "complete") {
-        await setActive({ session: result.createdSessionId });
+        await activeSetActive({ session: result.createdSessionId });
         router.replace("/" as never);
         return;
       }
@@ -83,9 +103,9 @@ export default function SignInScreen() {
         // Password is the first factor — attempt it explicitly
         const pwFactor = factors?.find((f) => f["strategy"] === "password");
         if (pwFactor) {
-          const pwResult = await signIn.attemptFirstFactor({ strategy: "password", password } as never);
+          const pwResult = await activeSignIn.attemptFirstFactor({ strategy: "password", password } as never);
           if (pwResult.status === "complete") {
-            await setActive({ session: pwResult.createdSessionId });
+            await activeSetActive({ session: pwResult.createdSessionId });
             router.replace("/" as never);
             return;
           }
@@ -98,7 +118,7 @@ export default function SignInScreen() {
         // Email code is the first factor — send the code
         const emailFactor = factors?.find((f) => f["strategy"] === "email_code");
         if (emailFactor && typeof emailFactor["emailAddressId"] === "string") {
-          await signIn.prepareFirstFactor({
+          await activeSignIn.prepareFirstFactor({
             strategy: "email_code",
             emailAddressId: emailFactor["emailAddressId"] as string,
           });
