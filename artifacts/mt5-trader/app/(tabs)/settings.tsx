@@ -503,35 +503,6 @@ export default function SettingsScreen() {
               hint={`${(cs.slPips * 0.10).toFixed(2)} below market entry — shared by all orders`}
             />
 
-            <View style={styles.cascadeDivider} />
-
-            {/* Take Profit */}
-            <View style={styles.settingRow}>
-              <Switch
-                value={cs.takeProfitEnabled}
-                onValueChange={(v) => {
-                  void Haptics.selectionAsync();
-                  updateSettings({ takeProfitEnabled: v });
-                }}
-                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
-                thumbColor={cs.takeProfitEnabled ? C.gold : C.textMuted}
-              />
-              <Text style={[styles.settingLabel, { marginLeft: 10, flex: 1 }]}>Cancel pending limits at pip target</Text>
-            </View>
-
-            {cs.takeProfitEnabled && (
-              <>
-                <View style={styles.cascadeDivider} />
-                <PillSelector
-                  label="Cancel limits at"
-                  hint={`Pending limit orders will be cancelled when price reaches +${cs.takeProfitPips} pips from 1st entry. Market position stays open.`}
-                  options={[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]}
-                  value={cs.takeProfitPips}
-                  onChange={(v) => updateSettings({ takeProfitPips: v })}
-                />
-              </>
-            )}
-
             <View style={styles.cascadePreviewBox}>
               <Text style={styles.cascadePreviewTitle}>Preview with current settings (buy example)</Text>
               <Text style={styles.cascadePreviewText}>
