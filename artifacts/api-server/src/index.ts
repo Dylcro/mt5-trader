@@ -1,5 +1,5 @@
 import app from "./app";
-import { loadCascadeConfig } from "./routes/mt5";
+import { loadCascadeConfig, startAutoConnect, startConnectionWatchdog } from "./routes/mt5";
 
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err);
@@ -31,6 +31,13 @@ async function main() {
   app.listen(port, () => {
     console.log(`Server listening on port ${port}`);
   });
+
+  // Reconnect all previously-seen MT5 accounts so auto-cascade works
+  // immediately on startup — even when the app / phone is off.
+  await startAutoConnect();
+
+  // Watchdog: every 60 s, reconnect any account whose stream has dropped.
+  startConnectionWatchdog();
 }
 
 main().catch((err) => {

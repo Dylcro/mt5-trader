@@ -1,6 +1,6 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import { createRequire } from "module";
-import { db, cascadeConfigTable } from "@workspace/db";
+import { db, cascadeConfigTable, storedAccountsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
 // In dev (tsx/ESM) import.meta.url is the real file URL.
@@ -208,6 +208,11 @@ function makeDealListener(accountId: string) {
   // Rather than enumerating every possible method name, we use a Proxy to
   // silently no-op any method the SDK calls that we haven't explicitly defined.
   const handler = {
+    async onDisconnected(_instanceIndex: string): Promise<void> {
+      activeStreams.delete(accountId);
+      activeConnections.delete(accountId);
+      console.log(`[stream ${accountId}] WebSocket disconnected — watchdog will reconnect`);
+    },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async onDealAdded(_instanceIndex: string, deal: any): Promise<void> {
       if (deal?.entryType !== "DEAL_ENTRY_IN") return;
@@ -319,11 +324,65 @@ async function startStreaming(token: string, accountId: string, region: string =
     activeConnections.set(accountId, conn);
     activeRegions.set(accountId, region);
     console.log(`[stream ${accountId}] streaming connection established — SDK trade path armed`);
+    // Persist credentials so the server can auto-reconnect after a restart
+    // without waiting for the app to call /connect again.
+    try {
+      await db.insert(storedAccountsTable)
+        .values({ accountId, region, storedAt: Date.now() })
+        .onConflictDoUpdate({
+          target: storedAccountsTable.accountId,
+          set: { region, storedAt: Date.now() },
+        });
+      console.log(`[stream ${accountId}] credentials saved to DB for auto-reconnect`);
+    } catch (dbErr) {
+      console.warn(`[stream ${accountId}] failed to persist account to DB:`, (dbErr as Error).message);
+    }
   } catch (err) {
     activeStreams.delete(accountId); // allow retry on next poll
     activeConnections.delete(accountId);
     console.error(`[stream ${accountId}] streaming start failed:`, (err as Error).message);
   }
+}
+
+// ── Auto-connect & watchdog ───────────────────────────────────────────────────
+// On server startup, reconnect all previously-seen accounts from the DB so
+// auto-cascade works even when the app is closed / phone is off.
+// The watchdog fires every 60 s and retries any account that lost its stream.
+
+export async function startAutoConnect(): Promise<void> {
+  try {
+    const token = getToken();
+    const rows = await db.select().from(storedAccountsTable);
+    if (rows.length === 0) {
+      console.log("[auto-connect] no stored accounts yet — waiting for first app connect");
+      return;
+    }
+    for (const { accountId, region } of rows) {
+      console.log(`[auto-connect] reconnecting accountId=${accountId} region=${region}`);
+      void startStreaming(token, accountId, region);
+    }
+  } catch (err) {
+    console.error("[auto-connect] failed:", (err as Error).message);
+  }
+}
+
+export function startConnectionWatchdog(): void {
+  const INTERVAL_MS = 60_000;
+  setInterval(async () => {
+    try {
+      const token = getToken();
+      const rows = await db.select().from(storedAccountsTable);
+      for (const { accountId, region } of rows) {
+        if (!activeStreams.has(accountId)) {
+          console.log(`[watchdog] ${accountId} not streaming — reconnecting`);
+          void startStreaming(token, accountId, region);
+        }
+      }
+    } catch (err) {
+      console.warn("[watchdog] error:", (err as Error).message);
+    }
+  }, INTERVAL_MS);
+  console.log("[watchdog] connection watchdog started (60 s interval)");
 }
 
 // ── SDK connection-based trade execution ─────────────────────────────────────
