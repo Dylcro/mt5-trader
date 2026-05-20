@@ -485,7 +485,7 @@ export default function SettingsScreen() {
             <PillSelector
               label="Pips between orders"
               hint={`${(cs.pipsBetween * 0.10).toFixed(2)} price gap between each level`}
-              options={[10, 20, 30, 50, 75, 100, 150, 200]}
+              options={[5, 10, 15, 20]}
               value={cs.pipsBetween}
               onChange={(v) => updateSettings({ pipsBetween: v })}
             />
@@ -505,13 +505,32 @@ export default function SettingsScreen() {
 
             <View style={styles.cascadeDivider} />
 
-            <PillSelector
-              label="Cancel pending limits at"
-              hint={`When price moves +${cs.takeProfitPips} pips from 1st entry, remaining limit orders are cancelled automatically. Market position stays open.`}
-              options={[5, 10, 15, 20, 25, 30, 40, 50, 60, 80, 100]}
-              value={cs.takeProfitPips}
-              onChange={(v) => updateSettings({ takeProfitPips: v })}
-            />
+            {/* Take Profit */}
+            <View style={styles.settingRow}>
+              <Switch
+                value={cs.takeProfitEnabled}
+                onValueChange={(v) => {
+                  void Haptics.selectionAsync();
+                  updateSettings({ takeProfitEnabled: v });
+                }}
+                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
+                thumbColor={cs.takeProfitEnabled ? C.gold : C.textMuted}
+              />
+              <Text style={[styles.settingLabel, { marginLeft: 10, flex: 1 }]}>Cancel pending limits at pip target</Text>
+            </View>
+
+            {cs.takeProfitEnabled && (
+              <>
+                <View style={styles.cascadeDivider} />
+                <PillSelector
+                  label="Cancel limits at"
+                  hint={`Pending limit orders will be cancelled when price reaches +${cs.takeProfitPips} pips from 1st entry. Market position stays open.`}
+                  options={[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]}
+                  value={cs.takeProfitPips}
+                  onChange={(v) => updateSettings({ takeProfitPips: v })}
+                />
+              </>
+            )}
 
             <View style={styles.cascadePreviewBox}>
               <Text style={styles.cascadePreviewTitle}>Preview with current settings (buy example)</Text>

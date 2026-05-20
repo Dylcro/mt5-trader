@@ -335,7 +335,6 @@ export default function TradeScreen() {
   // Visible watcher state — mirrors tpWatchersRef so the UI can show what's armed
   const [armedWatchers, setArmedWatchers] = useState<Array<{ id: string; trigger: number; dir: Direction; pips: number }>>([]);
 
-
   // Per-cascade watcher entry — each cascade gets its own entry so they never interfere
   type WatcherEntry = {
     id: string; // unique per cascade placement
@@ -567,7 +566,7 @@ export default function TradeScreen() {
         const readyAt = Date.now() + 3000;
         // Always use bid as the reference price for watcher triggers — same price the user sees on the chart
         const watcherEntryPrice = p?.bid ?? mktPrice;
-        if (cs.takeProfitPips > 0) {
+        if (cs.takeProfitEnabled && cs.takeProfitPips > 0) {
           const tpTrigger = dir === "buy" ? watcherEntryPrice + cs.takeProfitPips * 0.10 : watcherEntryPrice - cs.takeProfitPips * 0.10;
           console.log(`[tp-watcher id=${cascadeId}] arming +${cs.takeProfitPips}pip dir=${dir} entry(bid)=${watcherEntryPrice} trigger=${tpTrigger} posId=${result.marketPositionId}`);
           tpWatchersRef.current.push({
@@ -825,7 +824,6 @@ export default function TradeScreen() {
                 )}
               </View>
             ))}
-
           </>
         )}
 
