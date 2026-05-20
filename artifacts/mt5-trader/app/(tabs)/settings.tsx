@@ -503,6 +503,26 @@ export default function SettingsScreen() {
               hint={`${(cs.slPips * 0.10).toFixed(2)} below market entry — shared by all orders`}
             />
 
+            <View style={styles.cascadeDivider} />
+
+            <View style={styles.settingRow}>
+              <Switch
+                value={cs.autoCascadeEnabled}
+                onValueChange={(v) => {
+                  void Haptics.selectionAsync();
+                  updateSettings({ autoCascadeEnabled: v });
+                }}
+                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
+                thumbColor={cs.autoCascadeEnabled ? C.gold : C.textMuted}
+              />
+              <View style={{ marginLeft: 10, flex: 1 }}>
+                <Text style={styles.settingLabel}>Auto-cascade MT5 trades</Text>
+                <Text style={styles.settingHint}>
+                  When ON, any trade opened directly in MT5 will automatically get cascade limit orders placed using the settings above.
+                </Text>
+              </View>
+            </View>
+
             <View style={styles.cascadePreviewBox}>
               <Text style={styles.cascadePreviewTitle}>Preview with current settings (buy example)</Text>
               <Text style={styles.cascadePreviewText}>

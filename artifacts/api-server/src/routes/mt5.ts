@@ -1,3 +1,4 @@
+import { readFileSync, writeFileSync } from "fs";
 import { Router, type IRouter, type Request, type Response } from "express";
 import { createRequire } from "module";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
@@ -32,7 +33,54 @@ const dealStore = new Map<string, DealEvent[]>(); // accountId → recent deals
 const activeStreams = new Set<string>();           // accountIds with live connections
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const activeConnections = new Map<string, any>(); // accountId → StreamingMetaApiConnectionInstance (for SDK trades)
+const activeRegions = new Map<string, string>();  // accountId → region (used for REST fallback in auto-cascade)
 let sdkInstance: InstanceType<typeof MetaApi> | null = null;
+
+// ── Cascade Config ────────────────────────────────────────────────────────────
+// Persisted to disk so settings survive server restarts.
+// The app syncs these whenever the user changes settings.
+
+interface CascadeConfig {
+  enabled: boolean;
+  numPositions: number;
+  pipsBetween: number;
+  slPips: number;
+}
+
+const CASCADE_DEFAULTS: CascadeConfig = { enabled: false, numPositions: 3, pipsBetween: 50, slPips: 100 };
+const CASCADE_CONFIG_PATH = "/tmp/cascade-config.json";
+
+let cascadeConfig: CascadeConfig = { ...CASCADE_DEFAULTS };
+try {
+  cascadeConfig = { ...CASCADE_DEFAULTS, ...(JSON.parse(readFileSync(CASCADE_CONFIG_PATH, "utf-8")) as Partial<CascadeConfig>) };
+  console.log("[cascade-config] loaded:", JSON.stringify(cascadeConfig));
+} catch { /* no saved config — use defaults */ }
+
+function saveCascadeConfig(): void {
+  try { writeFileSync(CASCADE_CONFIG_PATH, JSON.stringify(cascadeConfig)); } catch {}
+}
+
+const PIP = 0.10;
+
+function buildCascadeLevels(
+  marketPrice: number,
+  direction: "buy" | "sell",
+  config: CascadeConfig
+): { limitEntries: number[]; stopLoss: number } {
+  const step = config.pipsBetween * PIP;
+  const slDist = config.slPips * PIP;
+  const limitEntries: number[] = [];
+  for (let i = 1; i < config.numPositions; i++) {
+    const price = direction === "buy"
+      ? parseFloat((marketPrice - i * step).toFixed(2))
+      : parseFloat((marketPrice + i * step).toFixed(2));
+    limitEntries.push(price);
+  }
+  const stopLoss = direction === "buy"
+    ? parseFloat((marketPrice - slDist).toFixed(2))
+    : parseFloat((marketPrice + slDist).toFixed(2));
+  return { limitEntries, stopLoss };
+}
 
 function getSdk(token: string): InstanceType<typeof MetaApi> {
   if (!sdkInstance) sdkInstance = new MetaApi(token);
@@ -79,6 +127,49 @@ function makeDealListener(accountId: string) {
       };
       console.log(`[stream ${accountId}] deal dealId=${evt.dealId} posId=${evt.positionId} type=${evt.type} sym=${evt.symbol} price=${evt.openPrice} comment="${evt.comment ?? ""}"`);
       storeDealEvent(accountId, evt);
+
+      // ── Auto-cascade: place limit orders for trades opened directly in MT5 ──
+      if (cascadeConfig.enabled && evt.symbol === "XAUUSD" && evt.openPrice > 0) {
+        const comment = evt.comment ?? "";
+        const isFromApp = comment.startsWith("Cascade") || comment === "XAUUSD Trader App";
+        if (!isFromApp) {
+          void (async () => {
+            const direction: "buy" | "sell" = evt.type === "DEAL_TYPE_BUY" ? "buy" : "sell";
+            const levels = buildCascadeLevels(evt.openPrice, direction, cascadeConfig);
+            const total = 1 + levels.limitEntries.length;
+            console.log(`[auto-cascade] posId=${evt.positionId} dir=${direction} price=${evt.openPrice} limits=[${levels.limitEntries.join(",")}] sl=${levels.stopLoss}`);
+            const conn = activeConnections.get(accountId);
+            const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
+            const token = getToken();
+            await Promise.all(
+              levels.limitEntries.map(async (limitPrice, i) => {
+                const body: Record<string, unknown> = {
+                  actionType: direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT",
+                  symbol: "XAUUSD",
+                  volume: evt.volume,
+                  openPrice: limitPrice,
+                  stopLoss: levels.stopLoss,
+                  comment: `Cascade ${i + 2}/${total}`,
+                };
+                try {
+                  if (conn) {
+                    await tradeViaConnection(conn, body);
+                  } else {
+                    await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
+                      method: "POST",
+                      headers: authHeaders(token),
+                      body: JSON.stringify(body),
+                    });
+                  }
+                  console.log(`[auto-cascade] placed limit ${i + 2}/${total} @ ${limitPrice}`);
+                } catch (tradeErr) {
+                  console.error(`[auto-cascade] failed limit ${i + 2}/${total} @ ${limitPrice}:`, (tradeErr as Error).message);
+                }
+              })
+            );
+          })();
+        }
+      }
     },
   };
 
@@ -92,7 +183,7 @@ function makeDealListener(accountId: string) {
   });
 }
 
-async function startStreaming(token: string, accountId: string): Promise<void> {
+async function startStreaming(token: string, accountId: string, region: string = DEFAULT_REGION): Promise<void> {
   if (activeStreams.has(accountId)) return;
   activeStreams.add(accountId);
   try {
@@ -105,6 +196,7 @@ async function startStreaming(token: string, accountId: string): Promise<void> {
     // Store connection so the trade endpoint can reuse this WebSocket
     // instead of making new HTTP calls to MetaAPI REST for every order.
     activeConnections.set(accountId, conn);
+    activeRegions.set(accountId, region);
     console.log(`[stream ${accountId}] streaming connection established — SDK trade path armed`);
   } catch (err) {
     activeStreams.delete(accountId); // allow retry on next poll
@@ -723,7 +815,7 @@ router.post("/mt5/account/:accountId/trade", async (req: Request, res: Response)
     const token = getToken();
     const region = qstr(req.query.region) || DEFAULT_REGION;
     const body = req.body as Record<string, unknown>;
-    const { accountId } = req.params;
+    const accountId = String(req.params.accountId);
     let code: number;
     let data: { numericCode?: number; message?: string; orderId?: string; positionId?: string };
     let httpStatus = 200;
@@ -774,7 +866,7 @@ router.post("/mt5/account/:accountId/trade", async (req: Request, res: Response)
   }
 });
 
-// GET /api/mt5/events/:accountId?since=<ms>
+// GET /api/mt5/events/:accountId?since=<ms>&region=london
 // Returns new DEAL_ENTRY_IN events since `since` (ms epoch).
 // Also kicks off the streaming connection for this account if not already running.
 router.get("/mt5/events/:accountId", async (req: Request, res: Response) => {
@@ -782,15 +874,36 @@ router.get("/mt5/events/:accountId", async (req: Request, res: Response) => {
     const token = getToken();
     const { accountId } = req.params as { accountId: string };
     const since = parseInt(qstr(req.query.since) ?? "0", 10) || 0;
+    const region = qstr(req.query.region) || DEFAULT_REGION;
 
     // Start streaming connection in the background (idempotent — safe to call repeatedly)
-    void startStreaming(token, accountId);
+    void startStreaming(token, accountId, region);
 
     const events = getEventsSince(accountId, since);
     return res.json({ events, serverTime: Date.now() });
   } catch (err) {
     return res.status(500).json({ error: (err as Error).message });
   }
+});
+
+// GET /api/cascade-config
+// Returns the current cascade auto-trigger configuration.
+router.get("/cascade-config", (_req: Request, res: Response) => {
+  return res.json(cascadeConfig);
+});
+
+// PUT /api/cascade-config
+// Body: { enabled?, numPositions?, pipsBetween?, slPips? }
+// Updates and persists cascade auto-trigger settings synced from the app.
+router.put("/cascade-config", (req: Request, res: Response) => {
+  const body = req.body as Partial<CascadeConfig>;
+  if (typeof body.enabled === "boolean")      cascadeConfig.enabled      = body.enabled;
+  if (typeof body.numPositions === "number")  cascadeConfig.numPositions = body.numPositions;
+  if (typeof body.pipsBetween === "number")   cascadeConfig.pipsBetween  = body.pipsBetween;
+  if (typeof body.slPips === "number")        cascadeConfig.slPips       = body.slPips;
+  saveCascadeConfig();
+  console.log("[cascade-config] updated:", JSON.stringify(cascadeConfig));
+  return res.json(cascadeConfig);
 });
 
 export default router;
