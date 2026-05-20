@@ -26,15 +26,33 @@ function requireAuth(req: Request, res: Response, next: NextFunction): void {
   next();
 }
 
-function checkOwner(req: Request, res: Response, next: NextFunction): void {
+async function checkOwner(req: Request, res: Response, next: NextFunction): Promise<void> {
   const userId = (req as Record<string, unknown>)["userId"] as string;
   const accountId = req.params["accountId"];
   if (!accountId || !userId) { next(); return; }
-  const ownedId = userAccountCache.get(userId);
-  if (ownedId !== undefined && ownedId !== accountId) {
-    res.status(403).json({ error: "Forbidden" }); return;
+
+  // Fast path: in-memory cache
+  const cachedId = userAccountCache.get(userId);
+  if (cachedId !== undefined) {
+    if (cachedId !== accountId) { res.status(403).json({ error: "Forbidden" }); return; }
+    next(); return;
   }
-  next();
+
+  // Cache miss — check DB (covers fresh server restarts)
+  try {
+    const [row] = await db.select().from(storedAccountsTable)
+      .where(eq(storedAccountsTable.userId, userId))
+      .limit(1);
+    if (row) {
+      userAccountCache.set(userId, row.accountId); // repopulate cache
+      if (row.accountId !== accountId) { res.status(403).json({ error: "Forbidden" }); return; }
+    }
+    // No row: user hasn't connected yet (allowed — connect will bind them)
+    next();
+  } catch {
+    // DB error — fail open so legitimate users aren't blocked
+    next();
+  }
 }
 
 router.use(requireAuth);
@@ -81,7 +99,8 @@ const CASCADE_DEFAULTS: CascadeConfig = { enabled: false, numPositions: 3, pipsB
 // In-memory cache: accountId (or "" for global) → config.
 const cascadeConfigs = new Map<string, CascadeConfig>();
 
-function getCascadeConfig(accountId: string): CascadeConfig {
+function getCascadeConfig(accountId: string, userId?: string): CascadeConfig {
+  if (userId && cascadeConfigs.has(userId)) return cascadeConfigs.get(userId)!;
   return cascadeConfigs.get(accountId) ?? cascadeConfigs.get("") ?? { ...CASCADE_DEFAULTS };
 }
 
@@ -671,6 +690,14 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
 
     // ── RECONNECT PATH: existing MetaAPI account ID stored on device ──────────
     if (existingId) {
+      // Ownership check: prevent a user from hijacking another user's account
+      const [storedRow] = await db.select().from(storedAccountsTable)
+        .where(eq(storedAccountsTable.accountId, existingId))
+        .limit(1);
+      if (storedRow?.userId && userId && storedRow.userId !== userId) {
+        return res.status(403).json({ error: "This account is linked to a different user." });
+      }
+
       const acct = await getProvisioningAccount(token, existingId).catch(() => null);
       if (!acct) {
         return res.status(404).json({ error: "Account not found. Please log in again with your credentials." });
@@ -1173,21 +1200,25 @@ router.get("/mt5/events/:accountId", checkOwner, async (req: Request, res: Respo
 });
 
 // GET /api/cascade-config?accountId=<id>
-// Returns the cascade config for the given account, falling back to the global config.
-// Omit accountId (or pass "") to get the global config.
+// Returns cascade config for the authenticated user (userId key),
+// falling back to accountId-keyed config, then global default.
 router.get("/cascade-config", (req: Request, res: Response) => {
+  const userId = (req as Record<string, unknown>)["userId"] as string | undefined;
   const accountId = typeof req.query.accountId === "string" ? req.query.accountId.trim() : "";
-  return res.json(getCascadeConfig(accountId));
+  return res.json(getCascadeConfig(accountId, userId));
 });
 
 // PUT /api/cascade-config?accountId=<id>
 // Body: { enabled?, numPositions?, pipsBetween?, slPips? }
-// Updates and persists cascade auto-trigger settings for the given account.
-// Omit accountId (or pass "") to update the global (fallback) config.
+// Saves under the authenticated userId (for per-user isolation).
+// Also caches under accountId so the auto-cascade background loop can find it.
 router.put("/cascade-config", async (req: Request, res: Response) => {
+  const userId = (req as Record<string, unknown>)["userId"] as string | undefined;
   const accountId = typeof req.query.accountId === "string" ? req.query.accountId.trim() : "";
+  // Primary save key is userId; fall back to accountId for backwards-compat.
+  const saveKey = userId ?? accountId;
   const body = req.body as Partial<CascadeConfig>;
-  const current = getCascadeConfig(accountId);
+  const current = getCascadeConfig(accountId, userId);
   // Build the candidate config without mutating in-memory state yet.
   const nextConfig: CascadeConfig = {
     enabled:      typeof body.enabled      === "boolean" ? body.enabled      : current.enabled,
@@ -1196,12 +1227,15 @@ router.put("/cascade-config", async (req: Request, res: Response) => {
     slPips:       typeof body.slPips       === "number"  ? body.slPips       : current.slPips,
   };
   // Persist first — only commit to in-memory state when DB write succeeds.
-  const saved = await saveCascadeConfig(nextConfig, accountId);
+  const saved = await saveCascadeConfig(nextConfig, saveKey);
   if (!saved) {
     return res.status(500).json({ error: "Failed to persist cascade config to database" });
   }
-  cascadeConfigs.set(accountId, nextConfig);
-  console.log(`[cascade-config] updated accountId="${accountId}":`, JSON.stringify(nextConfig));
+  cascadeConfigs.set(saveKey, nextConfig);
+  // Also cache under accountId so the background auto-cascade loop (which only
+  // knows accountId) uses the latest user config.
+  if (userId && accountId) cascadeConfigs.set(accountId, nextConfig);
+  console.log(`[cascade-config] updated key="${saveKey}":`, JSON.stringify(nextConfig));
   return res.json(nextConfig);
 });
 

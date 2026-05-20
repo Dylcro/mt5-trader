@@ -1,7 +1,15 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import React, { createContext, useCallback, useContext, useEffect, useState } from "react";
 
+import { getAuthToken } from "@/lib/authToken";
 import { useTrading } from "@/context/TradingContext";
+
+async function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
+  const token = await getAuthToken();
+  const headers: Record<string, string> = { ...(options.headers as Record<string, string> ?? {}) };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  return fetch(url, { ...options, headers });
+}
 
 const API_BASE = process.env.EXPO_PUBLIC_API_URL ?? "";
 
@@ -54,7 +62,7 @@ async function pushToServer(s: CascadeSettings, accountId: string): Promise<void
     ? `${API_BASE}/cascade-config?accountId=${encodeURIComponent(accountId)}`
     : `${API_BASE}/cascade-config`;
   try {
-    await fetch(url, {
+    await authFetch(url, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -142,7 +150,7 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
       ? `${API_BASE}/cascade-config?accountId=${encodeURIComponent(accountId)}`
       : `${API_BASE}/cascade-config`;
     try {
-      const res = await fetch(url, {
+      const res = await authFetch(url, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
