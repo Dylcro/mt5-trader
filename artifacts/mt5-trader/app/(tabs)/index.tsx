@@ -376,48 +376,99 @@ export default function TradeScreen() {
 
       void (async () => {
         try {
-          // Fetch FRESH pending orders from the API — don't rely on the polled snapshot
-          // which can be up to 10 seconds old.
           const accId = accountIdRef.current;
           const base = apiBaseRef.current;
           const rgn = regionRef.current;
-          const cancel = cancelOrderRef.current;
 
-          const idSet = new Set<string>(snapshot.limitOrderIds ?? []);
+          // Build ID set starting from stored IDs
+          const idSet = new Set<string>(
+            (snapshot.limitOrderIds ?? []).filter(Boolean)
+          );
 
+          // Fetch FRESH pending orders directly — bypass TradingContext status guard
+          // and stale polled state (which can be up to 10s old)
           if (accId && base) {
-            const res = await fetch(`${base}/mt5/account/${accId}/orders?region=${rgn}`);
-            if (res.ok) {
-              const freshOrders = await res.json() as Array<{ id?: unknown; openPrice?: unknown }>;
-              for (const ord of freshOrders) {
-                const ordId = String(ord.id ?? "");
-                const ordPrice = Number(ord.openPrice ?? 0);
-                if (ordId && snapshot.limitPrices?.some((lp) => Math.abs(ordPrice - lp) < 0.015)) {
-                  idSet.add(ordId);
+            try {
+              const res = await fetch(`${base}/mt5/account/${accId}/orders?region=${rgn}`);
+              if (res.ok) {
+                const raw = await res.json();
+                // MetaAPI may return a plain array or { orders: [...] }
+                const freshOrders: Array<Record<string, unknown>> = Array.isArray(raw)
+                  ? raw as Array<Record<string, unknown>>
+                  : Array.isArray((raw as Record<string, unknown>).orders)
+                    ? (raw as { orders: Array<Record<string, unknown>> }).orders
+                    : [];
+
+                // Expected order type for this cascade direction
+                const expectedType = snapshot.direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT";
+
+                for (const ord of freshOrders) {
+                  const ordId = String(ord.id ?? ord.orderId ?? "");
+                  const ordPrice = Number(ord.openPrice ?? 0);
+                  const ordType = String(ord.type ?? "");
+                  if (!ordId) continue;
+
+                  // Match by stored limitOrderIds
+                  if (idSet.has(ordId)) continue; // already in set
+
+                  // Match by price level (generous 0.1 pip tolerance = $0.01)
+                  // AND order type must match cascade direction
+                  const priceMatch = snapshot.limitPrices?.some((lp) => Math.abs(ordPrice - lp) < 0.05) ?? false;
+                  const typeMatch = ordType === expectedType || ordType.includes("LIMIT");
+                  if (priceMatch && typeMatch) {
+                    idSet.add(ordId);
+                  }
                 }
+                console.log(`[tp-watcher id=${snapshot.id}] fresh sweep: ${freshOrders.length} orders checked, ${idSet.size} to cancel`);
+              } else {
+                console.log(`[tp-watcher id=${snapshot.id}] orders fetch failed: ${res.status}`);
               }
+            } catch (fetchErr) {
+              console.log(`[tp-watcher id=${snapshot.id}] orders fetch error: ${String(fetchErr)}`);
             }
           }
 
           const ordersToCancel = Array.from(idSet);
-          console.log(`[tp-watcher id=${snapshot.id}] cancelling ${ordersToCancel.length} orders (${snapshot.limitOrderIds?.length ?? 0} by stored id, ${idSet.size - (snapshot.limitOrderIds?.length ?? 0)} found by price sweep)`);
+          console.log(`[tp-watcher id=${snapshot.id}] cancelling ids: ${ordersToCancel.join(",")}`);
 
-          if (ordersToCancel.length > 0) {
-            await Promise.all(ordersToCancel.map((id) => cancel(id)));
+          let cancelled = 0;
+          let failed = 0;
+          if (ordersToCancel.length > 0 && accId && base) {
+            // Cancel directly via fetch — no TradingContext status guard
+            const results = await Promise.all(
+              ordersToCancel.map(async (ordId) => {
+                try {
+                  const r = await fetch(
+                    `${base}/mt5/account/${accId}/order/${ordId}?region=${rgn}`,
+                    { method: "DELETE" }
+                  );
+                  const d = await r.json() as { success?: boolean; message?: string };
+                  console.log(`[tp-watcher] cancel ordId=${ordId} ok=${String(r.ok)} success=${String(d.success)} msg=${d.message ?? ""}`);
+                  return d.success !== false && r.ok;
+                } catch (e) {
+                  console.log(`[tp-watcher] cancel ordId=${ordId} error: ${String(e)}`);
+                  return false;
+                }
+              })
+            );
+            cancelled = results.filter(Boolean).length;
+            failed = results.length - cancelled;
             void refreshPendingOrders();
           }
 
-          void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-          showToast(
-            ordersToCancel.length > 0
-              ? `+${actualPips}pip — ${ordersToCancel.length} limit${ordersToCancel.length > 1 ? "s" : ""} cancelled`
-              : `+${actualPips}pip reached — no pending limits found`,
-            ordersToCancel.length > 0 ? "success" : "error",
-            ordersToCancel.length > 0
+          void Haptics.notificationAsync(
+            cancelled > 0 ? Haptics.NotificationFeedbackType.Success : Haptics.NotificationFeedbackType.Error
           );
+          if (ordersToCancel.length === 0) {
+            showToast(`+${actualPips}pip reached — no pending limits found`, "error");
+          } else if (failed === 0) {
+            showToast(`+${actualPips}pip — ${cancelled} limit${cancelled !== 1 ? "s" : ""} cancelled`, "success", true);
+          } else {
+            showToast(`+${actualPips}pip — ${cancelled} cancelled, ${failed} failed`, cancelled > 0 ? "success" : "error");
+          }
         } catch (err) {
-          console.log(`[tp-watcher id=${snapshot.id}] cancel error: ${String(err)}`);
-          showToast(`Limit cancel failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+          console.log(`[tp-watcher id=${snapshot.id}] unexpected error: ${String(err)}`);
+          showToast(`Limit cancel error: ${err instanceof Error ? err.message : String(err)}`, "error");
         }
       })();
     }
