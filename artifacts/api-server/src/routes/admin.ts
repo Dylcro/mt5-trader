@@ -23,8 +23,8 @@ function formatDate(ms: number | null | undefined): string {
   return new Date(ms).toLocaleString("en-GB", { timeZone: "UTC", dateStyle: "medium", timeStyle: "short" }) + " UTC";
 }
 
-router.get("/admin", async (req: Request, res: Response) => {
-  // accessible at /api/admin?key=ADMIN_KEY
+router.get("/", async (req: Request, res: Response) => {
+  // mounted at /api/admin in app.ts — before Clerk auth
   if (!requireAdminKey(req, res)) return;
 
   try {

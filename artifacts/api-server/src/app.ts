@@ -8,6 +8,7 @@ import {
   getClerkProxyHost,
 } from "./middlewares/clerkProxyMiddleware";
 import router from "./routes";
+import adminRouter from "./routes/admin";
 
 const app: Express = express();
 
@@ -16,6 +17,9 @@ app.use(CLERK_PROXY_PATH, clerkProxyMiddleware());
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Admin dashboard — mounted before Clerk auth so no token is required
+app.use("/api/admin", adminRouter);
 
 app.use(
   clerkMiddleware((req) => ({
