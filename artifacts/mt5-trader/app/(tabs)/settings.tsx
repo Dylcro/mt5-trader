@@ -118,7 +118,7 @@ function PillSelector({
   labels?: Record<number, string>;
 }) {
   return (
-    <View style={styles.settingRow}>
+    <View style={styles.pillSelectorColumn}>
       <View style={styles.settingRowLeft}>
         <Text style={styles.settingLabel}>{label}</Text>
         <Text style={styles.settingHint}>{hint}</Text>
@@ -855,6 +855,7 @@ const styles = StyleSheet.create({
   cascadeCardDesc: { fontSize: 13, fontFamily: "Inter_400Regular", color: C.textSecondary, lineHeight: 19 },
   cascadeDivider: { height: 1, backgroundColor: C.border },
   settingRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 },
+  pillSelectorColumn: { flexDirection: "column", gap: 10 },
   settingRowLeft: { flex: 1, gap: 2 },
   settingLabel: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: C.text },
   settingHint: { fontSize: 11, fontFamily: "Inter_400Regular", color: C.textSecondary },
