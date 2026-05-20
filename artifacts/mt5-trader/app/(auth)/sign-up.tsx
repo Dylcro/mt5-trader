@@ -1,4 +1,4 @@
-import { useSignUp, isClerkAPIResponseError } from "@clerk/expo";
+import { useSignUp } from "@clerk/expo";
 import { Link, useRouter } from "expo-router";
 import React, { useState } from "react";
 import {
@@ -24,8 +24,18 @@ const RED = "#FF4757";
 
 type Step = "form" | "code";
 
+function clerkError(err: unknown): string {
+  if (err && typeof err === "object") {
+    const e = err as Record<string, unknown>;
+    if (typeof e["longMessage"] === "string") return e["longMessage"];
+    if (typeof e["message"] === "string") return e["message"];
+  }
+  if (err instanceof Error) return err.message;
+  return "Something went wrong. Please try again.";
+}
+
 export default function SignUpScreen() {
-  const { signUp, setActive } = useSignUp();
+  const { signUp } = useSignUp();
   const router = useRouter();
   const insets = useSafeAreaInsets();
 
@@ -36,14 +46,6 @@ export default function SignUpScreen() {
   const [verifyCode, setVerifyCode] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-
-  function clerkError(err: unknown): string {
-    if (isClerkAPIResponseError(err)) {
-      return err.errors[0]?.longMessage ?? err.errors[0]?.message ?? "Registration failed";
-    }
-    if (err instanceof Error) return err.message;
-    return "Something went wrong. Please try again.";
-  }
 
   const handleSignUp = async () => {
     if (!signUp) {
@@ -56,14 +58,14 @@ export default function SignUpScreen() {
     setLoading(true);
     setError("");
     try {
-      await signUp.create({
-        emailAddress: email.trim(),
-        password,
-      });
-      await signUp.prepareEmailAddressVerification({ strategy: "email_code" });
+      const { error: createErr } = await signUp.create({ emailAddress: email.trim(), password });
+      if (createErr) { setError(clerkError(createErr)); return; }
+
+      const { error: sendErr } = await signUp.verifications.sendEmailCode();
+      if (sendErr) { setError(clerkError(sendErr)); return; }
+
       setStep("code");
-    } catch (err) {
-      console.error("[sign-up] error:", JSON.stringify(err, null, 2));
+    } catch (err: unknown) {
       setError(clerkError(err));
     } finally {
       setLoading(false);
@@ -74,28 +76,25 @@ export default function SignUpScreen() {
     if (!signUp) return;
     setError("");
     try {
-      await signUp.prepareEmailAddressVerification({ strategy: "email_code" });
+      const { error: sendErr } = await signUp.verifications.sendEmailCode();
+      if (sendErr) setError(clerkError(sendErr));
     } catch (err) {
       setError(clerkError(err));
     }
   };
 
   const handleVerifyCode = async () => {
-    if (!signUp || !setActive) return;
+    if (!signUp) return;
     setLoading(true);
     setError("");
     try {
-      const result = await signUp.attemptEmailAddressVerification({
-        code: verifyCode.trim(),
-      });
+      const { error: verifyErr } = await signUp.verifications.verifyEmailCode({ code: verifyCode.trim() });
+      if (verifyErr) { setError(clerkError(verifyErr)); return; }
 
-      if (result.status === "complete") {
-        await setActive({ session: result.createdSessionId });
-        router.replace("/" as never);
-        return;
-      }
+      const { error: finalizeErr } = await signUp.finalize();
+      if (finalizeErr) { setError(clerkError(finalizeErr)); return; }
 
-      setError("Verification failed. Please try again.");
+      router.replace("/" as never);
     } catch (err) {
       setError(clerkError(err));
     } finally {

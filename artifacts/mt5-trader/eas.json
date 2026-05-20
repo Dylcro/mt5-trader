@@ -11,7 +11,8 @@
         "simulator": true
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://meta-trader-link.replit.app/api"
+        "EXPO_PUBLIC_API_URL": "https://meta-trader-link.replit.app/api",
+        "EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY": "REPLACE_WITH_YOUR_CLERK_PUBLISHABLE_KEY"
       }
     },
     "preview": {
@@ -23,19 +24,23 @@
         "buildType": "apk"
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://meta-trader-link.replit.app/api"
+        "EXPO_PUBLIC_API_URL": "https://meta-trader-link.replit.app/api",
+        "EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY": "REPLACE_WITH_YOUR_CLERK_PUBLISHABLE_KEY"
       }
     },
     "production": {
       "autoIncrement": true,
       "ios": {
-        "simulator": false
+        "simulator": false,
+        "credentialsSource": "remote"
       },
       "android": {
-        "buildType": "app-bundle"
+        "buildType": "app-bundle",
+        "credentialsSource": "remote"
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://meta-trader-link.replit.app/api"
+        "EXPO_PUBLIC_API_URL": "https://meta-trader-link.replit.app/api",
+        "EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY": "REPLACE_WITH_YOUR_CLERK_PUBLISHABLE_KEY"
       }
     }
   },

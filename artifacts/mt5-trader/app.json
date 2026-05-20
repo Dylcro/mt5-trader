@@ -21,6 +21,7 @@
       "supportsTablet": false,
       "bundleIdentifier": "com.xauusdtrader.app",
       "buildNumber": "1",
+      "appleTeamId": "PLACEHOLDER_APPLE_TEAM_ID",
       "infoPlist": {
         "NSPrivacyAccessedAPITypes": []
       }

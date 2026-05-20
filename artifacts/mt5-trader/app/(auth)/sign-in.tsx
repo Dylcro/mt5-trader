@@ -1,4 +1,4 @@
-import { useSignIn, isClerkAPIResponseError } from "@clerk/expo";
+import { useSignIn } from "@clerk/expo";
 import { Link, useRouter } from "expo-router";
 import React, { useState } from "react";
 import {
@@ -24,8 +24,18 @@ const RED = "#FF4757";
 
 type Step = "credentials" | "code";
 
+function clerkError(err: unknown): string {
+  if (err && typeof err === "object") {
+    const e = err as Record<string, unknown>;
+    if (typeof e["longMessage"] === "string") return e["longMessage"];
+    if (typeof e["message"] === "string") return e["message"];
+  }
+  if (err instanceof Error) return err.message;
+  return "Something went wrong. Please try again.";
+}
+
 export default function SignInScreen() {
-  const { signIn, setActive } = useSignIn();
+  const { signIn } = useSignIn();
   const router = useRouter();
   const insets = useSafeAreaInsets();
 
@@ -36,14 +46,6 @@ export default function SignInScreen() {
   const [verifyCode, setVerifyCode] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-
-  function clerkError(err: unknown): string {
-    if (isClerkAPIResponseError(err)) {
-      return err.errors[0]?.longMessage ?? err.errors[0]?.message ?? "Authentication failed";
-    }
-    if (err instanceof Error) return err.message;
-    return "Something went wrong. Please try again.";
-  }
 
   const handleSignIn = async () => {
     if (!signIn) {
@@ -56,34 +58,25 @@ export default function SignInScreen() {
     setLoading(true);
     setError("");
     try {
-      const result = await signIn.create({
-        identifier: email.trim(),
-        password,
-      });
+      const { error: createErr } = await signIn.create({ identifier: email.trim(), password });
+      if (createErr) { setError(clerkError(createErr)); return; }
 
-      if (result.status === "complete") {
-        await setActive!({ session: result.createdSessionId });
+      if (signIn.status === "complete") {
+        const { error: finalizeErr } = await signIn.finalize();
+        if (finalizeErr) { setError(clerkError(finalizeErr)); return; }
         router.replace("/" as never);
         return;
       }
 
-      // Email code MFA required after password
-      if (result.status === "needs_first_factor") {
-        const emailFactor = result.supportedFirstFactors?.find(
-          (f) => f.strategy === "email_code"
-        );
-        if (emailFactor && "emailAddressId" in emailFactor) {
-          await signIn.prepareFirstFactor({
-            strategy: "email_code",
-            emailAddressId: emailFactor.emailAddressId,
-          });
-        }
+      if (signIn.status === "needs_first_factor") {
+        const { error: sendErr } = await signIn.emailCode.sendCode();
+        if (sendErr) { setError(clerkError(sendErr)); return; }
         setStep("code");
         return;
       }
 
       setError("Unable to complete sign in. Please try again.");
-    } catch (err) {
+    } catch (err: unknown) {
       setError(clerkError(err));
     } finally {
       setLoading(false);
@@ -94,37 +87,25 @@ export default function SignInScreen() {
     if (!signIn) return;
     setError("");
     try {
-      const emailFactor = signIn.supportedFirstFactors?.find(
-        (f) => f.strategy === "email_code"
-      );
-      if (emailFactor && "emailAddressId" in emailFactor) {
-        await signIn.prepareFirstFactor({
-          strategy: "email_code",
-          emailAddressId: emailFactor.emailAddressId,
-        });
-      }
+      const { error: sendErr } = await signIn.emailCode.sendCode();
+      if (sendErr) setError(clerkError(sendErr));
     } catch (err) {
       setError(clerkError(err));
     }
   };
 
   const handleVerifyCode = async () => {
-    if (!signIn || !setActive) return;
+    if (!signIn) return;
     setLoading(true);
     setError("");
     try {
-      const result = await signIn.attemptFirstFactor({
-        strategy: "email_code",
-        code: verifyCode.trim(),
-      });
+      const { error: verifyErr } = await signIn.emailCode.verifyCode({ code: verifyCode.trim() });
+      if (verifyErr) { setError(clerkError(verifyErr)); return; }
 
-      if (result.status === "complete") {
-        await setActive({ session: result.createdSessionId });
-        router.replace("/" as never);
-        return;
-      }
+      const { error: finalizeErr } = await signIn.finalize();
+      if (finalizeErr) { setError(clerkError(finalizeErr)); return; }
 
-      setError("Verification failed. Please try again.");
+      router.replace("/" as never);
     } catch (err) {
       setError(clerkError(err));
     } finally {
