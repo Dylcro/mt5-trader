@@ -456,28 +456,37 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       try {
         const connectUrl = `${API_BASE}/mt5/connect`;
         console.log("[connect] POST", connectUrl);
-        let res: Response;
-        try {
-          res = await fetch(connectUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              login: useCreds.login.trim(),
-              password: useCreds.password.trim(),
-              server: useCreds.server.trim(),
-            }),
-          });
-        } catch (netErr) {
-          throw new Error(`Cannot reach server. Check your connection. (${netErr instanceof Error ? netErr.message : netErr})`);
+        let res: Response | null = null;
+        let data: ({
+          status?: string; error?: string; accountId?: string; region?: string; retryAfterMs?: number;
+        } & Partial<AccountInfo>) | null = null;
+        // Retry up to 3 times on transient "not ready" errors (server still warming up)
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            res = await fetch(connectUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                login: useCreds.login.trim(),
+                password: useCreds.password.trim(),
+                server: useCreds.server.trim(),
+              }),
+            });
+            data = await safeJson<{
+              status?: string; error?: string; accountId?: string; region?: string; retryAfterMs?: number;
+            } & Partial<AccountInfo>>(res);
+            break; // success
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : "";
+            if (attempt < 3 && (msg.includes("not ready") || msg.includes("Unexpected server"))) {
+              console.warn(`[connect] attempt ${attempt} failed (${msg}) — retrying in 2s`);
+              await new Promise((r) => setTimeout(r, 2000));
+            } else {
+              throw err;
+            }
+          }
         }
-
-        const data = await safeJson<{
-          status?: string;
-          error?: string;
-          accountId?: string;
-          region?: string;
-          retryAfterMs?: number;
-        } & Partial<AccountInfo>>(res);
+        if (!res || !data) throw new Error("Cannot reach server after 3 attempts. Check your connection.");
 
         if (!res.ok || data.error) throw new Error(data.error ?? "Connection failed");
 
