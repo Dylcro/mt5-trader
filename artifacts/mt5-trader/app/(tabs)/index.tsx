@@ -285,6 +285,14 @@ export default function TradeScreen() {
   const isPlacingRef = useRef(false);
   const statusRef = useRef(status);
   useEffect(() => { statusRef.current = status; }, [status]);
+  const cancelOrderRef = useRef(cancelOrder);
+  useEffect(() => { cancelOrderRef.current = cancelOrder; }, [cancelOrder]);
+  const accountIdRef = useRef(accountId);
+  useEffect(() => { accountIdRef.current = accountId; }, [accountId]);
+  const apiBaseRef = useRef(apiBase);
+  useEffect(() => { apiBaseRef.current = apiBase; }, [apiBase]);
+  const regionRef = useRef(region);
+  useEffect(() => { regionRef.current = region; }, [region]);
 
   const [toast, setToast] = useState<ToastState>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -351,7 +359,7 @@ export default function TradeScreen() {
     if (!price) return;
     const now = Date.now();
 
-    // — Take profit queue —
+    // — Limit-cancel queue —
     const firedTpIds = new Set<string>();
     for (const tp of tpWatchersRef.current) {
       if (now < tp.readyAt) continue;
@@ -360,35 +368,63 @@ export default function TradeScreen() {
       if (!hit) continue;
       firedTpIds.add(tp.id);
 
-      // Build cancel list: stored limitOrderIds + price-based sweep of current pendingOrders.
-      // The price sweep is a reliable fallback in case limitOrderIds is empty or stale
-      // (e.g. orderId not returned from the SDK for some orders).
-      const idSet = new Set<string>(tp.limitOrderIds ?? []);
-      if (tp.limitPrices && tp.limitPrices.length > 0) {
-        for (const order of pendingOrders) {
-          if (tp.limitPrices.some((lp) => Math.abs(order.openPrice - lp) < 0.015)) {
-            idSet.add(order.id);
-          }
-        }
-      }
-      const ordersToCancel = Array.from(idSet);
-
       const actualPips = ((tp.direction === "buy" ? price.bid - tp.entryPrice : tp.entryPrice - price.bid) / 0.10).toFixed(1);
-      console.log(`[tp-watcher id=${tp.id}] FIRE dir=${tp.direction} target=+${tp.pipsTarget}pip actual=+${actualPips}pip bid=${price.bid} entry=${tp.entryPrice} — cancelling ${ordersToCancel.length} pending limits (${tp.limitOrderIds?.length ?? 0} by id, ${idSet.size - (tp.limitOrderIds?.length ?? 0)} by price)`);
-      void Promise.all(ordersToCancel.map((id) => cancelOrder(id))).then(() => {
-        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        showToast(
-          `+${actualPips}pip — pending limits cancelled (target ${tp.pipsTarget})`,
-          "success",
-          true
-        );
-        void refreshPendingOrders();
-      });
+      console.log(`[tp-watcher id=${tp.id}] FIRE dir=${tp.direction} target=+${tp.pipsTarget}pip actual=+${actualPips}pip bid=${price.bid} entry=${tp.entryPrice}`);
+
+      // Capture watcher snapshot so async work below has a stable reference
+      const snapshot = { ...tp };
+
+      void (async () => {
+        try {
+          // Fetch FRESH pending orders from the API — don't rely on the polled snapshot
+          // which can be up to 10 seconds old.
+          const accId = accountIdRef.current;
+          const base = apiBaseRef.current;
+          const rgn = regionRef.current;
+          const cancel = cancelOrderRef.current;
+
+          const idSet = new Set<string>(snapshot.limitOrderIds ?? []);
+
+          if (accId && base) {
+            const res = await fetch(`${base}/mt5/account/${accId}/orders?region=${rgn}`);
+            if (res.ok) {
+              const freshOrders = await res.json() as Array<{ id?: unknown; openPrice?: unknown }>;
+              for (const ord of freshOrders) {
+                const ordId = String(ord.id ?? "");
+                const ordPrice = Number(ord.openPrice ?? 0);
+                if (ordId && snapshot.limitPrices?.some((lp) => Math.abs(ordPrice - lp) < 0.015)) {
+                  idSet.add(ordId);
+                }
+              }
+            }
+          }
+
+          const ordersToCancel = Array.from(idSet);
+          console.log(`[tp-watcher id=${snapshot.id}] cancelling ${ordersToCancel.length} orders (${snapshot.limitOrderIds?.length ?? 0} by stored id, ${idSet.size - (snapshot.limitOrderIds?.length ?? 0)} found by price sweep)`);
+
+          if (ordersToCancel.length > 0) {
+            await Promise.all(ordersToCancel.map((id) => cancel(id)));
+            void refreshPendingOrders();
+          }
+
+          void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+          showToast(
+            ordersToCancel.length > 0
+              ? `+${actualPips}pip — ${ordersToCancel.length} limit${ordersToCancel.length > 1 ? "s" : ""} cancelled`
+              : `+${actualPips}pip reached — no pending limits found`,
+            ordersToCancel.length > 0 ? "success" : "error",
+            ordersToCancel.length > 0
+          );
+        } catch (err) {
+          console.log(`[tp-watcher id=${snapshot.id}] cancel error: ${String(err)}`);
+          showToast(`Limit cancel failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+        }
+      })();
     }
     if (firedTpIds.size > 0) {
       tpWatchersRef.current = tpWatchersRef.current.filter((tp) => !firedTpIds.has(tp.id));
     }
-  }, [price, pendingOrders, cancelOrder, refreshPendingOrders, showToast]);
+  }, [price, showToast, refreshPendingOrders]);
 
   // Safety valve: if isPlacing somehow gets stuck, auto-reset after 90 seconds
   useEffect(() => {
