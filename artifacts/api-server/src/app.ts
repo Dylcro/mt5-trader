@@ -3,38 +3,21 @@ import cors from "cors";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
-import { clerkMiddleware } from "@clerk/express";
-import { publishableKeyFromHost } from "@clerk/shared/keys";
-import {
-  CLERK_PROXY_PATH,
-  clerkProxyMiddleware,
-  getClerkProxyHost,
-} from "./middlewares/clerkProxyMiddleware";
 import router from "./routes";
 import adminRouter from "./routes/admin";
+import authRouter from "./routes/auth";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app: Express = express();
 
-app.use(CLERK_PROXY_PATH, clerkProxyMiddleware());
-
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Admin dashboard — mounted before Clerk auth so no token is required
 app.use("/api/admin", adminRouter);
-
-app.use(
-  clerkMiddleware((req) => ({
-    publishableKey: publishableKeyFromHost(
-      getClerkProxyHost(req) ?? "",
-      process.env.CLERK_PUBLISHABLE_KEY,
-    ),
-  })),
-);
+app.use("/api/auth", authRouter);
 
 // Public privacy policy page — required by App Store and Google Play for financial apps
 app.get("/privacy", (_req: Request, res: Response) => {
@@ -59,7 +42,7 @@ app.get("/privacy", (_req: Request, res: Response) => {
 <p>We collect the minimum information necessary to provide the service:</p>
 <ul>
   <li><strong>Account credentials</strong>: Your MetaTrader 5 broker login and server details, transmitted over TLS and stored encrypted at rest. We never store your password in plaintext.</li>
-  <li><strong>Authentication data</strong>: Email address used to create your in-app account (via Clerk). We do not sell this data.</li>
+  <li><strong>Authentication data</strong>: Email address and hashed password used to create your in-app account. We do not sell this data.</li>
   <li><strong>Trading activity</strong>: Trade commands and position data are relayed to your MetaTrader 5 broker via MetaAPI. We log requests for error-debugging purposes only.</li>
   <li><strong>Device/app data</strong>: App settings (cascade configuration) stored server-side and associated with your account.</li>
 </ul>
@@ -78,7 +61,6 @@ app.get("/privacy", (_req: Request, res: Response) => {
 <p>Your data is shared only with the following third-party services required to operate the app:</p>
 <ul>
   <li><strong>MetaAPI</strong> (metaapi.cloud) &mdash; executes trades on your broker via the MetaTrader 5 protocol</li>
-  <li><strong>Clerk</strong> (clerk.com) &mdash; handles authentication and session management</li>
 </ul>
 <p>We do not sell, rent, or share your personal information with any other parties.</p>
 
@@ -86,7 +68,7 @@ app.get("/privacy", (_req: Request, res: Response) => {
 <p>Your account data is retained for as long as your account is active. You may request deletion at any time by contacting us; we will remove your records within 30 days.</p>
 
 <h2>5. Security</h2>
-<p>All data in transit is protected by TLS. Broker credentials are encrypted at rest using industry-standard encryption. We apply the principle of least privilege: each user can only access data tied to their own account.</p>
+<p>All data in transit is protected by TLS. Passwords are hashed using bcrypt and never stored in plaintext. Broker credentials are encrypted at rest. We apply the principle of least privilege: each user can only access data tied to their own account.</p>
 
 <h2>6. Your Rights</h2>
 <p>Depending on your jurisdiction, you may have the right to access, correct, or delete your personal data. To exercise these rights, contact us at the address below.</p>
@@ -109,7 +91,6 @@ app.use("/api", router);
 const webDist = path.join(__dirname, "../public");
 if (fs.existsSync(webDist)) {
   app.use(express.static(webDist));
-  // SPA fallback: any route not matched above (or not a static file) gets index.html
   app.use((_req: Request, res: Response) => {
     res.sendFile(path.join(webDist, "index.html"));
   });

@@ -1,5 +1,4 @@
-import { useAuth, useSignIn } from "@clerk/expo";
-import { Link, useRouter } from "expo-router";
+import { useRouter } from "expo-router";
 import React, { useEffect, useState } from "react";
 import {
   ActivityIndicator,
@@ -13,6 +12,9 @@ import {
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { Link } from "expo-router";
+
+import { useAuth } from "@/context/AuthContext";
 
 const GOLD = "#C9A84C";
 const BG = "#0A0A0F";
@@ -22,39 +24,14 @@ const TEXT = "#F0EFE7";
 const MUTED = "#6E6E8A";
 const RED = "#FF4757";
 
-type Step = "credentials" | "code";
-
-function clerkError(err: unknown): string {
-  if (err && typeof err === "object") {
-    const e = err as Record<string, unknown>;
-    if (Array.isArray(e["errors"])) {
-      const first = (e["errors"] as Record<string, unknown>[])[0];
-      if (first && typeof first["longMessage"] === "string") return first["longMessage"];
-      if (first && typeof first["message"] === "string") return first["message"];
-    }
-    if (typeof e["longMessage"] === "string") return e["longMessage"];
-    if (typeof e["message"] === "string") return e["message"];
-  }
-  if (err instanceof Error) return err.message;
-  return "Something went wrong. Please try again.";
-}
-
-function clerkResultError(result: { error: unknown } | null | undefined): string | null {
-  if (!result?.error) return null;
-  return clerkError(result.error);
-}
-
 export default function SignInScreen() {
-  const { signIn, errors, fetchStatus } = useSignIn() as any;
-  const { isSignedIn, signOut } = useAuth();
+  const { isSignedIn, signIn } = useAuth();
   const router = useRouter();
   const insets = useSafeAreaInsets();
 
-  const [step, setStep] = useState<Step>("credentials");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
-  const [verifyCode, setVerifyCode] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -64,167 +41,19 @@ export default function SignInScreen() {
 
   const handleSignIn = async () => {
     if (!email.trim()) { setError("Please enter your email address."); return; }
-    if (!password) { setError("Please enter a password."); return; }
-    if (!signIn) { setError("Auth not initialised — please refresh the page."); return; }
+    if (!password) { setError("Please enter your password."); return; }
 
     setLoading(true);
     setError("");
-    try {
-      // Step 1: identify the account
-      const createResult = await signIn.create({ identifier: email.trim() });
-      const createErr = clerkResultError(createResult);
-      if (createErr) { setError(createErr); return; }
+    const result = await signIn(email.trim(), password);
+    setLoading(false);
 
-      const status: string = signIn.status;
-      const supportedFirstFactors: Array<{ strategy: string; emailAddressId?: string }> =
-        signIn.supportedFirstFactors ?? [];
-
-      if (status === "complete") {
-        await signIn.finalize();
-        router.replace("/" as never);
-        return;
-      }
-
-      if (status === "needs_first_factor") {
-        const hasPassword = supportedFirstFactors.some((f) => f.strategy === "password");
-        const emailFactor = supportedFirstFactors.find((f) => f.strategy === "email_code");
-
-        if (hasPassword) {
-          const pwResult = await signIn.password({ password });
-          const pwErr = clerkResultError(pwResult);
-          if (pwErr) { setError(pwErr); return; }
-
-          const pwStatus: string = signIn.status;
-          if (pwStatus === "complete") {
-            await signIn.finalize();
-            router.replace("/" as never);
-            return;
-          }
-          if (pwStatus === "needs_second_factor") {
-            setError("Two-factor auth is required. Please disable 2FA in your account settings.");
-            return;
-          }
-          setError(`Unexpected status after password: ${pwStatus}`);
-          return;
-        }
-
-        if (emailFactor) {
-          const sendResult = await signIn.emailCode.sendCode();
-          const sendErr = clerkResultError(sendResult);
-          if (sendErr) { setError(sendErr); return; }
-          setStep("code");
-          return;
-        }
-
-        const strategies = supportedFirstFactors.map((f) => f.strategy).join(", ") || "none";
-        setError(`No supported sign-in method found (available: ${strategies}). Please contact support.`);
-        return;
-      }
-
-      if (status === "needs_second_factor") {
-        setError("Two-factor auth is required. Please disable 2FA in your account settings.");
-        return;
-      }
-
-      setError(`Unexpected sign-in status: ${status ?? "unknown"}. Please try again.`);
-    } catch (err: unknown) {
-      const msg = clerkError(err);
-      if (msg.toLowerCase().includes("already signed in")) {
-        router.replace("/" as never);
-        return;
-      }
-      setError(msg);
-    } finally {
-      setLoading(false);
+    if (result.error) {
+      setError(result.error);
+    } else {
+      router.replace("/" as never);
     }
   };
-
-  const handleResendCode = async () => {
-    if (!signIn) return;
-    setError("");
-    try {
-      const result = await signIn.emailCode.sendCode();
-      const err = clerkResultError(result);
-      if (err) setError(err);
-    } catch (err) {
-      setError(clerkError(err));
-    }
-  };
-
-  const handleVerifyCode = async () => {
-    if (!signIn) return;
-    setLoading(true);
-    setError("");
-    try {
-      const result = await signIn.emailCode.verifyCode({ code: verifyCode.trim() });
-      const err = clerkResultError(result);
-      if (err) { setError(err); return; }
-
-      const status: string = signIn.status;
-      if (status === "complete") {
-        await signIn.finalize();
-        router.replace("/" as never);
-        return;
-      }
-      setError(`Verification failed (status: ${status}). Please try again.`);
-    } catch (err) {
-      setError(clerkError(err));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleSignOut = async () => {
-    try { await signOut(); } catch {}
-    router.replace("/sign-in" as never);
-  };
-
-  const handleStartOver = () => {
-    setStep("credentials");
-    setVerifyCode("");
-    setError("");
-  };
-
-  if (step === "code") {
-    return (
-      <View style={[styles.container, { paddingTop: insets.top + 20 }]}>
-        <View style={styles.card}>
-          <Text style={styles.logo}>XAUUSD</Text>
-          <Text style={styles.title}>Check your email</Text>
-          <Text style={styles.subtitle}>Enter the code we sent to {email}</Text>
-
-          <Text style={styles.label}>Verification Code</Text>
-          <TextInput
-            style={styles.input}
-            value={verifyCode}
-            onChangeText={setVerifyCode}
-            placeholder="000000"
-            placeholderTextColor={MUTED}
-            keyboardType="number-pad"
-            autoFocus
-          />
-          {error ? <Text style={styles.error}>{error}</Text> : null}
-
-          <Pressable
-            style={[styles.btn, (loading || verifyCode.length < 4) && styles.btnDisabled]}
-            onPress={handleVerifyCode}
-            disabled={loading || verifyCode.length < 4}
-          >
-            {loading
-              ? <ActivityIndicator color="#000" />
-              : <Text style={styles.btnText}>Verify</Text>}
-          </Pressable>
-
-          <Pressable onPress={handleResendCode} style={styles.linkBtn}>
-            <Text style={styles.link}>Resend code</Text>
-          </Pressable>
-          <Pressable onPress={handleStartOver} style={styles.linkBtn}>
-            <Text style={styles.link}>Use a different email</Text>
-          </Pressable>
-        </View>
-      </View>
-    );
-  }
 
   return (
     <KeyboardAvoidingView
@@ -250,6 +79,8 @@ export default function SignInScreen() {
             keyboardType="email-address"
             autoCapitalize="none"
             autoCorrect={false}
+            onSubmitEditing={() => {}}
+            returnKeyType="next"
           />
 
           <Text style={styles.label}>Password</Text>
@@ -262,6 +93,8 @@ export default function SignInScreen() {
               placeholderTextColor={MUTED}
               secureTextEntry={!showPassword}
               autoCapitalize="none"
+              returnKeyType="done"
+              onSubmitEditing={handleSignIn}
             />
             <Pressable onPress={() => setShowPassword((s) => !s)} style={styles.eyeBtn} hitSlop={8}>
               <Text style={{ color: MUTED, fontSize: 12 }}>{showPassword ? "HIDE" : "SHOW"}</Text>
@@ -281,14 +114,11 @@ export default function SignInScreen() {
           </Pressable>
 
           <View style={styles.footer}>
-            <Text style={styles.footerText}>Don&apos;t have an account? </Text>
+            <Text style={styles.footerText}>No account? </Text>
             <Link href="/(auth)/sign-up">
               <Text style={styles.link}>Create one</Text>
             </Link>
           </View>
-          <Pressable onPress={handleSignOut} style={styles.linkBtn}>
-            <Text style={[styles.link, { color: MUTED, fontSize: 12 }]}>Sign out of existing session</Text>
-          </Pressable>
         </View>
       </ScrollView>
     </KeyboardAvoidingView>
@@ -329,7 +159,7 @@ const styles = StyleSheet.create({
   },
   pwWrap: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 4 },
   eyeBtn: { paddingHorizontal: 4 },
-  error: { color: RED, fontSize: 12, marginBottom: 6, marginTop: 4 },
+  error: { color: RED, fontSize: 12, marginBottom: 6, marginTop: 8 },
   btn: {
     backgroundColor: GOLD,
     borderRadius: 10,
@@ -342,5 +172,4 @@ const styles = StyleSheet.create({
   footer: { flexDirection: "row", justifyContent: "center", marginTop: 20 },
   footerText: { color: MUTED, fontSize: 13 },
   link: { color: GOLD, fontSize: 13, fontWeight: "600" },
-  linkBtn: { alignItems: "center", marginTop: 12 },
 });

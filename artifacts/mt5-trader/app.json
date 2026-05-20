@@ -15,7 +15,7 @@
     "splash": {
       "image": "./assets/images/splash-icon.png",
       "resizeMode": "contain",
-      "backgroundColor": "#0A0A0A"
+      "backgroundColor": "#0A0A0F"
     },
     "ios": {
       "supportsTablet": false,
@@ -29,12 +29,12 @@
       }
     },
     "android": {
-      "backgroundColor": "#0A0A0A",
+      "backgroundColor": "#0A0A0F",
       "package": "com.xauusdtrader.app",
       "versionCode": 1,
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/icon.png",
-        "backgroundColor": "#0A0A0A"
+        "backgroundColor": "#0A0A0F"
       },
       "permissions": []
     },
@@ -44,7 +44,7 @@
       "shortName": "XAUUSD",
       "description": "Gold trading via MetaTrader 5 with cascade ladder orders",
       "themeColor": "#C9A84C",
-      "backgroundColor": "#0A0A0A",
+      "backgroundColor": "#0A0A0F",
       "display": "standalone",
       "output": "static"
     },
@@ -60,7 +60,7 @@
       [
         "expo-splash-screen",
         {
-          "backgroundColor": "#0A0A0A",
+          "backgroundColor": "#0A0A0F",
           "image": "./assets/images/splash-icon.png",
           "imageWidth": 300
         }

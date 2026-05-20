@@ -1,8 +1,9 @@
 import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
-import { getAuth } from "@clerk/express";
+import jwt from "jsonwebtoken";
 import { createRequire } from "module";
 import { db, cascadeConfigTable, storedAccountsTable } from "@workspace/db";
 import { eq, isNotNull } from "drizzle-orm";
+import { JWT_SECRET } from "./auth";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
 // In dev (tsx/ESM) import.meta.url is the real file URL.
 // In production (esbuild CJS) build.ts injects a __importMetaUrl banner and
@@ -20,10 +21,18 @@ const router: IRouter = Router();
 const userAccountCache = new Map<string, string>(); // userId → accountId
 
 function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  const { userId } = getAuth(req);
-  if (!userId) { res.status(401).json({ error: "Unauthorized" }); return; }
-  (req as Record<string, unknown>)["userId"] = userId;
-  next();
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer ")) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  try {
+    const payload = jwt.verify(authHeader.slice(7), JWT_SECRET) as { sub: string };
+    (req as Record<string, unknown>)["userId"] = payload.sub;
+    next();
+  } catch {
+    res.status(401).json({ error: "Invalid or expired token." });
+  }
 }
 
 async function checkOwner(req: Request, res: Response, next: NextFunction): Promise<void> {
