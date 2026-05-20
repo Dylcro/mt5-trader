@@ -115,7 +115,15 @@ export default function SignInScreen() {
         return;
       }
 
-      setError(`Sign-in returned unexpected status: ${result.status ?? "unknown"}. Please try again.`);
+      // Temporary diagnostic — shows exactly what Clerk returned
+      const diag = JSON.stringify({
+        status: result.status,
+        createdSessionId: result.createdSessionId,
+        firstFactors: ((result.supportedFirstFactors ?? []) as Array<Record<string, unknown>>)
+          .map((f) => f["strategy"]),
+        identifier: result.identifier,
+      });
+      setError(`Debug (send screenshot): ${diag}`);
     } catch (err: unknown) {
       const msg = clerkError(err);
       if (msg.toLowerCase().includes("already signed in")) {
