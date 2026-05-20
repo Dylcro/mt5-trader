@@ -18,8 +18,13 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import Colors from "@/constants/colors";
 
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
 import { useTrading, type SLMode } from "@/context/TradingContext";
 import { buildCascadeLevels, useCascadeSettings } from "@/hooks/useCascadeSettings";
+
+const LOT_SIZE_SINGLE_KEY = "lot_size_single";
+const LOT_SIZE_CASCADE_KEY = "lot_size_cascade";
 
 const C = Colors.dark;
 
@@ -298,7 +303,11 @@ export default function TradeScreen() {
 
   // Single trade state
   const [direction, setDirection] = useState<Direction>("buy");
-  const [lotSize, setLotSize] = useState(0.01);
+  const [lotSize, setLotSizeRaw] = useState(0.01);
+  const setLotSize = useCallback((v: number) => {
+    setLotSizeRaw(v);
+    void AsyncStorage.setItem(LOT_SIZE_SINGLE_KEY, String(v));
+  }, []);
   const [slMode, setSlMode] = useState<SLMode>("points");
   const [slPips, setSlPips] = useState(50);
   const [slPercent, setSlPercent] = useState(1);
@@ -307,7 +316,11 @@ export default function TradeScreen() {
 
   // Cascade state
   const [cascadeDirection, setCascadeDirection] = useState<Direction>("buy");
-  const [cascadeLotSize, setCascadeLotSize] = useState(0.01);
+  const [cascadeLotSize, setCascadeLotSizeRaw] = useState(0.01);
+  const setCascadeLotSize = useCallback((v: number) => {
+    setCascadeLotSizeRaw(v);
+    void AsyncStorage.setItem(LOT_SIZE_CASCADE_KEY, String(v));
+  }, []);
 
   const [isPlacing, setIsPlacing] = useState(false);
 
@@ -322,6 +335,15 @@ export default function TradeScreen() {
     limitOrderIds?: string[];
     limitPrices?: number[]; // to find filled limits that became positions
   };
+
+  // Load persisted lot sizes on mount
+  useEffect(() => {
+    AsyncStorage.multiGet([LOT_SIZE_SINGLE_KEY, LOT_SIZE_CASCADE_KEY]).then((pairs) => {
+      const [single, cascade] = pairs.map((p) => p[1]);
+      if (single) setLotSizeRaw(parseFloat(single));
+      if (cascade) setCascadeLotSizeRaw(parseFloat(cascade));
+    });
+  }, []);
 
   const tpWatchersRef = useRef<WatcherEntry[]>([]); // take-profit queue
 
