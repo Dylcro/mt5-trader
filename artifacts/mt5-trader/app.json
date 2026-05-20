@@ -23,7 +23,9 @@
       "buildNumber": "1",
       "appleTeamId": "PLACEHOLDER_APPLE_TEAM_ID",
       "infoPlist": {
-        "NSPrivacyAccessedAPITypes": []
+        "NSPrivacyAccessedAPITypes": [],
+        "NSFaceIDUsageDescription": "Used to protect access to your trading account.",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
@@ -33,14 +35,15 @@
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/icon.png",
         "backgroundColor": "#0A0A0A"
-      }
+      },
+      "permissions": []
     },
     "web": {
       "favicon": "./assets/images/icon.png",
       "name": "XAUUSD Trader",
       "shortName": "XAUUSD",
       "description": "Gold trading via MetaTrader 5 with cascade ladder orders",
-      "themeColor": "#B8860B",
+      "themeColor": "#C9A84C",
       "backgroundColor": "#0A0A0A",
       "display": "standalone",
       "output": "static"
@@ -53,7 +56,15 @@
         }
       ],
       "expo-font",
-      "expo-web-browser"
+      "expo-web-browser",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#0A0A0A",
+          "image": "./assets/images/splash-icon.png",
+          "imageWidth": 300
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,

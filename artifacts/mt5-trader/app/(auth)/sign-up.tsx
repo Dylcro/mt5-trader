@@ -27,6 +27,11 @@ type Step = "form" | "code";
 function clerkError(err: unknown): string {
   if (err && typeof err === "object") {
     const e = err as Record<string, unknown>;
+    if (Array.isArray(e["errors"])) {
+      const first = (e["errors"] as Record<string, unknown>[])[0];
+      if (first && typeof first["longMessage"] === "string") return first["longMessage"];
+      if (first && typeof first["message"] === "string") return first["message"];
+    }
     if (typeof e["longMessage"] === "string") return e["longMessage"];
     if (typeof e["message"] === "string") return e["message"];
   }
@@ -35,7 +40,7 @@ function clerkError(err: unknown): string {
 }
 
 export default function SignUpScreen() {
-  const { signUp } = useSignUp();
+  const { signUp, setActive, isLoaded } = useSignUp();
   const { isSignedIn } = useAuth();
   const router = useRouter();
   const insets = useSafeAreaInsets();
@@ -53,7 +58,7 @@ export default function SignUpScreen() {
   }, [isSignedIn, router]);
 
   const handleSignUp = async () => {
-    if (!signUp) {
+    if (!isLoaded || !signUp || !setActive) {
       setError("Auth is still initialising — please wait a moment and try again.");
       return;
     }
@@ -63,12 +68,8 @@ export default function SignUpScreen() {
     setLoading(true);
     setError("");
     try {
-      const { error: createErr } = await signUp.create({ emailAddress: email.trim(), password });
-      if (createErr) { setError(clerkError(createErr)); return; }
-
-      const { error: sendErr } = await signUp.verifications.sendEmailCode();
-      if (sendErr) { setError(clerkError(sendErr)); return; }
-
+      await signUp.create({ emailAddress: email.trim(), password });
+      await signUp.prepareEmailAddressVerification({ strategy: "email_code" });
       setStep("code");
     } catch (err: unknown) {
       setError(clerkError(err));
@@ -81,25 +82,26 @@ export default function SignUpScreen() {
     if (!signUp) return;
     setError("");
     try {
-      const { error: sendErr } = await signUp.verifications.sendEmailCode();
-      if (sendErr) setError(clerkError(sendErr));
+      await signUp.prepareEmailAddressVerification({ strategy: "email_code" });
     } catch (err) {
       setError(clerkError(err));
     }
   };
 
   const handleVerifyCode = async () => {
-    if (!signUp) return;
+    if (!signUp || !setActive) return;
     setLoading(true);
     setError("");
     try {
-      const { error: verifyErr } = await signUp.verifications.verifyEmailCode({ code: verifyCode.trim() });
-      if (verifyErr) { setError(clerkError(verifyErr)); return; }
+      const result = await signUp.attemptEmailAddressVerification({ code: verifyCode.trim() });
 
-      const { error: finalizeErr } = await signUp.finalize();
-      if (finalizeErr) { setError(clerkError(finalizeErr)); return; }
+      if (result.status === "complete") {
+        await setActive({ session: result.createdSessionId });
+        router.replace("/" as never);
+        return;
+      }
 
-      router.replace("/" as never);
+      setError("Verification failed. Please try again.");
     } catch (err) {
       setError(clerkError(err));
     } finally {

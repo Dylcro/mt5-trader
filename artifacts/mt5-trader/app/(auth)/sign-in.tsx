@@ -27,6 +27,11 @@ type Step = "credentials" | "code";
 function clerkError(err: unknown): string {
   if (err && typeof err === "object") {
     const e = err as Record<string, unknown>;
+    if (Array.isArray(e["errors"])) {
+      const first = (e["errors"] as Record<string, unknown>[])[0];
+      if (first && typeof first["longMessage"] === "string") return first["longMessage"];
+      if (first && typeof first["message"] === "string") return first["message"];
+    }
     if (typeof e["longMessage"] === "string") return e["longMessage"];
     if (typeof e["message"] === "string") return e["message"];
   }
@@ -35,7 +40,7 @@ function clerkError(err: unknown): string {
 }
 
 export default function SignInScreen() {
-  const { signIn } = useSignIn();
+  const { signIn, setActive, isLoaded } = useSignIn();
   const { isSignedIn, signOut } = useAuth();
   const router = useRouter();
   const insets = useSafeAreaInsets();
@@ -48,13 +53,12 @@ export default function SignInScreen() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  // If already signed in (e.g. session persisted from a previous visit), go straight to the app.
   useEffect(() => {
     if (isSignedIn) router.replace("/" as never);
   }, [isSignedIn, router]);
 
   const handleSignIn = async () => {
-    if (!signIn) {
+    if (!isLoaded || !signIn || !setActive) {
       setError("Auth is still initialising — please wait a moment and try again.");
       return;
     }
@@ -64,27 +68,31 @@ export default function SignInScreen() {
     setLoading(true);
     setError("");
     try {
-      const { error: createErr } = await signIn.create({ identifier: email.trim(), password });
-      if (createErr) { setError(clerkError(createErr)); return; }
+      const result = await signIn.create({ identifier: email.trim(), password });
 
-      if (signIn.status === "complete") {
-        const { error: finalizeErr } = await signIn.finalize();
-        if (finalizeErr) { setError(clerkError(finalizeErr)); return; }
+      if (result.status === "complete") {
+        await setActive({ session: result.createdSessionId });
         router.replace("/" as never);
         return;
       }
 
-      if (signIn.status === "needs_first_factor") {
-        const { error: sendErr } = await signIn.emailCode.sendCode();
-        if (sendErr) { setError(clerkError(sendErr)); return; }
-        setStep("code");
-        return;
+      if (result.status === "needs_first_factor") {
+        const emailFactor = result.supportedFirstFactors?.find(
+          (f: Record<string, unknown>) => f["strategy"] === "email_code"
+        ) as Record<string, unknown> | undefined;
+        if (emailFactor && typeof emailFactor["emailAddressId"] === "string") {
+          await signIn.prepareFirstFactor({
+            strategy: "email_code",
+            emailAddressId: emailFactor["emailAddressId"] as string,
+          });
+          setStep("code");
+          return;
+        }
       }
 
       setError("Unable to complete sign in. Please try again.");
     } catch (err: unknown) {
       const msg = clerkError(err);
-      // Already signed in — just go to the app instead of showing an error.
       if (msg.toLowerCase().includes("already signed in")) {
         router.replace("/" as never);
         return;
@@ -95,39 +103,51 @@ export default function SignInScreen() {
     }
   };
 
-  const handleSignOut = async () => {
-    try { await signOut(); } catch {}
-    router.replace("/sign-in" as never);
-  };
-
   const handleResendCode = async () => {
     if (!signIn) return;
     setError("");
     try {
-      const { error: sendErr } = await signIn.emailCode.sendCode();
-      if (sendErr) setError(clerkError(sendErr));
+      const emailFactor = signIn.supportedFirstFactors?.find(
+        (f: Record<string, unknown>) => f["strategy"] === "email_code"
+      ) as Record<string, unknown> | undefined;
+      if (emailFactor && typeof emailFactor["emailAddressId"] === "string") {
+        await signIn.prepareFirstFactor({
+          strategy: "email_code",
+          emailAddressId: emailFactor["emailAddressId"] as string,
+        });
+      }
     } catch (err) {
       setError(clerkError(err));
     }
   };
 
   const handleVerifyCode = async () => {
-    if (!signIn) return;
+    if (!signIn || !setActive) return;
     setLoading(true);
     setError("");
     try {
-      const { error: verifyErr } = await signIn.emailCode.verifyCode({ code: verifyCode.trim() });
-      if (verifyErr) { setError(clerkError(verifyErr)); return; }
+      const result = await signIn.attemptFirstFactor({
+        strategy: "email_code",
+        code: verifyCode.trim(),
+      });
 
-      const { error: finalizeErr } = await signIn.finalize();
-      if (finalizeErr) { setError(clerkError(finalizeErr)); return; }
+      if (result.status === "complete") {
+        await setActive({ session: result.createdSessionId });
+        router.replace("/" as never);
+        return;
+      }
 
-      router.replace("/" as never);
+      setError("Verification failed. Please try again.");
     } catch (err) {
       setError(clerkError(err));
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleSignOut = async () => {
+    try { await signOut(); } catch {}
+    router.replace("/sign-in" as never);
   };
 
   const handleStartOver = () => {
