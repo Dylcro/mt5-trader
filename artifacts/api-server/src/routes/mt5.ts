@@ -236,6 +236,12 @@ function getEventsSince(accountId: string, since: number): DealEvent[] {
   return (dealStore.get(accountId) ?? []).filter(e => e.time > since);
 }
 
+// Tracks accountIds where an app-initiated market order is currently in-flight.
+// The deal event from MetaAPI's stream arrives before the SDK trade call resolves,
+// so we can't rely on positionId pre-marking alone — the deal fires BEFORE we call
+// markCascaded. Setting this flag synchronously before the SDK call closes the race.
+const pendingAppCascades = new Set<string>();
+
 // Tracks orderIds of limit orders placed by our cascade logic.
 // When those orders fill (volatile market), their deals arrive with deal.orderId set.
 // We must NOT re-cascade those fills — even if the broker stripped the comment.
@@ -344,11 +350,19 @@ function makeDealListener(accountId: string) {
       else if (hasBeenCascaded(accountId, evt.positionId)) {
         console.log(`[auto-cascade] SKIP posId=${evt.positionId} — already cascaded`);
       }
+      // Layer 4: an app-initiated market cascade trade is in-flight for this account.
+      // The deal event arrives via stream before the SDK trade response resolves, so
+      // markCascaded hasn't been called yet — we mark it here to close the race.
+      else if (pendingAppCascades.has(accountId)) {
+        markCascaded(accountId, evt.positionId);
+        console.log(`[auto-cascade] SKIP posId=${evt.positionId} — in-flight app cascade (race guard)`);
+      }
       else {
         const comment = evt.comment ?? "";
         const isFromApp = comment.startsWith("Cascade") || comment === "XAUUSD Trader App";
         if (isFromApp) {
           console.log(`[auto-cascade] SKIP posId=${evt.positionId} — app-placed trade (comment="${comment}")`);
+          markCascaded(accountId, evt.positionId);
         } else {
           markCascaded(accountId, evt.positionId);
           void (async () => {
@@ -1171,6 +1185,19 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
     let data: { numericCode?: number; message?: string; orderId?: string; positionId?: string };
     let httpStatus = 200;
 
+    // Detect app-initiated market cascade BEFORE any await so we can set the
+    // in-flight guard synchronously. The streaming deal event arrives on the
+    // WebSocket before the SDK trade call resolves, so pendingAppCascades must
+    // be populated before we yield to the event loop for the first time.
+    const _tradeActionType = String(body.actionType ?? "");
+    const _tradeComment    = String(body.comment ?? "");
+    const _isAppMarketCascade =
+      (_tradeComment.startsWith("Cascade") || _tradeComment === "XAUUSD Trader App") &&
+      !_tradeActionType.endsWith("_LIMIT");
+    if (_isAppMarketCascade) {
+      pendingAppCascades.add(accountId);
+    }
+
     const conn = activeConnections.get(accountId);
     if (conn) {
       try {
@@ -1206,6 +1233,10 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
     const errorMessage = success ? undefined : (TRADE_ERROR_MESSAGES[code] ?? data.message ?? `Trade failed (code ${code})`);
     if (!success) console.log(`[trade] FAILED action=${body.actionType} code=${code} msg="${errorMessage}"`);
 
+    // Clear the in-flight guard now that the trade response is back (the race
+    // window is closed — the deal event has already been handled or won't fire).
+    pendingAppCascades.delete(accountId);
+
     if (success) {
       const actionType = String(body.actionType ?? "");
       const comment   = String(body.comment ?? "");
@@ -1235,6 +1266,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
       positionId: data.positionId,
     });
   } catch (err) {
+    pendingAppCascades.delete(accountId);
     return res.status(500).json({ success: false, code: 0, message: err instanceof Error ? err.message : "Trade failed" });
   }
 });
