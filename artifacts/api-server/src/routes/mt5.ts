@@ -202,6 +202,25 @@ function isDuplicate(dealId: string): boolean {
   return false;
 }
 
+// Tracks positionIds that have already been auto-cascaded (per account).
+// Survives reconnects intentionally — the same position must never be
+// double-cascaded even if MetaAPI re-delivers its deal after a reconnect.
+// Capped at 2000 entries total across all accounts to bound memory.
+const cascadedPositions = new Map<string, Set<string>>(); // accountId → Set<positionId>
+function hasBeenCascaded(accountId: string, positionId: string): boolean {
+  return cascadedPositions.get(accountId)?.has(positionId) ?? false;
+}
+function markCascaded(accountId: string, positionId: string): void {
+  let set = cascadedPositions.get(accountId);
+  if (!set) { set = new Set(); cascadedPositions.set(accountId, set); }
+  set.add(positionId);
+  // Evict oldest entry if this account's set grows too large
+  if (set.size > 2000) {
+    const first = set.values().next().value;
+    if (first !== undefined) set.delete(first);
+  }
+}
+
 // Tracks which accounts have completed the initial MetaAPI synchronisation.
 // onDealAdded fires for HISTORICAL deals during sync replay — we must NOT
 // auto-cascade those. Only deals that arrive after onSynchronized are live.
@@ -251,12 +270,21 @@ function makeDealListener(accountId: string) {
       storeDealEvent(accountId, evt);
 
       // ── Auto-cascade: place limit orders for trades opened directly in MT5 ──
-      // Guard: only fire on live deals — not the history replay during initial sync.
+      // Guard 1: only fire on live deals — not history replay during initial sync.
+      // Guard 2: skip any positionId we've already cascaded — prevents double-cascade
+      //          when MetaAPI re-delivers a missed deal after a reconnect.
       const acctCascadeCfg = getCascadeConfig(accountId);
-      if (syncReady.has(accountId) && acctCascadeCfg.enabled && evt.symbol === "XAUUSD" && evt.openPrice > 0) {
+      if (
+        syncReady.has(accountId) &&
+        acctCascadeCfg.enabled &&
+        evt.symbol === "XAUUSD" &&
+        evt.openPrice > 0 &&
+        !hasBeenCascaded(accountId, evt.positionId)
+      ) {
         const comment = evt.comment ?? "";
         const isFromApp = comment.startsWith("Cascade") || comment === "XAUUSD Trader App";
         if (!isFromApp) {
+          markCascaded(accountId, evt.positionId);
           void (async () => {
             const direction: "buy" | "sell" = evt.type === "DEAL_TYPE_BUY" ? "buy" : "sell";
             const levels = buildCascadeLevels(evt.openPrice, direction, acctCascadeCfg);
