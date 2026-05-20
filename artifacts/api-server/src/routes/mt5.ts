@@ -400,7 +400,7 @@ function makeDealListener(accountId: string) {
   });
 }
 
-async function startStreaming(token: string, accountId: string, region: string = DEFAULT_REGION): Promise<void> {
+async function startStreaming(token: string, accountId: string, region: string = DEFAULT_REGION, userId?: string): Promise<void> {
   if (activeStreams.has(accountId)) return;
   activeStreams.add(accountId);
   try {
@@ -417,13 +417,18 @@ async function startStreaming(token: string, accountId: string, region: string =
     console.log(`[stream ${accountId}] streaming connection established — SDK trade path armed`);
     // Persist credentials so the server can auto-reconnect after a restart
     // without waiting for the app to call /connect again.
+    // userId is included when available so /my-account lookups work reliably.
     try {
+      const now = Date.now();
+      const updateFields: Record<string, unknown> = { region, storedAt: now };
+      if (userId) updateFields["userId"] = userId;
       await db.insert(storedAccountsTable)
-        .values({ accountId, region, storedAt: Date.now() })
+        .values({ accountId, region, storedAt: now, ...(userId ? { userId } : {}) })
         .onConflictDoUpdate({
           target: storedAccountsTable.accountId,
-          set: { region, storedAt: Date.now() },
+          set: updateFields,
         });
+      if (userId) userAccountCache.set(userId, accountId);
       console.log(`[stream ${accountId}] credentials saved to DB for auto-reconnect`);
     } catch (dbErr) {
       console.warn(`[stream ${accountId}] failed to persist account to DB:`, (dbErr as Error).message);
@@ -714,7 +719,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         // If the client API isn't warm yet (just redeployed), fall back to polling.
         // Kick off streaming in background so deal events (and auto-cascade) work
         // even though the app never polls the /events endpoint directly.
-        void startStreaming(token, existingId, region);
+        void startStreaming(token, existingId, region, userId ?? undefined);
         try {
           const info = await getAccountInfo(token, existingId, region) as Record<string, unknown>;
           return res.json({
@@ -997,7 +1002,7 @@ router.get("/mt5/account/:accountId/info", checkOwner, async (req: Request, res:
 
 // GET /api/mt5/account/:accountId/candles?region=london&timeframe=5m&limit=150
 // Candles are built from live price ticks accumulated by the /price endpoint.
-router.get("/mt5/account/:accountId/candles", (req: Request, res: Response) => {
+router.get("/mt5/account/:accountId/candles", checkOwner, (req: Request, res: Response) => {
   const timeframe = qstr(req.query.timeframe) || "5m";
   const limit = Math.min(parseInt(qstr(req.query.limit) || "150", 10) || 150, 500);
   const candles = buildCandles(req.params.accountId as string, timeframe, limit);
@@ -1194,7 +1199,8 @@ router.get("/mt5/events/:accountId", checkOwner, async (req: Request, res: Respo
     const region = qstr(req.query.region) || DEFAULT_REGION;
 
     // Start streaming connection in the background (idempotent — safe to call repeatedly)
-    void startStreaming(token, accountId, region);
+    const eventsUserId = (req as Record<string, unknown>)["userId"] as string | undefined;
+    void startStreaming(token, accountId, region, eventsUserId);
 
     const events = getEventsSince(accountId, since);
     return res.json({ events, serverTime: Date.now() });
