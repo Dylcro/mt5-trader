@@ -4,6 +4,8 @@
     <title>APP_NAME_PLACEHOLDER</title>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="XAUUSD gold trading app for MetaTrader 5. Place cascade ladder orders, monitor open positions, and manage risk directly from your mobile device." />
+    <link rel="preconnect" href="https://unpkg.com" />
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg width='180' height='180' viewBox='0 0 180 180' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Crect width='180' height='180' rx='36' fill='%23FF3C00'/%3E%3C/svg%3E" />
     <style>
       * {
@@ -394,8 +396,9 @@
       </div>
     </div>
 
-    <script src="https://unpkg.com/qr-code-styling@1.6.0/lib/qr-code-styling.js"></script>
+    <script src="https://unpkg.com/qr-code-styling@1.6.0/lib/qr-code-styling.js" defer></script>
     <script>
+      document.addEventListener("DOMContentLoaded", function () {
       (function () {
         const ua = navigator.userAgent;
         const loadingEl = document.getElementById("loading");
@@ -455,6 +458,7 @@
           }, 500);
         }
       })();
+      });
     </script>
   </body>
 </html>
