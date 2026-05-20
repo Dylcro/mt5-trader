@@ -503,6 +503,16 @@ export default function SettingsScreen() {
               hint={`${(cs.slPips * 0.10).toFixed(2)} below market entry — shared by all orders`}
             />
 
+            <View style={styles.cascadeDivider} />
+
+            <PillSelector
+              label="Cancel pending limits at"
+              hint={`When price moves +${cs.takeProfitPips} pips from 1st entry, remaining limit orders are cancelled automatically. Market position stays open.`}
+              options={[5, 10, 15, 20, 25, 30, 40, 50, 60, 80, 100]}
+              value={cs.takeProfitPips}
+              onChange={(v) => updateSettings({ takeProfitPips: v })}
+            />
+
             <View style={styles.cascadePreviewBox}>
               <Text style={styles.cascadePreviewTitle}>Preview with current settings (buy example)</Text>
               <Text style={styles.cascadePreviewText}>

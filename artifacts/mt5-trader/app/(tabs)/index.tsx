@@ -567,7 +567,7 @@ export default function TradeScreen() {
         const readyAt = Date.now() + 3000;
         // Always use bid as the reference price for watcher triggers — same price the user sees on the chart
         const watcherEntryPrice = p?.bid ?? mktPrice;
-        if (cs.takeProfitEnabled && cs.takeProfitPips > 0) {
+        if (cs.takeProfitPips > 0) {
           const tpTrigger = dir === "buy" ? watcherEntryPrice + cs.takeProfitPips * 0.10 : watcherEntryPrice - cs.takeProfitPips * 0.10;
           console.log(`[tp-watcher id=${cascadeId}] arming +${cs.takeProfitPips}pip dir=${dir} entry(bid)=${watcherEntryPrice} trigger=${tpTrigger} posId=${result.marketPositionId}`);
           tpWatchersRef.current.push({
