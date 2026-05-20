@@ -100,6 +100,20 @@ function getEventsSince(accountId: string, since: number): DealEvent[] {
   return (dealStore.get(accountId) ?? []).filter(e => e.time > since);
 }
 
+// Deduplication: MetaAPI connects to two server nodes (london-a and london-b)
+// so every deal event arrives twice. Track recently seen deal IDs and drop duplicates.
+const seenDealIds = new Set<string>();
+function isDuplicate(dealId: string): boolean {
+  if (seenDealIds.has(dealId)) return true;
+  seenDealIds.add(dealId);
+  // Prevent unbounded growth — keep at most 500 entries
+  if (seenDealIds.size > 500) {
+    const first = seenDealIds.values().next().value;
+    if (first !== undefined) seenDealIds.delete(first);
+  }
+  return false;
+}
+
 function makeDealListener(accountId: string) {
   // The MetaAPI SDK calls many methods on every registered listener and throws
   // if any of them is missing — aborting the entire synchronization packet.
@@ -110,6 +124,7 @@ function makeDealListener(accountId: string) {
     async onDealAdded(_instanceIndex: string, deal: any): Promise<void> {
       if (deal?.entryType !== "DEAL_ENTRY_IN") return;
       if (!deal?.symbol) return;
+      if (isDuplicate(String(deal.id ?? ""))) return;
       // MetaAPI streaming deal events expose the execution price as `deal.price`
       // (the tick price at fill time). `deal.openPrice` may be 0 or absent in
       // the streaming payload — always prefer whichever field is non-zero.
