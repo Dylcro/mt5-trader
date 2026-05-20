@@ -133,7 +133,7 @@ router.get("/", async (req: Request, res: Response) => {
   }
 });
 
-router.patch("/users", async (req: Request, res: Response) => {
+router.post("/users/update-name", async (req: Request, res: Response) => {
   if (!requireAdminKey(req, res)) return;
   const { email, fullName } = req.body ?? {};
   if (!email || !fullName) { res.status(400).json({ error: "email and fullName required" }); return; }
