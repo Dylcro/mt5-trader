@@ -1,5 +1,8 @@
 import express, { type Express, type Request, type Response } from "express";
 import cors from "cors";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
 import { clerkMiddleware } from "@clerk/express";
 import { publishableKeyFromHost } from "@clerk/shared/keys";
 import {
@@ -9,6 +12,9 @@ import {
 } from "./middlewares/clerkProxyMiddleware";
 import router from "./routes";
 import adminRouter from "./routes/admin";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app: Express = express();
 
@@ -98,5 +104,15 @@ app.get("/privacy", (_req: Request, res: Response) => {
 });
 
 app.use("/api", router);
+
+// ── PWA web app — served after all API routes so /api/* is never shadowed ──
+const webDist = path.join(__dirname, "../../../artifacts/mt5-trader/dist");
+if (fs.existsSync(webDist)) {
+  app.use(express.static(webDist));
+  // SPA fallback: any route not matched above (or not a static file) gets index.html
+  app.use((_req: Request, res: Response) => {
+    res.sendFile(path.join(webDist, "index.html"));
+  });
+}
 
 export default app;

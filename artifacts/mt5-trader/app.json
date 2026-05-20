@@ -36,13 +36,20 @@
       }
     },
     "web": {
-      "favicon": "./assets/images/icon.png"
+      "favicon": "./assets/images/icon.png",
+      "name": "XAUUSD Trader",
+      "shortName": "XAUUSD",
+      "description": "Gold trading via MetaTrader 5 with cascade ladder orders",
+      "themeColor": "#B8860B",
+      "backgroundColor": "#0A0A0A",
+      "display": "standalone",
+      "output": "static"
     },
     "plugins": [
       [
         "expo-router",
         {
-          "origin": "https://replit.com/"
+          "origin": "https://meta-trader-link.replit.app/"
         }
       ],
       "expo-font",
