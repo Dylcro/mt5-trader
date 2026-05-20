@@ -61,15 +61,10 @@ export default function SignInScreen() {
     if (!email.trim()) { setError("Please enter your email address."); return; }
     if (!password) { setError("Please enter a password."); return; }
 
-    // Clerk not ready yet (autofill race) — ask user to try once more
-    if (!isLoaded || !signIn) {
-      setError("Almost ready — please tap Sign In once more.");
-      return;
-    }
-
     setLoading(true);
     setError("");
     try {
+      if (!signIn) throw new Error("Auth not initialised — please refresh the page and try again.");
       const result = await signIn.create({ identifier: email.trim(), password });
 
       if (result.status === "complete") {
