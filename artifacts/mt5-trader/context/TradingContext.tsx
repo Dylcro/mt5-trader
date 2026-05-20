@@ -555,7 +555,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         msg?.toLowerCase().includes("not connected to broker") ||
         msg?.toLowerCase().includes("account is not connected");
 
-      const MAX_ATTEMPTS = 2;
+      // Market orders must NEVER be retried — the first submission may have already filled at
+      // the broker even if the response was lost in transit. Retrying would open a duplicate position.
+      // Only limit/stop orders (which create pending orders, not immediate fills) may be retried.
+      const isMarketOrder = params.limitPrice == null;
+      const MAX_ATTEMPTS = isMarketOrder ? 1 : 2;
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         console.log("[submitOrderRaw] →", actionType, "vol=" + String(params.volume), params.limitPrice != null ? "openPrice=" + String(params.limitPrice) : "market", "sl=" + String(params.stopLoss ?? "none"), attempt > 1 ? `(attempt ${attempt})` : "");
         const res = await fetch(`${API_BASE}/mt5/account/${accountId}/trade?region=${region}`, {
@@ -568,7 +572,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         if (res.ok && data.success !== false) {
           return { success: true, message: data.message ?? "Trade placed successfully", positionId: data.positionId, orderId: data.orderId };
         }
-        // Retry once on transient broker-not-ready errors with a short delay
+        // Retry once on transient broker-not-ready errors with a short delay (limit orders only)
         if (attempt < MAX_ATTEMPTS && isTransient(data.message)) {
           console.log("[submitOrderRaw] transient error — retrying in 500ms");
           await new Promise((r) => setTimeout(r, 500));
