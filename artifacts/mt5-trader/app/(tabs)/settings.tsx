@@ -485,7 +485,7 @@ export default function SettingsScreen() {
             <PillSelector
               label="Pips between orders"
               hint={`${(cs.pipsBetween * 0.10).toFixed(2)} price gap between each level`}
-              options={[5, 10, 15, 20]}
+              options={[10, 20, 30, 50, 75, 100, 150, 200]}
               value={cs.pipsBetween}
               onChange={(v) => updateSettings({ pipsBetween: v })}
             />
