@@ -43,6 +43,7 @@ function storageKeys(accountId: string) {
 interface CascadeSettingsContextValue {
   settings: CascadeSettings;
   updateSettings: (partial: Partial<CascadeSettings>) => void;
+  saveToServer: () => Promise<boolean>;
 }
 
 const CascadeSettingsContext = createContext<CascadeSettingsContextValue | null>(null);
@@ -129,14 +130,37 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         // autoCascadeEnabled is device-global — always written to the same key
         [GLOBAL_AUTO_CASCADE_KEY, String(next.autoCascadeEnabled)],
       ]);
-      void pushToServer(next, accountId);
       return next;
     });
   }, [accountId]);
 
+  // Explicit save to server — returns true on success, false on failure.
+  // Called by the Save Settings button so the user gets clear feedback.
+  const saveToServer = useCallback(async (): Promise<boolean> => {
+    if (!API_BASE) return false;
+    const url = accountId
+      ? `${API_BASE}/cascade-config?accountId=${encodeURIComponent(accountId)}`
+      : `${API_BASE}/cascade-config`;
+    try {
+      const res = await fetch(url, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          enabled: settings.autoCascadeEnabled,
+          numPositions: settings.numPositions,
+          pipsBetween: settings.pipsBetween,
+          slPips: settings.slPips,
+        }),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }, [accountId, settings]);
+
   return React.createElement(
     CascadeSettingsContext.Provider,
-    { value: { settings, updateSettings } },
+    { value: { settings, updateSettings, saveToServer } },
     children
   );
 }

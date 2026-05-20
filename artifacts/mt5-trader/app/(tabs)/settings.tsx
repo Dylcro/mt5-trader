@@ -202,7 +202,8 @@ function SliderSetting({
 export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
   const { credentials, status, errorMsg, accountInfo, connect, disconnect } = useTrading();
-  const { settings: cs, updateSettings } = useCascadeSettings();
+  const { settings: cs, updateSettings, saveToServer } = useCascadeSettings();
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const { hapticEnabled, setHapticEnabled } = useHapticSettings();
 
   const [login, setLogin] = useState(credentials.login);
@@ -570,6 +571,40 @@ export default function SettingsScreen() {
                 {`SL  ${(5058 - cs.slPips * 0.10).toFixed(2)}  ← all orders (${cs.slPips} pips from entry)`}
               </Text>
             </View>
+
+            <Pressable
+              style={({ pressed }) => [
+                styles.saveBtn,
+                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
+                saveState === "saving" && { opacity: 0.6 },
+              ]}
+              disabled={saveState === "saving"}
+              onPress={async () => {
+                setSaveState("saving");
+                void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                const ok = await saveToServer();
+                setSaveState(ok ? "saved" : "error");
+                if (ok) void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                else void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+                setTimeout(() => setSaveState("idle"), 3000);
+              }}
+            >
+              {saveState === "saving" ? (
+                <ActivityIndicator size="small" color="#000" />
+              ) : (
+                <Feather
+                  name={saveState === "saved" ? "check" : saveState === "error" ? "alert-circle" : "upload-cloud"}
+                  size={15}
+                  color={saveState === "error" ? C.sell : "#000"}
+                />
+              )}
+              <Text style={[styles.saveBtnText, saveState === "error" && { color: C.sell }]}>
+                {saveState === "saving" ? "Saving…"
+                  : saveState === "saved" ? "Saved to server"
+                  : saveState === "error" ? "Save failed — check connection"
+                  : "Save Settings to Server"}
+              </Text>
+            </Pressable>
           </View>
 
           {/* About */}
@@ -868,6 +903,21 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontFamily: "Inter_600SemiBold",
     color: C.sell,
+  },
+  saveBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    marginTop: 16,
+    borderRadius: 14,
+    paddingVertical: 14,
+    backgroundColor: C.gold,
+  },
+  saveBtnText: {
+    fontSize: 14,
+    fontFamily: "Inter_600SemiBold",
+    color: "#000",
   },
   cascadeCard: {
     backgroundColor: C.card,

@@ -25,3 +25,6 @@ BASE_PATH = "/"
 [services.production]
 build = ["pnpm", "--filter", "@workspace/mt5-trader", "run", "build"]
 run = ["pnpm", "--filter", "@workspace/mt5-trader", "run", "serve"]
+
+[services.production.env]
+EXPO_PUBLIC_API_URL = "https://meta-trader-link.replit.app/api"
