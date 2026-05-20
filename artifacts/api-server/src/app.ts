@@ -106,7 +106,7 @@ app.get("/privacy", (_req: Request, res: Response) => {
 app.use("/api", router);
 
 // ── PWA web app — served after all API routes so /api/* is never shadowed ──
-const webDist = path.join(__dirname, "../../../artifacts/mt5-trader/dist");
+const webDist = path.join(__dirname, "../public");
 if (fs.existsSync(webDist)) {
   app.use(express.static(webDist));
   // SPA fallback: any route not matched above (or not a static file) gets index.html
