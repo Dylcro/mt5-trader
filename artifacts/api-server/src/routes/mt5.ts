@@ -43,15 +43,19 @@ async function checkOwner(req: Request, res: Response, next: NextFunction): Prom
     const [row] = await db.select().from(storedAccountsTable)
       .where(eq(storedAccountsTable.userId, userId))
       .limit(1);
-    if (row) {
-      userAccountCache.set(userId, row.accountId); // repopulate cache
-      if (row.accountId !== accountId) { res.status(403).json({ error: "Forbidden" }); return; }
+    if (!row) {
+      // No bound account for this user — deny all account-scoped routes
+      res.status(403).json({ error: "No account bound to this user." }); return;
     }
-    // No row: user hasn't connected yet (allowed — connect will bind them)
+    userAccountCache.set(userId, row.accountId); // repopulate cache
+    if (row.accountId !== accountId) {
+      res.status(403).json({ error: "Forbidden" }); return;
+    }
     next();
-  } catch {
-    // DB error — fail open so legitimate users aren't blocked
-    next();
+  } catch (err) {
+    // DB error — fail closed, do not allow access
+    console.error("[checkOwner] DB error:", (err as Error).message);
+    res.status(503).json({ error: "Authorization check failed, please retry." });
   }
 }
 
