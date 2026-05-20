@@ -1,4 +1,5 @@
 import { Feather } from "@expo/vector-icons";
+import * as Haptics from "expo-haptics";
 import React, { useEffect, useRef } from "react";
 import { Animated, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 
@@ -16,6 +17,10 @@ export function CascadeToast() {
 
   useEffect(() => {
     if (!cascadeNotification) return;
+
+    if (Platform.OS !== "web") {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+    }
 
     if (timerRef.current) clearTimeout(timerRef.current);
 
