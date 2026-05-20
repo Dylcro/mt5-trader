@@ -1,6 +1,7 @@
-import { readFileSync, writeFileSync } from "fs";
 import { Router, type IRouter, type Request, type Response } from "express";
 import { createRequire } from "module";
+import { db, cascadeConfigTable } from "@workspace/db";
+import { eq } from "drizzle-orm";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
 // In dev (tsx/ESM) import.meta.url is the real file URL.
 // In production (esbuild CJS) build.ts injects a __importMetaUrl banner and
@@ -50,16 +51,52 @@ interface CascadeConfig {
 }
 
 const CASCADE_DEFAULTS: CascadeConfig = { enabled: false, numPositions: 3, pipsBetween: 50, slPips: 100 };
-const CASCADE_CONFIG_PATH = "/tmp/cascade-config.json";
 
 let cascadeConfig: CascadeConfig = { ...CASCADE_DEFAULTS };
-try {
-  cascadeConfig = { ...CASCADE_DEFAULTS, ...(JSON.parse(readFileSync(CASCADE_CONFIG_PATH, "utf-8")) as Partial<CascadeConfig>) };
-  console.log("[cascade-config] loaded:", JSON.stringify(cascadeConfig));
-} catch { /* no saved config — use defaults */ }
 
-function saveCascadeConfig(): void {
-  try { writeFileSync(CASCADE_CONFIG_PATH, JSON.stringify(cascadeConfig)); } catch {}
+// Exported so index.ts can await it before the server begins accepting requests,
+// eliminating the startup race where GET /cascade-config returns defaults.
+export async function loadCascadeConfig(): Promise<void> {
+  try {
+    const rows = await db.select().from(cascadeConfigTable).where(eq(cascadeConfigTable.id, 1)).limit(1);
+    if (rows.length > 0) {
+      const row = rows[0];
+      cascadeConfig = {
+        enabled:      row.enabled,
+        numPositions: row.numPositions,
+        pipsBetween:  row.pipsBetween,
+        slPips:       row.slPips,
+      };
+      console.log("[cascade-config] loaded from db:", JSON.stringify(cascadeConfig));
+    } else {
+      // Seed the singleton row with defaults so future upserts work correctly.
+      await db.insert(cascadeConfigTable).values({ id: 1, ...CASCADE_DEFAULTS }).onConflictDoNothing();
+      console.log("[cascade-config] seeded defaults into db");
+    }
+  } catch (err) {
+    console.warn("[cascade-config] failed to load from db, using defaults:", (err as Error).message);
+  }
+}
+
+// Returns true on success, false on DB failure.
+async function saveCascadeConfig(config: CascadeConfig): Promise<boolean> {
+  try {
+    await db.insert(cascadeConfigTable)
+      .values({ id: 1, ...config })
+      .onConflictDoUpdate({
+        target: cascadeConfigTable.id,
+        set: {
+          enabled:      config.enabled,
+          numPositions: config.numPositions,
+          pipsBetween:  config.pipsBetween,
+          slPips:       config.slPips,
+        },
+      });
+    return true;
+  } catch (err) {
+    console.error("[cascade-config] failed to save to db:", (err as Error).message);
+    return false;
+  }
 }
 
 const PIP = 0.10;
@@ -932,13 +969,21 @@ router.get("/cascade-config", (_req: Request, res: Response) => {
 // PUT /api/cascade-config
 // Body: { enabled?, numPositions?, pipsBetween?, slPips? }
 // Updates and persists cascade auto-trigger settings synced from the app.
-router.put("/cascade-config", (req: Request, res: Response) => {
+router.put("/cascade-config", async (req: Request, res: Response) => {
   const body = req.body as Partial<CascadeConfig>;
-  if (typeof body.enabled === "boolean")      cascadeConfig.enabled      = body.enabled;
-  if (typeof body.numPositions === "number")  cascadeConfig.numPositions = body.numPositions;
-  if (typeof body.pipsBetween === "number")   cascadeConfig.pipsBetween  = body.pipsBetween;
-  if (typeof body.slPips === "number")        cascadeConfig.slPips       = body.slPips;
-  saveCascadeConfig();
+  // Build the candidate config without mutating in-memory state yet.
+  const nextConfig: CascadeConfig = {
+    enabled:      typeof body.enabled      === "boolean" ? body.enabled      : cascadeConfig.enabled,
+    numPositions: typeof body.numPositions === "number"  ? body.numPositions : cascadeConfig.numPositions,
+    pipsBetween:  typeof body.pipsBetween  === "number"  ? body.pipsBetween  : cascadeConfig.pipsBetween,
+    slPips:       typeof body.slPips       === "number"  ? body.slPips       : cascadeConfig.slPips,
+  };
+  // Persist first — only commit to in-memory state when DB write succeeds.
+  const saved = await saveCascadeConfig(nextConfig);
+  if (!saved) {
+    return res.status(500).json({ error: "Failed to persist cascade config to database" });
+  }
+  cascadeConfig = nextConfig;
   console.log("[cascade-config] updated:", JSON.stringify(cascadeConfig));
   return res.json(cascadeConfig);
 });
