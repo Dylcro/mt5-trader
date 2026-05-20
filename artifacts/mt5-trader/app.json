@@ -52,10 +52,7 @@
       "reactCompiler": true
     },
     "extra": {
-      "privacyPolicyUrl": "https://meta-trader-link.replit.app/privacy",
-      "eas": {
-        "projectId": "PLACEHOLDER_EAS_PROJECT_ID"
-      }
+      "privacyPolicyUrl": "https://meta-trader-link.replit.app/privacy"
     }
   }
 }
