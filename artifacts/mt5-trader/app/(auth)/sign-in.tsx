@@ -1,4 +1,4 @@
-import { useSignIn } from "@clerk/expo";
+import { useSignIn, isClerkAPIResponseError } from "@clerk/expo";
 import { Link, useRouter } from "expo-router";
 import React, { useState } from "react";
 import {
@@ -22,48 +22,117 @@ const TEXT = "#F0EFE7";
 const MUTED = "#6E6E8A";
 const RED = "#FF4757";
 
+type Step = "credentials" | "code";
+
 export default function SignInScreen() {
-  const { signIn, errors, fetchStatus } = useSignIn();
+  const { signIn, setActive, isLoaded } = useSignIn();
   const router = useRouter();
   const insets = useSafeAreaInsets();
 
+  const [step, setStep] = useState<Step>("credentials");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [verifyCode, setVerifyCode] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
 
-  const handleSubmit = async () => {
-    const { error } = await signIn.password({ emailAddress: email, password });
-    if (error) return;
+  function clerkError(err: unknown): string {
+    if (isClerkAPIResponseError(err)) {
+      return err.errors[0]?.longMessage ?? err.errors[0]?.message ?? "Authentication failed";
+    }
+    if (err instanceof Error) return err.message;
+    return "Something went wrong. Please try again.";
+  }
 
-    if (signIn.status === "complete") {
-      await signIn.finalize({
-        navigate: ({ decorateUrl }) => {
-          const url = decorateUrl("/");
-          router.replace(url as never);
-        },
+  const handleSignIn = async () => {
+    if (!isLoaded) return;
+    setLoading(true);
+    setError("");
+    try {
+      const result = await signIn.create({
+        identifier: email.trim(),
+        password,
       });
-    } else if (signIn.status === "needs_client_trust") {
-      await signIn.mfa.sendEmailCode();
+
+      if (result.status === "complete") {
+        await setActive({ session: result.createdSessionId });
+        router.replace("/" as never);
+        return;
+      }
+
+      // Email code MFA required after password
+      if (result.status === "needs_first_factor") {
+        const emailFactor = result.supportedFirstFactors?.find(
+          (f) => f.strategy === "email_code"
+        );
+        if (emailFactor && "emailAddressId" in emailFactor) {
+          await signIn.prepareFirstFactor({
+            strategy: "email_code",
+            emailAddressId: emailFactor.emailAddressId,
+          });
+        }
+        setStep("code");
+        return;
+      }
+
+      setError("Unable to complete sign in. Please try again.");
+    } catch (err) {
+      setError(clerkError(err));
+    } finally {
+      setLoading(false);
     }
   };
 
-  const handleVerify = async () => {
-    await signIn.mfa.verifyEmailCode({ code: verifyCode });
-    if (signIn.status === "complete") {
-      await signIn.finalize({
-        navigate: ({ decorateUrl }) => {
-          const url = decorateUrl("/");
-          router.replace(url as never);
-        },
-      });
+  const handleResendCode = async () => {
+    if (!isLoaded) return;
+    setError("");
+    try {
+      const emailFactor = signIn.supportedFirstFactors?.find(
+        (f) => f.strategy === "email_code"
+      );
+      if (emailFactor && "emailAddressId" in emailFactor) {
+        await signIn.prepareFirstFactor({
+          strategy: "email_code",
+          emailAddressId: emailFactor.emailAddressId,
+        });
+      }
+    } catch (err) {
+      setError(clerkError(err));
     }
   };
 
-  const isLoading = fetchStatus === "fetching";
-  const canSubmit = email.trim() !== "" && password !== "" && !isLoading;
+  const handleVerifyCode = async () => {
+    if (!isLoaded) return;
+    setLoading(true);
+    setError("");
+    try {
+      const result = await signIn.attemptFirstFactor({
+        strategy: "email_code",
+        code: verifyCode.trim(),
+      });
 
-  if (signIn.status === "needs_client_trust") {
+      if (result.status === "complete") {
+        await setActive({ session: result.createdSessionId });
+        router.replace("/" as never);
+        return;
+      }
+
+      setError("Verification failed. Please try again.");
+    } catch (err) {
+      setError(clerkError(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleStartOver = () => {
+    setStep("credentials");
+    setVerifyCode("");
+    setError("");
+  };
+
+  if (step === "code") {
     return (
       <View style={[styles.container, { paddingTop: insets.top + 20 }]}>
         <View style={styles.card}>
@@ -71,6 +140,7 @@ export default function SignInScreen() {
           <Text style={styles.title}>Check your email</Text>
           <Text style={styles.subtitle}>Enter the code we sent to {email}</Text>
 
+          <Text style={styles.label}>Verification Code</Text>
           <TextInput
             style={styles.input}
             value={verifyCode}
@@ -80,21 +150,23 @@ export default function SignInScreen() {
             keyboardType="number-pad"
             autoFocus
           />
-          {errors.fields.code && <Text style={styles.error}>{errors.fields.code.message}</Text>}
+          {error ? <Text style={styles.error}>{error}</Text> : null}
 
           <Pressable
-            style={[styles.btn, isLoading && styles.btnDisabled]}
-            onPress={handleVerify}
-            disabled={isLoading}
+            style={[styles.btn, (loading || verifyCode.length < 4) && styles.btnDisabled]}
+            onPress={handleVerifyCode}
+            disabled={loading || verifyCode.length < 4}
           >
-            {isLoading ? <ActivityIndicator color="#000" /> : <Text style={styles.btnText}>Verify</Text>}
+            {loading
+              ? <ActivityIndicator color="#000" />
+              : <Text style={styles.btnText}>Verify</Text>}
           </Pressable>
 
-          <Pressable onPress={() => signIn.mfa.sendEmailCode()} style={styles.linkBtn}>
+          <Pressable onPress={handleResendCode} style={styles.linkBtn}>
             <Text style={styles.link}>Resend code</Text>
           </Pressable>
-          <Pressable onPress={() => signIn.reset()} style={styles.linkBtn}>
-            <Text style={styles.link}>Start over</Text>
+          <Pressable onPress={handleStartOver} style={styles.linkBtn}>
+            <Text style={styles.link}>Use a different email</Text>
           </Pressable>
         </View>
       </View>
@@ -126,7 +198,6 @@ export default function SignInScreen() {
             autoCapitalize="none"
             autoCorrect={false}
           />
-          {errors.fields.identifier && <Text style={styles.error}>{errors.fields.identifier.message}</Text>}
 
           <Text style={styles.label}>Password</Text>
           <View style={styles.pwWrap}>
@@ -143,14 +214,15 @@ export default function SignInScreen() {
               <Text style={{ color: MUTED, fontSize: 12 }}>{showPassword ? "HIDE" : "SHOW"}</Text>
             </Pressable>
           </View>
-          {errors.fields.password && <Text style={styles.error}>{errors.fields.password.message}</Text>}
+
+          {error ? <Text style={styles.error}>{error}</Text> : null}
 
           <Pressable
-            style={[styles.btn, !canSubmit && styles.btnDisabled]}
-            onPress={handleSubmit}
-            disabled={!canSubmit}
+            style={[styles.btn, (!email.trim() || !password || loading) && styles.btnDisabled]}
+            onPress={handleSignIn}
+            disabled={!email.trim() || !password || loading}
           >
-            {isLoading
+            {loading
               ? <ActivityIndicator color="#000" />
               : <Text style={styles.btnText}>Sign In</Text>}
           </Pressable>
@@ -201,7 +273,7 @@ const styles = StyleSheet.create({
   },
   pwWrap: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 4 },
   eyeBtn: { paddingHorizontal: 4 },
-  error: { color: RED, fontSize: 12, marginBottom: 6 },
+  error: { color: RED, fontSize: 12, marginBottom: 6, marginTop: 4 },
   btn: {
     backgroundColor: GOLD,
     borderRadius: 10,
