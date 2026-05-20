@@ -24,6 +24,7 @@ function formatDate(ms: number | null | undefined): string {
 }
 
 router.get("/admin", async (req: Request, res: Response) => {
+  // accessible at /api/admin?key=ADMIN_KEY
   if (!requireAdminKey(req, res)) return;
 
   try {
