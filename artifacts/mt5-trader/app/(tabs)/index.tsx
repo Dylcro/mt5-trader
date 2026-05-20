@@ -383,46 +383,34 @@ export default function TradeScreen() {
           const base = apiBaseRef.current;
           const rgn = regionRef.current;
 
-          // Build ID set starting from stored IDs
-          const idSet = new Set<string>(
-            (snapshot.limitOrderIds ?? []).filter(Boolean)
-          );
+          // Fetch ALL fresh pending orders and cancel every limit of matching direction.
+          // This is the most reliable approach — avoids fragile ID/price matching
+          // that can fail when REST placement doesn't echo back orderId or broker
+          // normalises prices.
+          const expectedType = snapshot.direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT";
+          const idSet = new Set<string>();
 
-          // Fetch FRESH pending orders directly — bypass TradingContext status guard
-          // and stale polled state (which can be up to 10s old)
           if (accId && base) {
             try {
               const res = await fetch(`${base}/mt5/account/${accId}/orders?region=${rgn}`);
               if (res.ok) {
                 const raw = await res.json();
-                // MetaAPI may return a plain array or { orders: [...] }
                 const freshOrders: Array<Record<string, unknown>> = Array.isArray(raw)
                   ? raw as Array<Record<string, unknown>>
                   : Array.isArray((raw as Record<string, unknown>).orders)
                     ? (raw as { orders: Array<Record<string, unknown>> }).orders
                     : [];
 
-                // Expected order type for this cascade direction
-                const expectedType = snapshot.direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT";
-
                 for (const ord of freshOrders) {
                   const ordId = String(ord.id ?? ord.orderId ?? "");
-                  const ordPrice = Number(ord.openPrice ?? 0);
                   const ordType = String(ord.type ?? "");
                   if (!ordId) continue;
-
-                  // Match by stored limitOrderIds
-                  if (idSet.has(ordId)) continue; // already in set
-
-                  // Match by price level (generous 0.1 pip tolerance = $0.01)
-                  // AND order type must match cascade direction
-                  const priceMatch = snapshot.limitPrices?.some((lp) => Math.abs(ordPrice - lp) < 0.05) ?? false;
-                  const typeMatch = ordType === expectedType || ordType.includes("LIMIT");
-                  if (priceMatch && typeMatch) {
+                  // Cancel all pending limits of matching direction
+                  if (ordType === expectedType || (ordType.includes("LIMIT") && ordType.includes(snapshot.direction === "buy" ? "BUY" : "SELL"))) {
                     idSet.add(ordId);
                   }
                 }
-                console.log(`[tp-watcher id=${snapshot.id}] fresh sweep: ${freshOrders.length} orders checked, ${idSet.size} to cancel`);
+                console.log(`[tp-watcher id=${snapshot.id}] fresh fetch: ${freshOrders.length} total orders, ${idSet.size} ${expectedType} to cancel`);
               } else {
                 console.log(`[tp-watcher id=${snapshot.id}] orders fetch failed: ${res.status}`);
               }
