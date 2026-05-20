@@ -699,12 +699,14 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
 
     // ── RECONNECT PATH: existing MetaAPI account ID stored on device ──────────
     if (existingId) {
-      // Ownership check: prevent a user from hijacking another user's account
+      // Fail-closed ownership check: only allow reconnect when the DB row exists
+      // AND is already bound to the current authenticated user.
+      // No row, null userId, or a different userId all return 403.
       const [storedRow] = await db.select().from(storedAccountsTable)
         .where(eq(storedAccountsTable.accountId, existingId))
         .limit(1);
-      if (storedRow?.userId && userId && storedRow.userId !== userId) {
-        return res.status(403).json({ error: "This account is linked to a different user." });
+      if (!storedRow || !storedRow.userId || storedRow.userId !== userId) {
+        return res.status(403).json({ error: "This account is not linked to your user. Please connect using your MT5 credentials." });
       }
 
       const acct = await getProvisioningAccount(token, existingId).catch(() => null);
