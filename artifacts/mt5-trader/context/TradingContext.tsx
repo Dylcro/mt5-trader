@@ -108,6 +108,11 @@ export interface CascadeOrderParams {
   volume: number;
   limitEntries: number[];
   stopLoss: number;
+  /** Per-limit stop-loss prices — index-matched to limitEntries.
+   *  Each limit's SL is slPips below its own price (not the entry price),
+   *  which avoids MT5 rejecting orders where the shared entry-anchored SL
+   *  would end up at or above the limit price. Falls back to stopLoss if absent. */
+  limitStopLosses?: number[];
   /** If set, skip the market order and use this position ID as the market leg */
   existingPositionId?: string;
 }
@@ -654,7 +659,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
                 direction: params.direction,
                 volume: params.volume,
                 limitPrice,
-                stopLoss: params.stopLoss,
+                stopLoss: params.limitStopLosses?.[i] ?? params.stopLoss,
                 comment: `Cascade ${i + 2}/${total}`,
               })
             )
@@ -682,7 +687,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
                 direction: params.direction,
                 volume: params.volume,
                 limitPrice,
-                stopLoss: params.stopLoss,
+                stopLoss: params.limitStopLosses?.[i] ?? params.stopLoss,
                 comment: `Cascade ${i + 2}/${total}`,
               })
             ),

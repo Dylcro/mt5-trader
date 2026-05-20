@@ -105,20 +105,29 @@ function buildCascadeLevels(
   marketPrice: number,
   direction: "buy" | "sell",
   config: CascadeConfig
-): { limitEntries: number[]; stopLoss: number } {
+): { limitEntries: number[]; stopLoss: number; limitStopLosses: number[] } {
   const step = config.pipsBetween * PIP;
   const slDist = config.slPips * PIP;
   const limitEntries: number[] = [];
+  const limitStopLosses: number[] = [];
   for (let i = 1; i < config.numPositions; i++) {
     const price = direction === "buy"
       ? parseFloat((marketPrice - i * step).toFixed(2))
       : parseFloat((marketPrice + i * step).toFixed(2));
     limitEntries.push(price);
+    // Each limit's SL is slPips below its own price (not the entry price).
+    // Anchoring SL to entry breaks MT5 validation when the limit is deeper
+    // than slPips from entry — the SL ends up at or above the limit price.
+    const limitSL = direction === "buy"
+      ? parseFloat((price - slDist).toFixed(2))
+      : parseFloat((price + slDist).toFixed(2));
+    limitStopLosses.push(limitSL);
   }
+  // Market-order SL stays anchored to entry price
   const stopLoss = direction === "buy"
     ? parseFloat((marketPrice - slDist).toFixed(2))
     : parseFloat((marketPrice + slDist).toFixed(2));
-  return { limitEntries, stopLoss };
+  return { limitEntries, stopLoss, limitStopLosses };
 }
 
 function getSdk(token: string): InstanceType<typeof MetaApi> {
@@ -191,7 +200,7 @@ function makeDealListener(accountId: string) {
             const direction: "buy" | "sell" = evt.type === "DEAL_TYPE_BUY" ? "buy" : "sell";
             const levels = buildCascadeLevels(evt.openPrice, direction, cascadeConfig);
             const total = 1 + levels.limitEntries.length;
-            console.log(`[auto-cascade] posId=${evt.positionId} dir=${direction} price=${evt.openPrice} limits=[${levels.limitEntries.join(",")}] sl=${levels.stopLoss}`);
+            console.log(`[auto-cascade] posId=${evt.positionId} dir=${direction} price=${evt.openPrice} limits=[${levels.limitEntries.join(",")}] limitSLs=[${levels.limitStopLosses.join(",")}]`);
             const conn = activeConnections.get(accountId);
             const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
             const token = getToken();
@@ -203,7 +212,7 @@ function makeDealListener(accountId: string) {
                   symbol: "XAUUSD",
                   volume: evt.volume,
                   openPrice: limitPrice,
-                  stopLoss: levels.stopLoss,
+                  stopLoss: levels.limitStopLosses[i],
                   comment: `Cascade ${i + 2}/${total}`,
                 };
                 try {
