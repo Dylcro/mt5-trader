@@ -288,6 +288,29 @@ function markCascaded(accountId: string, positionId: string): void {
   }
 }
 
+// ── Rapid-trade dedup guard (Layer 6) ────────────────────────────────────────
+// If two separate DEAL_ENTRY_IN events arrive for the same account within
+// RAPID_CASCADE_WINDOW_MS at nearly the same price (within RAPID_PRICE_TOLERANCE),
+// the second is almost certainly a double-click / double-tap in MT5 rather than
+// an intentional separate position — skip auto-cascading it.
+const RAPID_CASCADE_WINDOW_MS   = 4_000;  // 4 seconds between cascades per account
+const RAPID_PRICE_TOLERANCE     = 0.5;    // XAUUSD points — tighter than normal spread
+
+interface LastCascadeInfo { time: number; price: number; }
+const lastCascadeByAccount = new Map<string, LastCascadeInfo>();
+
+function isRapidDuplicate(accountId: string, price: number): boolean {
+  const prev = lastCascadeByAccount.get(accountId);
+  if (!prev) return false;
+  const ageMs   = Date.now() - prev.time;
+  const priceDiff = Math.abs(price - prev.price);
+  return ageMs < RAPID_CASCADE_WINDOW_MS && priceDiff < RAPID_PRICE_TOLERANCE;
+}
+
+function recordCascade(accountId: string, price: number): void {
+  lastCascadeByAccount.set(accountId, { time: Date.now(), price });
+}
+
 // Tracks which accounts have completed the initial MetaAPI synchronisation.
 // onDealAdded fires for HISTORICAL deals during sync replay — we must NOT
 // auto-cascade those. Only deals that arrive after onSynchronized are live.
@@ -357,15 +380,22 @@ function makeDealListener(accountId: string) {
         markCascaded(accountId, evt.positionId);
         console.log(`[auto-cascade] SKIP posId=${evt.positionId} — in-flight app cascade (race guard)`);
       }
+      // Layer 5: comment identifies this as an app-placed trade (broker may strip comment, so this
+      // is a best-effort check — Layer 4 and Layer 6 handle the cases where comment is absent).
+      else if ((evt.comment ?? "").startsWith("Cascade") || evt.comment === "XAUUSD Trader App") {
+        console.log(`[auto-cascade] SKIP posId=${evt.positionId} — app-placed trade (comment="${evt.comment ?? ""}")`);
+        markCascaded(accountId, evt.positionId);
+      }
+      // Layer 6: rapid-trade dedup — two deals at nearly the same price within a few seconds
+      // almost certainly means a double-click / double-tap in MT5 rather than a new position.
+      else if (isRapidDuplicate(accountId, evt.openPrice)) {
+        markCascaded(accountId, evt.positionId);
+        console.log(`[auto-cascade] SKIP posId=${evt.positionId} price=${evt.openPrice} — rapid duplicate (Layer 6)`);
+      }
       else {
-        const comment = evt.comment ?? "";
-        const isFromApp = comment.startsWith("Cascade") || comment === "XAUUSD Trader App";
-        if (isFromApp) {
-          console.log(`[auto-cascade] SKIP posId=${evt.positionId} — app-placed trade (comment="${comment}")`);
-          markCascaded(accountId, evt.positionId);
-        } else {
-          markCascaded(accountId, evt.positionId);
-          void (async () => {
+        markCascaded(accountId, evt.positionId);
+        recordCascade(accountId, evt.openPrice);
+        void (async () => {
             const direction: "buy" | "sell" = evt.type === "DEAL_TYPE_BUY" ? "buy" : "sell";
             const levels = buildCascadeLevels(evt.openPrice, direction, acctCascadeCfg);
             const total = 1 + levels.limitEntries.length;
@@ -420,7 +450,6 @@ function makeDealListener(accountId: string) {
               console.log(`[auto-cascade] stored synthetic notification event dealId=${syntheticEvt.dealId} autoCascadeCount=${placed}`);
             }
           })();
-        }
       }
     },
   };

@@ -173,6 +173,13 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Privacy policy — required by App Store and Google Play for financial apps.
+  if (pathname === "/privacy") {
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Privacy Policy — XAUUSD Trader</title><style>body{background:#0A0A0F;color:#F0EFE7;font-family:-apple-system,sans-serif;max-width:680px;margin:0 auto;padding:40px 24px 80px;line-height:1.7}h1{color:#C9A84C;font-size:1.6rem;margin-bottom:4px}h2{color:#C9A84C;font-size:1.1rem;margin-top:2rem}p,li{color:#C0BFB7;font-size:0.95rem}a{color:#C9A84C}hr{border:none;border-top:1px solid #1E1E2E;margin:2rem 0}</style></head><body><h1>Privacy Policy</h1><p style="color:#6E6E8A;font-size:0.85rem">Last updated: May 2026</p><hr><h2>What we collect</h2><p>XAUUSD Trader collects only what is necessary to operate the service:</p><ul><li>Your email address and hashed password for authentication (managed by Clerk).</li><li>Your MetaTrader 5 account credentials (login, password, server), stored encrypted and used solely to connect to your broker via MetaAPI.</li><li>Basic usage logs (API request metadata) for debugging and security purposes. These logs do not contain trade content.</li></ul><h2>What we do NOT collect</h2><ul><li>We do not sell, share, or rent your personal data to any third party.</li><li>We do not use your data for advertising.</li><li>We do not store trade history or financial data beyond what MetaTrader 5 and MetaAPI retain on their own infrastructure.</li></ul><h2>Third-party services</h2><p>The app uses the following third-party services, each with their own privacy policy:</p><ul><li><a href="https://clerk.com/privacy" target="_blank">Clerk</a> — authentication</li><li><a href="https://metaapi.cloud/privacy-policy" target="_blank">MetaAPI</a> — MetaTrader 5 connectivity</li></ul><h2>Data retention</h2><p>You may delete your account at any time by contacting support. Upon deletion, all stored credentials and account data are removed within 30 days.</p><h2>Contact</h2><p>For privacy questions, contact us at the support address listed in the App Store listing.</p></body></html>`);
+    return;
+  }
+
   // Regular browser — serve the Expo web PWA
   if (hasWebBuild) {
     return serveWebFile(pathname, res);

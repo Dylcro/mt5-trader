@@ -60,7 +60,11 @@
       "reactCompiler": true
     },
     "extra": {
-      "privacyPolicyUrl": "https://meta-trader-link.replit.app/privacy"
-    }
+      "privacyPolicyUrl": "https://meta-trader-link.replit.app/privacy",
+      "eas": {
+        "projectId": "REPLACE_WITH_EAS_PROJECT_ID"
+      }
+    },
+    "owner": "REPLACE_WITH_EXPO_ACCOUNT_USERNAME"
   }
 }
