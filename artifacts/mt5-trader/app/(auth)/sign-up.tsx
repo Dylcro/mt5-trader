@@ -25,7 +25,7 @@ const RED = "#FF4757";
 type Step = "form" | "code";
 
 export default function SignUpScreen() {
-  const { signUp, setActive, isLoaded } = useSignUp();
+  const { signUp, setActive } = useSignUp();
   const router = useRouter();
   const insets = useSafeAreaInsets();
 
@@ -46,7 +46,13 @@ export default function SignUpScreen() {
   }
 
   const handleSignUp = async () => {
-    if (!isLoaded) return;
+    if (!signUp) {
+      setError("Auth is still initialising — please wait a moment and try again.");
+      return;
+    }
+    if (!email.trim()) { setError("Please enter your email address."); return; }
+    if (!password) { setError("Please enter a password."); return; }
+
     setLoading(true);
     setError("");
     try {
@@ -65,7 +71,7 @@ export default function SignUpScreen() {
   };
 
   const handleResendCode = async () => {
-    if (!isLoaded) return;
+    if (!signUp) return;
     setError("");
     try {
       await signUp.prepareEmailAddressVerification({ strategy: "email_code" });
@@ -75,7 +81,7 @@ export default function SignUpScreen() {
   };
 
   const handleVerifyCode = async () => {
-    if (!isLoaded) return;
+    if (!signUp || !setActive) return;
     setLoading(true);
     setError("");
     try {
@@ -189,9 +195,9 @@ export default function SignUpScreen() {
           {error ? <Text style={styles.error}>{error}</Text> : null}
 
           <Pressable
-            style={[styles.btn, (!email.trim() || !password || loading) && styles.btnDisabled]}
+            style={[styles.btn, loading && styles.btnDisabled]}
             onPress={handleSignUp}
-            disabled={!email.trim() || !password || loading}
+            disabled={loading}
           >
             {loading
               ? <ActivityIndicator color="#000" />

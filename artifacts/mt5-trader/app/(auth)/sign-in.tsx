@@ -25,7 +25,7 @@ const RED = "#FF4757";
 type Step = "credentials" | "code";
 
 export default function SignInScreen() {
-  const { signIn, setActive, isLoaded } = useSignIn();
+  const { signIn, setActive } = useSignIn();
   const router = useRouter();
   const insets = useSafeAreaInsets();
 
@@ -46,7 +46,13 @@ export default function SignInScreen() {
   }
 
   const handleSignIn = async () => {
-    if (!isLoaded) return;
+    if (!signIn) {
+      setError("Auth is still initialising — please wait a moment and try again.");
+      return;
+    }
+    if (!email.trim()) { setError("Please enter your email address."); return; }
+    if (!password) { setError("Please enter a password."); return; }
+
     setLoading(true);
     setError("");
     try {
@@ -56,7 +62,7 @@ export default function SignInScreen() {
       });
 
       if (result.status === "complete") {
-        await setActive({ session: result.createdSessionId });
+        await setActive!({ session: result.createdSessionId });
         router.replace("/" as never);
         return;
       }
@@ -85,7 +91,7 @@ export default function SignInScreen() {
   };
 
   const handleResendCode = async () => {
-    if (!isLoaded) return;
+    if (!signIn) return;
     setError("");
     try {
       const emailFactor = signIn.supportedFirstFactors?.find(
@@ -103,7 +109,7 @@ export default function SignInScreen() {
   };
 
   const handleVerifyCode = async () => {
-    if (!isLoaded) return;
+    if (!signIn || !setActive) return;
     setLoading(true);
     setError("");
     try {
@@ -218,9 +224,9 @@ export default function SignInScreen() {
           {error ? <Text style={styles.error}>{error}</Text> : null}
 
           <Pressable
-            style={[styles.btn, (!email.trim() || !password || loading) && styles.btnDisabled]}
+            style={[styles.btn, loading && styles.btnDisabled]}
             onPress={handleSignIn}
-            disabled={!email.trim() || !password || loading}
+            disabled={loading}
           >
             {loading
               ? <ActivityIndicator color="#000" />
