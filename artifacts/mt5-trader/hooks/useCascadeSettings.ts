@@ -16,12 +16,14 @@ export interface CascadeSettings {
 
 const DEFAULTS: CascadeSettings = {
   numPositions: 3,
-  pipsBetween: 50,
+  pipsBetween: 10,
   slPips: 100,
   takeProfitEnabled: false,
   takeProfitPips: 30,
   autoCascadeEnabled: false,
 };
+
+const VALID_PIPS_BETWEEN = [5, 10, 15, 20];
 
 function storageKeys(accountId: string) {
   const prefix = accountId ? `cascade_${accountId}_` : "cascade_";
@@ -72,9 +74,11 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
     // Load from AsyncStorage first for instant display, then reconcile with server
     AsyncStorage.multiGet(Object.values(keys)).then((pairs) => {
       const [num, between, sl, tpEnabled, tpPips, autoEnabled] = pairs.map((p) => p[1]);
+      const storedPips = between ? parseFloat(between) : DEFAULTS.pipsBetween;
       const local: CascadeSettings = {
         numPositions: num ? parseFloat(num) : DEFAULTS.numPositions,
-        pipsBetween: between ? parseFloat(between) : DEFAULTS.pipsBetween,
+        // Migrate: if stored value is not one of the valid pill options (e.g. old default of 50), reset to 10
+        pipsBetween: VALID_PIPS_BETWEEN.includes(storedPips) ? storedPips : DEFAULTS.pipsBetween,
         slPips: sl ? parseFloat(sl) : DEFAULTS.slPips,
         takeProfitEnabled: tpEnabled === "true",
         takeProfitPips: tpPips ? parseFloat(tpPips) : DEFAULTS.takeProfitPips,

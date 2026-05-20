@@ -51,7 +51,7 @@ interface CascadeConfig {
   slPips: number;
 }
 
-const CASCADE_DEFAULTS: CascadeConfig = { enabled: false, numPositions: 3, pipsBetween: 50, slPips: 100 };
+const CASCADE_DEFAULTS: CascadeConfig = { enabled: false, numPositions: 3, pipsBetween: 10, slPips: 100 };
 
 // In-memory cache: accountId (or "" for global) → config.
 const cascadeConfigs = new Map<string, CascadeConfig>();

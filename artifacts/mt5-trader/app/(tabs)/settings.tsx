@@ -550,6 +550,15 @@ export default function SettingsScreen() {
               </View>
             </View>
 
+            {cs.numPositions > 1 && cs.slPips <= (cs.numPositions - 1) * cs.pipsBetween && (
+              <View style={styles.cascadeWarningBox}>
+                <Feather name="alert-triangle" size={14} color="#f59e0b" />
+                <Text style={styles.cascadeWarningText}>
+                  {`SL (${cs.slPips} pips) is too tight — limit ${Math.ceil(cs.slPips / cs.pipsBetween) + 1}+ will be rejected by MT5. Increase SL to at least ${(cs.numPositions - 1) * cs.pipsBetween + 5} pips, or reduce pips between orders.`}
+                </Text>
+              </View>
+            )}
+
             <View style={styles.cascadePreviewBox}>
               <Text style={styles.cascadePreviewTitle}>Preview with current settings (buy example)</Text>
               <Text style={styles.cascadePreviewText}>
@@ -963,6 +972,17 @@ const styles = StyleSheet.create({
   pillTextActive: {
     color: "#000",
   },
+  cascadeWarningBox: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 8,
+    backgroundColor: "rgba(245,158,11,0.10)",
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "rgba(245,158,11,0.35)",
+    padding: 12,
+  },
+  cascadeWarningText: { flex: 1, fontSize: 12, fontFamily: "Inter_400Regular", color: "#f59e0b", lineHeight: 18 },
   cascadePreviewBox: {
     backgroundColor: C.surface,
     borderRadius: 12,
