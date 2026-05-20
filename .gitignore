@@ -47,3 +47,6 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# MetaAPI SDK runtime caches — contain trading history and account identifiers
+.metaapi/

@@ -1,0 +1,7 @@
+# MetaAPI SDK runtime caches — contain trading history and account identifiers,
+# must never be committed to version control.
+.metaapi/
+
+# Build artifacts
+dist/
+node_modules/
