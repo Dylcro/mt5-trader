@@ -250,10 +250,10 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const reconnectSaved = async (savedId: string) => {
     setStatus("connecting");
     try {
-      // Retry up to 3 times — on first app launch the API server may still be warming up
+      // Retry up to 8 times — autoscale cold-starts can take 20-30 s before serving JSON
       let res: Response | null = null;
       let data: ({ status?: string; error?: string; accountId?: string; region?: string } & Partial<AccountInfo>) | null = null;
-      for (let attempt = 1; attempt <= 3; attempt++) {
+      for (let attempt = 1; attempt <= 8; attempt++) {
         try {
           res = await authFetch(`${API_BASE}/mt5/connect`, {
             method: "POST",
@@ -264,9 +264,10 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           break; // success — exit retry loop
         } catch (err) {
           const msg = err instanceof Error ? err.message : "";
-          if (attempt < 3 && msg.includes("not ready")) {
-            console.warn(`[reconnect] attempt ${attempt} failed (server not ready) — retrying in 2s`);
-            await new Promise((r) => setTimeout(r, 2000));
+          const isTransient = msg.includes("not ready") || msg.includes("Unexpected server");
+          if (attempt < 8 && isTransient) {
+            console.warn(`[reconnect] attempt ${attempt} failed (${msg}) — retrying in 4s`);
+            await new Promise((r) => setTimeout(r, 4000));
           } else {
             throw err;
           }
@@ -468,8 +469,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         let data: ({
           status?: string; error?: string; accountId?: string; region?: string; retryAfterMs?: number;
         } & Partial<AccountInfo>) | null = null;
-        // Retry up to 3 times on transient "not ready" errors (server still warming up)
-        for (let attempt = 1; attempt <= 3; attempt++) {
+        // Retry up to 8 times — autoscale cold-starts can take 20-30 s before serving JSON
+        for (let attempt = 1; attempt <= 8; attempt++) {
           try {
             res = await authFetch(connectUrl, {
               method: "POST",
@@ -486,15 +487,16 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
             break; // success
           } catch (err) {
             const msg = err instanceof Error ? err.message : "";
-            if (attempt < 3 && (msg.includes("not ready") || msg.includes("Unexpected server"))) {
-              console.warn(`[connect] attempt ${attempt} failed (${msg}) — retrying in 2s`);
-              await new Promise((r) => setTimeout(r, 2000));
+            const isTransient = msg.includes("not ready") || msg.includes("Unexpected server");
+            if (attempt < 8 && isTransient) {
+              console.warn(`[connect] attempt ${attempt} failed (${msg}) — retrying in 4s`);
+              await new Promise((r) => setTimeout(r, 4000));
             } else {
               throw err;
             }
           }
         }
-        if (!res || !data) throw new Error("Cannot reach server after 3 attempts. Check your connection.");
+        if (!res || !data) throw new Error("Cannot reach server after 8 attempts. Check your connection.");
 
         if (!res.ok || data.error) throw new Error(data.error ?? "Connection failed");
 
