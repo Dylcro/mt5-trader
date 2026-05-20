@@ -275,9 +275,7 @@ export default function SignInScreen() {
           >
             {loading
               ? <ActivityIndicator color="#000" />
-              : !isLoaded
-                ? <Text style={styles.btnText}>Connecting…</Text>
-                : <Text style={styles.btnText}>Sign In</Text>}
+              : <Text style={styles.btnText}>Sign In</Text>}
           </Pressable>
 
           <View style={styles.footer}>
