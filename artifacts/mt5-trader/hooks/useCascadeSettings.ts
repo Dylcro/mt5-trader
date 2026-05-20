@@ -73,23 +73,30 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
   const [settings, setSettings] = useState<CascadeSettings>(DEFAULTS);
 
   useEffect(() => {
-    const keys = storageKeys(accountId);
-    // Load per-account keys + global autoCascadeEnabled key together
-    const allKeys = [...Object.values(keys), GLOBAL_AUTO_CASCADE_KEY];
-    AsyncStorage.multiGet(allKeys).then((pairs) => {
-      const [num, between, sl, tpEnabled, tpPips, autoEnabled] = pairs.map((p) => p[1]);
-      const storedPips = between ? parseFloat(between) : DEFAULTS.pipsBetween;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const keys = storageKeys(accountId);
+        // Fetch per-account keys + global autoCascadeEnabled in one call
+        const allKeys = [...Object.values(keys), GLOBAL_AUTO_CASCADE_KEY];
+        const pairs = await AsyncStorage.multiGet(allKeys);
+        const [num, between, sl, tpEnabled, tpPips, globalAutoEnabled] = pairs.map((p) => p[1]);
 
-      // Also migrate the old per-account auto_enabled key if the global key is not yet set
-      // so existing users don't lose their toggle state after this update.
-      const legacyAutoKey = accountId ? `cascade_${accountId}_auto_enabled` : "cascade_auto_enabled";
-      const resolveAutoEnabled = async () => {
-        if (autoEnabled !== null) return autoEnabled === "true";
-        const [[, legacy]] = await AsyncStorage.multiGet([legacyAutoKey]);
-        return legacy === "true";
-      };
+        // Resolve autoCascadeEnabled: prefer global key, fall back to legacy per-account key
+        let autoCascadeEnabled = DEFAULTS.autoCascadeEnabled;
+        if (globalAutoEnabled !== null) {
+          autoCascadeEnabled = globalAutoEnabled === "true";
+        } else {
+          // Migration: read old per-account key once, then write to global key
+          const legacyKey = accountId ? `cascade_${accountId}_auto_enabled` : "cascade_auto_enabled";
+          const [[, legacy]] = await AsyncStorage.multiGet([legacyKey]);
+          autoCascadeEnabled = legacy === "true";
+          await AsyncStorage.setItem(GLOBAL_AUTO_CASCADE_KEY, String(autoCascadeEnabled));
+        }
 
-      void resolveAutoEnabled().then((autoCascadeEnabled) => {
+        if (cancelled) return;
+
+        const storedPips = between ? parseFloat(between) : DEFAULTS.pipsBetween;
         const local: CascadeSettings = {
           numPositions: num ? parseFloat(num) : DEFAULTS.numPositions,
           // Migrate: if stored value is not one of the valid pill options (e.g. old default of 50), reset to 10
@@ -100,10 +107,13 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
           autoCascadeEnabled,
         };
         setSettings(local);
-        // Push local settings to server so the server always has the latest config
         void pushToServer(local, accountId);
-      });
-    });
+      } catch (e) {
+        console.warn("[CascadeSettings] failed to load from storage:", e);
+      }
+    };
+    void load();
+    return () => { cancelled = true; };
   }, [accountId]);
 
   const updateSettings = useCallback((partial: Partial<CascadeSettings>) => {
