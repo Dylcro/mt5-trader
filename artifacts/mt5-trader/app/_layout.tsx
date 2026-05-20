@@ -17,6 +17,7 @@ import { CascadeToast } from "@/components/CascadeToast";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { TradingProvider } from "@/context/TradingContext";
 import { CascadeSettingsProvider } from "@/hooks/useCascadeSettings";
+import { HapticSettingsProvider } from "@/hooks/useHapticSettings";
 
 SplashScreen.preventAutoHideAsync();
 
@@ -53,10 +54,12 @@ export default function RootLayout() {
           <GestureHandlerRootView style={{ flex: 1 }}>
             <KeyboardProvider>
               <TradingProvider>
-                <CascadeSettingsProvider>
-                  <RootLayoutNav />
-                  <CascadeToast />
-                </CascadeSettingsProvider>
+                <HapticSettingsProvider>
+                  <CascadeSettingsProvider>
+                    <RootLayoutNav />
+                    <CascadeToast />
+                  </CascadeSettingsProvider>
+                </HapticSettingsProvider>
               </TradingProvider>
             </KeyboardProvider>
           </GestureHandlerRootView>

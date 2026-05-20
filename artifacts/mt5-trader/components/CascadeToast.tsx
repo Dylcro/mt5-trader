@@ -5,12 +5,14 @@ import { Animated, Platform, Pressable, StyleSheet, Text, View } from "react-nat
 
 import Colors from "@/constants/colors";
 import { useTrading } from "@/context/TradingContext";
+import { useHapticSettings } from "@/hooks/useHapticSettings";
 
 const C = Colors.dark;
 const AUTO_DISMISS_MS = 5000;
 
 export function CascadeToast() {
   const { cascadeNotification, clearCascadeNotification } = useTrading();
+  const { hapticEnabled } = useHapticSettings();
   const translateY = useRef(new Animated.Value(-100)).current;
   const opacity = useRef(new Animated.Value(0)).current;
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -18,7 +20,7 @@ export function CascadeToast() {
   useEffect(() => {
     if (!cascadeNotification) return;
 
-    if (Platform.OS !== "web") {
+    if (Platform.OS !== "web" && hapticEnabled) {
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
     }
 

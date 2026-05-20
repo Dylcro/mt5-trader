@@ -19,6 +19,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Colors from "@/constants/colors";
 import { useTrading } from "@/context/TradingContext";
 import { useCascadeSettings } from "@/hooks/useCascadeSettings";
+import { useHapticSettings } from "@/hooks/useHapticSettings";
 
 const C = Colors.dark;
 
@@ -202,6 +203,7 @@ export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
   const { credentials, status, errorMsg, accountInfo, connect, disconnect } = useTrading();
   const { settings: cs, updateSettings } = useCascadeSettings();
+  const { hapticEnabled, setHapticEnabled } = useHapticSettings();
 
   const [login, setLogin] = useState(credentials.login);
   const [password, setPassword] = useState("");
@@ -458,6 +460,31 @@ export default function SettingsScreen() {
               <Text style={[styles.disconnectText, { color: C.textSecondary }]}>Cancel Connection</Text>
             </Pressable>
           )}
+
+          {/* Preferences */}
+          <View style={styles.cascadeCard}>
+            <View style={styles.cascadeCardHeader}>
+              <Feather name="sliders" size={16} color={C.gold} />
+              <Text style={styles.cascadeCardTitle}>Preferences</Text>
+            </View>
+
+            <View style={styles.settingRow}>
+              <Switch
+                value={hapticEnabled}
+                onValueChange={(v) => {
+                  setHapticEnabled(v);
+                }}
+                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
+                thumbColor={hapticEnabled ? C.gold : C.textMuted}
+              />
+              <View style={{ marginLeft: 10, flex: 1 }}>
+                <Text style={styles.settingLabel}>Haptic feedback</Text>
+                <Text style={styles.settingHint}>
+                  Vibrate when a cascade toast notification appears.
+                </Text>
+              </View>
+            </View>
+          </View>
 
           {/* Cascade Order Settings — always visible */}
           <View style={styles.cascadeCard}>
