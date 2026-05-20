@@ -124,31 +124,22 @@ export function buildCascadeLevels(
   marketPrice: number,
   direction: "buy" | "sell",
   settings: CascadeSettings
-): { limitEntries: number[]; stopLoss: number; limitStopLosses: number[] } {
+): { limitEntries: number[]; stopLoss: number } {
   const { numPositions, pipsBetween, slPips } = settings;
   const step = pipsBetween * PIP;
   const slDist = slPips * PIP;
 
   const limitEntries: number[] = [];
-  const limitStopLosses: number[] = [];
   for (let i = 1; i < numPositions; i++) {
     const price = direction === "buy"
       ? parseFloat((marketPrice - i * step).toFixed(2))
       : parseFloat((marketPrice + i * step).toFixed(2));
     limitEntries.push(price);
-    // Each limit's SL is slPips below its own price (not the entry price).
-    // Anchoring to entry breaks MT5 validation for deeper limits where
-    // the shared SL ends up at or above the limit price.
-    const limitSL = direction === "buy"
-      ? parseFloat((price - slDist).toFixed(2))
-      : parseFloat((price + slDist).toFixed(2));
-    limitStopLosses.push(limitSL);
   }
 
-  // Market-order SL stays anchored to entry price
   const stopLoss = direction === "buy"
     ? parseFloat((marketPrice - slDist).toFixed(2))
     : parseFloat((marketPrice + slDist).toFixed(2));
 
-  return { limitEntries, stopLoss, limitStopLosses };
+  return { limitEntries, stopLoss };
 }
