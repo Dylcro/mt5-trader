@@ -69,6 +69,11 @@ async function checkOwner(req: Request, res: Response, next: NextFunction): Prom
   }
 }
 
+// Admin-key-protected endpoint — registered BEFORE requireAuth so it does
+// not require a JWT (it has its own x-admin-key check). The handler is a
+// hoisted async function declared further down in this file.
+router.post("/mt5/admin/migrate-region", (req, res) => { void migrateRegionHandler(req, res); });
+
 router.use(requireAuth);
 
 // ── MetaAPI Streaming Manager ────────────────────────────────────────────────
@@ -1461,7 +1466,7 @@ const migrationLocks = new Set<string>();
 // bad credentials), the old account is gone — admin must call this endpoint
 // again with the same payload. The retry will find no existing account and
 // fall through to the create path, restoring the userId binding.
-router.post("/mt5/admin/migrate-region", async (req: Request, res: Response) => {
+async function migrateRegionHandler(req: Request, res: Response): Promise<void> {
   // Fail-closed: require ADMIN_KEY to be configured AND match. No default.
   const ADMIN_KEY = process.env["ADMIN_KEY"];
   if (!ADMIN_KEY) {
@@ -1633,7 +1638,7 @@ router.post("/mt5/admin/migrate-region", async (req: Request, res: Response) => 
   } finally {
     migrationLocks.delete(lockKey);
   }
-});
+}
 
 // POST /api/mt5/account/:accountId/disconnect
 router.post("/mt5/account/:accountId/disconnect", checkOwner, async (req: Request, res: Response) => {
