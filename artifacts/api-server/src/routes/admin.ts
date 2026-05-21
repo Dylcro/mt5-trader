@@ -1,4 +1,5 @@
 import { Router, type IRouter, type Request, type Response } from "express";
+import bcrypt from "bcryptjs";
 import { db, storedAccountsTable, supportTicketsTable, usersTable } from "@workspace/db";
 import { desc, eq } from "drizzle-orm";
 
@@ -130,6 +131,30 @@ router.get("/", async (req: Request, res: Response) => {
   } catch (err) {
     console.error("[admin] error:", (err as Error).message);
     res.status(500).send("Internal server error");
+  }
+});
+
+router.post("/users/reset-password", async (req: Request, res: Response) => {
+  if (!requireAdminKey(req, res)) return;
+  const { email, newPassword } = req.body ?? {};
+  if (!email || typeof email !== "string" || !email.includes("@")) {
+    res.status(400).json({ error: "A valid email is required." });
+    return;
+  }
+  if (!newPassword || typeof newPassword !== "string" || newPassword.length < 8) {
+    res.status(400).json({ error: "New password must be at least 8 characters." });
+    return;
+  }
+  try {
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+    const [updated] = await db.update(usersTable)
+      .set({ passwordHash })
+      .where(eq(usersTable.email, email.toLowerCase().trim()))
+      .returning({ id: usersTable.id, email: usersTable.email });
+    if (!updated) { res.status(404).json({ error: "User not found." }); return; }
+    res.json({ ok: true, user: updated, message: "Password reset. Share the new password with the user securely." });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
   }
 });
 

@@ -16,6 +16,7 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import Colors from "@/constants/colors";
+import { useAuth } from "@/context/AuthContext";
 
 const C = Colors.dark;
 const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "";
@@ -25,6 +26,7 @@ type SubmitState = "idle" | "sending" | "sent" | "error";
 export default function SupportScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const { getToken } = useAuth();
 
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -46,9 +48,19 @@ export default function SupportScreen() {
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
 
     try {
+      const token = await getToken();
+      if (!token) {
+        setErrorMsg("Please sign in again to send a support request.");
+        setSubmitState("error");
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+        return;
+      }
       const res = await fetch(`${API_URL}/support`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify({
           name: name.trim(),
           email: email.trim() || undefined,
