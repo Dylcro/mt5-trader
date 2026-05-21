@@ -628,7 +628,8 @@ function makeDealListener(accountId: string) {
         markCascaded(accountId, evt.positionId); // prevent re-processing on duplicate events
 
         if (!acctCascadeCfg.mt5SlEnabled) {
-          // Feature disabled — nothing to do.
+          // Feature disabled — log once per posId so silent skips are debuggable.
+          console.log(`[mt5-sl] SKIP posId=${evt.positionId} — mt5SlEnabled=false for ${accountId}`);
         } else {
           const direction: "buy" | "sell" = evt.type === "DEAL_TYPE_BUY" ? "buy" : "sell";
           const slPips = acctCascadeCfg.mt5SlPips;
@@ -743,7 +744,10 @@ async function stopStreaming(accountId: string): Promise<void> {
   activeRegions.delete(accountId);
   syncReady.delete(accountId);
   syncReadyAt.delete(accountId);
-  cascadeConfigs.delete(accountId);
+  // Do NOT delete cascadeConfigs here — config is persistent settings, not
+  // stream state. Deleting it caused auto-SL to silently skip live deals on
+  // reconnect because the lookup fell back to the global default which has
+  // mt5_sl_enabled=false, with no log line to indicate the skip.
   mt5SlZones.delete(accountId);
   const pending = recoveryTimers.get(accountId);
   if (pending) {
