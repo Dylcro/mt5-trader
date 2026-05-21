@@ -135,7 +135,23 @@ const cascadeConfigs = new Map<string, CascadeConfig>();
 
 function getCascadeConfig(accountId: string, userId?: string): CascadeConfig {
   if (userId && cascadeConfigs.has(userId)) return cascadeConfigs.get(userId)!;
-  return cascadeConfigs.get(accountId) ?? cascadeConfigs.get("") ?? { ...CASCADE_DEFAULTS };
+  if (cascadeConfigs.has(accountId)) return cascadeConfigs.get(accountId)!;
+  // Reverse-lookup safety net: deal-stream callers know only accountId, but the
+  // PUT /cascade-config endpoint stores the latest config under the saver's
+  // userId. Walk the userId→accountId cache to find the owning userId and use
+  // its config. Without this, MT5 auto-SL silently no-ops for any user whose
+  // accountId-keyed cache entry was never populated (e.g. saved config before
+  // first /connect, or restored from DB before storedAccounts cross-mapping).
+  if (accountId) {
+    for (const [uid, aid] of userAccountCache.entries()) {
+      if (aid === accountId && cascadeConfigs.has(uid)) {
+        const cfg = cascadeConfigs.get(uid)!;
+        cascadeConfigs.set(accountId, cfg); // memoize for next lookup
+        return cfg;
+      }
+    }
+  }
+  return cascadeConfigs.get("") ?? { ...CASCADE_DEFAULTS };
 }
 
 // Attempt a single load from the database; throws on failure.
@@ -824,9 +840,10 @@ export async function startAutoConnect(): Promise<void> {
       console.log("[auto-connect] no stored accounts with bound users — waiting for first app connect");
       return;
     }
-    for (const { accountId, region } of rows) {
+    for (const { accountId, region, userId } of rows) {
       console.log(`[auto-connect] reconnecting accountId=${accountId} region=${region}`);
-      void startStreaming(token, accountId, region);
+      if (userId) userAccountCache.set(userId, accountId);
+      void startStreaming(token, accountId, region, userId ?? undefined);
     }
   } catch (err) {
     console.error("[auto-connect] failed:", (err as Error).message);
@@ -842,10 +859,11 @@ export function startConnectionWatchdog(): void {
         .select()
         .from(storedAccountsTable)
         .where(isNotNull(storedAccountsTable.userId));
-      for (const { accountId, region } of rows) {
+      for (const { accountId, region, userId } of rows) {
+        if (userId) userAccountCache.set(userId, accountId);
         if (!activeStreams.has(accountId)) {
           console.log(`[watchdog] ${accountId} not streaming — reconnecting`);
-          void startStreaming(token, accountId, region);
+          void startStreaming(token, accountId, region, userId ?? undefined);
         }
       }
     } catch (err) {
