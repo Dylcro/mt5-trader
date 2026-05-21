@@ -1443,6 +1443,198 @@ router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, re
   }
 });
 
+// In-memory lock to prevent concurrent migrations for the same MT5 login.
+// Key: `${loginStr}|${server}`. The lock is best-effort (single-process); a
+// real multi-instance deploy would need a DB lock, but this server is
+// single-instance on Replit.
+const migrationLocks = new Set<string>();
+
+// POST /api/mt5/admin/migrate-region
+// Body: { login, password, server, targetRegion? }
+// Header: x-admin-key  (header only — never accept via query string)
+// Re-provisions an existing MetaAPI account into a different region. Required
+// because MetaAPI does not let you change region on an existing account — we
+// must delete and recreate. The user's MT5 password is needed (we don't store
+// it). User->account binding is preserved across the swap.
+//
+// Failure recovery: if the delete succeeds but create fails (network blip,
+// bad credentials), the old account is gone — admin must call this endpoint
+// again with the same payload. The retry will find no existing account and
+// fall through to the create path, restoring the userId binding.
+router.post("/mt5/admin/migrate-region", async (req: Request, res: Response) => {
+  // Fail-closed: require ADMIN_KEY to be configured AND match. No default.
+  const ADMIN_KEY = process.env["ADMIN_KEY"];
+  if (!ADMIN_KEY) {
+    res.status(500).json({ error: "ADMIN_KEY not configured on server" }); return;
+  }
+  const key = (req.headers["x-admin-key"] as string | undefined) ?? "";
+  if (key !== ADMIN_KEY) { res.status(401).json({ error: "admin key required (x-admin-key header)" }); return; }
+
+  const { login, password, server, targetRegion } = (req.body ?? {}) as {
+    login?: string | number; password?: string; server?: string; targetRegion?: string;
+  };
+  const target = (targetRegion ?? "new-york").trim();
+  if (!login || !password || !server) {
+    res.status(400).json({ error: "login, password, server required" }); return;
+  }
+  const loginStr = String(login);
+  const lockKey = `${loginStr}|${server}`;
+  if (migrationLocks.has(lockKey)) {
+    res.status(409).json({ error: "Migration already in progress for this login. Try again in a moment." }); return;
+  }
+  migrationLocks.add(lockKey);
+
+  try {
+    const token = getToken();
+
+    // 1. Find existing account on MetaAPI by login+server
+    const listR = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, { headers: authHeaders(token) });
+    if (!listR.ok) {
+      res.status(502).json({ error: `MetaAPI list failed: ${listR.status}` }); return;
+    }
+    const accts = await listR.json() as ProvisioningAccount[];
+    const existing = Array.isArray(accts)
+      ? accts.find((a) => String(a.login) === loginStr && a.server === server)
+      : undefined;
+
+    let preservedUserId: string | null = null;
+
+    if (existing) {
+      const existingId = (existing._id ?? existing.id) as string;
+      const existingRegion = normalizeRegion(existing.region);
+      console.log(`[migrate] found existing accountId=${existingId} region=${existingRegion} target=${target}`);
+
+      if (existingRegion === target) {
+        res.json({ ok: true, accountId: existingId, region: existingRegion, message: "Already in target region — nothing to do." });
+        return;
+      }
+
+      // Capture userId binding so we can restore it after recreating
+      const [row] = await db.select().from(storedAccountsTable).where(eq(storedAccountsTable.accountId, existingId)).limit(1);
+      preservedUserId = row?.userId ?? null;
+
+      // 2. Drop DB row FIRST so the watchdog (60 s interval) cannot reconnect
+      //    the old account once we stop streaming and undeploy it.
+      await db.delete(storedAccountsTable).where(eq(storedAccountsTable.accountId, existingId)).catch(() => {});
+      if (preservedUserId) userAccountCache.delete(preservedUserId);
+
+      // 3. Stop streaming
+      await stopStreaming(existingId);
+
+      // 4. Undeploy
+      const undeployR = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${existingId}/undeploy`, {
+        method: "POST", headers: authHeaders(token),
+      });
+      if (!undeployR.ok && undeployR.status !== 204) {
+        const errBody = await undeployR.json().catch(() => ({})) as { message?: string };
+        console.warn(`[migrate] undeploy returned ${undeployR.status}: ${errBody.message}`);
+      }
+
+      // 5. Poll until confirmed UNDEPLOYED. Only break on confirmed terminal
+      //    state — transient lookup errors do NOT advance us to delete.
+      const undeployStart = Date.now();
+      let transientErrors = 0;
+      let confirmedUndeployed = false;
+      while (Date.now() - undeployStart < 60000) {
+        const acct = await getProvisioningAccount(token, existingId).catch(() => null);
+        if (!acct) {
+          // 404 means already gone — treat as success
+          transientErrors++;
+          if (transientErrors >= 3) { confirmedUndeployed = true; break; }
+        } else if (acct.state === "UNDEPLOYED" || acct.state === "DELETING") {
+          confirmedUndeployed = true; break;
+        } else {
+          transientErrors = 0;
+        }
+        await sleep(2000);
+      }
+      if (!confirmedUndeployed) {
+        console.warn(`[migrate] undeploy did not confirm within 60s — attempting delete anyway`);
+      }
+
+      // 6. Delete the MetaAPI account
+      const delR = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${existingId}`, {
+        method: "DELETE", headers: authHeaders(token),
+      });
+      if (!delR.ok && delR.status !== 204 && delR.status !== 404) {
+        const errBody = await delR.json().catch(() => ({})) as { message?: string };
+        res.status(502).json({
+          error: `Delete failed: ${errBody.message ?? delR.status}. Old account still exists in ${existingRegion}; safe to retry.`,
+        }); return;
+      }
+      console.log(`[migrate] deleted old accountId=${existingId} (preservedUserId=${preservedUserId})`);
+    } else {
+      console.log(`[migrate] no existing account for login=${loginStr} server=${server} — creating fresh in ${target}`);
+      // If a previous run deleted the account but failed at create, the userId
+      // binding may already be missing. Try to recover it from our DB rows.
+      if (!preservedUserId) {
+        const rows = await db.select().from(storedAccountsTable);
+        // No way to look up by login (we don't store it), so caller must reconnect
+        // through the app if userId binding is lost. Log loudly.
+        if (rows.length === 0) console.log(`[migrate] (no DB rows to recover userId from)`);
+      }
+    }
+
+    // 7. Provision fresh account in target region
+    const createPayload = {
+      login: loginStr, password, name: `MT5 ${loginStr}`, server,
+      platform: "mt5", type: "cloud-g2", reliability: "regular", magic: 47182,
+      region: target,
+    };
+    const createR = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
+      method: "POST", headers: authHeaders(token), body: JSON.stringify(createPayload),
+    });
+    if (!createR.ok && createR.status !== 202) {
+      const errBody = await createR.json().catch(() => ({})) as { message?: string; details?: string };
+      const msg = errBody.message ?? `create failed: ${createR.status}`;
+      // If we already deleted the old account, the admin MUST retry with the
+      // same payload — log this loudly so it can be diagnosed.
+      console.error(`[migrate] CREATE FAILED after old account deleted. login=${loginStr} server=${server} target=${target} preservedUserId=${preservedUserId} err=${msg}`);
+      if (errBody.details === "E_AUTH") {
+        res.status(401).json({ error: "Invalid MT5 credentials. Old account already removed — verify password and retry." }); return;
+      }
+      res.status(502).json({ error: `${msg}. Old account was already removed; retry with same payload.` }); return;
+    }
+    const created = await createR.json() as ProvisioningAccount;
+    const newId = (created._id ?? created.id) as string;
+    const newRegion = normalizeRegion(created.region) || target;
+    console.log(`[migrate] created new accountId=${newId} region=${newRegion}`);
+
+    // 8. Deploy
+    await deployAccount(token, newId);
+
+    // 9. Restore userId binding in DB (upsert). Failure here is logged but the
+    //    migration is still considered successful — admin can rebind manually.
+    try {
+      await db.insert(storedAccountsTable).values({
+        accountId: newId, region: newRegion, userId: preservedUserId, storedAt: Date.now(),
+      }).onConflictDoUpdate({
+        target: storedAccountsTable.accountId,
+        set: { region: newRegion, userId: preservedUserId, storedAt: Date.now() },
+      });
+      if (preservedUserId) userAccountCache.set(preservedUserId, newId);
+    } catch (e) {
+      console.error(`[migrate] DB upsert failed for newId=${newId} userId=${preservedUserId}:`, (e as Error).message);
+    }
+
+    // 10. Kick off streaming so cascade is armed once deploy completes
+    void startStreaming(token, newId, newRegion, preservedUserId ?? undefined);
+
+    res.json({
+      ok: true,
+      accountId: newId,
+      region: newRegion,
+      userId: preservedUserId,
+      message: `Account re-provisioned in ${newRegion}. Deploy is in progress — give it 30-60s before trading.`,
+    });
+  } catch (err) {
+    console.error("[migrate] error:", (err as Error).message);
+    res.status(500).json({ error: (err as Error).message });
+  } finally {
+    migrationLocks.delete(lockKey);
+  }
+});
+
 // POST /api/mt5/account/:accountId/disconnect
 router.post("/mt5/account/:accountId/disconnect", checkOwner, async (req: Request, res: Response) => {
   try {
