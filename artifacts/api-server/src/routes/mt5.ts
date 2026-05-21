@@ -518,7 +518,18 @@ function makeDealListener(accountId: string) {
       skipLogged.delete(accountId);
       activeStreams.delete(accountId);
       activeConnections.delete(accountId);
-      console.log(`[stream ${accountId}] WebSocket disconnected — watchdog will reconnect`);
+      console.log(`[stream ${accountId}] WebSocket disconnected — kicking immediate reconnect`);
+      // Don't wait up to 30s for the watchdog; reconnect immediately using the
+      // in-memory snapshot so the stream is back online as fast as possible.
+      const meta = knownAccounts.get(accountId);
+      if (meta) {
+        try {
+          const token = getToken();
+          void startStreaming(token, accountId, meta.region, meta.userId ?? undefined);
+        } catch (err) {
+          console.warn(`[stream ${accountId}] immediate reconnect failed:`, (err as Error).message);
+        }
+      }
     },
     // Fires when a position closes (TP hit, SL hit, or manual close).
     // ANY close invalidates the zone that position belonged to — surviving
@@ -675,6 +686,15 @@ function makeDealListener(accountId: string) {
 
           const zoneRef = zone;
           void (async () => {
+            // Guard against sync-replay: if a close/deal-out event for this
+            // position already arrived (which happens when MetaAPI replays a
+            // batch of historic deals after the stream finally syncs), the
+            // zone has been invalidated synchronously. Skip cleanly instead
+            // of firing a doomed modify that will return "Position not found".
+            if (!zoneRef.active || !zoneRef.positionIds.has(evt.positionId)) {
+              console.log(`[mt5-sl] SKIP modify posId=${evt.positionId} — position already closed (zone ${zoneRef.id})`);
+              return;
+            }
             const conn = activeConnections.get(accountId);
             const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
             const t0 = Date.now();
@@ -727,7 +747,15 @@ function makeDealListener(accountId: string) {
             } catch (err) {
               const errs = (err as AggregateError).errors ?? [err];
               const msgs = errs.map((e: Error) => e.message).join(" | ");
-              console.error(`[mt5-sl] failed to modify posId=${evt.positionId} (${Date.now() - t0}ms): ${msgs}`);
+              // "Position not found" / code=-2 is expected during sync replay
+              // when the position closed before we could touch it. Log as info,
+              // not error, so it doesn't pollute alerting.
+              const isBenign = /Position not found|code=-2/i.test(msgs);
+              if (isBenign) {
+                console.log(`[mt5-sl] SKIP posId=${evt.positionId} (${Date.now() - t0}ms) — position closed before SL apply`);
+              } else {
+                console.error(`[mt5-sl] failed to modify posId=${evt.positionId} (${Date.now() - t0}ms): ${msgs}`);
+              }
               zoneRef.positionIds.delete(evt.positionId);
               if (zoneAction === "new" && zoneRef.positionIds.size === 0) {
                 zoneRef.active = false;
