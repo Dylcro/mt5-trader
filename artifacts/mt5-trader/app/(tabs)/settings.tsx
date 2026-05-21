@@ -209,6 +209,7 @@ export default function SettingsScreen() {
   const { credentials, status, errorMsg, accountInfo, connect, disconnect } = useTrading();
   const { settings: cs, updateSettings, saveToServer } = useCascadeSettings();
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [settingsTab, setSettingsTab] = useState<"mt5" | "inapp">("mt5");
   const { hapticEnabled, setHapticEnabled } = useHapticSettings();
 
   const [login, setLogin] = useState(credentials.login);
@@ -499,17 +500,36 @@ export default function SettingsScreen() {
             </View>
           </View>
 
-          {/* ── SECTION 1: IN-APP TRADING ── */}
-          <View style={styles.sectionHeader}>
-            <View style={styles.sectionHeaderLine} />
-            <View style={styles.sectionHeaderLabelWrap}>
-              <Feather name="smartphone" size={11} color={C.gold} />
-              <Text style={styles.sectionHeaderLabel}>WHEN YOU TRADE FROM THIS APP</Text>
-            </View>
-            <View style={styles.sectionHeaderLine} />
+          {/* ── Settings tab switcher ── */}
+          <View style={styles.settingsTabBar}>
+            <Pressable
+              style={[styles.settingsTabBtn, settingsTab === "mt5" && styles.settingsTabBtnActive]}
+              onPress={() => {
+                void Haptics.selectionAsync();
+                setSettingsTab("mt5");
+              }}
+            >
+              <Feather name="external-link" size={13} color={settingsTab === "mt5" ? "#000" : C.textSecondary} />
+              <Text style={[styles.settingsTabBtnText, settingsTab === "mt5" && styles.settingsTabBtnTextActive]}>
+                MT5 settings
+              </Text>
+            </Pressable>
+            <Pressable
+              style={[styles.settingsTabBtn, settingsTab === "inapp" && styles.settingsTabBtnActive]}
+              onPress={() => {
+                void Haptics.selectionAsync();
+                setSettingsTab("inapp");
+              }}
+            >
+              <Feather name="smartphone" size={13} color={settingsTab === "inapp" ? "#000" : C.textSecondary} />
+              <Text style={[styles.settingsTabBtnText, settingsTab === "inapp" && styles.settingsTabBtnTextActive]}>
+                In-app settings
+              </Text>
+            </Pressable>
           </View>
 
           {/* In-app cascade — triggered from the Trade screen in this app */}
+          {settingsTab === "inapp" && (
           <View style={styles.cascadeCard}>
             <View style={styles.cascadeCardHeader}>
               <Feather name="layers" size={16} color={C.gold} />
@@ -611,18 +631,10 @@ export default function SettingsScreen() {
               </Text>
             </Pressable>
           </View>
-
-          {/* ── SECTION 2: MT5 PLATFORM TRADING ── */}
-          <View style={styles.sectionHeader}>
-            <View style={styles.sectionHeaderLine} />
-            <View style={styles.sectionHeaderLabelWrap}>
-              <Feather name="external-link" size={11} color={C.gold} />
-              <Text style={styles.sectionHeaderLabel}>WHEN YOU TRADE FROM THE MT5 APP</Text>
-            </View>
-            <View style={styles.sectionHeaderLine} />
-          </View>
+          )}
 
           {/* MT5 Auto-SL — only applies to trades placed inside the MT5 platform */}
+          {settingsTab === "mt5" && (
           <View style={[styles.cascadeCard, styles.mt5Card]}>
             <View style={styles.cascadeCardHeader}>
               <Feather name="shield" size={16} color={C.gold} />
@@ -712,6 +724,7 @@ export default function SettingsScreen() {
               </Text>
             </Pressable>
           </View>
+          )}
 
           {/* Help & Support */}
           <Pressable
@@ -1039,6 +1052,36 @@ const styles = StyleSheet.create({
   saveBtnText: {
     fontSize: 14,
     fontFamily: "Inter_600SemiBold",
+    color: "#000",
+  },
+  settingsTabBar: {
+    flexDirection: "row",
+    backgroundColor: C.card,
+    borderRadius: 12,
+    padding: 4,
+    borderWidth: 1,
+    borderColor: C.border,
+    gap: 4,
+    marginTop: 6,
+  },
+  settingsTabBtn: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    paddingVertical: 10,
+    borderRadius: 8,
+  },
+  settingsTabBtnActive: {
+    backgroundColor: C.gold,
+  },
+  settingsTabBtnText: {
+    fontSize: 13,
+    fontFamily: "Inter_600SemiBold",
+    color: C.textSecondary,
+  },
+  settingsTabBtnTextActive: {
     color: "#000",
   },
   sectionHeader: {
