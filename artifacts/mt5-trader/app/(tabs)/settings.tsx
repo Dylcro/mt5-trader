@@ -656,6 +656,14 @@ export default function SettingsScreen() {
               Only applies to buys/sells you place directly inside the MT5 platform — NOT trades placed from this app. A stop loss is attached automatically and a "zone" is created from your entry down (or up for sells) by the distance below. Any further MT5 trade in the same direction that lands inside that zone gets the SAME stop loss. The zone ends the moment ANY position in it closes (TP, SL, or manual) — the next MT5 trade then starts a fresh zone.
             </Text>
 
+            <View style={styles.warningBox}>
+              <Feather name="alert-triangle" size={14} color="#f59e0b" style={{ marginTop: 1 }} />
+              <Text style={styles.warningText}>
+                <Text style={styles.warningTitle}>Please monitor your trades at all times.</Text>
+                {"  "}Auto SL is a safety net, not a substitute for active risk management. In fast-moving or volatile markets there can be a brief delay between your trade opening and the stop loss being attached — and in rare cases price can move far enough during that window to skip the stop entirely. Always be ready to close manually if needed.
+              </Text>
+            </View>
+
             <View style={styles.cascadeDivider} />
 
             <View style={styles.settingRow}>
@@ -1130,6 +1138,28 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_700Bold",
     color: "#22c55e",
     letterSpacing: 0.5,
+  },
+  warningBox: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 8,
+    marginTop: 10,
+    padding: 10,
+    borderRadius: 8,
+    backgroundColor: "rgba(245,158,11,0.10)",
+    borderWidth: 1,
+    borderColor: "rgba(245,158,11,0.35)",
+  },
+  warningText: {
+    flex: 1,
+    fontSize: 12,
+    lineHeight: 17,
+    fontFamily: "Inter_400Regular",
+    color: C.textSecondary,
+  },
+  warningTitle: {
+    fontFamily: "Inter_600SemiBold",
+    color: "#f59e0b",
   },
   sectionHeader: {
     flexDirection: "row",
