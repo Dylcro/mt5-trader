@@ -25,6 +25,11 @@ export interface CascadeSettings {
   mt5SlEnabled: boolean;
   mt5SlNumPositions: number; // 1-6
   mt5SlPips: number;          // 10-200 ($ from entry — 1 pip = $1 on XAUUSD)
+  // Failsafe SL: server-side safety net. Every 10s scans for any XAUUSD
+  // position with no SL and attaches one at `mt5FailsafePips` from current
+  // market. Belt-and-braces protection against missed/failed primary SLs.
+  mt5FailsafeEnabled: boolean;
+  mt5FailsafePips: number; // 50-500
 }
 
 const DEFAULTS: CascadeSettings = {
@@ -37,6 +42,8 @@ const DEFAULTS: CascadeSettings = {
   mt5SlEnabled: false,
   mt5SlNumPositions: 3,
   mt5SlPips: 50,
+  mt5FailsafeEnabled: true,
+  mt5FailsafePips: 150,
 };
 
 const VALID_PIPS_BETWEEN = [5, 10, 15, 20];
@@ -46,6 +53,8 @@ const VALID_PIPS_BETWEEN = [5, 10, 15, 20];
 const GLOBAL_AUTO_CASCADE_KEY = "cascade_auto_enabled_global";
 // MT5 auto-SL toggle — also device-global for the same reason.
 const GLOBAL_MT5_SL_ENABLED_KEY = "mt5_sl_enabled_global";
+// Failsafe-SL toggle is also device-global.
+const GLOBAL_MT5_FAILSAFE_ENABLED_KEY = "mt5_failsafe_enabled_global";
 
 function storageKeys(accountId: string) {
   const prefix = accountId ? `cascade_${accountId}_` : "cascade_";
@@ -57,6 +66,7 @@ function storageKeys(accountId: string) {
     takeProfitPips:    `${prefix}tp_pips`,
     mt5SlNumPositions: `${prefix}mt5_sl_num_positions`,
     mt5SlPips:         `${prefix}mt5_sl_pips`,
+    mt5FailsafePips:   `${prefix}mt5_failsafe_pips`,
   };
 }
 
@@ -85,6 +95,8 @@ async function pushToServer(s: CascadeSettings, accountId: string): Promise<void
         mt5SlEnabled: s.mt5SlEnabled,
         mt5SlNumPositions: s.mt5SlNumPositions,
         mt5SlPips: s.mt5SlPips,
+        mt5FailsafeEnabled: s.mt5FailsafeEnabled,
+        mt5FailsafePips: s.mt5FailsafePips,
       }),
     });
   } catch {
@@ -102,9 +114,9 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
       try {
         const keys = storageKeys(accountId);
         // Fetch per-account keys + global autoCascadeEnabled in one call
-        const allKeys = [...Object.values(keys), GLOBAL_AUTO_CASCADE_KEY, GLOBAL_MT5_SL_ENABLED_KEY];
+        const allKeys = [...Object.values(keys), GLOBAL_AUTO_CASCADE_KEY, GLOBAL_MT5_SL_ENABLED_KEY, GLOBAL_MT5_FAILSAFE_ENABLED_KEY];
         const pairs = await AsyncStorage.multiGet(allKeys);
-        const [num, between, sl, tpEnabled, tpPips, mt5SlN, mt5SlP, globalAutoEnabled, globalMt5SlEnabled] = pairs.map((p) => p[1]);
+        const [num, between, sl, tpEnabled, tpPips, mt5SlN, mt5SlP, failsafePips, globalAutoEnabled, globalMt5SlEnabled, globalFailsafeEnabled] = pairs.map((p) => p[1]);
 
         // Resolve autoCascadeEnabled: prefer global key, fall back to legacy per-account key
         let autoCascadeEnabled = DEFAULTS.autoCascadeEnabled;
@@ -132,6 +144,9 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
           mt5SlEnabled: globalMt5SlEnabled === "true",
           mt5SlNumPositions: mt5SlN ? parseFloat(mt5SlN) : DEFAULTS.mt5SlNumPositions,
           mt5SlPips: mt5SlP ? parseFloat(mt5SlP) : DEFAULTS.mt5SlPips,
+          // Failsafe defaults to ON — only switch off if user explicitly set "false".
+          mt5FailsafeEnabled: globalFailsafeEnabled === null ? DEFAULTS.mt5FailsafeEnabled : globalFailsafeEnabled === "true",
+          mt5FailsafePips: failsafePips ? parseFloat(failsafePips) : DEFAULTS.mt5FailsafePips,
         };
         setSettings(local);
         void pushToServer(local, accountId);
@@ -155,9 +170,11 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         [keys.takeProfitPips, String(next.takeProfitPips)],
         [keys.mt5SlNumPositions, String(next.mt5SlNumPositions)],
         [keys.mt5SlPips, String(next.mt5SlPips)],
+        [keys.mt5FailsafePips, String(next.mt5FailsafePips)],
         // device-global toggles
         [GLOBAL_AUTO_CASCADE_KEY, String(next.autoCascadeEnabled)],
         [GLOBAL_MT5_SL_ENABLED_KEY, String(next.mt5SlEnabled)],
+        [GLOBAL_MT5_FAILSAFE_ENABLED_KEY, String(next.mt5FailsafeEnabled)],
       ]);
       return next;
     });
@@ -182,6 +199,8 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
           mt5SlEnabled: settings.mt5SlEnabled,
           mt5SlNumPositions: settings.mt5SlNumPositions,
           mt5SlPips: settings.mt5SlPips,
+          mt5FailsafeEnabled: settings.mt5FailsafeEnabled,
+          mt5FailsafePips: settings.mt5FailsafePips,
         }),
       });
       return res.ok;

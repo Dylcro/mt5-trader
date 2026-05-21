@@ -115,6 +115,10 @@ interface CascadeConfig {
   mt5SlEnabled: boolean;
   mt5SlNumPositions: number;
   mt5SlPips: number;
+  // Failsafe SL: periodic safety-net scan for any XAUUSD position without
+  // a stop loss — attaches one at `mt5FailsafePips` from current price.
+  mt5FailsafeEnabled: boolean;
+  mt5FailsafePips: number;
 }
 
 const CASCADE_DEFAULTS: CascadeConfig = {
@@ -125,6 +129,8 @@ const CASCADE_DEFAULTS: CascadeConfig = {
   mt5SlEnabled: false,
   mt5SlNumPositions: 3,
   mt5SlPips: 50,
+  mt5FailsafeEnabled: true,
+  mt5FailsafePips: 150,
 };
 
 // MT5 auto-SL: 1 "pip" = $0.10 of price movement on XAUUSD (matches cascade convention).
@@ -160,6 +166,8 @@ async function attemptLoadCascadeConfig(): Promise<void> {
         mt5SlEnabled:      row.mt5SlEnabled,
         mt5SlNumPositions: row.mt5SlNumPositions,
         mt5SlPips:         row.mt5SlPips,
+        mt5FailsafeEnabled: row.mt5FailsafeEnabled,
+        mt5FailsafePips:    row.mt5FailsafePips,
       };
       cascadeConfigs.set(key, cfg);
       // Also cache under the MetaAPI accountId so the auto-cascade background
@@ -237,6 +245,8 @@ async function saveCascadeConfig(config: CascadeConfig, accountId: string): Prom
           mt5SlEnabled:      config.mt5SlEnabled,
           mt5SlNumPositions: config.mt5SlNumPositions,
           mt5SlPips:         config.mt5SlPips,
+          mt5FailsafeEnabled: config.mt5FailsafeEnabled,
+          mt5FailsafePips:    config.mt5FailsafePips,
         },
       });
     return true;
@@ -852,6 +862,92 @@ export async function startAutoConnect(): Promise<void> {
     }
   } catch (err) {
     console.error("[auto-connect] failed:", (err as Error).message);
+  }
+}
+
+// ── Failsafe SL scanner ──────────────────────────────────────────────────────
+// Every 10 s, iterate every live streaming connection and look for open
+// XAUUSD positions that have NO stop loss attached. Apply an emergency SL
+// at `mt5FailsafePips` from the CURRENT market price (not the entry — see
+// settings docs). This is a true safety net: catches positions that opened
+// during a server restart, deals that the SDK missed, or primary SL that
+// failed all 3 retries. Per-account opt-in (default ON).
+const failsafeAppliedAt = new Map<string, number>(); // positionId -> ts (debounce)
+const FAILSAFE_RETRY_BACKOFF_MS = 60_000;
+
+export function startFailsafeScanner(): void {
+  const INTERVAL_MS = 10_000;
+  setInterval(() => {
+    for (const [accountId, conn] of activeConnections) {
+      void scanOneAccountForFailsafe(accountId, conn);
+    }
+  }, INTERVAL_MS);
+  console.log("[failsafe] periodic naked-position scanner started (10 s interval)");
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function scanOneAccountForFailsafe(accountId: string, conn: any): Promise<void> {
+  try {
+    const cfg = getCascadeConfig(accountId);
+    if (!cfg.mt5FailsafeEnabled) return;
+    const terminalState = conn?.terminalState;
+    if (!terminalState) return;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const positions: any[] = terminalState.positions ?? [];
+    if (positions.length === 0) return;
+    for (const pos of positions) {
+      if (pos?.symbol !== "XAUUSD") continue;
+      if (!pos?.id) continue;
+      // Has SL? Move on. (`stopLoss` is 0 or undefined when none set.)
+      if (typeof pos.stopLoss === "number" && pos.stopLoss > 0) continue;
+      const posId = String(pos.id);
+      // Debounce: don't hammer the same naked position every 10 s if the
+      // broker keeps rejecting our modifyPosition. Wait 60 s between tries.
+      const last = failsafeAppliedAt.get(posId) ?? 0;
+      if (Date.now() - last < FAILSAFE_RETRY_BACKOFF_MS) continue;
+      // Determine direction & current price.
+      const isBuy = pos.type === "POSITION_TYPE_BUY";
+      const isSell = pos.type === "POSITION_TYPE_SELL";
+      if (!isBuy && !isSell) continue;
+      const direction: "buy" | "sell" = isBuy ? "buy" : "sell";
+      // Prefer the live current price from terminal state; fall back to
+      // position's own currentPrice field.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const quote = typeof terminalState.price === "function" ? terminalState.price("XAUUSD") : undefined;
+      const liveBid = quote?.bid ?? pos.currentPrice ?? pos.openPrice ?? 0;
+      const liveAsk = quote?.ask ?? pos.currentPrice ?? pos.openPrice ?? 0;
+      // For a buy SL we use bid (price you'd close at); for a sell SL ask.
+      const reference = direction === "buy" ? liveBid : liveAsk;
+      if (!reference || reference <= 0) continue;
+      const slDistance = cfg.mt5FailsafePips * MT5_SL_PIP;
+      const slPrice = direction === "buy"
+        ? parseFloat((reference - slDistance).toFixed(2))
+        : parseFloat((reference + slDistance).toFixed(2));
+      failsafeAppliedAt.set(posId, Date.now());
+      const t0 = Date.now();
+      try {
+        await conn.modifyPosition(posId, slPrice);
+        console.log(`[mt5-failsafe] posId=${posId} (${direction}) had no SL — applied emergency SL ${slPrice} (${cfg.mt5FailsafePips} pips from current ${reference.toFixed(2)}, ${Date.now() - t0}ms)`);
+        // Record as a synthetic deal so it shows in the user's feed.
+        storeDealEvent(accountId, {
+          dealId: `failsafe-${posId}-${Date.now()}`,
+          positionId: posId,
+          symbol: "XAUUSD",
+          type: direction === "buy" ? "DEAL_TYPE_BUY" : "DEAL_TYPE_SELL",
+          entryType: "DEAL_ENTRY_IN",
+          openPrice: reference,
+          volume: pos.volume ?? 0,
+          comment: "Failsafe SL applied",
+          time: Date.now(),
+          autoCascade: true,
+          autoCascadeCount: 1,
+        });
+      } catch (err) {
+        console.warn(`[mt5-failsafe] failed to attach SL to posId=${posId} (${Date.now() - t0}ms): ${(err as Error).message} — will retry in ${FAILSAFE_RETRY_BACKOFF_MS / 1000}s`);
+      }
+    }
+  } catch (err) {
+    console.warn(`[mt5-failsafe] scan error for ${accountId}: ${(err as Error).message}`);
   }
 }
 
@@ -1994,6 +2090,8 @@ router.put("/cascade-config", async (req: Request, res: Response) => {
     mt5SlEnabled:      typeof body.mt5SlEnabled      === "boolean" ? body.mt5SlEnabled      : current.mt5SlEnabled,
     mt5SlNumPositions: typeof body.mt5SlNumPositions === "number"  ? body.mt5SlNumPositions : current.mt5SlNumPositions,
     mt5SlPips:         typeof body.mt5SlPips         === "number"  ? body.mt5SlPips         : current.mt5SlPips,
+    mt5FailsafeEnabled: typeof body.mt5FailsafeEnabled === "boolean" ? body.mt5FailsafeEnabled : current.mt5FailsafeEnabled,
+    mt5FailsafePips:    typeof body.mt5FailsafePips    === "number"  ? body.mt5FailsafePips    : current.mt5FailsafePips,
   };
   // Persist first — only commit to in-memory state when DB write succeeds.
   const saved = await saveCascadeConfig(nextConfig, saveKey);
