@@ -127,9 +127,8 @@ const CASCADE_DEFAULTS: CascadeConfig = {
   mt5SlPips: 50,
 };
 
-// MT5 auto-SL: 1 "pip" = $1 of price movement on XAUUSD (Vantage convention).
-// Differs from the cascade `PIP` constant (0.10) below intentionally.
-const MT5_SL_PIP = 1.0;
+// MT5 auto-SL: 1 "pip" = $0.10 of price movement on XAUUSD (matches cascade convention).
+const MT5_SL_PIP = 0.10;
 
 // In-memory cache: accountId (or "" for global) → config.
 const cascadeConfigs = new Map<string, CascadeConfig>();

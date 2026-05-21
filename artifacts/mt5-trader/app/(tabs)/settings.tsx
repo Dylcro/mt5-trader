@@ -650,14 +650,14 @@ export default function SettingsScreen() {
               step={5}
               onChange={(v) => updateSettings({ mt5SlPips: v })}
               displayValue={`${cs.mt5SlPips} pips`}
-              hint={`$${cs.mt5SlPips} away from entry — applied to every trade in the batch`}
+              hint={`${(cs.mt5SlPips * 0.10).toFixed(2)} away from entry — applied to every trade in the batch`}
             />
 
             <View style={styles.cascadePreviewBox}>
               <Text style={styles.cascadePreviewTitle}>Preview (buy at 5500)</Text>
               <Text style={styles.cascadePreviewText}>
                 {`Entry  @ 5500.00\n`}
-                {`SL     @ ${(5500 - cs.mt5SlPips).toFixed(2)}  ← ${cs.mt5SlPips} pips below\n`}
+                {`SL     @ ${(5500 - cs.mt5SlPips * 0.10).toFixed(2)}  ← ${cs.mt5SlPips} pips below\n`}
                 {`Applies to next ${cs.mt5SlNumPositions} MT5 trade${cs.mt5SlNumPositions === 1 ? "" : "s"}, then waits for all to close before resetting.`}
               </Text>
             </View>
