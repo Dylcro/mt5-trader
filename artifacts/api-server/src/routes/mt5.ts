@@ -323,18 +323,14 @@ async function placeCascadeLimit(opts: {
   region: string;
   token: string;
   accountId: string;
-  positionId: string;  // used to build the deterministic clientId
-  levelIndex: number;  // 0-based index among the limit levels
+  positionId: string;
+  levelIndex: number;
   body: Record<string, unknown>;
 }): Promise<string | undefined> {
-  const { region, token, accountId, positionId, levelIndex, body } = opts;
+  const { region, token, accountId, body } = opts;
   const url = `${clientBase(region)}/users/current/accounts/${accountId}/trade`;
   const headers = authHeaders(token);
-  // Deterministic clientId: MetaAPI uses this to deduplicate on its side.
-  // Same positionId + same level will never produce a second order even if
-  // a retry races with a successful first attempt that timed out on our end.
-  const clientId = `casc-${positionId}-${levelIndex}`;
-  const payload = JSON.stringify({ ...body, clientId });
+  const payload = JSON.stringify(body);
 
   const attempt = async (isRetry: boolean): Promise<string | undefined> => {
     const ctrl = new AbortController();
@@ -354,8 +350,8 @@ async function placeCascadeLimit(opts: {
       const e = err as Error;
       if (e.name === "AbortError") {
         // Timed out — the request may have reached MetaAPI and been processed.
-        // Do NOT retry; a second identical request could double the order.
-        // clientId on the body means MetaAPI will deduplicate if it did arrive.
+        // Do NOT retry; the cascadedPositions set already prevents a second cascade
+        // for the same positionId, so no double-order risk at the server level.
         throw new Error(`timeout${isRetry ? " (retry)" : ""} — order may be live`);
       }
       throw e; // re-throw for caller to decide on retry
@@ -371,7 +367,7 @@ async function placeCascadeLimit(opts: {
     if (e.message.startsWith("timeout") || e.message.startsWith("HTTP ")) {
       throw e;
     }
-    // Network error — wait briefly and try once more with the same clientId.
+    // Network error — wait briefly and try once more.
     await new Promise(r => setTimeout(r, 300));
     return await attempt(true);
   }
