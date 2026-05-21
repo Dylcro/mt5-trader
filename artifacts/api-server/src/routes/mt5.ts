@@ -492,21 +492,17 @@ function makeDealListener(accountId: string) {
                     stopLoss:  levels.stopLoss,
                     comment:   `Cascade ${i + 2}/${total}`,
                   };
+                  const t0 = Date.now();
                   try {
-                    if (conn) {
-                      const resp = await tradeViaConnection(conn, body);
-                      trackCascadeOrder(accountId, resp.orderId);
-                    } else {
-                      const resp = await fetch(
-                        `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
-                        { method: "POST", headers: authHeaders(token), body: JSON.stringify(body) }
-                      );
-                      const data = await resp.json() as { orderId?: string };
-                      trackCascadeOrder(accountId, data.orderId);
-                    }
-                    console.log(`[post-sync-cascade] placed limit ${i + 2}/${total} @ ${limitPrice}`);
+                    const resp = await fetch(
+                      `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
+                      { method: "POST", headers: authHeaders(token), body: JSON.stringify(body) }
+                    );
+                    const data = await resp.json() as { orderId?: string };
+                    trackCascadeOrder(accountId, data.orderId);
+                    console.log(`[post-sync-cascade] placed limit ${i + 2}/${total} @ ${limitPrice} (${Date.now() - t0}ms)`);
                   } catch (e) {
-                    console.error(`[post-sync-cascade] failed limit ${i + 2}/${total} @ ${limitPrice}:`, (e as Error).message);
+                    console.error(`[post-sync-cascade] failed limit ${i + 2}/${total} @ ${limitPrice} (${Date.now() - t0}ms):`, (e as Error).message);
                   }
                 })
               );
@@ -592,13 +588,18 @@ function makeDealListener(accountId: string) {
             const levels = buildCascadeLevels(evt.openPrice, direction, acctCascadeCfg);
             const total = 1 + levels.limitEntries.length;
             console.log(`[auto-cascade] posId=${evt.positionId} dir=${direction} price=${evt.openPrice} limits=[${levels.limitEntries.join(",")}] sl=${levels.stopLoss}`);
-            const conn = activeConnections.get(accountId);
             const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
             const token = getToken();
             let placed = 0;
-            // Use the already-open streaming WebSocket for limit placement — it is faster
-            // than REST because no HTTP connection overhead, and MetaAPI multiplexes all
-            // trade commands by request ID so concurrent limits don't block each other.
+            const cascadeStart = Date.now();
+            // REST (not streaming WebSocket) for cascade limits. Reasoning:
+            // when MetaAPI's WebSocket node hiccups (intermittent disconnects,
+            // 89-second sync recoveries observed in prod), every queued
+            // tradeViaConnection call blocks until the socket recovers — making
+            // ALL limits land at the same delayed timestamp. REST calls are
+            // independent HTTPS requests with no shared connection state, so a
+            // WebSocket blip can't stall them. Double-cascade is prevented by
+            // the persisted cascadePlacedOrderIds (cascade_orders DB table).
             await Promise.all(
               levels.limitEntries.map(async (limitPrice, i) => {
                 const body: Record<string, unknown> = {
@@ -609,26 +610,23 @@ function makeDealListener(accountId: string) {
                   stopLoss: levels.stopLoss,
                   comment: `Cascade ${i + 2}/${total}`,
                 };
+                const t0 = Date.now();
                 try {
-                  if (conn) {
-                    const resp = await tradeViaConnection(conn, body);
-                    trackCascadeOrder(accountId, resp.orderId);
-                  } else {
-                    const resp = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
-                      method: "POST",
-                      headers: authHeaders(token),
-                      body: JSON.stringify(body),
-                    });
-                    const data = await resp.json() as { orderId?: string };
-                    trackCascadeOrder(accountId, data.orderId);
-                  }
+                  const resp = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
+                    method: "POST",
+                    headers: authHeaders(token),
+                    body: JSON.stringify(body),
+                  });
+                  const data = await resp.json() as { orderId?: string };
+                  trackCascadeOrder(accountId, data.orderId);
                   placed++;
-                  console.log(`[auto-cascade] placed limit ${i + 2}/${total} @ ${limitPrice}`);
+                  console.log(`[auto-cascade] placed limit ${i + 2}/${total} @ ${limitPrice} (${Date.now() - t0}ms)`);
                 } catch (tradeErr) {
-                  console.error(`[auto-cascade] failed limit ${i + 2}/${total} @ ${limitPrice}:`, (tradeErr as Error).message);
+                  console.error(`[auto-cascade] failed limit ${i + 2}/${total} @ ${limitPrice} (${Date.now() - t0}ms):`, (tradeErr as Error).message);
                 }
               })
             );
+            console.log(`[auto-cascade] posId=${evt.positionId} all ${placed}/${total - 1} limits done in ${Date.now() - cascadeStart}ms`);
             // Append a new synthetic event after placement completes so the app can show a notification.
             // We do NOT mutate the original event in place — that would create a race where a client
             // poll during placement advances its `since` watermark past the original event's timestamp
