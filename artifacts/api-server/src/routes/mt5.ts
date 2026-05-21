@@ -1,7 +1,7 @@
 import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { createRequire } from "module";
-import { db, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable } from "@workspace/db";
+import { db, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable } from "@workspace/db";
 import { and, eq, isNotNull } from "drizzle-orm";
 import { JWT_SECRET } from "./auth";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
@@ -269,13 +269,38 @@ const pendingAppCascades = new Set<string>();
 // Tracks orderIds of limit orders placed by our cascade logic.
 // When those orders fill (volatile market), their deals arrive with deal.orderId set.
 // We must NOT re-cascade those fills — even if the broker stripped the comment.
+// Persisted to the cascade_orders DB table so it survives server restarts —
+// without this, every deploy/restart leaves previously-placed limits "unknown"
+// and their fills get re-cascaded as if they were brand-new user trades.
 const cascadePlacedOrderIds = new Set<string>();
-function trackCascadeOrder(orderId: string | undefined): void {
+function trackCascadeOrder(accountId: string, orderId: string | undefined): void {
   if (!orderId) return;
+  if (cascadePlacedOrderIds.has(orderId)) return;
   cascadePlacedOrderIds.add(orderId);
-  if (cascadePlacedOrderIds.size > 2000) {
+  if (cascadePlacedOrderIds.size > 5000) {
     const first = cascadePlacedOrderIds.values().next().value;
     if (first !== undefined) cascadePlacedOrderIds.delete(first);
+  }
+  db.insert(cascadeOrdersTable)
+    .values({ accountId, orderId, createdAt: Date.now() })
+    .onConflictDoNothing()
+    .catch((e: Error) => console.error(`[cascade-orders] persist error orderId=${orderId}:`, e.message));
+}
+
+// Load persisted cascade order IDs for an account on (re)connect so that
+// onDealAdded recognises fills of limits placed in previous sessions.
+async function loadCascadeOrders(accountId: string): Promise<void> {
+  try {
+    const rows = await db
+      .select()
+      .from(cascadeOrdersTable)
+      .where(eq(cascadeOrdersTable.accountId, accountId));
+    for (const row of rows) cascadePlacedOrderIds.add(row.orderId);
+    if (rows.length > 0) {
+      console.log(`[cascade-orders] loaded ${rows.length} previously-placed cascade orderIds for ${accountId}`);
+    }
+  } catch (e) {
+    console.error(`[cascade-orders] load error for ${accountId}:`, (e as Error).message);
   }
 }
 
@@ -470,14 +495,14 @@ function makeDealListener(accountId: string) {
                   try {
                     if (conn) {
                       const resp = await tradeViaConnection(conn, body);
-                      trackCascadeOrder(resp.orderId);
+                      trackCascadeOrder(accountId, resp.orderId);
                     } else {
                       const resp = await fetch(
                         `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
                         { method: "POST", headers: authHeaders(token), body: JSON.stringify(body) }
                       );
                       const data = await resp.json() as { orderId?: string };
-                      trackCascadeOrder(data.orderId);
+                      trackCascadeOrder(accountId, data.orderId);
                     }
                     console.log(`[post-sync-cascade] placed limit ${i + 2}/${total} @ ${limitPrice}`);
                   } catch (e) {
@@ -587,7 +612,7 @@ function makeDealListener(accountId: string) {
                 try {
                   if (conn) {
                     const resp = await tradeViaConnection(conn, body);
-                    trackCascadeOrder(resp.orderId);
+                    trackCascadeOrder(accountId, resp.orderId);
                   } else {
                     const resp = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
                       method: "POST",
@@ -595,7 +620,7 @@ function makeDealListener(accountId: string) {
                       body: JSON.stringify(body),
                     });
                     const data = await resp.json() as { orderId?: string };
-                    trackCascadeOrder(data.orderId);
+                    trackCascadeOrder(accountId, data.orderId);
                   }
                   placed++;
                   console.log(`[auto-cascade] placed limit ${i + 2}/${total} @ ${limitPrice}`);
@@ -656,6 +681,7 @@ async function startStreaming(token: string, accountId: string, region: string =
   // Load persisted cascade history BEFORE sync so post-sync catch-up
   // sees already-cascaded positions and skips re-cascading them.
   await loadCascadeHistory(accountId);
+  await loadCascadeOrders(accountId);
   try {
     const sdk = getSdk(token);
     const account = await sdk.metatraderAccountApi.getAccount(accountId);
@@ -1518,7 +1544,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
         // in a volatile market, onDealAdded skips re-cascading it — even if the
         // broker has stripped the comment by fill time.
         if (actionType.endsWith("_LIMIT") && data.orderId) {
-          trackCascadeOrder(data.orderId);
+          trackCascadeOrder(accountId, data.orderId);
           console.log(`[trade] tracked cascade limit orderId=${data.orderId}`);
         }
         // Market order placed by the app: mark its positionId immediately so the

@@ -30,6 +30,18 @@ async function ensureTables(): Promise<void> {
     CREATE UNIQUE INDEX IF NOT EXISTS cascade_history_acct_pos
       ON cascade_history (account_id, position_id);
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cascade_orders (
+      id          SERIAL PRIMARY KEY,
+      account_id  TEXT   NOT NULL,
+      order_id    TEXT   NOT NULL,
+      created_at  BIGINT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS cascade_orders_acct_ord
+      ON cascade_orders (account_id, order_id);
+    CREATE INDEX IF NOT EXISTS cascade_orders_acct_created
+      ON cascade_orders (account_id, created_at);
+  `);
 }
 
 async function main() {
