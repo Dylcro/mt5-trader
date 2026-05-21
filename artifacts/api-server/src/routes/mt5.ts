@@ -934,6 +934,11 @@ export async function startAutoConnect(): Promise<void> {
 // the deal-event stream, so it catches positions missed by SDK disconnects,
 // sync stalls, staleness skips, or any other event-delivery failure.
 const reconcileInFlight = new Set<string>(); // accountId:positionId currently being modified
+// Positions that have already moved past where their SL would go — the broker
+// rejects with "Invalid stops" (code 10016). We stop retrying them so the loop
+// doesn't spam logs every 8 s for the same losing position. Cleared every hour.
+const reconcileSkip = new Set<string>(); // accountId:positionId permanently skipped this session
+setInterval(() => reconcileSkip.clear(), 60 * 60_000);
 export function startSlReconciler(): void {
   const INTERVAL_MS = 8_000;
   setInterval(async () => {
@@ -959,17 +964,42 @@ export function startSlReconciler(): void {
           const hasSl = typeof p.stopLoss === "number" && p.stopLoss > 0;
           if (hasSl) continue;
           const key = `${accountId}:${posId}`;
-          if (reconcileInFlight.has(key)) continue;
+          if (reconcileInFlight.has(key) || reconcileSkip.has(key)) continue;
           const direction: "buy" | "sell" = p.type === "POSITION_TYPE_BUY" ? "buy" : "sell";
           const openPrice = Number(p.openPrice);
           if (!openPrice || !Number.isFinite(openPrice)) continue;
-          const slDistance = cfg.mt5SlPips * MT5_SL_PIP;
-          const slPrice = direction === "buy"
-            ? parseFloat((openPrice - slDistance).toFixed(2))
-            : parseFloat((openPrice + slDistance).toFixed(2));
+          // Zone-aware SL: if there's already an active zone in this direction
+          // that this entry falls inside, JOIN it and use the zone's shared SL
+          // (so cascade positions all show the same SL line). Otherwise create
+          // a fresh zone anchored at this entry.
+          let slPrice: number;
+          let zoneAction: "join" | "new";
+          const existingZone = findActiveZone(accountId, direction, openPrice);
+          if (existingZone) {
+            existingZone.positionIds.add(posId);
+            slPrice = existingZone.slPrice;
+            zoneAction = "join";
+          } else {
+            const slDistance = cfg.mt5SlPips * MT5_SL_PIP;
+            slPrice = direction === "buy"
+              ? parseFloat((openPrice - slDistance).toFixed(2))
+              : parseFloat((openPrice + slDistance).toFixed(2));
+            const newZone: SlZone = {
+              id: `z${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+              direction,
+              anchorEntry: openPrice,
+              slPrice,
+              positionIds: new Set([posId]),
+              active: true,
+              createdAt: Date.now(),
+            };
+            mt5ZonesFor(accountId).push(newZone);
+            pruneZones(accountId);
+            zoneAction = "new";
+          }
           reconcileInFlight.add(key);
           const t0 = Date.now();
-          console.log(`[mt5-sl-reconcile] posId=${posId} dir=${direction} entry=${openPrice} MISSING sl — applying ${slPrice} (${cfg.mt5SlPips} pips)`);
+          console.log(`[mt5-sl-reconcile] posId=${posId} dir=${direction} entry=${openPrice} MISSING sl — applying ${slPrice} (${zoneAction === "join" ? "join zone" : `${cfg.mt5SlPips} pips, new zone`})`);
           void (async () => {
             try {
               const modR = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
@@ -986,8 +1016,16 @@ export function startSlReconciler(): void {
               if (!modR.ok || (typeof code === "number" && !TRADE_SUCCESS_CODES.has(code))) {
                 const msg = (j as { message?: string }).message ?? "";
                 const benign = /Position not found/i.test(msg) || code === -2;
+                // code 10016 "Invalid stops" means the market has already moved
+                // past where the SL would go (e.g. price dropped below a BUY's
+                // SL line). The broker won't accept it and retrying every 8 s
+                // is pointless — skip this position for the rest of the session.
+                const invalidStops = code === 10016 || /Invalid stops/i.test(msg);
                 if (benign) {
                   console.log(`[mt5-sl-reconcile] posId=${posId} closed before reconcile (${Date.now() - t0}ms)`);
+                } else if (invalidStops) {
+                  reconcileSkip.add(key);
+                  console.warn(`[mt5-sl-reconcile] posId=${posId} cannot set SL ${slPrice} — market already past it (position needs manual action); skipping future retries`);
                 } else {
                   console.error(`[mt5-sl-reconcile] failed posId=${posId} status=${modR.status} code=${code ?? "?"} msg=${msg}`);
                 }
