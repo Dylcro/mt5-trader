@@ -403,6 +403,10 @@ const syncReady = new Set<string>();
 // Used to filter out historical deal events that the SDK delivers AFTER
 // onDealsSynchronized fires (a known SDK buffering quirk).
 const syncReadyAt = new Map<string, number>();
+// Tracks whether we've already logged a Layer-1 SKIP for this account's
+// current replay window. Reset on disconnect and on sync-arm so we get
+// one diagnostic line per replay, not per historical deal.
+const skipLogged = new Set<string>();
 
 function makeDealListener(accountId: string) {
   // The MetaAPI SDK calls many methods on every registered listener and throws
@@ -413,6 +417,7 @@ function makeDealListener(accountId: string) {
     async onDisconnected(_instanceIndex: string): Promise<void> {
       syncReady.delete(accountId); // reset — next reconnect must re-sync before cascading
       syncReadyAt.delete(accountId);
+      skipLogged.delete(accountId);
       activeStreams.delete(accountId);
       activeConnections.delete(accountId);
       console.log(`[stream ${accountId}] WebSocket disconnected — watchdog will reconnect`);
@@ -423,6 +428,7 @@ function makeDealListener(accountId: string) {
       if (!syncReady.has(accountId)) {
         syncReady.add(accountId);
         syncReadyAt.set(accountId, Date.now());
+        skipLogged.delete(accountId); // reset so next disconnect-replay logs once
         console.log(`[stream ${accountId}] deals sync complete — auto-cascade armed for live deals`);
 
         // ── Post-sync catch-up ─────────────────────────────────────────────
@@ -544,9 +550,15 @@ function makeDealListener(accountId: string) {
       // ── Auto-cascade: place limit orders for trades opened directly in MT5 ──
       const acctCascadeCfg = getCascadeConfig(accountId);
 
-      // Layer 1: sync guard — never cascade historical deals replayed on connect
+      // Layer 1: sync guard — never cascade historical deals replayed on connect.
+      // Silent skip: historical replays can deliver hundreds of deals back-to-back;
+      // logging every one floods stdout and blocks the SDK event loop, delaying
+      // live trades. We log at most once per replay window (gated below).
       if (!syncReady.has(accountId)) {
-        console.log(`[auto-cascade] SKIP posId=${evt.positionId} price=${evt.openPrice} — sync not ready yet (historical replay or onDealsSynchronized hasn't fired)`);
+        if (!skipLogged.has(accountId)) {
+          skipLogged.add(accountId);
+          console.log(`[auto-cascade] SKIP posId=${evt.positionId} price=${evt.openPrice} — sync not ready (further skips for this account suppressed until sync arms)`);
+        }
       }
       // Layer 1b: staleness guard — the SDK sometimes delivers buffered historical
       // onDealAdded events AFTER onDealsSynchronized fires, so they slip past Layer 1.
