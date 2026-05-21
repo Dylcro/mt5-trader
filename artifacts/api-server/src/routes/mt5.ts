@@ -822,9 +822,9 @@ async function startStreaming(token: string, accountId: string, region: string =
       if (syncReady.has(accountId)) return;
       const current = activeConnections.get(accountId);
       if (!current || current !== myConn) return;
-      console.warn(`[stream ${accountId}] onDealsSynchronized never fired after 150s — triggering sync recovery`);
+      console.warn(`[stream ${accountId}] onDealsSynchronized never fired after 240s — triggering sync recovery`);
       void recoverStuckSync(token, accountId);
-    }, 150_000);
+    }, 240_000);
     recoveryTimers.set(accountId, timer);
     // Persist credentials so the server can auto-reconnect after a restart
     // without waiting for the app to call /connect again.
@@ -909,6 +909,126 @@ export function startConnectionWatchdog(): void {
     }
   }, INTERVAL_MS);
   console.log("[watchdog] connection watchdog started (60 s interval)");
+}
+
+// ── Auto-SL safety net ───────────────────────────────────────────────────────
+// Runs every 30 s, completely independent of the streaming deal feed. For each
+// connected account it fetches open positions via REST and applies the user's
+// configured SL to any XAUUSD position that's still naked. This makes auto-SL
+// reliable even when MetaAPI's streaming sync is slow, stuck, or churning
+// through a recovery cycle — the deal stream is the fast path (sub-second),
+// the safety net is the guarantee (≤30 s).
+export function startAutoSlSafetyNet(): void {
+  const INTERVAL_MS = 30_000;
+  setInterval(async () => {
+    try {
+      const token = getToken();
+      const rows = await db
+        .select()
+        .from(storedAccountsTable)
+        .where(isNotNull(storedAccountsTable.userId));
+      for (const { accountId, userId, region } of rows) {
+        // Fire each account scan independently so a slow REST call for one
+        // user can't hold up another user's SL.
+        void scanAccountForNakedPositions(token, accountId, userId ?? undefined, region);
+      }
+    } catch (err) {
+      console.warn("[mt5-sl-safety] tick error:", (err as Error).message);
+    }
+  }, INTERVAL_MS);
+  console.log("[mt5-sl-safety] auto-SL safety net started (30 s interval)");
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+interface MetaApiPosition { id: string; symbol: string; type: string; openPrice: number; stopLoss?: number | null; volume?: number; }
+async function scanAccountForNakedPositions(token: string, accountId: string, userId: string | undefined, region: string): Promise<void> {
+  const cfg = getCascadeConfig(accountId, userId);
+  if (!cfg.mt5SlEnabled) return; // user doesn't want auto-SL — leave naked positions alone
+
+  let positions: MetaApiPosition[];
+  try {
+    const resp = await fetch(
+      `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
+      { headers: authHeaders(token) },
+    );
+    if (!resp.ok) {
+      // 404 is normal when account is between deploys; only log other errors
+      if (resp.status !== 404) console.warn(`[mt5-sl-safety] ${accountId} positions fetch ${resp.status}`);
+      return;
+    }
+    positions = await resp.json() as MetaApiPosition[];
+  } catch (err) {
+    console.warn(`[mt5-sl-safety] ${accountId} positions fetch failed: ${(err as Error).message}`);
+    return;
+  }
+
+  const slPips = cfg.mt5SlPips;
+  const slDistance = slPips * MT5_SL_PIP;
+  for (const pos of positions) {
+    if (pos.symbol !== "XAUUSD") continue;
+    if (pos.stopLoss && pos.stopLoss > 0) continue; // already protected
+    if (!pos.openPrice || pos.openPrice <= 0) continue;
+    if (pos.type !== "POSITION_TYPE_BUY" && pos.type !== "POSITION_TYPE_SELL") continue;
+
+    const direction: "buy" | "sell" = pos.type === "POSITION_TYPE_BUY" ? "buy" : "sell";
+
+    // Join an existing zone if entry is inside it; otherwise create a new one.
+    // Uses the same logic as the live deal handler so streamed and polled SLs
+    // are consistent.
+    let zone = findActiveZone(accountId, direction, pos.openPrice);
+    let slPrice: number;
+    if (zone) {
+      zone.positionIds.add(pos.id);
+      slPrice = zone.slPrice;
+    } else {
+      slPrice = direction === "buy"
+        ? parseFloat((pos.openPrice - slDistance).toFixed(2))
+        : parseFloat((pos.openPrice + slDistance).toFixed(2));
+      zone = {
+        id: `z${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+        direction,
+        anchorEntry: pos.openPrice,
+        slPrice,
+        positionIds: new Set([pos.id]),
+        active: true,
+        createdAt: Date.now(),
+      };
+      mt5ZonesFor(accountId).push(zone);
+      pruneZones(accountId);
+    }
+    const zoneRef = zone;
+
+    // Prefer the streaming connection (faster, no extra HTTP) but fall back to
+    // REST when the stream is down — REST is exactly why this safety net works
+    // when the deal stream is wedged.
+    const conn = activeConnections.get(accountId);
+    const t0 = Date.now();
+    try {
+      if (conn && typeof conn.modifyPosition === "function") {
+        await conn.modifyPosition(pos.id, slPrice);
+      } else {
+        const resp = await fetch(
+          `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
+          {
+            method: "POST",
+            headers: authHeaders(token),
+            body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: pos.id, stopLoss: slPrice }),
+          },
+        );
+        if (!resp.ok) {
+          const txt = await resp.text().catch(() => "");
+          throw new Error(`REST ${resp.status}: ${txt.slice(0, 200)}`);
+        }
+      }
+      console.log(`[mt5-sl-safety] applied SL ${slPrice} to naked posId=${pos.id} acct=${accountId} (${Date.now() - t0}ms, zone ${zoneRef.id})`);
+      markCascaded(accountId, pos.id);
+    } catch (err) {
+      console.warn(`[mt5-sl-safety] failed to SL posId=${pos.id} acct=${accountId}: ${(err as Error).message}`);
+      // Roll back zone membership so a retry next tick can recompute cleanly.
+      zoneRef.positionIds.delete(pos.id);
+      if (zoneRef.positionIds.size === 0) zoneRef.active = false;
+    }
+  }
 }
 
 // ── SDK connection-based trade execution ─────────────────────────────────────
