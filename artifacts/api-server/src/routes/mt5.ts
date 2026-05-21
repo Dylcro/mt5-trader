@@ -562,26 +562,30 @@ function makeDealListener(accountId: string) {
       // ── Auto-cascade: place limit orders for trades opened directly in MT5 ──
       const acctCascadeCfg = getCascadeConfig(accountId);
 
-      // Layer 1: sync guard — never cascade historical deals replayed on connect.
-      // Silent skip: historical replays can deliver hundreds of deals back-to-back;
-      // logging every one floods stdout and blocks the SDK event loop, delaying
-      // live trades. We log at most once per replay window (gated below).
-      if (!syncReady.has(accountId)) {
-        if (!skipLogged.has(accountId)) {
-          skipLogged.add(accountId);
-          console.log(`[auto-cascade] SKIP posId=${evt.positionId} price=${evt.openPrice} — sync not ready (further skips for this account suppressed until sync arms)`);
-        }
-      }
-      // Layer 1b: staleness guard — the SDK sometimes delivers buffered historical
-      // onDealAdded events AFTER onDealsSynchronized fires, so they slip past Layer 1.
-      // If the deal's MT5 execution time is more than 60 s older than when sync
-      // completed, it is historical data, not a live trade — skip it.
-      else if (deal.time && (() => {
-        const dealMs = new Date(deal.time).getTime();
+      // Layer 1: staleness guard — gate on the deal's actual MT5 execution time
+      // rather than the SDK sync flag. The SDK replays historical deals on
+      // reconnect (which can happen mid-session if the WebSocket drops), and a
+      // pure sync-flag check would also block genuinely live trades that happened
+      // during the brief reconnect window. Any deal whose MT5 time is older than
+      // 120 s is treated as historical replay and skipped; anything fresher is a
+      // live trade that we must process.
+      const dealMs = deal.time ? new Date(deal.time).getTime() : 0;
+      const dealAgeMs = dealMs > 0 ? Date.now() - dealMs : Number.POSITIVE_INFINITY;
+      const isStale = !syncReady.has(accountId) ? dealAgeMs > 120_000 : (() => {
         const armedAt = syncReadyAt.get(accountId) ?? 0;
-        return armedAt > 0 && dealMs < armedAt - 60_000;
-      })()) {
-        console.log(`[auto-cascade] SKIP posId=${evt.positionId} — stale deal (dealTime=${deal.time})`);
+        return armedAt > 0 && dealMs > 0 && dealMs < armedAt - 60_000;
+      })();
+      if (isStale) {
+        if (!syncReady.has(accountId)) {
+          // During sync replay we only log the FIRST skip per replay window to
+          // avoid stdout flooding (replays can be hundreds of deals).
+          if (!skipLogged.has(accountId)) {
+            skipLogged.add(accountId);
+            console.log(`[auto-cascade] SKIP posId=${evt.positionId} price=${evt.openPrice} — stale deal during resync (dealAge=${Math.round(dealAgeMs / 1000)}s; further skips suppressed)`);
+          }
+        } else {
+          console.log(`[auto-cascade] SKIP posId=${evt.positionId} — stale deal (dealTime=${deal.time})`);
+        }
       }
       // Layer 2: feature enabled + correct symbol + valid price
       else if (!acctCascadeCfg.enabled || evt.symbol !== "XAUUSD" || evt.openPrice <= 0) { /* skip — disabled or irrelevant */ }
