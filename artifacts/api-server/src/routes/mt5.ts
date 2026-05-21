@@ -584,6 +584,21 @@ function makeDealListener(accountId: string) {
   });
 }
 
+// Stop an active stream, close the WebSocket, and clean up all in-memory state.
+// Called when a user connects a different MT5 account so the old one stops cascading.
+async function stopStreaming(accountId: string): Promise<void> {
+  const conn = activeConnections.get(accountId);
+  if (conn) {
+    try { await conn.close(); } catch { /* ignore close errors */ }
+  }
+  activeStreams.delete(accountId);
+  activeConnections.delete(accountId);
+  activeRegions.delete(accountId);
+  syncReady.delete(accountId);
+  cascadeConfigs.delete(accountId);
+  console.log(`[stream ${accountId}] stopped and cleaned up`);
+}
+
 async function startStreaming(token: string, accountId: string, region: string = DEFAULT_REGION, userId?: string): Promise<void> {
   if (activeStreams.has(accountId)) return;
   activeStreams.add(accountId);
@@ -887,6 +902,27 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
     const token = getToken();
     const userId = (req as Record<string, unknown>)["userId"] as string | undefined;
 
+    // Stop streaming and remove DB rows for any previous account belonging to this user
+    // that is different from the incoming accountId.  Must be awaited before binding
+    // the new account so the old stream's cascade logic is fully shut down first.
+    const evictPreviousAccount = async (newAccountId: string) => {
+      if (!userId) return;
+      try {
+        const oldRows = await db.select().from(storedAccountsTable)
+          .where(eq(storedAccountsTable.userId, userId));
+        for (const row of oldRows) {
+          if (row.accountId === newAccountId) continue;
+          console.log(`[connect] evicting old account ${row.accountId} for userId=${userId}`);
+          await stopStreaming(row.accountId);
+          await db.delete(storedAccountsTable)
+            .where(eq(storedAccountsTable.accountId, row.accountId));
+          userAccountCache.delete(userId);
+        }
+      } catch (e) {
+        console.warn(`[connect] evictPreviousAccount error:`, (e as Error).message);
+      }
+    };
+
     // Helper: bind userId → accountId in cache + DB (best-effort, non-blocking)
     const bindAccount = (accountId: string) => {
       if (!userId) return;
@@ -898,12 +934,15 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
     };
 
     // Intercept res.json so every successful response with an accountId field automatically
-    // binds the user — no need to call bindAccount at every individual return point.
+    // evicts any old account and binds the new one — no need to call these at every return point.
     const _origJson = res.json.bind(res);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (res as any).json = (body: unknown) => {
       if (body && typeof body === "object" && "accountId" in (body as object)) {
-        bindAccount((body as Record<string, unknown>)["accountId"] as string);
+        const newId = (body as Record<string, unknown>)["accountId"] as string;
+        // Fire eviction async — must not block the HTTP response
+        void evictPreviousAccount(newId);
+        bindAccount(newId);
       }
       return _origJson(body);
     };
