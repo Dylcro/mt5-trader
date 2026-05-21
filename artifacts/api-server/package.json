@@ -18,6 +18,8 @@
     "cors": "^2",
     "drizzle-orm": "catalog:",
     "express": "^5",
+    "express-rate-limit": "^8.5.2",
+    "helmet": "^8.1.0",
     "http-proxy-middleware": "^4.0.0",
     "jsonwebtoken": "^9.0.3",
     "metaapi.cloud-sdk": "^29.3.3"

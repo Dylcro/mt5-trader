@@ -1,5 +1,7 @@
 import express, { type Express, type Request, type Response } from "express";
 import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
@@ -12,12 +14,44 @@ const __dirname = path.dirname(__filename);
 
 const app: Express = express();
 
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// ── Security headers ─────────────────────────────────────────────────────────
+app.use(helmet({ contentSecurityPolicy: false }));
+
+// ── CORS — only allow the production domain and local dev ────────────────────
+const ALLOWED_ORIGINS = [
+  "https://meta-trader-link.replit.app",
+  /^https:\/\/.*\.replit\.dev$/,
+  /^https:\/\/.*\.expo\.dev$/,
+  "http://localhost:19006",
+  "http://localhost:8081",
+];
+app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
+
+// ── Rate limiting ─────────────────────────────────────────────────────────────
+// Auth endpoints: 10 attempts per 15 minutes per IP (brute force protection)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { error: "Too many attempts. Please wait 15 minutes and try again." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// General API: 300 requests per minute per IP
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 300,
+  message: { error: "Too many requests. Please slow down." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
 app.use("/api/admin", adminRouter);
-app.use("/api/auth", authRouter);
+app.use("/api/auth", authLimiter, authRouter);
+app.use("/api", apiLimiter);
 
 // Public privacy policy page — required by App Store and Google Play for financial apps
 app.get("/privacy", (_req: Request, res: Response) => {
