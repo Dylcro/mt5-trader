@@ -654,36 +654,58 @@ function makeDealListener(accountId: string) {
           }
 
           const zoneRef = zone;
-          void (async () => {
-            const conn = activeConnections.get(accountId);
-            if (!conn || typeof conn.modifyPosition !== "function") {
-              console.error(`[mt5-sl] no active connection for ${accountId} — cannot modify position ${evt.positionId}`);
-              zoneRef.positionIds.delete(evt.positionId);
-              if (zoneAction === "new" && zoneRef.positionIds.size === 0) {
-                zoneRef.active = false; // dead zone, never had its anchor SL applied
-              }
-              return;
+          // Fire the SL apply ASAP — start the network call BEFORE doing the
+          // local bookkeeping/logging below. The IIAF returns immediately so
+          // the streaming SDK can move on to the next event.
+          const conn = activeConnections.get(accountId);
+          if (!conn || typeof conn.modifyPosition !== "function") {
+            console.error(`[mt5-sl] no active connection for ${accountId} — cannot modify position ${evt.positionId}`);
+            zoneRef.positionIds.delete(evt.positionId);
+            if (zoneAction === "new" && zoneRef.positionIds.size === 0) {
+              zoneRef.active = false; // dead zone, never had its anchor SL applied
             }
+          } else {
+            // Kick off the network call synchronously (no async wrapper / no
+            // extra microtask) so the request hits the wire as early as possible.
             const t0 = Date.now();
-            try {
-              await conn.modifyPosition(evt.positionId, slPrice);
-              console.log(`[mt5-sl] applied SL ${slPrice} to posId=${evt.positionId} (${Date.now() - t0}ms, zone ${zoneRef.id})`);
-              const syntheticEvt: DealEvent = {
-                ...evt,
-                dealId: `mt5sl-${evt.dealId}`,
-                time: Date.now(),
-                autoCascade: true,
-                autoCascadeCount: 1,
-              };
-              storeDealEvent(accountId, syntheticEvt);
-            } catch (err) {
-              console.error(`[mt5-sl] failed to modify posId=${evt.positionId} (${Date.now() - t0}ms):`, (err as Error).message);
+            const attemptModify = async (): Promise<void> => {
+              // Up to 3 attempts with tight backoff. In volatile markets the
+              // first attempt occasionally fails with a transient WebSocket
+              // error or a broker "trade context busy" — without retries the
+              // SL would simply be dropped. Total worst-case extra latency
+              // ~550ms only when retries are actually needed.
+              const delays = [0, 150, 400];
+              let lastErr: unknown = null;
+              for (let i = 0; i < delays.length; i++) {
+                if (delays[i] > 0) await new Promise((r) => setTimeout(r, delays[i]));
+                try {
+                  await conn.modifyPosition(evt.positionId, slPrice);
+                  const tag = i === 0 ? "" : ` (retry ${i})`;
+                  console.log(`[mt5-sl] applied SL ${slPrice} to posId=${evt.positionId} (${Date.now() - t0}ms${tag}, zone ${zoneRef.id})`);
+                  const syntheticEvt: DealEvent = {
+                    ...evt,
+                    dealId: `mt5sl-${evt.dealId}`,
+                    time: Date.now(),
+                    autoCascade: true,
+                    autoCascadeCount: 1,
+                  };
+                  storeDealEvent(accountId, syntheticEvt);
+                  return;
+                } catch (err) {
+                  lastErr = err;
+                  console.warn(`[mt5-sl] attempt ${i + 1}/${delays.length} failed for posId=${evt.positionId} (${Date.now() - t0}ms): ${(err as Error).message}`);
+                }
+              }
+              console.error(`[mt5-sl] GIVING UP on posId=${evt.positionId} after ${delays.length} attempts (${Date.now() - t0}ms):`, (lastErr as Error).message);
               zoneRef.positionIds.delete(evt.positionId);
               if (zoneAction === "new" && zoneRef.positionIds.size === 0) {
                 zoneRef.active = false;
               }
-            }
-          })();
+            };
+            // Fire and forget — do NOT await, so the streaming SDK can process
+            // the next deal event immediately.
+            void attemptModify();
+          }
         }
       }
     },
