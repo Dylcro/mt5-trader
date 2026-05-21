@@ -494,12 +494,8 @@ function makeDealListener(accountId: string) {
                   };
                   const t0 = Date.now();
                   try {
-                    const resp = await fetch(
-                      `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
-                      { method: "POST", headers: authHeaders(token), body: JSON.stringify(body) }
-                    );
-                    const data = await resp.json() as { orderId?: string };
-                    trackCascadeOrder(accountId, data.orderId);
+                    const orderId = await placeCascadeLimitFast(conn, region, accountId, token, body, i + 2, total);
+                    trackCascadeOrder(accountId, orderId);
                     console.log(`[post-sync-cascade] placed limit ${i + 2}/${total} @ ${limitPrice} (${Date.now() - t0}ms)`);
                   } catch (e) {
                     console.error(`[post-sync-cascade] failed limit ${i + 2}/${total} @ ${limitPrice} (${Date.now() - t0}ms):`, (e as Error).message);
@@ -588,18 +584,17 @@ function makeDealListener(accountId: string) {
             const levels = buildCascadeLevels(evt.openPrice, direction, acctCascadeCfg);
             const total = 1 + levels.limitEntries.length;
             console.log(`[auto-cascade] posId=${evt.positionId} dir=${direction} price=${evt.openPrice} limits=[${levels.limitEntries.join(",")}] sl=${levels.stopLoss}`);
+            const conn = activeConnections.get(accountId);
             const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
             const token = getToken();
             let placed = 0;
             const cascadeStart = Date.now();
-            // REST (not streaming WebSocket) for cascade limits. Reasoning:
-            // when MetaAPI's WebSocket node hiccups (intermittent disconnects,
-            // 89-second sync recoveries observed in prod), every queued
-            // tradeViaConnection call blocks until the socket recovers — making
-            // ALL limits land at the same delayed timestamp. REST calls are
-            // independent HTTPS requests with no shared connection state, so a
-            // WebSocket blip can't stall them. Double-cascade is prevented by
-            // the persisted cascadePlacedOrderIds (cascade_orders DB table).
+            // Hybrid: use the streaming WebSocket first (typically 1-3s — matches
+            // the speed of app-initiated cascades, which also go via this path).
+            // Race against a 4-second timeout; if streaming hangs (rare MetaAPI
+            // WebSocket hiccup), fall back to REST. If the streaming call later
+            // completes after the REST fallback, cancel the duplicate orderId.
+            // Double-placement on restart is still prevented by cascade_orders DB.
             await Promise.all(
               levels.limitEntries.map(async (limitPrice, i) => {
                 const body: Record<string, unknown> = {
@@ -612,13 +607,8 @@ function makeDealListener(accountId: string) {
                 };
                 const t0 = Date.now();
                 try {
-                  const resp = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
-                    method: "POST",
-                    headers: authHeaders(token),
-                    body: JSON.stringify(body),
-                  });
-                  const data = await resp.json() as { orderId?: string };
-                  trackCascadeOrder(accountId, data.orderId);
+                  const orderId = await placeCascadeLimitFast(conn, region, accountId, token, body, i + 2, total);
+                  trackCascadeOrder(accountId, orderId);
                   placed++;
                   console.log(`[auto-cascade] placed limit ${i + 2}/${total} @ ${limitPrice} (${Date.now() - t0}ms)`);
                 } catch (tradeErr) {
@@ -825,6 +815,68 @@ async function tradeViaConnection(conn: any, body: Record<string, unknown>): Pro
       throw new Error(`Unknown actionType: ${String(actionType)}`);
   }
   return { numericCode: resp?.numericCode ?? 0, message: resp?.message, orderId: resp?.orderId, positionId: resp?.positionId };
+}
+
+// Place a cascade limit order with hybrid streaming-first / REST-fallback strategy.
+// Returns the orderId of the order that won the race (streaming or REST).
+// If the streaming call later completes after REST already returned, cancels the
+// duplicate orderId so the user never sees two orders for the same slot.
+const STREAMING_CASCADE_TIMEOUT_MS = 4000;
+async function placeCascadeLimitFast(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  conn: any | undefined,
+  region: string,
+  accountId: string,
+  token: string,
+  body: Record<string, unknown>,
+  limitNum: number,
+  total: number,
+): Promise<string | undefined> {
+  // No streaming connection at all — REST only.
+  if (!conn) {
+    const resp = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
+      method: "POST",
+      headers: authHeaders(token),
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json() as { orderId?: string };
+    return data.orderId;
+  }
+
+  // Fire streaming call. Race it against a 4s timeout.
+  const streamPromise = tradeViaConnection(conn, body);
+  let timedOut = false;
+  const winner = await Promise.race([
+    streamPromise.then(r => ({ src: "stream" as const, orderId: r.orderId })),
+    new Promise<{ src: "timeout" }>(resolve => setTimeout(() => { timedOut = true; resolve({ src: "timeout" }); }, STREAMING_CASCADE_TIMEOUT_MS)),
+  ]);
+
+  if (winner.src === "stream") {
+    return winner.orderId;
+  }
+
+  // Streaming timed out — fire REST as fallback.
+  console.warn(`[auto-cascade] streaming hung >${STREAMING_CASCADE_TIMEOUT_MS}ms for limit ${limitNum}/${total}, falling back to REST`);
+  const restRespPromise = fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify(body),
+  }).then(r => r.json() as Promise<{ orderId?: string }>);
+
+  // Watch for late streaming completion AFTER we've committed to REST — cancel the duplicate.
+  streamPromise.then(streamResult => {
+    if (!timedOut) return; // streaming actually won the race, nothing to clean up
+    if (!streamResult.orderId) return;
+    console.warn(`[auto-cascade] late streaming response for limit ${limitNum}/${total} orderId=${streamResult.orderId} — cancelling duplicate`);
+    fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
+      method: "POST",
+      headers: authHeaders(token),
+      body: JSON.stringify({ actionType: "ORDER_CANCEL", orderId: streamResult.orderId }),
+    }).catch((e: Error) => console.error(`[auto-cascade] cancel-duplicate failed orderId=${streamResult.orderId}:`, e.message));
+  }).catch(() => { /* streaming errored — nothing to cancel */ });
+
+  const restData = await restRespPromise;
+  return restData.orderId;
 }
 
 // ── In-memory tick store ────────────────────────────────────────────────────
