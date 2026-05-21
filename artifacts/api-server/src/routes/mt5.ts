@@ -96,6 +96,10 @@ interface DealEvent {
 
 const dealStore = new Map<string, DealEvent[]>(); // accountId → recent deals
 const activeStreams = new Set<string>();           // accountIds with live connections
+// In-memory snapshot of stored-accounts rows so the watchdog can recover the
+// stream even when the database is briefly unavailable (e.g. Neon idle-conn
+// eviction). Refreshed on every successful DB read in auto-connect/watchdog.
+const knownAccounts = new Map<string, { region: string; userId: string | null }>();
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const activeConnections = new Map<string, any>(); // accountId → StreamingMetaApiConnectionInstance (for SDK trades)
 const activeRegions = new Map<string, string>();  // accountId → region (used for REST fallback in auto-cascade)
@@ -843,6 +847,7 @@ export async function startAutoConnect(): Promise<void> {
     for (const { accountId, region, userId } of rows) {
       console.log(`[auto-connect] reconnecting accountId=${accountId} region=${region}`);
       if (userId) userAccountCache.set(userId, accountId);
+      knownAccounts.set(accountId, { region, userId: userId ?? null });
       void startStreaming(token, accountId, region, userId ?? undefined);
     }
   } catch (err) {
@@ -853,24 +858,33 @@ export async function startAutoConnect(): Promise<void> {
 export function startConnectionWatchdog(): void {
   const INTERVAL_MS = 30_000;
   setInterval(async () => {
+    const token = getToken();
+    // Try DB first; on failure fall back to the in-memory snapshot so a brief
+    // DB outage (e.g. Neon idle-conn eviction) doesn't block stream recovery.
+    let entries: Array<{ accountId: string; region: string; userId: string | null }> = [];
     try {
-      const token = getToken();
       const rows = await db
         .select()
         .from(storedAccountsTable)
         .where(isNotNull(storedAccountsTable.userId));
-      for (const { accountId, region, userId } of rows) {
-        if (userId) userAccountCache.set(userId, accountId);
-        if (!activeStreams.has(accountId)) {
-          console.log(`[watchdog] ${accountId} not streaming — reconnecting`);
-          void startStreaming(token, accountId, region, userId ?? undefined);
-        }
-      }
+      entries = rows.map(r => ({ accountId: r.accountId, region: r.region, userId: r.userId ?? null }));
+      // Refresh in-memory snapshot from authoritative source.
+      for (const e of entries) knownAccounts.set(e.accountId, { region: e.region, userId: e.userId });
     } catch (err) {
-      console.warn("[watchdog] error:", (err as Error).message);
+      console.warn("[watchdog] DB read failed, using in-memory snapshot:", (err as Error).message);
+      for (const [accountId, meta] of knownAccounts.entries()) {
+        entries.push({ accountId, region: meta.region, userId: meta.userId });
+      }
+    }
+    for (const { accountId, region, userId } of entries) {
+      if (userId) userAccountCache.set(userId, accountId);
+      if (!activeStreams.has(accountId)) {
+        console.log(`[watchdog] ${accountId} not streaming — reconnecting`);
+        void startStreaming(token, accountId, region, userId ?? undefined);
+      }
     }
   }, INTERVAL_MS);
-  console.log("[watchdog] connection watchdog started (60 s interval)");
+  console.log(`[watchdog] connection watchdog started (${INTERVAL_MS / 1000}s interval)`);
 }
 
 // ── SDK connection-based trade execution ─────────────────────────────────────
