@@ -36,6 +36,12 @@ const POPULAR_SERVERS = [
   "VantageInternational-Live 8",
   "VantageInternational-Live 9",
   "VantageInternational-Live 10",
+  "VantageInternational-Live 11",
+  "VantageInternational-Live 12",
+  "VantageInternational-Live 13",
+  "VantageInternational-Live 14",
+  "VantageInternational-Live 15",
+  "VantageInternational-Live 16",
   "VantageInternational-Demo",
 ];
 
