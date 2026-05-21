@@ -1,7 +1,7 @@
 import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { createRequire } from "module";
-import { db, cascadeConfigTable, storedAccountsTable } from "@workspace/db";
+import { db, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable } from "@workspace/db";
 import { and, eq, isNotNull } from "drizzle-orm";
 import { JWT_SECRET } from "./auth";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
@@ -296,9 +296,10 @@ function isDuplicate(dealId: string): boolean {
 }
 
 // Tracks positionIds that have already been auto-cascaded (per account).
-// Survives reconnects intentionally — the same position must never be
-// double-cascaded even if MetaAPI re-delivers its deal after a reconnect.
-// Capped at 2000 entries total across all accounts to bound memory.
+// Persisted to the cascade_history table so it survives server restarts —
+// without this, post-sync catch-up re-cascades positions whose cascade limit
+// orders already filled (filled orders vanish from MT5's pending list, so
+// the comment-based "already cascaded" heuristic can't detect them).
 const cascadedPositions = new Map<string, Set<string>>(); // accountId → Set<positionId>
 function hasBeenCascaded(accountId: string, positionId: string): boolean {
   return cascadedPositions.get(accountId)?.has(positionId) ?? false;
@@ -306,11 +307,38 @@ function hasBeenCascaded(accountId: string, positionId: string): boolean {
 function markCascaded(accountId: string, positionId: string): void {
   let set = cascadedPositions.get(accountId);
   if (!set) { set = new Set(); cascadedPositions.set(accountId, set); }
+  if (set.has(positionId)) return; // already marked — skip DB write
   set.add(positionId);
   // Evict oldest entry if this account's set grows too large
   if (set.size > 2000) {
     const first = set.values().next().value;
     if (first !== undefined) set.delete(first);
+  }
+  // Persist to DB — fire-and-forget (in-memory set is the source of truth
+  // for the current session; DB is loaded on the next server startup).
+  db.insert(cascadeHistoryTable)
+    .values({ accountId, positionId, createdAt: Date.now() })
+    .onConflictDoNothing()
+    .catch((e: Error) => console.error(`[cascade-history] persist error posId=${positionId}:`, e.message));
+}
+
+// Load persisted cascade history for an account on (re)connect so that
+// post-sync catch-up never re-cascades positions that were already handled
+// in a previous server session.
+async function loadCascadeHistory(accountId: string): Promise<void> {
+  try {
+    const rows = await db
+      .select()
+      .from(cascadeHistoryTable)
+      .where(eq(cascadeHistoryTable.accountId, accountId));
+    let set = cascadedPositions.get(accountId);
+    if (!set) { set = new Set(); cascadedPositions.set(accountId, set); }
+    for (const row of rows) set.add(row.positionId);
+    if (rows.length > 0) {
+      console.log(`[cascade-history] loaded ${rows.length} previously-cascaded positions for ${accountId}`);
+    }
+  } catch (e) {
+    console.error(`[cascade-history] load error for ${accountId}:`, (e as Error).message);
   }
 }
 
@@ -622,6 +650,9 @@ async function stopStreaming(accountId: string): Promise<void> {
 async function startStreaming(token: string, accountId: string, region: string = DEFAULT_REGION, userId?: string): Promise<void> {
   if (activeStreams.has(accountId)) return;
   activeStreams.add(accountId);
+  // Load persisted cascade history BEFORE sync so post-sync catch-up
+  // sees already-cascaded positions and skips re-cascading them.
+  await loadCascadeHistory(accountId);
   try {
     const sdk = getSdk(token);
     const account = await sdk.metatraderAccountApi.getAccount(accountId);

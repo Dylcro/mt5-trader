@@ -20,6 +20,16 @@ async function ensureTables(): Promise<void> {
       created_at    BIGINT  NOT NULL
     );
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cascade_history (
+      id          SERIAL PRIMARY KEY,
+      account_id  TEXT   NOT NULL,
+      position_id TEXT   NOT NULL,
+      created_at  BIGINT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS cascade_history_acct_pos
+      ON cascade_history (account_id, position_id);
+  `);
 }
 
 async function main() {

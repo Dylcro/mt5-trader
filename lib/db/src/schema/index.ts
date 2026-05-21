@@ -18,6 +18,7 @@
 //   export type Post = typeof postsTable.$inferSelect;
 
 export * from "./cascadeConfig";
+export * from "./cascadeHistory";
 export * from "./storedAccounts";
 export * from "./supportTickets";
 export * from "./users";
