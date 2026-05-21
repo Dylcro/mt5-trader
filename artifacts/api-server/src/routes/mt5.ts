@@ -502,6 +502,7 @@ function makeDealListener(accountId: string) {
                   }
                 })
               );
+              scheduleCascadeReconcile(accountId, region, token);
             }
           } catch (e) {
             console.error(`[post-sync-cascade] catch-up error:`, (e as Error).message);
@@ -617,6 +618,7 @@ function makeDealListener(accountId: string) {
               })
             );
             console.log(`[auto-cascade] posId=${evt.positionId} all ${placed}/${total - 1} limits done in ${Date.now() - cascadeStart}ms`);
+            scheduleCascadeReconcile(accountId, region, token);
             // Append a new synthetic event after placement completes so the app can show a notification.
             // We do NOT mutate the original event in place — that would create a race where a client
             // poll during placement advances its `since` watermark past the original event's timestamp
@@ -864,19 +866,92 @@ async function placeCascadeLimitFast(
   }).then(r => r.json() as Promise<{ orderId?: string }>);
 
   // Watch for late streaming completion AFTER we've committed to REST — cancel the duplicate.
-  streamPromise.then(streamResult => {
+  // Retry the cancel up to 4 times with backoff because WebSocket hiccups (the very reason
+  // we fell back to REST) often also disrupt the cancel call.
+  streamPromise.then(async streamResult => {
     if (!timedOut) return; // streaming actually won the race, nothing to clean up
     if (!streamResult.orderId) return;
-    console.warn(`[auto-cascade] late streaming response for limit ${limitNum}/${total} orderId=${streamResult.orderId} — cancelling duplicate`);
-    fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
-      method: "POST",
-      headers: authHeaders(token),
-      body: JSON.stringify({ actionType: "ORDER_CANCEL", orderId: streamResult.orderId }),
-    }).catch((e: Error) => console.error(`[auto-cascade] cancel-duplicate failed orderId=${streamResult.orderId}:`, e.message));
+    const dupOrderId = streamResult.orderId;
+    console.warn(`[auto-cascade] late streaming response for limit ${limitNum}/${total} orderId=${dupOrderId} — cancelling duplicate`);
+    // Track it so any later reconciliation knows this orderId is OURS (not a user-placed limit)
+    cascadePlacedOrderIds.add(dupOrderId);
+    const delays = [0, 1500, 4000, 8000]; // ~14s of retries
+    for (let attempt = 0; attempt < delays.length; attempt++) {
+      if (delays[attempt] > 0) await new Promise(r => setTimeout(r, delays[attempt]));
+      try {
+        const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
+          method: "POST",
+          headers: authHeaders(token),
+          body: JSON.stringify({ actionType: "ORDER_CANCEL", orderId: dupOrderId }),
+        });
+        if (r.ok) {
+          console.log(`[auto-cascade] cancelled duplicate orderId=${dupOrderId} (attempt ${attempt + 1})`);
+          return;
+        }
+        console.warn(`[auto-cascade] cancel attempt ${attempt + 1} for orderId=${dupOrderId} returned status ${r.status}`);
+      } catch (e) {
+        console.warn(`[auto-cascade] cancel attempt ${attempt + 1} for orderId=${dupOrderId} threw:`, (e as Error).message);
+      }
+    }
+    console.error(`[auto-cascade] ALL cancel attempts failed for duplicate orderId=${dupOrderId} — reconciliation will sweep it`);
   }).catch(() => { /* streaming errored — nothing to cancel */ });
 
   const restData = await restRespPromise;
   return restData.orderId;
+}
+
+// ── Post-cascade orphan sweeper ─────────────────────────────────────────────
+// 15 s after a cascade fires, scan pending limit orders. Any "Cascade"-tagged
+// order whose orderId we did NOT track is an orphan (the most common cause:
+// a late streaming response that landed on MT5 but our cancel-duplicate failed
+// because the WebSocket was disconnecting). Cancel it.
+const RECONCILE_DELAY_MS = 15_000;
+
+function scheduleCascadeReconcile(accountId: string, region: string, token: string): void {
+  setTimeout(async () => {
+    try {
+      const resp = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`, {
+        headers: authHeaders(token),
+      });
+      if (!resp.ok) return;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const orders: any[] = await resp.json();
+      // Only treat orders older than 10s as "settled" — anything newer might
+      // belong to a cascade that's currently mid-placement (whose orderIds
+      // haven't yet been added to cascadePlacedOrderIds).
+      const ORPHAN_MIN_AGE_MS = 10_000;
+      const nowMs = Date.now();
+      const orphans: { id: string; comment: string }[] = [];
+      for (const o of orders) {
+        const comment = String(o.comment ?? "");
+        if (!comment.startsWith("Cascade")) continue;
+        const oid = String(o.id ?? o._id ?? "");
+        if (!oid) continue;
+        if (cascadePlacedOrderIds.has(oid)) continue; // we know about this one
+        // Skip very fresh orders to avoid eating a concurrent in-flight cascade
+        const orderTimeMs = o.time ? new Date(o.time).getTime() : 0;
+        if (orderTimeMs > 0 && (nowMs - orderTimeMs) < ORPHAN_MIN_AGE_MS) continue;
+        orphans.push({ id: oid, comment });
+      }
+      if (orphans.length === 0) return;
+      console.warn(`[reconcile ${accountId}] found ${orphans.length} untracked Cascade order(s): ${orphans.map(o => `${o.id}(${o.comment})`).join(", ")}`);
+      await Promise.all(orphans.map(async o => {
+        try {
+          const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
+            method: "POST",
+            headers: authHeaders(token),
+            body: JSON.stringify({ actionType: "ORDER_CANCEL", orderId: o.id }),
+          });
+          if (r.ok) console.log(`[reconcile ${accountId}] cancelled orphan orderId=${o.id}`);
+          else console.warn(`[reconcile ${accountId}] failed to cancel orphan orderId=${o.id} status=${r.status}`);
+        } catch (e) {
+          console.error(`[reconcile ${accountId}] cancel orphan threw orderId=${o.id}:`, (e as Error).message);
+        }
+      }));
+    } catch (e) {
+      console.error(`[reconcile ${accountId}] sweep error:`, (e as Error).message);
+    }
+  }, RECONCILE_DELAY_MS).unref();
 }
 
 // ── In-memory tick store ────────────────────────────────────────────────────
