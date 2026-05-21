@@ -16,6 +16,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import Colors from "@/constants/colors";
 import { useTrading, type PendingOrder, type Position } from "@/context/TradingContext";
+import GoldChart from "@/components/GoldChart";
 
 const C = Colors.dark;
 
@@ -315,6 +316,14 @@ export default function PositionsScreen() {
           />
         }
       >
+        <View style={styles.chartWrap}>
+          <View style={styles.chartHeader}>
+            <Text style={styles.sectionLabel}>XAUUSD  ·  LIVE CHART</Text>
+            <Text style={styles.chartSource}>TradingView</Text>
+          </View>
+          <GoldChart height={320} />
+        </View>
+
         {status !== "connected" ? (
           <View style={styles.emptyState}>
             <Feather name="wifi-off" size={40} color={C.textMuted} />
@@ -432,6 +441,22 @@ const styles = StyleSheet.create({
   scroll: {
     padding: 16,
     gap: 12,
+  },
+  chartWrap: {
+    gap: 8,
+    marginBottom: 4,
+  },
+  chartHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 2,
+  },
+  chartSource: {
+    fontSize: 10,
+    fontFamily: "Inter_500Medium",
+    color: C.textMuted,
+    letterSpacing: 0.5,
   },
   emptyState: {
     alignItems: "center",
