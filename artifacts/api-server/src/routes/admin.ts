@@ -120,6 +120,58 @@ router.get("/", async (req: Request, res: Response) => {
   </div>
 
   <div class="section">
+    <h2>Migrate MT5 Account To New Region</h2>
+    <div style="background:#111118;border:1px solid #1e1e2e;border-radius:12px;padding:20px;max-width:560px">
+      <p class="muted" style="font-size:12px;margin-bottom:14px;line-height:1.5">
+        Re-provisions a MetaAPI account in the target region (default: new-york).
+        Use this to move an existing london account to NY for lower latency.
+      </p>
+      <form id="migrateForm" style="display:grid;gap:10px">
+        <input name="login" placeholder="MT5 login (e.g. 12345678)" required
+          style="padding:10px;background:#0a0a0f;border:1px solid #1e1e2e;color:#e8e6de;border-radius:6px;font-family:inherit;font-size:13px">
+        <input name="password" type="password" placeholder="MT5 password" required
+          style="padding:10px;background:#0a0a0f;border:1px solid #1e1e2e;color:#e8e6de;border-radius:6px;font-family:inherit;font-size:13px">
+        <input name="server" placeholder="MT5 server (e.g. VantageInternational-Live)" required
+          style="padding:10px;background:#0a0a0f;border:1px solid #1e1e2e;color:#e8e6de;border-radius:6px;font-family:inherit;font-size:13px">
+        <input name="targetRegion" placeholder="Target region (default: new-york)" value="new-york"
+          style="padding:10px;background:#0a0a0f;border:1px solid #1e1e2e;color:#e8e6de;border-radius:6px;font-family:inherit;font-size:13px">
+        <button type="submit" style="padding:12px;background:#c9a84c;color:#0a0a0f;border:0;border-radius:6px;font-weight:700;cursor:pointer;font-size:13px">
+          MIGRATE ACCOUNT
+        </button>
+      </form>
+      <pre id="migrateResult" style="margin-top:14px;padding:12px;background:#0a0a0f;border:1px solid #1e1e2e;border-radius:6px;font-size:11px;color:#a0a0b8;white-space:pre-wrap;display:none;max-height:200px;overflow:auto"></pre>
+    </div>
+  </div>
+  <script>
+    (function() {
+      var form = document.getElementById('migrateForm');
+      var out = document.getElementById('migrateResult');
+      var key = new URLSearchParams(location.search).get('key') || '';
+      form.addEventListener('submit', async function(e) {
+        e.preventDefault();
+        var btn = form.querySelector('button');
+        btn.disabled = true; btn.textContent = 'MIGRATING... (10-60s)';
+        out.style.display = 'block'; out.textContent = 'Sending request...';
+        var fd = new FormData(form);
+        var body = { login: fd.get('login'), password: fd.get('password'), server: fd.get('server'), targetRegion: fd.get('targetRegion') || 'new-york' };
+        try {
+          var r = await fetch('/api/mt5/admin/migrate-region', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-admin-key': key },
+            body: JSON.stringify(body),
+          });
+          var j = await r.json();
+          out.textContent = 'HTTP ' + r.status + '\\n\\n' + JSON.stringify(j, null, 2);
+        } catch (err) {
+          out.textContent = 'Network error: ' + err.message;
+        } finally {
+          btn.disabled = false; btn.textContent = 'MIGRATE ACCOUNT';
+        }
+      });
+    })();
+  </script>
+
+  <div class="section">
     <h2>Support Requests <span class="badge">${tickets.length}</span></h2>
     <table>
       <thead><tr><th>Name</th><th>Account</th><th>Message</th><th>Submitted</th></tr></thead>
