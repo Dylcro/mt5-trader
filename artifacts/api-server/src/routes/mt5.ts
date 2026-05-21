@@ -786,10 +786,12 @@ async function startStreaming(token: string, accountId: string, region: string =
     // and redeploy the account on MetaAPI's side, which wipes the stuck
     // session. Recovery is rate-limited to avoid loops.
     setTimeout(() => {
-      if (!syncReady.has(accountId) && activeConnections.has(accountId)) {
-        console.warn(`[stream ${accountId}] onDealsSynchronized never fired after 60s — triggering sync recovery`);
-        void recoverStuckSync(token, accountId);
-      }
+      // Re-check at fire time — sync may have completed between scheduling
+      // and the timer firing, in which case recovery would needlessly tear
+      // down a perfectly healthy connection.
+      if (syncReady.has(accountId) || !activeConnections.has(accountId)) return;
+      console.warn(`[stream ${accountId}] onDealsSynchronized never fired after 60s — triggering sync recovery`);
+      void recoverStuckSync(token, accountId);
     }, 60_000);
     // Persist credentials so the server can auto-reconnect after a restart
     // without waiting for the app to call /connect again.
