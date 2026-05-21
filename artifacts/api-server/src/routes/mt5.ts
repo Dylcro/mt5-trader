@@ -281,12 +281,14 @@ function trackCascadeOrder(orderId: string | undefined): void {
 
 // Deduplication: MetaAPI connects to two server nodes (london-a and london-b)
 // so every deal event arrives twice. Track recently seen deal IDs and drop duplicates.
+// Cap raised to 5000 — sync replay can deliver hundreds of historical deals and a
+// 500-entry cap caused early entries to be evicted, allowing double-cascades on reconnect.
 const seenDealIds = new Set<string>();
 function isDuplicate(dealId: string): boolean {
   if (seenDealIds.has(dealId)) return true;
   seenDealIds.add(dealId);
-  // Prevent unbounded growth — keep at most 500 entries
-  if (seenDealIds.size > 500) {
+  // Prevent unbounded growth — keep at most 5000 entries
+  if (seenDealIds.size > 5000) {
     const first = seenDealIds.values().next().value;
     if (first !== undefined) seenDealIds.delete(first);
   }
@@ -339,6 +341,10 @@ function recordCascade(accountId: string, price: number): void {
 // onDealAdded fires for HISTORICAL deals during sync replay — we must NOT
 // auto-cascade those. Only deals that arrive after onSynchronized are live.
 const syncReady = new Set<string>();
+// Records the server-side ms timestamp when each account's sync completed.
+// Used to filter out historical deal events that the SDK delivers AFTER
+// onDealsSynchronized fires (a known SDK buffering quirk).
+const syncReadyAt = new Map<string, number>();
 
 function makeDealListener(accountId: string) {
   // The MetaAPI SDK calls many methods on every registered listener and throws
@@ -348,6 +354,7 @@ function makeDealListener(accountId: string) {
   const handler = {
     async onDisconnected(_instanceIndex: string): Promise<void> {
       syncReady.delete(accountId); // reset — next reconnect must re-sync before cascading
+      syncReadyAt.delete(accountId);
       activeStreams.delete(accountId);
       activeConnections.delete(accountId);
       console.log(`[stream ${accountId}] WebSocket disconnected — watchdog will reconnect`);
@@ -357,6 +364,7 @@ function makeDealListener(accountId: string) {
     async onDealsSynchronized(_instanceIndex: string, _synchronizationId: string): Promise<void> {
       if (!syncReady.has(accountId)) {
         syncReady.add(accountId);
+        syncReadyAt.set(accountId, Date.now());
         console.log(`[stream ${accountId}] deals sync complete — auto-cascade armed for live deals`);
 
         // ── Post-sync catch-up ─────────────────────────────────────────────
@@ -487,6 +495,17 @@ function makeDealListener(accountId: string) {
 
       // Layer 1: sync guard — never cascade historical deals replayed on connect
       if (!syncReady.has(accountId)) { /* skip — historical replay */ }
+      // Layer 1b: staleness guard — the SDK sometimes delivers buffered historical
+      // onDealAdded events AFTER onDealsSynchronized fires, so they slip past Layer 1.
+      // If the deal's MT5 execution time is more than 60 s older than when sync
+      // completed, it is historical data, not a live trade — skip it.
+      else if (deal.time && (() => {
+        const dealMs = new Date(deal.time).getTime();
+        const armedAt = syncReadyAt.get(accountId) ?? 0;
+        return armedAt > 0 && dealMs < armedAt - 60_000;
+      })()) {
+        console.log(`[auto-cascade] SKIP posId=${evt.positionId} — stale deal (dealTime=${deal.time})`);
+      }
       // Layer 2: feature enabled + correct symbol + valid price
       else if (!acctCascadeCfg.enabled || evt.symbol !== "XAUUSD" || evt.openPrice <= 0) { /* skip — disabled or irrelevant */ }
       // Layer 3: positionId already cascaded (covers app-placed market orders pre-marked above)
@@ -595,6 +614,7 @@ async function stopStreaming(accountId: string): Promise<void> {
   activeConnections.delete(accountId);
   activeRegions.delete(accountId);
   syncReady.delete(accountId);
+  syncReadyAt.delete(accountId);
   cascadeConfigs.delete(accountId);
   console.log(`[stream ${accountId}] stopped and cleaned up`);
 }
