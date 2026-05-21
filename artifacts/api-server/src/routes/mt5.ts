@@ -709,7 +709,12 @@ async function startStreaming(token: string, accountId: string, region: string =
         console.log(`[stream ${accountId}] waiting for deploy... (${(i + 1) * 5}s)`);
       }
     }
-    const conn = account.getStreamingConnection();
+    // Skip historical deal/order replay entirely. We never read history —
+    // only react to live `onDealAdded` events for auto-cascade. Accounts
+    // with large histories (like Gethin's) were taking 90-120 s to sync,
+    // causing subscribe timeouts and a permanent reconnect loop on the
+    // london region. Starting from "now" makes sync near-instant.
+    const conn = account.getStreamingConnection(undefined, new Date());
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (conn as any).addSynchronizationListener(makeDealListener(accountId));
     await conn.connect();
