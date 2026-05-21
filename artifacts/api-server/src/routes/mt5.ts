@@ -2,7 +2,7 @@ import { Router, type IRouter, type Request, type Response, type NextFunction } 
 import jwt from "jsonwebtoken";
 import { createRequire } from "module";
 import { db, cascadeConfigTable, storedAccountsTable } from "@workspace/db";
-import { eq, isNotNull } from "drizzle-orm";
+import { and, eq, isNotNull } from "drizzle-orm";
 import { JWT_SECRET } from "./auth";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
 // In dev (tsx/ESM) import.meta.url is the real file URL.
@@ -40,26 +40,27 @@ async function checkOwner(req: Request, res: Response, next: NextFunction): Prom
   const accountId = req.params["accountId"];
   if (!accountId || !userId) { next(); return; }
 
-  // Fast path: in-memory cache
+  // Fast path: in-memory cache — only trust the cache when it matches.
+  // On mismatch fall through to the DB so a reconnect with a new accountId
+  // (after re-provisioning) is not permanently blocked by a stale cache entry.
   const cachedId = userAccountCache.get(userId);
-  if (cachedId !== undefined) {
-    if (cachedId !== accountId) { res.status(403).json({ error: "Forbidden" }); return; }
-    next(); return;
-  }
+  if (cachedId === accountId) { next(); return; }
 
-  // Cache miss — check DB (covers fresh server restarts)
+  // DB check: verify this specific accountId is owned by this user.
+  // Querying by both columns avoids false denials caused by the user having
+  // multiple account rows or the cache holding an older accountId.
   try {
     const [row] = await db.select().from(storedAccountsTable)
-      .where(eq(storedAccountsTable.userId, userId))
+      .where(and(
+        eq(storedAccountsTable.userId, userId),
+        eq(storedAccountsTable.accountId, accountId),
+      ))
       .limit(1);
     if (!row) {
-      // No bound account for this user — deny all account-scoped routes
-      res.status(403).json({ error: "No account bound to this user." }); return;
-    }
-    userAccountCache.set(userId, row.accountId); // repopulate cache
-    if (row.accountId !== accountId) {
+      console.warn(`[checkOwner] userId=${userId} does not own accountId=${accountId}`);
       res.status(403).json({ error: "Forbidden" }); return;
     }
+    userAccountCache.set(userId, accountId); // refresh cache with confirmed value
     next();
   } catch (err) {
     // DB error — fail closed, do not allow access

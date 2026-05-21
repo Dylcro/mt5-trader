@@ -655,18 +655,19 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
-        const data = await safeJson<{ success?: boolean; code?: number; message?: string; positionId?: string; orderId?: string }>(res);
-        console.log("[submitOrderRaw] ←", actionType, "httpStatus=" + String(res.status), "success=" + String(data.success) + " code=" + String(data.code) + " msg=" + String(data.message));
+        const data = await safeJson<{ success?: boolean; code?: number; message?: string; error?: string; positionId?: string; orderId?: string }>(res);
+        const errMsg = data.message ?? data.error;
+        console.log("[submitOrderRaw] ←", actionType, "httpStatus=" + String(res.status), "success=" + String(data.success) + " code=" + String(data.code) + " msg=" + String(errMsg));
         if (res.ok && data.success !== false) {
           return { success: true, message: data.message ?? "Trade placed successfully", positionId: data.positionId, orderId: data.orderId };
         }
         // Retry once on transient broker-not-ready errors with a short delay
-        if (attempt < MAX_ATTEMPTS && isTransient(data.message)) {
+        if (attempt < MAX_ATTEMPTS && isTransient(errMsg)) {
           console.log("[submitOrderRaw] transient error — retrying in 500ms");
           await new Promise((r) => setTimeout(r, 500));
           continue;
         }
-        return { success: false, message: data.message ?? `Trade failed (code ${data.code ?? res.status})` };
+        return { success: false, message: errMsg ?? `Trade failed (code ${data.code ?? res.status})` };
       }
       return { success: false, message: "Trade failed after retries" };
     },
