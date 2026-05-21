@@ -312,6 +312,71 @@ function markCascaded(accountId: string, positionId: string): void {
   }
 }
 
+// ── Cascade REST placement helper ────────────────────────────────────────────
+// Places a single cascade limit order via REST with:
+//  • A deterministic clientId (positionId + level index) so MetaAPI deduplicates
+//    the order if a retry somehow reaches the server after a timeout.
+//  • One retry on pure network errors (fetch throws before we get any response).
+//  • No retry on timeout — the order may already be live on the broker.
+//  • No retry on HTTP errors — bad request / auth / broker rejection won't fix itself.
+async function placeCascadeLimit(opts: {
+  region: string;
+  token: string;
+  accountId: string;
+  positionId: string;  // used to build the deterministic clientId
+  levelIndex: number;  // 0-based index among the limit levels
+  body: Record<string, unknown>;
+}): Promise<string | undefined> {
+  const { region, token, accountId, positionId, levelIndex, body } = opts;
+  const url = `${clientBase(region)}/users/current/accounts/${accountId}/trade`;
+  const headers = authHeaders(token);
+  // Deterministic clientId: MetaAPI uses this to deduplicate on its side.
+  // Same positionId + same level will never produce a second order even if
+  // a retry races with a successful first attempt that timed out on our end.
+  const clientId = `casc-${positionId}-${levelIndex}`;
+  const payload = JSON.stringify({ ...body, clientId });
+
+  const attempt = async (isRetry: boolean): Promise<string | undefined> => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000); // 8s hard timeout
+    try {
+      const resp = await fetch(url, { method: "POST", headers, body: payload, signal: ctrl.signal });
+      clearTimeout(timer);
+      const data = await resp.json() as { orderId?: string; message?: string };
+      if (!resp.ok) {
+        // HTTP error — broker rejected the order or MetaAPI auth failed.
+        // No point retrying — log and move on.
+        throw new Error(`HTTP ${resp.status}: ${data.message ?? "trade rejected"}`);
+      }
+      return data.orderId;
+    } catch (err) {
+      clearTimeout(timer);
+      const e = err as Error;
+      if (e.name === "AbortError") {
+        // Timed out — the request may have reached MetaAPI and been processed.
+        // Do NOT retry; a second identical request could double the order.
+        // clientId on the body means MetaAPI will deduplicate if it did arrive.
+        throw new Error(`timeout${isRetry ? " (retry)" : ""} — order may be live`);
+      }
+      throw e; // re-throw for caller to decide on retry
+    }
+  };
+
+  try {
+    return await attempt(false);
+  } catch (err) {
+    const e = err as Error;
+    // Only retry on network-level errors (fetch threw before any HTTP response).
+    // Timeout and HTTP errors are not retried (see comments above).
+    if (e.message.startsWith("timeout") || e.message.startsWith("HTTP ")) {
+      throw e;
+    }
+    // Network error — wait briefly and try once more with the same clientId.
+    await new Promise(r => setTimeout(r, 300));
+    return await attempt(true);
+  }
+}
+
 // ── Rapid-trade dedup guard (Layer 6) ────────────────────────────────────────
 // If two separate DEAL_ENTRY_IN events arrive for the same account within
 // RAPID_CASCADE_WINDOW_MS at nearly the same price (within RAPID_PRICE_TOLERANCE),
@@ -421,7 +486,6 @@ function makeDealListener(accountId: string) {
               recordCascade(accountId, openPrice);
               console.log(`[post-sync-cascade] posId=${posId} dir=${direction} price=${openPrice} limits=[${levels.limitEntries.join(",")}] sl=${levels.stopLoss}`);
 
-              // Use REST for parallel placement — SDK WebSocket serialises requests.
               await Promise.all(
                 levels.limitEntries.map(async (limitPrice, i) => {
                   const body: Record<string, unknown> = {
@@ -433,12 +497,13 @@ function makeDealListener(accountId: string) {
                     comment:   `Cascade ${i + 2}/${total}`,
                   };
                   try {
-                    const resp = await fetch(
-                      `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
-                      { method: "POST", headers: authHeaders(token), body: JSON.stringify(body) }
-                    );
-                    const data = await resp.json() as { orderId?: string };
-                    trackCascadeOrder(data.orderId);
+                    const orderId = await placeCascadeLimit({
+                      region, token, accountId,
+                      positionId: posId,
+                      levelIndex: i,
+                      body,
+                    });
+                    trackCascadeOrder(orderId);
                     console.log(`[post-sync-cascade] placed limit ${i + 2}/${total} @ ${limitPrice}`);
                   } catch (e) {
                     console.error(`[post-sync-cascade] failed limit ${i + 2}/${total} @ ${limitPrice}:`, (e as Error).message);
@@ -519,8 +584,6 @@ function makeDealListener(accountId: string) {
             const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
             const token = getToken();
             let placed = 0;
-            // Use REST for cascade limit orders — the SDK WebSocket serialises concurrent
-            // trade requests internally causing 4-9 s stalls. REST calls are truly parallel.
             await Promise.all(
               levels.limitEntries.map(async (limitPrice, i) => {
                 const body: Record<string, unknown> = {
@@ -532,13 +595,13 @@ function makeDealListener(accountId: string) {
                   comment: `Cascade ${i + 2}/${total}`,
                 };
                 try {
-                  const resp = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
-                    method: "POST",
-                    headers: authHeaders(token),
-                    body: JSON.stringify(body),
+                  const orderId = await placeCascadeLimit({
+                    region, token, accountId,
+                    positionId: evt.positionId,
+                    levelIndex: i,
+                    body,
                   });
-                  const data = await resp.json() as { orderId?: string };
-                  trackCascadeOrder(data.orderId);
+                  trackCascadeOrder(orderId);
                   placed++;
                   console.log(`[auto-cascade] placed limit ${i + 2}/${total} @ ${limitPrice}`);
                 } catch (tradeErr) {
