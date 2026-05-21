@@ -929,6 +929,91 @@ export async function startAutoConnect(): Promise<void> {
   }
 }
 
+// Reconciliation backstop: every few seconds, list open positions for every
+// active account and apply an SL to any that are missing one. Independent of
+// the deal-event stream, so it catches positions missed by SDK disconnects,
+// sync stalls, staleness skips, or any other event-delivery failure.
+const reconcileInFlight = new Set<string>(); // accountId:positionId currently being modified
+export function startSlReconciler(): void {
+  const INTERVAL_MS = 8_000;
+  setInterval(async () => {
+    const token = (() => { try { return getToken(); } catch { return ""; } })();
+    if (!token) return;
+    for (const accountId of activeStreams) {
+      const meta = knownAccounts.get(accountId);
+      const region = meta?.region ?? activeRegions.get(accountId) ?? DEFAULT_REGION;
+      const cfg = getCascadeConfig(accountId, meta?.userId ?? undefined);
+      if (!cfg.mt5SlEnabled) continue;
+      try {
+        const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/positions`, {
+          headers: authHeaders(token),
+        });
+        if (!r.ok) continue;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const positions = await r.json() as Array<any>;
+        if (!Array.isArray(positions)) continue;
+        for (const p of positions) {
+          if (p?.symbol !== "XAUUSD") continue;
+          const posId = String(p.id ?? "");
+          if (!posId) continue;
+          const hasSl = typeof p.stopLoss === "number" && p.stopLoss > 0;
+          if (hasSl) continue;
+          const key = `${accountId}:${posId}`;
+          if (reconcileInFlight.has(key)) continue;
+          const direction: "buy" | "sell" = p.type === "POSITION_TYPE_BUY" ? "buy" : "sell";
+          const openPrice = Number(p.openPrice);
+          if (!openPrice || !Number.isFinite(openPrice)) continue;
+          const slDistance = cfg.mt5SlPips * MT5_SL_PIP;
+          const slPrice = direction === "buy"
+            ? parseFloat((openPrice - slDistance).toFixed(2))
+            : parseFloat((openPrice + slDistance).toFixed(2));
+          reconcileInFlight.add(key);
+          const t0 = Date.now();
+          console.log(`[mt5-sl-reconcile] posId=${posId} dir=${direction} entry=${openPrice} MISSING sl — applying ${slPrice} (${cfg.mt5SlPips} pips)`);
+          void (async () => {
+            try {
+              const modR = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
+                method: "POST",
+                headers: authHeaders(token),
+                body: JSON.stringify({
+                  actionType: "POSITION_MODIFY",
+                  positionId: posId,
+                  stopLoss: slPrice,
+                }),
+              });
+              const j = await modR.json().catch(() => ({} as Record<string, unknown>));
+              const code = (j as { numericCode?: number }).numericCode;
+              if (!modR.ok || (typeof code === "number" && !TRADE_SUCCESS_CODES.has(code))) {
+                const msg = (j as { message?: string }).message ?? "";
+                const benign = /Position not found/i.test(msg) || code === -2;
+                if (benign) {
+                  console.log(`[mt5-sl-reconcile] posId=${posId} closed before reconcile (${Date.now() - t0}ms)`);
+                } else {
+                  console.error(`[mt5-sl-reconcile] failed posId=${posId} status=${modR.status} code=${code ?? "?"} msg=${msg}`);
+                }
+              } else {
+                console.log(`[mt5-sl-reconcile] applied SL ${slPrice} to posId=${posId} (${Date.now() - t0}ms)`);
+              }
+            } catch (err) {
+              console.error(`[mt5-sl-reconcile] error posId=${posId}:`, (err as Error).message);
+            } finally {
+              // Hold the in-flight lock for a few seconds so we don't hammer the
+              // same position if the broker takes a moment to reflect the SL.
+              setTimeout(() => reconcileInFlight.delete(key), 5_000);
+            }
+          })();
+        }
+      } catch (err) {
+        // Don't spam logs; a single failed poll is fine, we'll try again next tick.
+        if (Math.random() < 0.1) {
+          console.warn(`[mt5-sl-reconcile] poll failed for ${accountId}:`, (err as Error).message);
+        }
+      }
+    }
+  }, INTERVAL_MS);
+  console.log(`[mt5-sl-reconcile] SL reconciliation loop started (${INTERVAL_MS / 1000}s interval)`);
+}
+
 export function startConnectionWatchdog(): void {
   const INTERVAL_MS = 30_000;
   setInterval(async () => {
