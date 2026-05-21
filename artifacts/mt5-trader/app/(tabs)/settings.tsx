@@ -27,21 +27,19 @@ const C = Colors.dark;
 
 const POPULAR_SERVERS = [
   "Vantage-Live",
-  "Vantage-Demo",
   "Vantage-Live 2",
-  "Vantage-Demo 2",
   "VantageFX-Live",
-  "VantageFX-Demo",
   "VantageFX-Live 2",
-  "VantageFX-Demo 2",
+  "VantageFX-Live 3",
   "VantageInternational-Live",
+  "VantageInternational-Live 2",
+  "VantageInternational-Live 3",
+  "Vantage-Demo",
+  "Vantage-Demo 2",
+  "VantageFX-Demo",
+  "VantageFX-Demo 2",
   "VantageInternational-Demo",
   "MetaQuotes-Demo",
-  "Exness-MT5Trial",
-  "ICMarketsSC-MT5",
-  "XM-MT5",
-  "FBS-MT5",
-  "Pepperstone-MT5",
 ];
 
 function InfoRow({ label, value, color }: { label: string; value: string; color?: string }) {
