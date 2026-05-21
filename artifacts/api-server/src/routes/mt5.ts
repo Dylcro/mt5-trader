@@ -676,18 +676,46 @@ function makeDealListener(accountId: string) {
           const zoneRef = zone;
           void (async () => {
             const conn = activeConnections.get(accountId);
-            if (!conn || typeof conn.modifyPosition !== "function") {
-              console.error(`[mt5-sl] no active connection for ${accountId} — cannot modify position ${evt.positionId}`);
-              zoneRef.positionIds.delete(evt.positionId);
-              if (zoneAction === "new" && zoneRef.positionIds.size === 0) {
-                zoneRef.active = false; // dead zone, never had its anchor SL applied
-              }
-              return;
-            }
+            const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
             const t0 = Date.now();
+
+            // Race SDK (websocket) vs REST (HTTPS) — whichever channel responds
+            // first wins. MetaAPI's websocket modifyPosition is normally <1 s but
+            // can stall to 10–90 s right before a disconnect; REST uses a totally
+            // separate transport and usually completes in 300–800 ms.
+            // POSITION_MODIFY with the same SL value is idempotent, so the loser
+            // is a harmless no-op.
+            const sdkP: Promise<string> = conn && typeof conn.modifyPosition === "function"
+              ? conn.modifyPosition(evt.positionId, slPrice).then(() => "sdk")
+              : Promise.reject(new Error("no active SDK connection"));
+
+            const token = (() => { try { return getToken(); } catch { return ""; } })();
+            const restP: Promise<string> = token
+              ? fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
+                  method: "POST",
+                  headers: authHeaders(token),
+                  body: JSON.stringify({
+                    actionType: "POSITION_MODIFY",
+                    positionId: evt.positionId,
+                    stopLoss: slPrice,
+                  }),
+                }).then(async (r) => {
+                  const j = await r.json().catch(() => ({} as Record<string, unknown>));
+                  const code = (j as { numericCode?: number }).numericCode;
+                  if (!r.ok || (typeof code === "number" && !TRADE_SUCCESS_CODES.has(code))) {
+                    throw new Error(`REST modify failed status=${r.status} code=${code ?? "?"} msg=${(j as {message?: string}).message ?? ""}`);
+                  }
+                  return "rest";
+                })
+              : Promise.reject(new Error("no METAAPI_TOKEN"));
+
+            // Suppress unhandled-rejection on the loser.
+            sdkP.catch(() => {});
+            restP.catch(() => {});
+
             try {
-              await conn.modifyPosition(evt.positionId, slPrice);
-              console.log(`[mt5-sl] applied SL ${slPrice} to posId=${evt.positionId} (${Date.now() - t0}ms, zone ${zoneRef.id})`);
+              const winner = await Promise.any([sdkP, restP]);
+              console.log(`[mt5-sl] applied SL ${slPrice} to posId=${evt.positionId} (${Date.now() - t0}ms via ${winner}, zone ${zoneRef.id})`);
               const syntheticEvt: DealEvent = {
                 ...evt,
                 dealId: `mt5sl-${evt.dealId}`,
@@ -697,7 +725,9 @@ function makeDealListener(accountId: string) {
               };
               storeDealEvent(accountId, syntheticEvt);
             } catch (err) {
-              console.error(`[mt5-sl] failed to modify posId=${evt.positionId} (${Date.now() - t0}ms):`, (err as Error).message);
+              const errs = (err as AggregateError).errors ?? [err];
+              const msgs = errs.map((e: Error) => e.message).join(" | ");
+              console.error(`[mt5-sl] failed to modify posId=${evt.positionId} (${Date.now() - t0}ms): ${msgs}`);
               zoneRef.positionIds.delete(evt.positionId);
               if (zoneAction === "new" && zoneRef.positionIds.size === 0) {
                 zoneRef.active = false;
