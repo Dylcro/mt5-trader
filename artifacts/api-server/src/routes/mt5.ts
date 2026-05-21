@@ -595,11 +595,10 @@ function makeDealListener(accountId: string) {
             const token = getToken();
             let placed = 0;
             const cascadeStart = Date.now();
-            // Streaming-only (no REST fallback). If streaming hangs or errors,
-            // the affected limit slot is skipped and logged — safer than risking
-            // an orphan duplicate from a late streaming response landing after a
-            // REST backup. Double-placement on restart is still prevented by
-            // cascade_orders DB; orphan sweeper still runs as defence-in-depth.
+            // Single-channel placement: streaming if connected, else REST.
+            // Never both in parallel (that's what caused the duplicate-order bug).
+            // Double-placement on restart is still prevented by cascade_orders DB;
+            // orphan sweeper still runs as defence-in-depth.
             await Promise.all(
               levels.limitEntries.map(async (limitPrice, i) => {
                 const body: Record<string, unknown> = {
@@ -823,29 +822,41 @@ async function tradeViaConnection(conn: any, body: Record<string, unknown>): Pro
   return { numericCode: resp?.numericCode ?? 0, message: resp?.message, orderId: resp?.orderId, positionId: resp?.positionId };
 }
 
-// Place a cascade limit order via the streaming SDK connection.
-// Streaming-only — NO REST fallback. The previous hybrid strategy could leave
-// orphan duplicates if streaming hung, REST fired, then streaming late-completed
-// during a WebSocket disconnect (cancel-duplicate would silently fail). Better
-// to under-place than to risk a stray order on the user's account.
-//
-// If no streaming connection exists OR streaming throws/hangs, this throws —
-// the caller logs and moves on; the trade is skipped for that limit slot.
+// Place a cascade limit order.
+// Picks ONE channel and commits to it — never fires both in parallel:
+//   - If a streaming SDK connection exists → streaming only (with 30 s safety bound).
+//   - Otherwise → REST only.
+// The previously-removed *parallel* hybrid was dangerous because a late
+// streaming response could land on MT5 after REST already placed the order,
+// and the cancel-duplicate call would silently fail during a WebSocket
+// disconnect. A single-channel REST call (when no streaming exists) cannot
+// produce a duplicate — nothing is racing it.
 const STREAMING_CASCADE_TIMEOUT_MS = 30_000;
 async function placeCascadeLimitFast(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   conn: any | undefined,
-  _region: string,
-  _accountId: string,
-  _token: string,
+  region: string,
+  accountId: string,
+  token: string,
   body: Record<string, unknown>,
   limitNum: number,
   total: number,
 ): Promise<string | undefined> {
   if (!conn) {
-    throw new Error(`no streaming connection — limit ${limitNum}/${total} skipped (safer than REST fallback)`);
+    console.warn(`[auto-cascade] no streaming connection for limit ${limitNum}/${total} — using REST (single-channel, no duplicate risk)`);
+    const resp = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
+      method: "POST",
+      headers: authHeaders(token),
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => "");
+      throw new Error(`REST trade ${resp.status}: ${txt.slice(0, 200)}`);
+    }
+    const data = await resp.json() as { orderId?: string };
+    return data.orderId;
   }
-  // Safety bound so a wedged SDK call cannot hang the cascade loop forever.
+  // Streaming path — safety bound so a wedged SDK call cannot hang the cascade loop.
   const result = await Promise.race([
     tradeViaConnection(conn, body),
     new Promise<never>((_, reject) =>
