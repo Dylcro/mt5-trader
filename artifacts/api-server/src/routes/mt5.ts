@@ -312,67 +312,6 @@ function markCascaded(accountId: string, positionId: string): void {
   }
 }
 
-// ── Cascade REST placement helper ────────────────────────────────────────────
-// Places a single cascade limit order via REST with:
-//  • A deterministic clientId (positionId + level index) so MetaAPI deduplicates
-//    the order if a retry somehow reaches the server after a timeout.
-//  • One retry on pure network errors (fetch throws before we get any response).
-//  • No retry on timeout — the order may already be live on the broker.
-//  • No retry on HTTP errors — bad request / auth / broker rejection won't fix itself.
-async function placeCascadeLimit(opts: {
-  region: string;
-  token: string;
-  accountId: string;
-  positionId: string;
-  levelIndex: number;
-  body: Record<string, unknown>;
-}): Promise<string | undefined> {
-  const { region, token, accountId, body } = opts;
-  const url = `${clientBase(region)}/users/current/accounts/${accountId}/trade`;
-  const headers = authHeaders(token);
-  const payload = JSON.stringify(body);
-
-  const attempt = async (isRetry: boolean): Promise<string | undefined> => {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 8000); // 8s hard timeout
-    try {
-      const resp = await fetch(url, { method: "POST", headers, body: payload, signal: ctrl.signal });
-      clearTimeout(timer);
-      const data = await resp.json() as { orderId?: string; message?: string };
-      if (!resp.ok) {
-        // HTTP error — broker rejected the order or MetaAPI auth failed.
-        // No point retrying — log and move on.
-        throw new Error(`HTTP ${resp.status}: ${data.message ?? "trade rejected"}`);
-      }
-      return data.orderId;
-    } catch (err) {
-      clearTimeout(timer);
-      const e = err as Error;
-      if (e.name === "AbortError") {
-        // Timed out — the request may have reached MetaAPI and been processed.
-        // Do NOT retry; the cascadedPositions set already prevents a second cascade
-        // for the same positionId, so no double-order risk at the server level.
-        throw new Error(`timeout${isRetry ? " (retry)" : ""} — order may be live`);
-      }
-      throw e; // re-throw for caller to decide on retry
-    }
-  };
-
-  try {
-    return await attempt(false);
-  } catch (err) {
-    const e = err as Error;
-    // Only retry on network-level errors (fetch threw before any HTTP response).
-    // Timeout and HTTP errors are not retried (see comments above).
-    if (e.message.startsWith("timeout") || e.message.startsWith("HTTP ")) {
-      throw e;
-    }
-    // Network error — wait briefly and try once more.
-    await new Promise(r => setTimeout(r, 300));
-    return await attempt(true);
-  }
-}
-
 // ── Rapid-trade dedup guard (Layer 6) ────────────────────────────────────────
 // If two separate DEAL_ENTRY_IN events arrive for the same account within
 // RAPID_CASCADE_WINDOW_MS at nearly the same price (within RAPID_PRICE_TOLERANCE),
@@ -493,13 +432,17 @@ function makeDealListener(accountId: string) {
                     comment:   `Cascade ${i + 2}/${total}`,
                   };
                   try {
-                    const orderId = await placeCascadeLimit({
-                      region, token, accountId,
-                      positionId: posId,
-                      levelIndex: i,
-                      body,
-                    });
-                    trackCascadeOrder(orderId);
+                    if (conn) {
+                      const resp = await tradeViaConnection(conn, body);
+                      trackCascadeOrder(resp.orderId);
+                    } else {
+                      const resp = await fetch(
+                        `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
+                        { method: "POST", headers: authHeaders(token), body: JSON.stringify(body) }
+                      );
+                      const data = await resp.json() as { orderId?: string };
+                      trackCascadeOrder(data.orderId);
+                    }
                     console.log(`[post-sync-cascade] placed limit ${i + 2}/${total} @ ${limitPrice}`);
                   } catch (e) {
                     console.error(`[post-sync-cascade] failed limit ${i + 2}/${total} @ ${limitPrice}:`, (e as Error).message);
@@ -577,6 +520,7 @@ function makeDealListener(accountId: string) {
             const levels = buildCascadeLevels(evt.openPrice, direction, acctCascadeCfg);
             const total = 1 + levels.limitEntries.length;
             console.log(`[auto-cascade] posId=${evt.positionId} dir=${direction} price=${evt.openPrice} limits=[${levels.limitEntries.join(",")}] sl=${levels.stopLoss}`);
+            const conn = activeConnections.get(accountId);
             const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
             const token = getToken();
             let placed = 0;
@@ -591,13 +535,18 @@ function makeDealListener(accountId: string) {
                   comment: `Cascade ${i + 2}/${total}`,
                 };
                 try {
-                  const orderId = await placeCascadeLimit({
-                    region, token, accountId,
-                    positionId: evt.positionId,
-                    levelIndex: i,
-                    body,
-                  });
-                  trackCascadeOrder(orderId);
+                  if (conn) {
+                    const resp = await tradeViaConnection(conn, body);
+                    trackCascadeOrder(resp.orderId);
+                  } else {
+                    const resp = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
+                      method: "POST",
+                      headers: authHeaders(token),
+                      body: JSON.stringify(body),
+                    });
+                    const data = await resp.json() as { orderId?: string };
+                    trackCascadeOrder(data.orderId);
+                  }
                   placed++;
                   console.log(`[auto-cascade] placed limit ${i + 2}/${total} @ ${limitPrice}`);
                 } catch (tradeErr) {
