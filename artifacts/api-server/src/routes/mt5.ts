@@ -779,20 +779,22 @@ async function startStreaming(token: string, accountId: string, region: string =
     activeConnections.set(accountId, conn);
     activeRegions.set(accountId, region);
     console.log(`[stream ${accountId}] streaming connection established — SDK trade path armed`);
-    // Sync-stuck recovery: if `onDealsSynchronized` hasn't fired within 60s,
+    // Sync-stuck recovery: if `onDealsSynchronized` hasn't fired within 150s,
     // the account's sync session on MetaAPI is wedged (the "synchronization
     // with this id is already running" error). Force-arming locally doesn't
     // help because no deal events ever arrive — the only cure is to undeploy
     // and redeploy the account on MetaAPI's side, which wipes the stuck
-    // session. Recovery is rate-limited to avoid loops.
+    // session. 150s is generous — successful syncs land in 25-90s; firing
+    // earlier just tears down a connection that was about to succeed and
+    // creates a churn loop. Recovery is rate-limited to avoid loops.
     setTimeout(() => {
       // Re-check at fire time — sync may have completed between scheduling
       // and the timer firing, in which case recovery would needlessly tear
       // down a perfectly healthy connection.
       if (syncReady.has(accountId) || !activeConnections.has(accountId)) return;
-      console.warn(`[stream ${accountId}] onDealsSynchronized never fired after 60s — triggering sync recovery`);
+      console.warn(`[stream ${accountId}] onDealsSynchronized never fired after 150s — triggering sync recovery`);
       void recoverStuckSync(token, accountId);
-    }, 60_000);
+    }, 150_000);
     // Persist credentials so the server can auto-reconnect after a restart
     // without waiting for the app to call /connect again.
     // userId is included when available so /my-account lookups work reliably.
