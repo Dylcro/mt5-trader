@@ -1,6 +1,6 @@
 import app from "./app";
 import { pool } from "@workspace/db";
-import { loadCascadeConfig, startAutoConnect, startConnectionWatchdog, startSlReconciler } from "./routes/mt5";
+import { loadCascadeConfig, startAutoConnect, startConnectionWatchdog } from "./routes/mt5";
 
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err);
@@ -75,7 +75,6 @@ async function main() {
 
   // Watchdog: every 60 s, reconnect any account whose stream has dropped.
   startConnectionWatchdog();
-  startSlReconciler();
 }
 
 main().catch((err) => {

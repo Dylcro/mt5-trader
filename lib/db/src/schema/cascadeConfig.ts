@@ -7,15 +7,6 @@ export const cascadeConfigTable = pgTable("cascade_config", {
   numPositions: integer("num_positions").notNull().default(3),
   pipsBetween:  integer("pips_between").notNull().default(50),
   slPips:       integer("sl_pips").notNull().default(100),
-  // MT5 auto-SL: when a trade is opened directly in MT5, automatically attach
-  // a stop loss. `mt5SlEnabled` toggles the feature. `mt5SlNumPositions` is
-  // the size of the auto-SL batch (1-6). `mt5SlPips` is the SL distance in
-  // dollars (1 "pip" = $1 price move on XAUUSD per Vantage convention).
-  // A batch starts when the user has zero open auto-SL'd positions, fills up
-  // to N positions, then resets to zero only when ALL tracked positions close.
-  mt5SlEnabled:      boolean("mt5_sl_enabled").notNull().default(false),
-  mt5SlNumPositions: integer("mt5_sl_num_positions").notNull().default(3),
-  mt5SlPips:         integer("mt5_sl_pips").notNull().default(50),
 });
 
 export type CascadeConfigRow = typeof cascadeConfigTable.$inferSelect;

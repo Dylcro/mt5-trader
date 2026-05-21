@@ -209,7 +209,6 @@ export default function SettingsScreen() {
   const { credentials, status, errorMsg, accountInfo, connect, disconnect } = useTrading();
   const { settings: cs, updateSettings, saveToServer } = useCascadeSettings();
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
-  const [settingsTab, setSettingsTab] = useState<"mt5" | "inapp">("mt5");
   const { hapticEnabled, setHapticEnabled } = useHapticSettings();
 
   const [login, setLogin] = useState(credentials.login);
@@ -500,46 +499,14 @@ export default function SettingsScreen() {
             </View>
           </View>
 
-          {/* ── Settings tab switcher ── */}
-          <View style={styles.settingsTabBar}>
-            <Pressable
-              style={[styles.settingsTabBtn, settingsTab === "mt5" && styles.settingsTabBtnActive]}
-              onPress={() => {
-                void Haptics.selectionAsync();
-                setSettingsTab("mt5");
-              }}
-            >
-              <Feather name="external-link" size={13} color={settingsTab === "mt5" ? "#000" : C.textSecondary} />
-              <Text style={[styles.settingsTabBtnText, settingsTab === "mt5" && styles.settingsTabBtnTextActive]}>
-                MT5 settings
-              </Text>
-            </Pressable>
-            <Pressable
-              style={[styles.settingsTabBtn, settingsTab === "inapp" && styles.settingsTabBtnActive]}
-              onPress={() => {
-                void Haptics.selectionAsync();
-                setSettingsTab("inapp");
-              }}
-            >
-              <Feather name="smartphone" size={13} color={settingsTab === "inapp" ? "#000" : C.textSecondary} />
-              <Text style={[styles.settingsTabBtnText, settingsTab === "inapp" && styles.settingsTabBtnTextActive]}>
-                In-app settings
-              </Text>
-            </Pressable>
-          </View>
-
-          {/* In-app cascade — triggered from the Trade screen in this app */}
-          {settingsTab === "inapp" && (
+          {/* Cascade Order Settings — always visible */}
           <View style={styles.cascadeCard}>
             <View style={styles.cascadeCardHeader}>
               <Feather name="layers" size={16} color={C.gold} />
               <Text style={styles.cascadeCardTitle}>Cascade Orders</Text>
-              <View style={styles.sourceBadge}>
-                <Text style={styles.sourceBadgeText}>IN-APP</Text>
-              </View>
             </View>
             <Text style={styles.cascadeCardDesc}>
-              Controls the ladder of orders placed when you tap Buy or Sell on the Trade screen of this app. Has no effect on trades you place inside the MT5 app.
+              Configure the ladder of orders placed when you enter a price on the Trade screen.
             </Text>
 
             <View style={styles.cascadeDivider} />
@@ -575,6 +542,26 @@ export default function SettingsScreen() {
               displayValue={`${cs.slPips} pips`}
               hint={`${(cs.slPips * 0.10).toFixed(2)} below market entry — shared by all orders`}
             />
+
+            <View style={styles.cascadeDivider} />
+
+            <View style={styles.settingRow}>
+              <Switch
+                value={cs.autoCascadeEnabled}
+                onValueChange={(v) => {
+                  void Haptics.selectionAsync();
+                  updateSettings({ autoCascadeEnabled: v });
+                }}
+                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
+                thumbColor={cs.autoCascadeEnabled ? C.gold : C.textMuted}
+              />
+              <View style={{ marginLeft: 10, flex: 1 }}>
+                <Text style={styles.settingLabel}>Auto-cascade MT5 trades</Text>
+                <Text style={styles.settingHint}>
+                  When ON, any trade opened directly in MT5 will automatically get cascade limit orders placed using the settings above.
+                </Text>
+              </View>
+            </View>
 
             {cs.numPositions > 1 && cs.slPips <= (cs.numPositions - 1) * cs.pipsBetween && (
               <View style={styles.cascadeWarningBox}>
@@ -631,100 +618,6 @@ export default function SettingsScreen() {
               </Text>
             </Pressable>
           </View>
-          )}
-
-          {/* MT5 Auto-SL — only applies to trades placed inside the MT5 platform */}
-          {settingsTab === "mt5" && (
-          <View style={[styles.cascadeCard, styles.mt5Card]}>
-            <View style={styles.cascadeCardHeader}>
-              <Feather name="shield" size={16} color={C.gold} />
-              <Text style={styles.cascadeCardTitle}>MT5 Auto Stop-Loss</Text>
-              <View style={[styles.sourceBadge, styles.sourceBadgeMt5]}>
-                <Text style={styles.sourceBadgeText}>FROM MT5</Text>
-              </View>
-            </View>
-            <Text style={styles.cascadeCardDesc}>
-              Only applies to buys/sells you place directly inside the MT5 platform — NOT trades placed from this app. A stop loss is attached automatically and a "zone" is created from your entry down (or up for sells) by the distance below. Any further MT5 trade in the same direction that lands inside that zone gets the SAME stop loss. The zone ends the moment ANY position in it closes (TP, SL, or manual) — the next MT5 trade then starts a fresh zone.
-            </Text>
-
-            <View style={styles.cascadeDivider} />
-
-            <View style={styles.settingRow}>
-              <Switch
-                value={cs.mt5SlEnabled}
-                onValueChange={(v) => {
-                  void Haptics.selectionAsync();
-                  updateSettings({ mt5SlEnabled: v });
-                }}
-                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
-                thumbColor={cs.mt5SlEnabled ? C.gold : C.textMuted}
-              />
-              <View style={{ marginLeft: 10, flex: 1 }}>
-                <Text style={styles.settingLabel}>Enable MT5 auto SL</Text>
-                <Text style={styles.settingHint}>
-                  Off by default. Cascade limit orders for MT5 trades are no longer placed — only the zone-based auto-SL.
-                </Text>
-              </View>
-            </View>
-
-            <View style={styles.cascadeDivider} />
-
-            <SliderSetting
-              label="Zone size / SL distance"
-              value={cs.mt5SlPips}
-              min={10}
-              max={200}
-              step={5}
-              onChange={(v) => updateSettings({ mt5SlPips: v })}
-              displayValue={`${cs.mt5SlPips} pips`}
-              hint={`${(cs.mt5SlPips * 0.10).toFixed(2)} from the anchor entry`}
-            />
-
-            <View style={styles.cascadePreviewBox}>
-              <Text style={styles.cascadePreviewTitle}>Preview (buy at 5500)</Text>
-              <Text style={styles.cascadePreviewText}>
-                {`Anchor entry  @ 5500.00\n`}
-                {`Zone range    ${(5500 - cs.mt5SlPips * 0.10).toFixed(2)} – 5500.00\n`}
-                {`SL            ${(5500 - cs.mt5SlPips * 0.10).toFixed(2)}  ← ${cs.mt5SlPips} pips below\n`}
-                {`Any further buy in that range gets the same SL. Zone ends when any position closes.`}
-              </Text>
-            </View>
-
-            <Pressable
-              style={({ pressed }) => [
-                styles.saveBtn,
-                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
-                saveState === "saving" && { opacity: 0.6 },
-              ]}
-              disabled={saveState === "saving"}
-              onPress={async () => {
-                setSaveState("saving");
-                void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                const ok = await saveToServer();
-                setSaveState(ok ? "saved" : "error");
-                if (ok) void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-                else void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-                setTimeout(() => setSaveState("idle"), 3000);
-              }}
-            >
-              {saveState === "saving" ? (
-                <ActivityIndicator size="small" color="#000" />
-              ) : (
-                <Feather
-                  name={saveState === "saved" ? "check" : saveState === "error" ? "alert-circle" : "upload-cloud"}
-                  size={15}
-                  color={saveState === "error" ? C.sell : "#000"}
-                />
-              )}
-              <Text style={[styles.saveBtnText, saveState === "error" && { color: C.sell }]}>
-                {saveState === "saving" ? "Saving…"
-                  : saveState === "saved" ? "Saved to server"
-                  : saveState === "error" ? "Save failed — check connection"
-                  : "Save Settings to Server"}
-              </Text>
-            </Pressable>
-          </View>
-          )}
 
           {/* Help & Support */}
           <Pressable
@@ -1054,78 +947,6 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_600SemiBold",
     color: "#000",
   },
-  settingsTabBar: {
-    flexDirection: "row",
-    backgroundColor: C.card,
-    borderRadius: 12,
-    padding: 4,
-    borderWidth: 1,
-    borderColor: C.border,
-    gap: 4,
-    marginTop: 6,
-  },
-  settingsTabBtn: {
-    flex: 1,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 6,
-    paddingVertical: 10,
-    borderRadius: 8,
-  },
-  settingsTabBtnActive: {
-    backgroundColor: C.gold,
-  },
-  settingsTabBtnText: {
-    fontSize: 13,
-    fontFamily: "Inter_600SemiBold",
-    color: C.textSecondary,
-  },
-  settingsTabBtnTextActive: {
-    color: "#000",
-  },
-  sectionHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-    marginTop: 6,
-    marginBottom: -4,
-  },
-  sectionHeaderLine: {
-    flex: 1,
-    height: 1,
-    backgroundColor: "rgba(201,168,76,0.25)",
-  },
-  sectionHeaderLabelWrap: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-  },
-  sectionHeaderLabel: {
-    fontSize: 10,
-    fontFamily: "Inter_700Bold",
-    color: C.gold,
-    letterSpacing: 1.2,
-  },
-  sourceBadge: {
-    marginLeft: "auto",
-    backgroundColor: "rgba(201,168,76,0.12)",
-    borderWidth: 1,
-    borderColor: "rgba(201,168,76,0.4)",
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 6,
-  },
-  sourceBadgeMt5: {
-    backgroundColor: "rgba(255,255,255,0.06)",
-    borderColor: "rgba(255,255,255,0.18)",
-  },
-  sourceBadgeText: {
-    fontSize: 9,
-    fontFamily: "Inter_700Bold",
-    color: C.gold,
-    letterSpacing: 1,
-  },
   cascadeCard: {
     backgroundColor: C.card,
     borderRadius: 20,
@@ -1133,10 +954,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: C.border,
     gap: 14,
-  },
-  mt5Card: {
-    borderColor: "rgba(201,168,76,0.25)",
-    backgroundColor: "rgba(201,168,76,0.04)",
   },
   cascadeCardHeader: { flexDirection: "row", alignItems: "center", gap: 10 },
   cascadeCardTitle: { fontSize: 16, fontFamily: "Inter_700Bold", color: C.text },
