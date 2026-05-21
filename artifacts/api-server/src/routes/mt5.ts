@@ -597,8 +597,13 @@ function makeDealListener(accountId: string) {
           console.log(`[auto-cascade] SKIP posId=${evt.positionId} — stale deal (dealTime=${deal.time})`);
         }
       }
-      // Layer 2: feature enabled + correct symbol + valid price
-      else if (!acctCascadeCfg.enabled || evt.symbol !== "XAUUSD" || evt.openPrice <= 0) { /* skip — disabled or irrelevant */ }
+      // Layer 2: irrelevant symbol or invalid price — skip silently. NOTE: we
+      // intentionally do NOT gate on cascade.enabled here. The else-branch
+      // below only handles auto-SL (cascade-limit placement was removed), and
+      // auto-SL is an independent feature with its own mt5SlEnabled flag.
+      // Coupling the two caused Gethin's MT5 trades to receive no SL because
+      // his cascade.enabled=false short-circuited the whole branch.
+      else if (evt.symbol !== "XAUUSD" || evt.openPrice <= 0) { /* skip — irrelevant */ }
       // Layer 3: positionId already cascaded (covers app-placed market orders pre-marked above)
       else if (hasBeenCascaded(accountId, evt.positionId)) {
         console.log(`[auto-cascade] SKIP posId=${evt.positionId} — already cascaded`);
