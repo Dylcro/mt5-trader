@@ -1284,6 +1284,10 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       type: "cloud-g2",
       reliability: "regular",
       magic: 47182,
+      // Vantage Markets executes from Equinix NY4 — provisioning the MetaAPI
+      // account in new-york minimises broker round-trip latency, which is the
+      // dominant cost when cascading limit orders.
+      region: "new-york",
     };
 
     console.log(`[connect] creating new account login=${login} server=${server}`);
