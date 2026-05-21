@@ -96,6 +96,7 @@ interface DealEvent {
 
 const dealStore = new Map<string, DealEvent[]>(); // accountId → recent deals
 const activeStreams = new Set<string>();           // accountIds with live connections
+const lastReconnectKickAt = new Map<string, number>(); // debounce immediate-reconnect kicks per account
 // In-memory snapshot of stored-accounts rows so the watchdog can recover the
 // stream even when the database is briefly unavailable (e.g. Neon idle-conn
 // eviction). Refreshed on every successful DB read in auto-connect/watchdog.
@@ -518,6 +519,17 @@ function makeDealListener(accountId: string) {
       skipLogged.delete(accountId);
       activeStreams.delete(accountId);
       activeConnections.delete(accountId);
+      // Debounce: a single broker disconnect can fire onDisconnected multiple
+      // times (once per instance-index, plus again as the old socket finishes
+      // closing after we've already started a new one). Without this guard we
+      // end up with two parallel streams thrashing the same account.
+      const now = Date.now();
+      const lastKick = lastReconnectKickAt.get(accountId) ?? 0;
+      if (now - lastKick < 15_000) {
+        console.log(`[stream ${accountId}] WebSocket disconnected — reconnect already in flight, skipping`);
+        return;
+      }
+      lastReconnectKickAt.set(accountId, now);
       console.log(`[stream ${accountId}] WebSocket disconnected — kicking immediate reconnect`);
       // Don't wait up to 30s for the watchdog; reconnect immediately using the
       // in-memory snapshot so the stream is back online as fast as possible.
