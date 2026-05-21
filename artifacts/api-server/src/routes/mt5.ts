@@ -477,6 +477,10 @@ function recordCascade(accountId: string, price: number): void {
 // onDealAdded fires for HISTORICAL deals during sync replay — we must NOT
 // auto-cascade those. Only deals that arrive after onSynchronized are live.
 const syncReady = new Set<string>();
+// Per-stream-lifetime recovery timer. Must be cleared on stopStreaming so a
+// timer scheduled by an old stream cannot fire against a future fresh stream
+// (which would tear down a perfectly healthy new connection).
+const recoveryTimers = new Map<string, NodeJS.Timeout>();
 // Records the server-side ms timestamp when each account's sync completed.
 // Used to filter out historical deal events that the SDK delivers AFTER
 // onDealsSynchronized fires (a known SDK buffering quirk).
@@ -516,6 +520,12 @@ function makeDealListener(accountId: string) {
         syncReady.add(accountId);
         syncReadyAt.set(accountId, Date.now());
         skipLogged.delete(accountId); // reset so next disconnect-replay logs once
+        // Cancel the pending stuck-sync recovery — we synced successfully.
+        const pending = recoveryTimers.get(accountId);
+        if (pending) {
+          clearTimeout(pending);
+          recoveryTimers.delete(accountId);
+        }
         console.log(`[stream ${accountId}] deals sync complete — auto-SL armed for live deals`);
         // Note: post-sync catch-up cascade removed — MT5-initiated trades no
         // longer get cascade limits, only an auto-SL (handled per live deal).
@@ -735,6 +745,11 @@ async function stopStreaming(accountId: string): Promise<void> {
   syncReadyAt.delete(accountId);
   cascadeConfigs.delete(accountId);
   mt5SlZones.delete(accountId);
+  const pending = recoveryTimers.get(accountId);
+  if (pending) {
+    clearTimeout(pending);
+    recoveryTimers.delete(accountId);
+  }
   console.log(`[stream ${accountId}] stopped and cleaned up`);
 }
 
@@ -787,14 +802,21 @@ async function startStreaming(token: string, accountId: string, region: string =
     // session. 150s is generous — successful syncs land in 25-90s; firing
     // earlier just tears down a connection that was about to succeed and
     // creates a churn loop. Recovery is rate-limited to avoid loops.
-    setTimeout(() => {
-      // Re-check at fire time — sync may have completed between scheduling
-      // and the timer firing, in which case recovery would needlessly tear
-      // down a perfectly healthy connection.
-      if (syncReady.has(accountId) || !activeConnections.has(accountId)) return;
+    // Capture this stream's specific connection instance so the timer can
+    // confirm it's still firing for the SAME stream — never against a
+    // future fresh stream born of a reconnect.
+    const myConn = conn;
+    const timer = setTimeout(() => {
+      recoveryTimers.delete(accountId);
+      // Bail if: sync completed, no connection, or this is a stale timer
+      // whose stream was already replaced by a newer reconnect.
+      if (syncReady.has(accountId)) return;
+      const current = activeConnections.get(accountId);
+      if (!current || current !== myConn) return;
       console.warn(`[stream ${accountId}] onDealsSynchronized never fired after 150s — triggering sync recovery`);
       void recoverStuckSync(token, accountId);
     }, 150_000);
+    recoveryTimers.set(accountId, timer);
     // Persist credentials so the server can auto-reconnect after a restart
     // without waiting for the app to call /connect again.
     // userId is included when available so /my-account lookups work reliably.
