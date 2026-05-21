@@ -343,6 +343,102 @@ function makeDealListener(accountId: string) {
       if (!syncReady.has(accountId)) {
         syncReady.add(accountId);
         console.log(`[stream ${accountId}] deals sync complete — auto-cascade armed for live deals`);
+
+        // ── Post-sync catch-up ─────────────────────────────────────────────
+        // Trades placed in MT5 while the server was restarting/reconnecting
+        // arrive as onDealAdded events BEFORE this callback fires, so the
+        // sync guard silently drops them. Catch those missed positions here.
+        void (async () => {
+          try {
+            const acctCascadeCfg = getCascadeConfig(accountId);
+            if (!acctCascadeCfg.enabled) return;
+
+            const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
+            const token  = getToken();
+
+            // Fetch open positions and pending orders in parallel
+            const [posRes, ordRes] = await Promise.all([
+              fetch(`${clientBase(region)}/users/current/accounts/${accountId}/positions`,
+                { headers: authHeaders(token) }),
+              fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`,
+                { headers: authHeaders(token) }),
+            ]);
+            if (!posRes.ok) return;
+
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const positions: any[]    = await posRes.json();
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const pendingOrders: any[] = ordRes.ok ? await ordRes.json() : [];
+
+            // Positions that already have at least one "Cascade"-tagged limit order
+            // don't need cascading — they survived the reconnect intact.
+            const cascadedComments = new Set<string>(
+              pendingOrders
+                .filter((o: any) => String(o.comment ?? "").startsWith("Cascade"))
+                // pending limit orders carry clientId or comment but NOT positionId —
+                // group by direction+symbol instead; any buy limit → buy positions covered
+                .map((o: any) => `${o.symbol}:${String(o.type ?? "").includes("BUY") ? "buy" : "sell"}`)
+            );
+
+            const conn = activeConnections.get(accountId);
+
+            for (const pos of positions) {
+              if (pos.symbol !== "XAUUSD") continue;
+              const posId = String(pos.id ?? pos._id ?? "");
+              if (!posId) continue;
+              if (hasBeenCascaded(accountId, posId)) continue;
+
+              const direction: "buy" | "sell" = String(pos.type ?? "").includes("BUY") ? "buy" : "sell";
+
+              // If cascade limits already exist for this direction, mark and skip
+              if (cascadedComments.has(`XAUUSD:${direction}`)) {
+                markCascaded(accountId, posId);
+                console.log(`[post-sync-cascade] SKIP posId=${posId} — existing limits found`);
+                continue;
+              }
+
+              const openPrice = pos.openPrice ?? 0;
+              if (openPrice <= 0) continue;
+
+              const levels = buildCascadeLevels(openPrice, direction, acctCascadeCfg);
+              const total  = 1 + levels.limitEntries.length;
+              markCascaded(accountId, posId);
+              recordCascade(accountId, openPrice);
+              console.log(`[post-sync-cascade] posId=${posId} dir=${direction} price=${openPrice} limits=[${levels.limitEntries.join(",")}] sl=${levels.stopLoss}`);
+
+              await Promise.all(
+                levels.limitEntries.map(async (limitPrice, i) => {
+                  const body: Record<string, unknown> = {
+                    actionType: direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT",
+                    symbol:    "XAUUSD",
+                    volume:    pos.volume,
+                    openPrice: limitPrice,
+                    stopLoss:  levels.stopLoss,
+                    comment:   `Cascade ${i + 2}/${total}`,
+                  };
+                  try {
+                    if (conn) {
+                      const resp = await tradeViaConnection(conn, body);
+                      trackCascadeOrder(resp.orderId);
+                    } else {
+                      const resp = await fetch(
+                        `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
+                        { method: "POST", headers: authHeaders(token), body: JSON.stringify(body) }
+                      );
+                      const data = await resp.json() as { orderId?: string };
+                      trackCascadeOrder(data.orderId);
+                    }
+                    console.log(`[post-sync-cascade] placed limit ${i + 2}/${total} @ ${limitPrice}`);
+                  } catch (e) {
+                    console.error(`[post-sync-cascade] failed limit ${i + 2}/${total} @ ${limitPrice}:`, (e as Error).message);
+                  }
+                })
+              );
+            }
+          } catch (e) {
+            console.error(`[post-sync-cascade] catch-up error:`, (e as Error).message);
+          }
+        })();
       }
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
