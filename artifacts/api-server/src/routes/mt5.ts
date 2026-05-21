@@ -606,17 +606,21 @@ function makeDealListener(accountId: string) {
       const acctCascadeCfg = getCascadeConfig(accountId);
 
       // Layer 1: staleness guard — gate on the deal's actual MT5 execution time
-      // rather than the SDK sync flag. The SDK replays historical deals on
-      // reconnect (which can happen mid-session if the WebSocket drops), and a
-      // pure sync-flag check would also block genuinely live trades that happened
-      // during the brief reconnect window. Any deal whose MT5 time is older than
-      // 120 s is treated as historical replay and skipped; anything fresher is a
-      // live trade that we must process.
+      // rather than the SDK sync flag. The streaming connection is opened with
+      // history start = Date.now(), so MetaAPI cannot replay deals from before
+      // the connection was created — the only "old" deals we ever receive are
+      // ones that fired during a mid-session disconnect/resync (which on bad
+      // days can stretch to 2–3 minutes). The threshold here is intentionally
+      // generous (30 min) so a long resync never throws away trades that are
+      // still open and still need an SL. Replays of positions that have since
+      // closed are handled cheaply at SL-apply time (pre-check + benign error
+      // demotion), so an over-permissive threshold here is safe.
+      const STALE_MS = 30 * 60_000;
       const dealMs = deal.time ? new Date(deal.time).getTime() : 0;
       const dealAgeMs = dealMs > 0 ? Date.now() - dealMs : Number.POSITIVE_INFINITY;
-      const isStale = !syncReady.has(accountId) ? dealAgeMs > 120_000 : (() => {
+      const isStale = !syncReady.has(accountId) ? dealAgeMs > STALE_MS : (() => {
         const armedAt = syncReadyAt.get(accountId) ?? 0;
-        return armedAt > 0 && dealMs > 0 && dealMs < armedAt - 60_000;
+        return armedAt > 0 && dealMs > 0 && dealMs < armedAt - STALE_MS;
       })();
       if (isStale) {
         if (!syncReady.has(accountId)) {
