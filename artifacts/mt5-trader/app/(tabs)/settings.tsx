@@ -499,14 +499,27 @@ export default function SettingsScreen() {
             </View>
           </View>
 
-          {/* Cascade Order Settings — always visible */}
+          {/* ── SECTION 1: IN-APP TRADING ── */}
+          <View style={styles.sectionHeader}>
+            <View style={styles.sectionHeaderLine} />
+            <View style={styles.sectionHeaderLabelWrap}>
+              <Feather name="smartphone" size={11} color={C.gold} />
+              <Text style={styles.sectionHeaderLabel}>WHEN YOU TRADE FROM THIS APP</Text>
+            </View>
+            <View style={styles.sectionHeaderLine} />
+          </View>
+
+          {/* In-app cascade — triggered from the Trade screen in this app */}
           <View style={styles.cascadeCard}>
             <View style={styles.cascadeCardHeader}>
               <Feather name="layers" size={16} color={C.gold} />
               <Text style={styles.cascadeCardTitle}>Cascade Orders</Text>
+              <View style={styles.sourceBadge}>
+                <Text style={styles.sourceBadgeText}>IN-APP</Text>
+              </View>
             </View>
             <Text style={styles.cascadeCardDesc}>
-              Configure the ladder of orders placed when you enter a price on the Trade screen.
+              Controls the ladder of orders placed when you tap Buy or Sell on the Trade screen of this app. Has no effect on trades you place inside the MT5 app.
             </Text>
 
             <View style={styles.cascadeDivider} />
@@ -599,14 +612,27 @@ export default function SettingsScreen() {
             </Pressable>
           </View>
 
-          {/* MT5 Auto-SL — applies an auto stop-loss to trades placed directly in MT5 */}
-          <View style={styles.cascadeCard}>
+          {/* ── SECTION 2: MT5 PLATFORM TRADING ── */}
+          <View style={styles.sectionHeader}>
+            <View style={styles.sectionHeaderLine} />
+            <View style={styles.sectionHeaderLabelWrap}>
+              <Feather name="external-link" size={11} color={C.gold} />
+              <Text style={styles.sectionHeaderLabel}>WHEN YOU TRADE FROM THE MT5 APP</Text>
+            </View>
+            <View style={styles.sectionHeaderLine} />
+          </View>
+
+          {/* MT5 Auto-SL — only applies to trades placed inside the MT5 platform */}
+          <View style={[styles.cascadeCard, styles.mt5Card]}>
             <View style={styles.cascadeCardHeader}>
               <Feather name="shield" size={16} color={C.gold} />
               <Text style={styles.cascadeCardTitle}>MT5 Auto Stop-Loss</Text>
+              <View style={[styles.sourceBadge, styles.sourceBadgeMt5]}>
+                <Text style={styles.sourceBadgeText}>FROM MT5</Text>
+              </View>
             </View>
             <Text style={styles.cascadeCardDesc}>
-              When you place a buy or sell in the MT5 app, a stop loss is attached and a "zone" is created from your entry down (or up for sells) by the distance below. Any further MT5 trade in the same direction that lands inside that zone gets the SAME stop loss. The zone ends the moment ANY position in it closes (TP, SL, or manual) — the next trade then starts a fresh zone.
+              Only applies to buys/sells you place directly inside the MT5 platform — NOT trades placed from this app. A stop loss is attached automatically and a "zone" is created from your entry down (or up for sells) by the distance below. Any further MT5 trade in the same direction that lands inside that zone gets the SAME stop loss. The zone ends the moment ANY position in it closes (TP, SL, or manual) — the next MT5 trade then starts a fresh zone.
             </Text>
 
             <View style={styles.cascadeDivider} />
@@ -1015,6 +1041,48 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_600SemiBold",
     color: "#000",
   },
+  sectionHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    marginTop: 6,
+    marginBottom: -4,
+  },
+  sectionHeaderLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: "rgba(201,168,76,0.25)",
+  },
+  sectionHeaderLabelWrap: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  sectionHeaderLabel: {
+    fontSize: 10,
+    fontFamily: "Inter_700Bold",
+    color: C.gold,
+    letterSpacing: 1.2,
+  },
+  sourceBadge: {
+    marginLeft: "auto",
+    backgroundColor: "rgba(201,168,76,0.12)",
+    borderWidth: 1,
+    borderColor: "rgba(201,168,76,0.4)",
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+  },
+  sourceBadgeMt5: {
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderColor: "rgba(255,255,255,0.18)",
+  },
+  sourceBadgeText: {
+    fontSize: 9,
+    fontFamily: "Inter_700Bold",
+    color: C.gold,
+    letterSpacing: 1,
+  },
   cascadeCard: {
     backgroundColor: C.card,
     borderRadius: 20,
@@ -1022,6 +1090,10 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: C.border,
     gap: 14,
+  },
+  mt5Card: {
+    borderColor: "rgba(201,168,76,0.25)",
+    backgroundColor: "rgba(201,168,76,0.04)",
   },
   cascadeCardHeader: { flexDirection: "row", alignItems: "center", gap: 10 },
   cascadeCardTitle: { fontSize: 16, fontFamily: "Inter_700Bold", color: C.text },
