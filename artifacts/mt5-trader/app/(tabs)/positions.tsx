@@ -319,7 +319,7 @@ export default function PositionsScreen() {
           <View style={styles.emptyState}>
             <Feather name="wifi-off" size={40} color={C.textMuted} />
             <Text style={styles.emptyTitle}>Not Connected</Text>
-            <Text style={styles.emptyText}>Connect your MetaAPI account in Settings to see positions</Text>
+            <Text style={styles.emptyText}>Connect your MT5 account in Settings to see positions</Text>
           </View>
         ) : !hasAnything ? (
           <View style={styles.emptyState}>

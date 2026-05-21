@@ -969,7 +969,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         const isBilling = msg.toLowerCase().includes("top up") || msg.toLowerCase().includes("forbidden");
         return res.status(503).json({
           error: isBilling
-            ? "MetaAPI free-tier limit reached. Please top up your MetaAPI account at metaapi.cloud to continue trading."
+            ? "Connection limit reached. Please contact support."
             : msg,
         });
       }
@@ -1081,7 +1081,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         return res.status(429).json({ error: `Too many failed attempts for this account.${retryMsg}` });
       }
       if (fetchRes.status === 403) {
-        return res.status(403).json({ error: "The MetaAPI service account has reached its provisioning limit. Please top up at metaapi.cloud." });
+        return res.status(403).json({ error: "Connection limit reached. Please contact support." });
       }
       if (errBody.details === "E_AUTH" || errBody.message?.includes("authenticate")) {
         return res.status(401).json({ error: "Invalid credentials — check your MT5 login, password, and server name." });
@@ -1112,7 +1112,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
 
     const newId = created._id ?? created.id;
     if (!newId || typeof newId !== "string" || newId.length < 10) {
-      return res.status(500).json({ error: "Unexpected response from MetaAPI. Please try again." });
+      return res.status(500).json({ error: "Unexpected error establishing connection. Please try again." });
     }
 
     const region = normalizeRegion(created.region);
@@ -1182,7 +1182,7 @@ router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, re
         return res.status(503).json({
           connectionStatus: "DEPLOY_FAILED",
           error: isBilling
-            ? "MetaAPI free-tier limit reached. Please top up your MetaAPI account at metaapi.cloud to continue trading."
+            ? "Connection limit reached. Please contact support."
             : msg,
         });
       }

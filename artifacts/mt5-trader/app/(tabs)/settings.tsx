@@ -353,14 +353,12 @@ export default function SettingsScreen() {
                   <Text style={styles.errorText}>{errorMsg}</Text>
                   {errorMsg.toLowerCase().includes("too many") && (
                     <Text style={[styles.errorText, { marginTop: 6, opacity: 0.8, fontSize: 11 }]}>
-                      MetaAPI rate-limits after several failed credential attempts. Wait the indicated time, then try again with your correct password.
+                      Too many failed attempts. Wait the indicated time, then try again with your correct password.
                     </Text>
                   )}
-                  {(errorMsg.toLowerCase().includes("top up") || errorMsg.toLowerCase().includes("free-tier")) && (
+                  {(errorMsg.toLowerCase().includes("contact support") || errorMsg.toLowerCase().includes("limit reached")) && (
                     <Text style={[styles.errorText, { marginTop: 8, lineHeight: 18 }]}>
-                      {"→ Go to "}
-                      <Text style={{ color: C.gold, textDecorationLine: "underline" }}>metaapi.cloud</Text>
-                      {" → Billing → top up or upgrade your plan, then tap Connect again."}
+                      Please contact support to resolve this issue.
                     </Text>
                   )}
                 </View>
@@ -391,7 +389,7 @@ export default function SettingsScreen() {
 
               {isConnecting && (
                 <Text style={styles.connectingNote}>
-                  This may take up to 2 minutes while MetaAPI establishes a connection with your broker.
+                  This may take up to 2 minutes while we establish a connection with your broker.
                 </Text>
               )}
             </View>
@@ -644,7 +642,7 @@ export default function SettingsScreen() {
               <Text style={styles.goldBarName}>Gold · MetaTrader 5</Text>
             </View>
             <Text style={styles.aboutText}>
-              Connects to your MT5 broker account via MetaAPI. Trades are placed live on your account. Always use a demo account first to test.
+              Connects directly to your MT5 broker account. Trades are placed live on your account. Always use a demo account first to test.
             </Text>
             <View style={styles.apiUrlRow}>
               <Feather name="server" size={11} color={C.textMuted} />

@@ -54,9 +54,9 @@ export default function PrivacyScreen() {
 
         <Para>
           XAUUSD Trader ("the App", "we", "our") is a mobile and web application that
-          connects to your MetaTrader 5 account via MetaAPI to display positions and
-          execute cascade ladder trades on XAUUSD (Gold). This Privacy Policy explains
-          what information we collect, how we use it, and how we protect it.
+          connects to your MetaTrader 5 account to display positions and execute cascade
+          ladder trades on XAUUSD (Gold). This Privacy Policy explains what information
+          we collect, how we use it, and how we protect it.
         </Para>
 
         <Section title="1. Information We Collect">
@@ -68,14 +68,14 @@ export default function PrivacyScreen() {
           <Para>
             <Text style={styles.bold}>MetaTrader 5 credentials.</Text> Your MT5 account
             number, server name, and trading password are stored encrypted in our database
-            solely to connect to MetaAPI on your behalf. We do not sell, share, or log
+            solely to establish your broker connection. We do not sell, share, or log
             these credentials beyond what is required for the trading connection.
           </Para>
           <Para>
             <Text style={styles.bold}>Trading activity.</Text> Trade history, open
-            positions, and balance data are retrieved from your MT5 broker via MetaAPI.
-            This data is displayed in the App and may be stored temporarily for
-            performance and deduplication purposes.
+            positions, and balance data are retrieved from your MT5 broker. This data is
+            displayed in the App and may be stored temporarily for performance and
+            deduplication purposes.
           </Para>
           <Para>
             <Text style={styles.bold}>Usage data.</Text> We collect standard server logs
@@ -99,11 +99,6 @@ export default function PrivacyScreen() {
           <Para>
             <Text style={styles.bold}>Clerk</Text> (authentication) — manages your email
             and session tokens. Subject to Clerk's privacy policy at clerk.com/privacy.
-          </Para>
-          <Para>
-            <Text style={styles.bold}>MetaAPI</Text> — acts as an intermediary to your
-            MT5 broker. Your MT5 credentials are transmitted to MetaAPI over TLS to
-            establish the trading connection. Subject to MetaAPI's terms at metaapi.cloud.
           </Para>
           <Para>
             <Text style={styles.bold}>Your MT5 broker</Text> — all trades are executed
