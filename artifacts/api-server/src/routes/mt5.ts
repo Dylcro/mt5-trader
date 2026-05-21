@@ -1023,7 +1023,13 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
       console.log(`[mt5-sl-safety] applied SL ${slPrice} to naked posId=${pos.id} acct=${accountId} (${Date.now() - t0}ms, zone ${zoneRef.id})`);
       markCascaded(accountId, pos.id);
     } catch (err) {
-      console.warn(`[mt5-sl-safety] failed to SL posId=${pos.id} acct=${accountId}: ${(err as Error).message}`);
+      const msg = (err as Error).message ?? "";
+      if (/market is closed/i.test(msg)) {
+        // Expected outside trading hours — log quietly so it doesn't look alarming.
+        console.log(`[mt5-sl-safety] market closed, will retry on open — posId=${pos.id} acct=${accountId}`);
+      } else {
+        console.warn(`[mt5-sl-safety] failed to SL posId=${pos.id} acct=${accountId}: ${msg}`);
+      }
       // Roll back zone membership so a retry next tick can recompute cleanly.
       zoneRef.positionIds.delete(pos.id);
       if (zoneRef.positionIds.size === 0) zoneRef.active = false;
