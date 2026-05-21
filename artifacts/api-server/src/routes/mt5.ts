@@ -595,12 +595,11 @@ function makeDealListener(accountId: string) {
             const token = getToken();
             let placed = 0;
             const cascadeStart = Date.now();
-            // Hybrid: use the streaming WebSocket first (typically 1-3s — matches
-            // the speed of app-initiated cascades, which also go via this path).
-            // Race against a 4-second timeout; if streaming hangs (rare MetaAPI
-            // WebSocket hiccup), fall back to REST. If the streaming call later
-            // completes after the REST fallback, cancel the duplicate orderId.
-            // Double-placement on restart is still prevented by cascade_orders DB.
+            // Streaming-only (no REST fallback). If streaming hangs or errors,
+            // the affected limit slot is skipped and logged — safer than risking
+            // an orphan duplicate from a late streaming response landing after a
+            // REST backup. Double-placement on restart is still prevented by
+            // cascade_orders DB; orphan sweeper still runs as defence-in-depth.
             await Promise.all(
               levels.limitEntries.map(async (limitPrice, i) => {
                 const body: Record<string, unknown> = {
@@ -824,85 +823,36 @@ async function tradeViaConnection(conn: any, body: Record<string, unknown>): Pro
   return { numericCode: resp?.numericCode ?? 0, message: resp?.message, orderId: resp?.orderId, positionId: resp?.positionId };
 }
 
-// Place a cascade limit order with hybrid streaming-first / REST-fallback strategy.
-// Returns the orderId of the order that won the race (streaming or REST).
-// If the streaming call later completes after REST already returned, cancels the
-// duplicate orderId so the user never sees two orders for the same slot.
-const STREAMING_CASCADE_TIMEOUT_MS = 4000;
+// Place a cascade limit order via the streaming SDK connection.
+// Streaming-only — NO REST fallback. The previous hybrid strategy could leave
+// orphan duplicates if streaming hung, REST fired, then streaming late-completed
+// during a WebSocket disconnect (cancel-duplicate would silently fail). Better
+// to under-place than to risk a stray order on the user's account.
+//
+// If no streaming connection exists OR streaming throws/hangs, this throws —
+// the caller logs and moves on; the trade is skipped for that limit slot.
+const STREAMING_CASCADE_TIMEOUT_MS = 30_000;
 async function placeCascadeLimitFast(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   conn: any | undefined,
-  region: string,
-  accountId: string,
-  token: string,
+  _region: string,
+  _accountId: string,
+  _token: string,
   body: Record<string, unknown>,
   limitNum: number,
   total: number,
 ): Promise<string | undefined> {
-  // No streaming connection at all — REST only.
   if (!conn) {
-    const resp = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
-      method: "POST",
-      headers: authHeaders(token),
-      body: JSON.stringify(body),
-    });
-    const data = await resp.json() as { orderId?: string };
-    return data.orderId;
+    throw new Error(`no streaming connection — limit ${limitNum}/${total} skipped (safer than REST fallback)`);
   }
-
-  // Fire streaming call. Race it against a 4s timeout.
-  const streamPromise = tradeViaConnection(conn, body);
-  let timedOut = false;
-  const winner = await Promise.race([
-    streamPromise.then(r => ({ src: "stream" as const, orderId: r.orderId })),
-    new Promise<{ src: "timeout" }>(resolve => setTimeout(() => { timedOut = true; resolve({ src: "timeout" }); }, STREAMING_CASCADE_TIMEOUT_MS)),
+  // Safety bound so a wedged SDK call cannot hang the cascade loop forever.
+  const result = await Promise.race([
+    tradeViaConnection(conn, body),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`streaming trade hung >${STREAMING_CASCADE_TIMEOUT_MS}ms — limit ${limitNum}/${total} skipped`)), STREAMING_CASCADE_TIMEOUT_MS)
+    ),
   ]);
-
-  if (winner.src === "stream") {
-    return winner.orderId;
-  }
-
-  // Streaming timed out — fire REST as fallback.
-  console.warn(`[auto-cascade] streaming hung >${STREAMING_CASCADE_TIMEOUT_MS}ms for limit ${limitNum}/${total}, falling back to REST`);
-  const restRespPromise = fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
-    method: "POST",
-    headers: authHeaders(token),
-    body: JSON.stringify(body),
-  }).then(r => r.json() as Promise<{ orderId?: string }>);
-
-  // Watch for late streaming completion AFTER we've committed to REST — cancel the duplicate.
-  // Retry the cancel up to 4 times with backoff because WebSocket hiccups (the very reason
-  // we fell back to REST) often also disrupt the cancel call.
-  streamPromise.then(async streamResult => {
-    if (!timedOut) return; // streaming actually won the race, nothing to clean up
-    if (!streamResult.orderId) return;
-    const dupOrderId = streamResult.orderId;
-    console.warn(`[auto-cascade] late streaming response for limit ${limitNum}/${total} orderId=${dupOrderId} — cancelling duplicate`);
-    // Track it so any later reconciliation knows this orderId is OURS (not a user-placed limit)
-    cascadePlacedOrderIds.add(dupOrderId);
-    const delays = [0, 1500, 4000, 8000]; // ~14s of retries
-    for (let attempt = 0; attempt < delays.length; attempt++) {
-      if (delays[attempt] > 0) await new Promise(r => setTimeout(r, delays[attempt]));
-      try {
-        const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
-          method: "POST",
-          headers: authHeaders(token),
-          body: JSON.stringify({ actionType: "ORDER_CANCEL", orderId: dupOrderId }),
-        });
-        if (r.ok) {
-          console.log(`[auto-cascade] cancelled duplicate orderId=${dupOrderId} (attempt ${attempt + 1})`);
-          return;
-        }
-        console.warn(`[auto-cascade] cancel attempt ${attempt + 1} for orderId=${dupOrderId} returned status ${r.status}`);
-      } catch (e) {
-        console.warn(`[auto-cascade] cancel attempt ${attempt + 1} for orderId=${dupOrderId} threw:`, (e as Error).message);
-      }
-    }
-    console.error(`[auto-cascade] ALL cancel attempts failed for duplicate orderId=${dupOrderId} — reconciliation will sweep it`);
-  }).catch(() => { /* streaming errored — nothing to cancel */ });
-
-  const restData = await restRespPromise;
-  return restData.orderId;
+  return result.orderId;
 }
 
 // ── Post-cascade orphan sweeper ─────────────────────────────────────────────
