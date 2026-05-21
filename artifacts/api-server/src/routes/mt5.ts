@@ -111,9 +111,25 @@ interface CascadeConfig {
   numPositions: number;
   pipsBetween: number;
   slPips: number;
+  // MT5 auto-SL settings (applied to trades opened directly in MT5).
+  mt5SlEnabled: boolean;
+  mt5SlNumPositions: number;
+  mt5SlPips: number;
 }
 
-const CASCADE_DEFAULTS: CascadeConfig = { enabled: false, numPositions: 3, pipsBetween: 10, slPips: 100 };
+const CASCADE_DEFAULTS: CascadeConfig = {
+  enabled: false,
+  numPositions: 3,
+  pipsBetween: 10,
+  slPips: 100,
+  mt5SlEnabled: false,
+  mt5SlNumPositions: 3,
+  mt5SlPips: 50,
+};
+
+// MT5 auto-SL: 1 "pip" = $1 of price movement on XAUUSD (Vantage convention).
+// Differs from the cascade `PIP` constant (0.10) below intentionally.
+const MT5_SL_PIP = 1.0;
 
 // In-memory cache: accountId (or "" for global) → config.
 const cascadeConfigs = new Map<string, CascadeConfig>();
@@ -137,11 +153,14 @@ async function attemptLoadCascadeConfig(): Promise<void> {
     }
     for (const row of rows) {
       const key = row.accountId ?? "";
-      const cfg = {
-        enabled:      row.enabled,
-        numPositions: row.numPositions,
-        pipsBetween:  row.pipsBetween,
-        slPips:       row.slPips,
+      const cfg: CascadeConfig = {
+        enabled:           row.enabled,
+        numPositions:      row.numPositions,
+        pipsBetween:       row.pipsBetween,
+        slPips:            row.slPips,
+        mt5SlEnabled:      row.mt5SlEnabled,
+        mt5SlNumPositions: row.mt5SlNumPositions,
+        mt5SlPips:         row.mt5SlPips,
       };
       cascadeConfigs.set(key, cfg);
       // Also cache under the MetaAPI accountId so the auto-cascade background
@@ -212,10 +231,13 @@ async function saveCascadeConfig(config: CascadeConfig, accountId: string): Prom
       .onConflictDoUpdate({
         target: cascadeConfigTable.accountId,
         set: {
-          enabled:      config.enabled,
-          numPositions: config.numPositions,
-          pipsBetween:  config.pipsBetween,
-          slPips:       config.slPips,
+          enabled:           config.enabled,
+          numPositions:      config.numPositions,
+          pipsBetween:       config.pipsBetween,
+          slPips:            config.slPips,
+          mt5SlEnabled:      config.mt5SlEnabled,
+          mt5SlNumPositions: config.mt5SlNumPositions,
+          mt5SlPips:         config.mt5SlPips,
         },
       });
     return true;
@@ -325,6 +347,20 @@ function isDuplicate(dealId: string): boolean {
   return false;
 }
 
+// ── MT5 Auto-SL batch state ──────────────────────────────────────────────
+// For each account, tracks positionIds opened directly in MT5 that have had
+// an auto-SL applied and are still open. A new batch can only start when this
+// set is empty (i.e. all previously-auto-SL'd positions have closed). While
+// open positions exist in the set, new MT5 trades fill remaining slots up to
+// `mt5SlNumPositions`. Once the set hits N, no further SLs are placed until
+// every tracked position closes (TP, SL hit, or manual close).
+const mt5AutoSlOpen = new Map<string, Set<string>>(); // accountId → Set<positionId>
+function mt5SlSet(accountId: string): Set<string> {
+  let set = mt5AutoSlOpen.get(accountId);
+  if (!set) { set = new Set(); mt5AutoSlOpen.set(accountId, set); }
+  return set;
+}
+
 // Tracks positionIds that have already been auto-cascaded (per account).
 // Persisted to the cascade_history table so it survives server restarts —
 // without this, post-sync catch-up re-cascades positions whose cascade limit
@@ -422,6 +458,15 @@ function makeDealListener(accountId: string) {
       activeConnections.delete(accountId);
       console.log(`[stream ${accountId}] WebSocket disconnected — watchdog will reconnect`);
     },
+    // Fires when a position closes (TP hit, SL hit, or manual close).
+    // We use this to clear the MT5 auto-SL batch slot so the next batch can
+    // start once all tracked positions are gone.
+    async onPositionRemoved(_instanceIndex: string, positionId: string): Promise<void> {
+      const set = mt5SlSet(accountId);
+      if (set.delete(positionId)) {
+        console.log(`[mt5-sl] position closed posId=${positionId} remaining=${set.size}`);
+      }
+    },
     // onDealsSynchronized fires after all historical deals have been replayed.
     // Any onDealAdded call AFTER this point is a live event — safe to cascade.
     async onDealsSynchronized(_instanceIndex: string, _synchronizationId: string): Promise<void> {
@@ -429,100 +474,25 @@ function makeDealListener(accountId: string) {
         syncReady.add(accountId);
         syncReadyAt.set(accountId, Date.now());
         skipLogged.delete(accountId); // reset so next disconnect-replay logs once
-        console.log(`[stream ${accountId}] deals sync complete — auto-cascade armed for live deals`);
-
-        // ── Post-sync catch-up ─────────────────────────────────────────────
-        // Trades placed in MT5 while the server was restarting/reconnecting
-        // arrive as onDealAdded events BEFORE this callback fires, so the
-        // sync guard silently drops them. Catch those missed positions here.
-        void (async () => {
-          try {
-            const acctCascadeCfg = getCascadeConfig(accountId);
-            if (!acctCascadeCfg.enabled) return;
-
-            const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
-            const token  = getToken();
-
-            // Fetch open positions and pending orders in parallel
-            const [posRes, ordRes] = await Promise.all([
-              fetch(`${clientBase(region)}/users/current/accounts/${accountId}/positions`,
-                { headers: authHeaders(token) }),
-              fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`,
-                { headers: authHeaders(token) }),
-            ]);
-            if (!posRes.ok) return;
-
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const positions: any[]    = await posRes.json();
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const pendingOrders: any[] = ordRes.ok ? await ordRes.json() : [];
-
-            // Positions that already have at least one "Cascade"-tagged limit order
-            // don't need cascading — they survived the reconnect intact.
-            const cascadedComments = new Set<string>(
-              pendingOrders
-                .filter((o: any) => String(o.comment ?? "").startsWith("Cascade"))
-                // pending limit orders carry clientId or comment but NOT positionId —
-                // group by direction+symbol instead; any buy limit → buy positions covered
-                .map((o: any) => `${o.symbol}:${String(o.type ?? "").includes("BUY") ? "buy" : "sell"}`)
-            );
-
-            const conn = activeConnections.get(accountId);
-
-            for (const pos of positions) {
-              if (pos.symbol !== "XAUUSD") continue;
-              const posId = String(pos.id ?? pos._id ?? "");
-              if (!posId) continue;
-              if (hasBeenCascaded(accountId, posId)) continue;
-
-              const direction: "buy" | "sell" = String(pos.type ?? "").includes("BUY") ? "buy" : "sell";
-
-              // If cascade limits already exist for this direction, mark and skip
-              if (cascadedComments.has(`XAUUSD:${direction}`)) {
-                markCascaded(accountId, posId);
-                console.log(`[post-sync-cascade] SKIP posId=${posId} — existing limits found`);
-                continue;
-              }
-
-              const openPrice = pos.openPrice ?? 0;
-              if (openPrice <= 0) continue;
-
-              const levels = buildCascadeLevels(openPrice, direction, acctCascadeCfg);
-              const total  = 1 + levels.limitEntries.length;
-              markCascaded(accountId, posId);
-              recordCascade(accountId, openPrice);
-              console.log(`[post-sync-cascade] posId=${posId} dir=${direction} price=${openPrice} limits=[${levels.limitEntries.join(",")}] sl=${levels.stopLoss}`);
-
-              await Promise.all(
-                levels.limitEntries.map(async (limitPrice, i) => {
-                  const body: Record<string, unknown> = {
-                    actionType: direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT",
-                    symbol:    "XAUUSD",
-                    volume:    pos.volume,
-                    openPrice: limitPrice,
-                    stopLoss:  levels.stopLoss,
-                    comment:   `Cascade ${i + 2}/${total}`,
-                  };
-                  const t0 = Date.now();
-                  try {
-                    const orderId = await placeCascadeLimitFast(conn, region, accountId, token, body, i + 2, total);
-                    trackCascadeOrder(accountId, orderId);
-                    console.log(`[post-sync-cascade] placed limit ${i + 2}/${total} @ ${limitPrice} (${Date.now() - t0}ms)`);
-                  } catch (e) {
-                    console.error(`[post-sync-cascade] failed limit ${i + 2}/${total} @ ${limitPrice} (${Date.now() - t0}ms):`, (e as Error).message);
-                  }
-                })
-              );
-              scheduleCascadeReconcile(accountId, region, token);
-            }
-          } catch (e) {
-            console.error(`[post-sync-cascade] catch-up error:`, (e as Error).message);
-          }
-        })();
+        console.log(`[stream ${accountId}] deals sync complete — auto-SL armed for live deals`);
+        // Note: post-sync catch-up cascade removed — MT5-initiated trades no
+        // longer get cascade limits, only an auto-SL (handled per live deal).
       }
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async onDealAdded(_instanceIndex: string, deal: any): Promise<void> {
+      // Position-close deals clear the MT5 auto-SL batch slot. Backup signal
+      // alongside onPositionRemoved so we don't miss closures.
+      if (deal?.entryType === "DEAL_ENTRY_OUT") {
+        const posId = String(deal.positionId ?? "");
+        if (posId) {
+          const set = mt5SlSet(accountId);
+          if (set.delete(posId)) {
+            console.log(`[mt5-sl] position closed (deal-out) posId=${posId} remaining=${set.size}`);
+          }
+        }
+        return;
+      }
       if (deal?.entryType !== "DEAL_ENTRY_IN") return;
       if (!deal?.symbol) return;
       if (isDuplicate(String(deal.id ?? ""))) return;
@@ -597,61 +567,57 @@ function makeDealListener(accountId: string) {
         console.log(`[auto-cascade] SKIP posId=${evt.positionId} price=${evt.openPrice} — rapid duplicate (Layer 6)`);
       }
       else {
-        markCascaded(accountId, evt.positionId);
-        recordCascade(accountId, evt.openPrice);
-        void (async () => {
+        // ── MT5-initiated trade — apply auto-SL (no cascade limits) ───────
+        // Only XAUUSD trades with a valid execution price qualify.
+        markCascaded(accountId, evt.positionId); // prevent re-processing on duplicate events
+
+        if (!acctCascadeCfg.mt5SlEnabled) {
+          // Feature disabled — nothing to do.
+        } else {
+          const slCfg = {
+            n: acctCascadeCfg.mt5SlNumPositions,
+            pips: acctCascadeCfg.mt5SlPips,
+          };
+          const set = mt5SlSet(accountId);
+          if (set.size >= slCfg.n) {
+            console.log(`[mt5-sl] SKIP posId=${evt.positionId} — batch full (${set.size}/${slCfg.n}); waiting for all to close before new batch`);
+          } else {
             const direction: "buy" | "sell" = evt.type === "DEAL_TYPE_BUY" ? "buy" : "sell";
-            const levels = buildCascadeLevels(evt.openPrice, direction, acctCascadeCfg);
-            const total = 1 + levels.limitEntries.length;
-            console.log(`[auto-cascade] posId=${evt.positionId} dir=${direction} price=${evt.openPrice} limits=[${levels.limitEntries.join(",")}] sl=${levels.stopLoss}`);
-            const conn = activeConnections.get(accountId);
-            const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
-            const token = getToken();
-            let placed = 0;
-            const cascadeStart = Date.now();
-            // Single-channel placement: streaming if connected, else REST.
-            // Never both in parallel (that's what caused the duplicate-order bug).
-            // Double-placement on restart is still prevented by cascade_orders DB;
-            // orphan sweeper still runs as defence-in-depth.
-            await Promise.all(
-              levels.limitEntries.map(async (limitPrice, i) => {
-                const body: Record<string, unknown> = {
-                  actionType: direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT",
-                  symbol: "XAUUSD",
-                  volume: evt.volume,
-                  openPrice: limitPrice,
-                  stopLoss: levels.stopLoss,
-                  comment: `Cascade ${i + 2}/${total}`,
+            const slDistance = slCfg.pips * MT5_SL_PIP;
+            const slPrice = direction === "buy"
+              ? parseFloat((evt.openPrice - slDistance).toFixed(2))
+              : parseFloat((evt.openPrice + slDistance).toFixed(2));
+            // Reserve the slot synchronously so concurrent deals don't overfill the batch.
+            set.add(evt.positionId);
+            const slot = set.size;
+            console.log(`[mt5-sl] posId=${evt.positionId} dir=${direction} entry=${evt.openPrice} sl=${slPrice} slot=${slot}/${slCfg.n}`);
+            void (async () => {
+              const conn = activeConnections.get(accountId);
+              if (!conn || typeof conn.modifyPosition !== "function") {
+                console.error(`[mt5-sl] no active connection for ${accountId} — cannot modify position ${evt.positionId}`);
+                set.delete(evt.positionId); // free slot so a retry/next trade can use it
+                return;
+              }
+              const t0 = Date.now();
+              try {
+                await conn.modifyPosition(evt.positionId, slPrice);
+                console.log(`[mt5-sl] applied SL ${slPrice} to posId=${evt.positionId} (${Date.now() - t0}ms)`);
+                // Surface to the app via a synthetic deal event (so it can toast).
+                const syntheticEvt: DealEvent = {
+                  ...evt,
+                  dealId: `mt5sl-${evt.dealId}`,
+                  time: Date.now(),
+                  autoCascade: true,
+                  autoCascadeCount: 1,
                 };
-                const t0 = Date.now();
-                try {
-                  const orderId = await placeCascadeLimitFast(conn, region, accountId, token, body, i + 2, total);
-                  trackCascadeOrder(accountId, orderId);
-                  placed++;
-                  console.log(`[auto-cascade] placed limit ${i + 2}/${total} @ ${limitPrice} (${Date.now() - t0}ms)`);
-                } catch (tradeErr) {
-                  console.error(`[auto-cascade] failed limit ${i + 2}/${total} @ ${limitPrice} (${Date.now() - t0}ms):`, (tradeErr as Error).message);
-                }
-              })
-            );
-            console.log(`[auto-cascade] posId=${evt.positionId} all ${placed}/${total - 1} limits done in ${Date.now() - cascadeStart}ms`);
-            scheduleCascadeReconcile(accountId, region, token);
-            // Append a new synthetic event after placement completes so the app can show a notification.
-            // We do NOT mutate the original event in place — that would create a race where a client
-            // poll during placement advances its `since` watermark past the original event's timestamp
-            // and never sees the mutation. A fresh event with time=now() is always after the watermark.
-            if (placed > 0) {
-              const syntheticEvt: DealEvent = {
-                ...evt,
-                dealId: `cascade-${evt.dealId}`, // unique ID — won't dedup with the real deal event
-                time: Date.now(),                 // timestamp after placement; guaranteed > any poll watermark set before now
-                autoCascade: true,
-                autoCascadeCount: placed,
-              };
-              storeDealEvent(accountId, syntheticEvt);
-              console.log(`[auto-cascade] stored synthetic notification event dealId=${syntheticEvt.dealId} autoCascadeCount=${placed}`);
-            }
-          })();
+                storeDealEvent(accountId, syntheticEvt);
+              } catch (err) {
+                console.error(`[mt5-sl] failed to modify posId=${evt.positionId} (${Date.now() - t0}ms):`, (err as Error).message);
+                set.delete(evt.positionId); // free slot — the SL didn't actually go on
+              }
+            })();
+          }
+        }
       }
     },
   };
@@ -679,6 +645,7 @@ async function stopStreaming(accountId: string): Promise<void> {
   syncReady.delete(accountId);
   syncReadyAt.delete(accountId);
   cascadeConfigs.delete(accountId);
+  mt5AutoSlOpen.delete(accountId);
   console.log(`[stream ${accountId}] stopped and cleaned up`);
 }
 
@@ -1931,10 +1898,13 @@ router.put("/cascade-config", async (req: Request, res: Response) => {
   const current = getCascadeConfig(accountId, userId);
   // Build the candidate config without mutating in-memory state yet.
   const nextConfig: CascadeConfig = {
-    enabled:      typeof body.enabled      === "boolean" ? body.enabled      : current.enabled,
-    numPositions: typeof body.numPositions === "number"  ? body.numPositions : current.numPositions,
-    pipsBetween:  typeof body.pipsBetween  === "number"  ? body.pipsBetween  : current.pipsBetween,
-    slPips:       typeof body.slPips       === "number"  ? body.slPips       : current.slPips,
+    enabled:           typeof body.enabled           === "boolean" ? body.enabled           : current.enabled,
+    numPositions:      typeof body.numPositions      === "number"  ? body.numPositions      : current.numPositions,
+    pipsBetween:       typeof body.pipsBetween       === "number"  ? body.pipsBetween       : current.pipsBetween,
+    slPips:            typeof body.slPips            === "number"  ? body.slPips            : current.slPips,
+    mt5SlEnabled:      typeof body.mt5SlEnabled      === "boolean" ? body.mt5SlEnabled      : current.mt5SlEnabled,
+    mt5SlNumPositions: typeof body.mt5SlNumPositions === "number"  ? body.mt5SlNumPositions : current.mt5SlNumPositions,
+    mt5SlPips:         typeof body.mt5SlPips         === "number"  ? body.mt5SlPips         : current.mt5SlPips,
   };
   // Persist first — only commit to in-memory state when DB write succeeds.
   const saved = await saveCascadeConfig(nextConfig, saveKey);

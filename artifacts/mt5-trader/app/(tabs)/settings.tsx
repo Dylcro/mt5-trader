@@ -543,26 +543,6 @@ export default function SettingsScreen() {
               hint={`${(cs.slPips * 0.10).toFixed(2)} below market entry — shared by all orders`}
             />
 
-            <View style={styles.cascadeDivider} />
-
-            <View style={styles.settingRow}>
-              <Switch
-                value={cs.autoCascadeEnabled}
-                onValueChange={(v) => {
-                  void Haptics.selectionAsync();
-                  updateSettings({ autoCascadeEnabled: v });
-                }}
-                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
-                thumbColor={cs.autoCascadeEnabled ? C.gold : C.textMuted}
-              />
-              <View style={{ marginLeft: 10, flex: 1 }}>
-                <Text style={styles.settingLabel}>Auto-cascade MT5 trades</Text>
-                <Text style={styles.settingHint}>
-                  When ON, any trade opened directly in MT5 will automatically get cascade limit orders placed using the settings above.
-                </Text>
-              </View>
-            </View>
-
             {cs.numPositions > 1 && cs.slPips <= (cs.numPositions - 1) * cs.pipsBetween && (
               <View style={styles.cascadeWarningBox}>
                 <Feather name="alert-triangle" size={14} color="#f59e0b" />
@@ -581,6 +561,104 @@ export default function SettingsScreen() {
                 ).join("\n")}
                 {cs.numPositions > 1 ? "\n" : ""}
                 {`SL  ${(5058 - cs.slPips * 0.10).toFixed(2)}  ← all orders (${cs.slPips} pips from entry)`}
+              </Text>
+            </View>
+
+            <Pressable
+              style={({ pressed }) => [
+                styles.saveBtn,
+                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
+                saveState === "saving" && { opacity: 0.6 },
+              ]}
+              disabled={saveState === "saving"}
+              onPress={async () => {
+                setSaveState("saving");
+                void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                const ok = await saveToServer();
+                setSaveState(ok ? "saved" : "error");
+                if (ok) void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                else void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+                setTimeout(() => setSaveState("idle"), 3000);
+              }}
+            >
+              {saveState === "saving" ? (
+                <ActivityIndicator size="small" color="#000" />
+              ) : (
+                <Feather
+                  name={saveState === "saved" ? "check" : saveState === "error" ? "alert-circle" : "upload-cloud"}
+                  size={15}
+                  color={saveState === "error" ? C.sell : "#000"}
+                />
+              )}
+              <Text style={[styles.saveBtnText, saveState === "error" && { color: C.sell }]}>
+                {saveState === "saving" ? "Saving…"
+                  : saveState === "saved" ? "Saved to server"
+                  : saveState === "error" ? "Save failed — check connection"
+                  : "Save Settings to Server"}
+              </Text>
+            </Pressable>
+          </View>
+
+          {/* MT5 Auto-SL — applies an auto stop-loss to trades placed directly in MT5 */}
+          <View style={styles.cascadeCard}>
+            <View style={styles.cascadeCardHeader}>
+              <Feather name="shield" size={16} color={C.gold} />
+              <Text style={styles.cascadeCardTitle}>MT5 Auto Stop-Loss</Text>
+            </View>
+            <Text style={styles.cascadeCardDesc}>
+              When you place a buy or sell directly in the MT5 app, automatically attach a stop loss. The same SL is applied to the next N trades; a new batch only starts after all those trades have closed (TP or SL).
+            </Text>
+
+            <View style={styles.cascadeDivider} />
+
+            <View style={styles.settingRow}>
+              <Switch
+                value={cs.mt5SlEnabled}
+                onValueChange={(v) => {
+                  void Haptics.selectionAsync();
+                  updateSettings({ mt5SlEnabled: v });
+                }}
+                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
+                thumbColor={cs.mt5SlEnabled ? C.gold : C.textMuted}
+              />
+              <View style={{ marginLeft: 10, flex: 1 }}>
+                <Text style={styles.settingLabel}>Enable MT5 auto SL</Text>
+                <Text style={styles.settingHint}>
+                  Off by default. Cascade limit orders for MT5 trades are no longer placed — only the auto-SL.
+                </Text>
+              </View>
+            </View>
+
+            <View style={styles.cascadeDivider} />
+
+            <PillSelector
+              label="Number of positions"
+              hint="How many MT5 trades in a row get the auto-SL"
+              options={[1, 2, 3, 4, 5, 6]}
+              value={cs.mt5SlNumPositions}
+              onChange={(v) => updateSettings({ mt5SlNumPositions: v })}
+              suffix=""
+            />
+
+            <View style={styles.cascadeDivider} />
+
+            <SliderSetting
+              label="Stop loss distance"
+              value={cs.mt5SlPips}
+              min={10}
+              max={200}
+              step={5}
+              onChange={(v) => updateSettings({ mt5SlPips: v })}
+              displayValue={`${cs.mt5SlPips} pips`}
+              hint={`$${cs.mt5SlPips} away from entry — applied to every trade in the batch`}
+            />
+
+            <View style={styles.cascadePreviewBox}>
+              <Text style={styles.cascadePreviewTitle}>Preview (buy at 5500)</Text>
+              <Text style={styles.cascadePreviewText}>
+                {`Entry  @ 5500.00\n`}
+                {`SL     @ ${(5500 - cs.mt5SlPips).toFixed(2)}  ← ${cs.mt5SlPips} pips below\n`}
+                {`Applies to next ${cs.mt5SlNumPositions} MT5 trade${cs.mt5SlNumPositions === 1 ? "" : "s"}, then waits for all to close before resetting.`}
               </Text>
             </View>
 
