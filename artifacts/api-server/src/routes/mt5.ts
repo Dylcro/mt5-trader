@@ -545,7 +545,9 @@ function makeDealListener(accountId: string) {
       const acctCascadeCfg = getCascadeConfig(accountId);
 
       // Layer 1: sync guard — never cascade historical deals replayed on connect
-      if (!syncReady.has(accountId)) { /* skip — historical replay */ }
+      if (!syncReady.has(accountId)) {
+        console.log(`[auto-cascade] SKIP posId=${evt.positionId} price=${evt.openPrice} — sync not ready yet (historical replay or onDealsSynchronized hasn't fired)`);
+      }
       // Layer 1b: staleness guard — the SDK sometimes delivers buffered historical
       // onDealAdded events AFTER onDealsSynchronized fires, so they slip past Layer 1.
       // If the deal's MT5 execution time is more than 60 s older than when sync
@@ -704,6 +706,19 @@ async function startStreaming(token: string, accountId: string, region: string =
     activeConnections.set(accountId, conn);
     activeRegions.set(accountId, region);
     console.log(`[stream ${accountId}] streaming connection established — SDK trade path armed`);
+    // Fallback arm: under flaky MetaAPI conditions (subscribe TimeoutError,
+    // mid-sync reconnects) `onDealsSynchronized` sometimes never fires even
+    // though the connection is fully functional for trades. Without this,
+    // every MT5-initiated deal is silently dropped at Layer 1.
+    // Safe to force-arm: Layer 1b filters historical deals by timestamp
+    // (>60s older than armedAt = stale).
+    setTimeout(() => {
+      if (!syncReady.has(accountId) && activeConnections.has(accountId)) {
+        syncReady.add(accountId);
+        syncReadyAt.set(accountId, Date.now());
+        console.warn(`[stream ${accountId}] onDealsSynchronized never fired after 90s — force-arming auto-cascade (staleness guard still active)`);
+      }
+    }, 90_000);
     // Persist credentials so the server can auto-reconnect after a restart
     // without waiting for the app to call /connect again.
     // userId is included when available so /my-account lookups work reliably.
