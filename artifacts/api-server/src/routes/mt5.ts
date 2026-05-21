@@ -589,6 +589,23 @@ async function startStreaming(token: string, accountId: string, region: string =
   try {
     const sdk = getSdk(token);
     const account = await sdk.metatraderAccountApi.getAccount(accountId);
+    // If MetaAPI auto-undeployed the account (common after inactivity), re-deploy
+    // before attempting to open a streaming connection — otherwise the subscribe
+    // call silently fails and no deal events are ever received.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const acctState: string = (account as any).state ?? "";
+    if (acctState === "UNDEPLOYED") {
+      console.warn(`[stream ${accountId}] account is UNDEPLOYED — re-deploying before connect...`);
+      await deployAccount(token, accountId);
+      // Give MetaAPI up to 30 s to bring the account online before we try to stream
+      for (let i = 0; i < 6; i++) {
+        await new Promise(r => setTimeout(r, 5000));
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const refreshed = await sdk.metatraderAccountApi.getAccount(accountId) as any;
+        if (refreshed.state === "DEPLOYED" || refreshed.connectionStatus === "CONNECTED") break;
+        console.log(`[stream ${accountId}] waiting for deploy... (${(i + 1) * 5}s)`);
+      }
+    }
     const conn = account.getStreamingConnection();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (conn as any).addSynchronizationListener(makeDealListener(accountId));
@@ -619,7 +636,20 @@ async function startStreaming(token: string, accountId: string, region: string =
   } catch (err) {
     activeStreams.delete(accountId); // allow retry on next poll
     activeConnections.delete(accountId);
-    console.error(`[stream ${accountId}] streaming start failed:`, (err as Error).message);
+    const msg = (err as Error).message ?? "";
+    // MetaAPI auto-undeploys accounts during inactivity. Detect the error and
+    // re-deploy automatically so the stream resumes without user intervention.
+    if (msg.includes("no accounts deployed") || msg.includes("deploy an account first")) {
+      console.warn(`[stream ${accountId}] account undeployed — triggering re-deploy...`);
+      try {
+        await deployAccount(token, accountId);
+        console.log(`[stream ${accountId}] re-deploy requested — watchdog will retry stream in 30 s`);
+      } catch (deployErr) {
+        console.error(`[stream ${accountId}] re-deploy failed:`, (deployErr as Error).message);
+      }
+    } else {
+      console.error(`[stream ${accountId}] streaming start failed:`, msg);
+    }
   }
 }
 
