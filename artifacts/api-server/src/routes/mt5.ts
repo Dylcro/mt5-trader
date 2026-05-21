@@ -372,11 +372,41 @@ async function loadCascadeHistory(accountId: string): Promise<void> {
   }
 }
 
-// ── MT5-initiated auto-cascading removed (user request, May 2026) ────────────
-// NOTE: MT5-initiated auto-cascading was removed by user request.
-// The streaming connection is kept ONLY for read-sync (position
-// updates, equity, manual closes reflecting back to the app).
-// All cascade orders are now placed exclusively from the app.
+// ── Rapid-trade dedup guard (Layer 6) ────────────────────────────────────────
+// If two separate DEAL_ENTRY_IN events arrive for the same account within
+// RAPID_CASCADE_WINDOW_MS at nearly the same price (within RAPID_PRICE_TOLERANCE),
+// the second is almost certainly a double-click / double-tap in MT5 rather than
+// an intentional separate position — skip auto-cascading it.
+const RAPID_CASCADE_WINDOW_MS   = 4_000;  // 4 seconds between cascades per account
+const RAPID_PRICE_TOLERANCE     = 0.5;    // XAUUSD points — tighter than normal spread
+
+interface LastCascadeInfo { time: number; price: number; }
+const lastCascadeByAccount = new Map<string, LastCascadeInfo>();
+
+function isRapidDuplicate(accountId: string, price: number): boolean {
+  const prev = lastCascadeByAccount.get(accountId);
+  if (!prev) return false;
+  const ageMs   = Date.now() - prev.time;
+  const priceDiff = Math.abs(price - prev.price);
+  return ageMs < RAPID_CASCADE_WINDOW_MS && priceDiff < RAPID_PRICE_TOLERANCE;
+}
+
+function recordCascade(accountId: string, price: number): void {
+  lastCascadeByAccount.set(accountId, { time: Date.now(), price });
+}
+
+// Tracks which accounts have completed the initial MetaAPI synchronisation.
+// onDealAdded fires for HISTORICAL deals during sync replay — we must NOT
+// auto-cascade those. Only deals that arrive after onSynchronized are live.
+const syncReady = new Set<string>();
+// Records the server-side ms timestamp when each account's sync completed.
+// Used to filter out historical deal events that the SDK delivers AFTER
+// onDealsSynchronized fires (a known SDK buffering quirk).
+const syncReadyAt = new Map<string, number>();
+// Tracks whether we've already logged a Layer-1 SKIP for this account's
+// current replay window. Reset on disconnect and on sync-arm so we get
+// one diagnostic line per replay, not per historical deal.
+const skipLogged = new Set<string>();
 
 function makeDealListener(accountId: string) {
   // The MetaAPI SDK calls many methods on every registered listener and throws
@@ -385,18 +415,120 @@ function makeDealListener(accountId: string) {
   // silently no-op any method the SDK calls that we haven't explicitly defined.
   const handler = {
     async onDisconnected(_instanceIndex: string): Promise<void> {
+      syncReady.delete(accountId); // reset — next reconnect must re-sync before cascading
+      syncReadyAt.delete(accountId);
+      skipLogged.delete(accountId);
       activeStreams.delete(accountId);
       activeConnections.delete(accountId);
       console.log(`[stream ${accountId}] WebSocket disconnected — watchdog will reconnect`);
     },
+    // onDealsSynchronized fires after all historical deals have been replayed.
+    // Any onDealAdded call AFTER this point is a live event — safe to cascade.
     async onDealsSynchronized(_instanceIndex: string, _synchronizationId: string): Promise<void> {
-      console.log(`[stream ${accountId}] deals sync complete — read-only stream active`);
+      if (!syncReady.has(accountId)) {
+        syncReady.add(accountId);
+        syncReadyAt.set(accountId, Date.now());
+        skipLogged.delete(accountId); // reset so next disconnect-replay logs once
+        console.log(`[stream ${accountId}] deals sync complete — auto-cascade armed for live deals`);
+
+        // ── Post-sync catch-up ─────────────────────────────────────────────
+        // Trades placed in MT5 while the server was restarting/reconnecting
+        // arrive as onDealAdded events BEFORE this callback fires, so the
+        // sync guard silently drops them. Catch those missed positions here.
+        void (async () => {
+          try {
+            const acctCascadeCfg = getCascadeConfig(accountId);
+            if (!acctCascadeCfg.enabled) return;
+
+            const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
+            const token  = getToken();
+
+            // Fetch open positions and pending orders in parallel
+            const [posRes, ordRes] = await Promise.all([
+              fetch(`${clientBase(region)}/users/current/accounts/${accountId}/positions`,
+                { headers: authHeaders(token) }),
+              fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`,
+                { headers: authHeaders(token) }),
+            ]);
+            if (!posRes.ok) return;
+
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const positions: any[]    = await posRes.json();
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const pendingOrders: any[] = ordRes.ok ? await ordRes.json() : [];
+
+            // Positions that already have at least one "Cascade"-tagged limit order
+            // don't need cascading — they survived the reconnect intact.
+            const cascadedComments = new Set<string>(
+              pendingOrders
+                .filter((o: any) => String(o.comment ?? "").startsWith("Cascade"))
+                // pending limit orders carry clientId or comment but NOT positionId —
+                // group by direction+symbol instead; any buy limit → buy positions covered
+                .map((o: any) => `${o.symbol}:${String(o.type ?? "").includes("BUY") ? "buy" : "sell"}`)
+            );
+
+            const conn = activeConnections.get(accountId);
+
+            for (const pos of positions) {
+              if (pos.symbol !== "XAUUSD") continue;
+              const posId = String(pos.id ?? pos._id ?? "");
+              if (!posId) continue;
+              if (hasBeenCascaded(accountId, posId)) continue;
+
+              const direction: "buy" | "sell" = String(pos.type ?? "").includes("BUY") ? "buy" : "sell";
+
+              // If cascade limits already exist for this direction, mark and skip
+              if (cascadedComments.has(`XAUUSD:${direction}`)) {
+                markCascaded(accountId, posId);
+                console.log(`[post-sync-cascade] SKIP posId=${posId} — existing limits found`);
+                continue;
+              }
+
+              const openPrice = pos.openPrice ?? 0;
+              if (openPrice <= 0) continue;
+
+              const levels = buildCascadeLevels(openPrice, direction, acctCascadeCfg);
+              const total  = 1 + levels.limitEntries.length;
+              markCascaded(accountId, posId);
+              recordCascade(accountId, openPrice);
+              console.log(`[post-sync-cascade] posId=${posId} dir=${direction} price=${openPrice} limits=[${levels.limitEntries.join(",")}] sl=${levels.stopLoss}`);
+
+              await Promise.all(
+                levels.limitEntries.map(async (limitPrice, i) => {
+                  const body: Record<string, unknown> = {
+                    actionType: direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT",
+                    symbol:    "XAUUSD",
+                    volume:    pos.volume,
+                    openPrice: limitPrice,
+                    stopLoss:  levels.stopLoss,
+                    comment:   `Cascade ${i + 2}/${total}`,
+                  };
+                  const t0 = Date.now();
+                  try {
+                    const orderId = await placeCascadeLimitFast(conn, region, accountId, token, body, i + 2, total);
+                    trackCascadeOrder(accountId, orderId);
+                    console.log(`[post-sync-cascade] placed limit ${i + 2}/${total} @ ${limitPrice} (${Date.now() - t0}ms)`);
+                  } catch (e) {
+                    console.error(`[post-sync-cascade] failed limit ${i + 2}/${total} @ ${limitPrice} (${Date.now() - t0}ms):`, (e as Error).message);
+                  }
+                })
+              );
+              scheduleCascadeReconcile(accountId, region, token);
+            }
+          } catch (e) {
+            console.error(`[post-sync-cascade] catch-up error:`, (e as Error).message);
+          }
+        })();
+      }
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async onDealAdded(_instanceIndex: string, deal: any): Promise<void> {
       if (deal?.entryType !== "DEAL_ENTRY_IN") return;
       if (!deal?.symbol) return;
       if (isDuplicate(String(deal.id ?? ""))) return;
+      // Guard: if this deal was created by filling one of our cascade limit orders,
+      // never re-cascade it — even if the broker stripped the comment.
+      if (deal.orderId && cascadePlacedOrderIds.has(String(deal.orderId))) return;
       // MetaAPI streaming deal events expose the execution price as `deal.price`
       // (the tick price at fill time). `deal.openPrice` may be 0 or absent in
       // the streaming payload — always prefer whichever field is non-zero.
@@ -414,9 +546,113 @@ function makeDealListener(accountId: string) {
       };
       console.log(`[stream ${accountId}] deal dealId=${evt.dealId} posId=${evt.positionId} type=${evt.type} sym=${evt.symbol} price=${evt.openPrice} comment="${evt.comment ?? ""}"`);
       storeDealEvent(accountId, evt);
-      // NOTE: MT5-initiated auto-cascading removed. Deal events are still
-      // stored so the app's events polling continues to reflect manual
-      // closes, fills of pending cascade limits, etc.
+
+      // ── Auto-cascade: place limit orders for trades opened directly in MT5 ──
+      const acctCascadeCfg = getCascadeConfig(accountId);
+
+      // Layer 1: sync guard — never cascade historical deals replayed on connect.
+      // Silent skip: historical replays can deliver hundreds of deals back-to-back;
+      // logging every one floods stdout and blocks the SDK event loop, delaying
+      // live trades. We log at most once per replay window (gated below).
+      if (!syncReady.has(accountId)) {
+        if (!skipLogged.has(accountId)) {
+          skipLogged.add(accountId);
+          console.log(`[auto-cascade] SKIP posId=${evt.positionId} price=${evt.openPrice} — sync not ready (further skips for this account suppressed until sync arms)`);
+        }
+      }
+      // Layer 1b: staleness guard — the SDK sometimes delivers buffered historical
+      // onDealAdded events AFTER onDealsSynchronized fires, so they slip past Layer 1.
+      // If the deal's MT5 execution time is more than 60 s older than when sync
+      // completed, it is historical data, not a live trade — skip it.
+      else if (deal.time && (() => {
+        const dealMs = new Date(deal.time).getTime();
+        const armedAt = syncReadyAt.get(accountId) ?? 0;
+        return armedAt > 0 && dealMs < armedAt - 60_000;
+      })()) {
+        console.log(`[auto-cascade] SKIP posId=${evt.positionId} — stale deal (dealTime=${deal.time})`);
+      }
+      // Layer 2: feature enabled + correct symbol + valid price
+      else if (!acctCascadeCfg.enabled || evt.symbol !== "XAUUSD" || evt.openPrice <= 0) { /* skip — disabled or irrelevant */ }
+      // Layer 3: positionId already cascaded (covers app-placed market orders pre-marked above)
+      else if (hasBeenCascaded(accountId, evt.positionId)) {
+        console.log(`[auto-cascade] SKIP posId=${evt.positionId} — already cascaded`);
+      }
+      // Layer 4: an app-initiated market cascade trade is in-flight for this account.
+      // The deal event arrives via stream before the SDK trade response resolves, so
+      // markCascaded hasn't been called yet — we mark it here to close the race.
+      else if (pendingAppCascades.has(accountId)) {
+        markCascaded(accountId, evt.positionId);
+        console.log(`[auto-cascade] SKIP posId=${evt.positionId} — in-flight app cascade (race guard)`);
+      }
+      // Layer 5: comment identifies this as an app-placed trade (broker may strip comment, so this
+      // is a best-effort check — Layer 4 and Layer 6 handle the cases where comment is absent).
+      else if ((evt.comment ?? "").startsWith("Cascade") || evt.comment === "XAUUSD Trader App") {
+        console.log(`[auto-cascade] SKIP posId=${evt.positionId} — app-placed trade (comment="${evt.comment ?? ""}")`);
+        markCascaded(accountId, evt.positionId);
+      }
+      // Layer 6: rapid-trade dedup — two deals at nearly the same price within a few seconds
+      // almost certainly means a double-click / double-tap in MT5 rather than a new position.
+      else if (isRapidDuplicate(accountId, evt.openPrice)) {
+        markCascaded(accountId, evt.positionId);
+        console.log(`[auto-cascade] SKIP posId=${evt.positionId} price=${evt.openPrice} — rapid duplicate (Layer 6)`);
+      }
+      else {
+        markCascaded(accountId, evt.positionId);
+        recordCascade(accountId, evt.openPrice);
+        void (async () => {
+            const direction: "buy" | "sell" = evt.type === "DEAL_TYPE_BUY" ? "buy" : "sell";
+            const levels = buildCascadeLevels(evt.openPrice, direction, acctCascadeCfg);
+            const total = 1 + levels.limitEntries.length;
+            console.log(`[auto-cascade] posId=${evt.positionId} dir=${direction} price=${evt.openPrice} limits=[${levels.limitEntries.join(",")}] sl=${levels.stopLoss}`);
+            const conn = activeConnections.get(accountId);
+            const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
+            const token = getToken();
+            let placed = 0;
+            const cascadeStart = Date.now();
+            // Single-channel placement: streaming if connected, else REST.
+            // Never both in parallel (that's what caused the duplicate-order bug).
+            // Double-placement on restart is still prevented by cascade_orders DB;
+            // orphan sweeper still runs as defence-in-depth.
+            await Promise.all(
+              levels.limitEntries.map(async (limitPrice, i) => {
+                const body: Record<string, unknown> = {
+                  actionType: direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT",
+                  symbol: "XAUUSD",
+                  volume: evt.volume,
+                  openPrice: limitPrice,
+                  stopLoss: levels.stopLoss,
+                  comment: `Cascade ${i + 2}/${total}`,
+                };
+                const t0 = Date.now();
+                try {
+                  const orderId = await placeCascadeLimitFast(conn, region, accountId, token, body, i + 2, total);
+                  trackCascadeOrder(accountId, orderId);
+                  placed++;
+                  console.log(`[auto-cascade] placed limit ${i + 2}/${total} @ ${limitPrice} (${Date.now() - t0}ms)`);
+                } catch (tradeErr) {
+                  console.error(`[auto-cascade] failed limit ${i + 2}/${total} @ ${limitPrice} (${Date.now() - t0}ms):`, (tradeErr as Error).message);
+                }
+              })
+            );
+            console.log(`[auto-cascade] posId=${evt.positionId} all ${placed}/${total - 1} limits done in ${Date.now() - cascadeStart}ms`);
+            scheduleCascadeReconcile(accountId, region, token);
+            // Append a new synthetic event after placement completes so the app can show a notification.
+            // We do NOT mutate the original event in place — that would create a race where a client
+            // poll during placement advances its `since` watermark past the original event's timestamp
+            // and never sees the mutation. A fresh event with time=now() is always after the watermark.
+            if (placed > 0) {
+              const syntheticEvt: DealEvent = {
+                ...evt,
+                dealId: `cascade-${evt.dealId}`, // unique ID — won't dedup with the real deal event
+                time: Date.now(),                 // timestamp after placement; guaranteed > any poll watermark set before now
+                autoCascade: true,
+                autoCascadeCount: placed,
+              };
+              storeDealEvent(accountId, syntheticEvt);
+              console.log(`[auto-cascade] stored synthetic notification event dealId=${syntheticEvt.dealId} autoCascadeCount=${placed}`);
+            }
+          })();
+      }
     },
   };
 
@@ -440,6 +676,8 @@ async function stopStreaming(accountId: string): Promise<void> {
   activeStreams.delete(accountId);
   activeConnections.delete(accountId);
   activeRegions.delete(accountId);
+  syncReady.delete(accountId);
+  syncReadyAt.delete(accountId);
   cascadeConfigs.delete(accountId);
   console.log(`[stream ${accountId}] stopped and cleaned up`);
 }
@@ -485,6 +723,19 @@ async function startStreaming(token: string, accountId: string, region: string =
     activeConnections.set(accountId, conn);
     activeRegions.set(accountId, region);
     console.log(`[stream ${accountId}] streaming connection established — SDK trade path armed`);
+    // Fallback arm: under flaky MetaAPI conditions (subscribe TimeoutError,
+    // mid-sync reconnects) `onDealsSynchronized` sometimes never fires even
+    // though the connection is fully functional for trades. Without this,
+    // every MT5-initiated deal is silently dropped at Layer 1.
+    // Safe to force-arm: Layer 1b filters historical deals by timestamp
+    // (>60s older than armedAt = stale).
+    setTimeout(() => {
+      if (!syncReady.has(accountId) && activeConnections.has(accountId)) {
+        syncReady.add(accountId);
+        syncReadyAt.set(accountId, Date.now());
+        console.warn(`[stream ${accountId}] onDealsSynchronized never fired after 90s — force-arming auto-cascade (staleness guard still active)`);
+      }
+    }, 90_000);
     // Persist credentials so the server can auto-reconnect after a restart
     // without waiting for the app to call /connect again.
     // userId is included when available so /my-account lookups work reliably.
