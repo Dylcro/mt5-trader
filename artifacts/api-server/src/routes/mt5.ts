@@ -119,16 +119,30 @@ function getCascadeConfig(accountId: string, userId?: string): CascadeConfig {
 
 // Attempt a single load from the database; throws on failure.
 async function attemptLoadCascadeConfig(): Promise<void> {
-  const rows = await db.select().from(cascadeConfigTable);
+  const [rows, accounts] = await Promise.all([
+    db.select().from(cascadeConfigTable),
+    db.select().from(storedAccountsTable),
+  ]);
   if (rows.length > 0) {
+    // Build userId → MetaAPI accountId map so we can cross-populate the cache.
+    const userToAccount = new Map<string, string>();
+    for (const acct of accounts) {
+      if (acct.userId && acct.accountId) userToAccount.set(acct.userId, acct.accountId);
+    }
     for (const row of rows) {
       const key = row.accountId ?? "";
-      cascadeConfigs.set(key, {
+      const cfg = {
         enabled:      row.enabled,
         numPositions: row.numPositions,
         pipsBetween:  row.pipsBetween,
         slPips:       row.slPips,
-      });
+      };
+      cascadeConfigs.set(key, cfg);
+      // Also cache under the MetaAPI accountId so the auto-cascade background
+      // loop (which only knows MetaAPI accountId) can find the right config
+      // after a server restart without waiting for the user to re-save settings.
+      const metaApiId = userToAccount.get(key);
+      if (metaApiId) cascadeConfigs.set(metaApiId, cfg);
     }
     console.log(`[cascade-config] loaded ${rows.length} row(s) from db`);
   } else {
