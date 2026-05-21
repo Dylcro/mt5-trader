@@ -779,19 +779,18 @@ async function startStreaming(token: string, accountId: string, region: string =
     activeConnections.set(accountId, conn);
     activeRegions.set(accountId, region);
     console.log(`[stream ${accountId}] streaming connection established — SDK trade path armed`);
-    // Fallback arm: under flaky MetaAPI conditions (subscribe TimeoutError,
-    // mid-sync reconnects) `onDealsSynchronized` sometimes never fires even
-    // though the connection is fully functional for trades. Without this,
-    // every MT5-initiated deal is silently dropped at Layer 1.
-    // Safe to force-arm: Layer 1b filters historical deals by timestamp
-    // (>60s older than armedAt = stale).
+    // Sync-stuck recovery: if `onDealsSynchronized` hasn't fired within 60s,
+    // the account's sync session on MetaAPI is wedged (the "synchronization
+    // with this id is already running" error). Force-arming locally doesn't
+    // help because no deal events ever arrive — the only cure is to undeploy
+    // and redeploy the account on MetaAPI's side, which wipes the stuck
+    // session. Recovery is rate-limited to avoid loops.
     setTimeout(() => {
       if (!syncReady.has(accountId) && activeConnections.has(accountId)) {
-        syncReady.add(accountId);
-        syncReadyAt.set(accountId, Date.now());
-        console.warn(`[stream ${accountId}] onDealsSynchronized never fired after 90s — force-arming auto-cascade (staleness guard still active)`);
+        console.warn(`[stream ${accountId}] onDealsSynchronized never fired after 60s — triggering sync recovery`);
+        void recoverStuckSync(token, accountId);
       }
-    }, 90_000);
+    }, 60_000);
     // Persist credentials so the server can auto-reconnect after a restart
     // without waiting for the app to call /connect again.
     // userId is included when available so /my-account lookups work reliably.
@@ -1138,6 +1137,79 @@ async function deployAccount(token: string, accountId: string): Promise<void> {
     const msg = body.message ?? `Deploy failed (HTTP ${res.status})`;
     console.warn(`[deploy] ${accountId} failed ${res.status}: ${msg}`);
     throw new Error(msg);
+  }
+}
+
+async function undeployAccount(token: string, accountId: string): Promise<void> {
+  const res = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}/undeploy`, {
+    method: "POST",
+    headers: authHeaders(token),
+  });
+  if (!res.ok && res.status !== 204) {
+    const body = await res.json().catch(() => ({})) as { message?: string };
+    const msg = body.message ?? `Undeploy failed (HTTP ${res.status})`;
+    console.warn(`[undeploy] ${accountId} failed ${res.status}: ${msg}`);
+    throw new Error(msg);
+  }
+}
+
+// ── Stuck-sync recovery ────────────────────────────────────────────────────
+// Some MetaAPI accounts (Gethin's is the canonical example) get into a state
+// where every subscribe call fails with "synchronization with this id is
+// already running" and onDealsSynchronized never fires. Reconnecting does
+// nothing because the stuck session lives on MetaAPI's server, not ours.
+// The only known cure is to undeploy → wait → redeploy, which wipes the
+// server-side sync state and lets the next streaming connect succeed.
+const recoveryAttempts = new Map<string, number[]>(); // accountId → recovery timestamps
+const RECOVERY_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
+const MAX_RECOVERIES_PER_WINDOW = 3;
+
+function canAttemptRecovery(accountId: string): boolean {
+  const now = Date.now();
+  const recent = (recoveryAttempts.get(accountId) ?? []).filter(t => now - t < RECOVERY_WINDOW_MS);
+  recoveryAttempts.set(accountId, recent);
+  return recent.length < MAX_RECOVERIES_PER_WINDOW;
+}
+
+function recordRecoveryAttempt(accountId: string): void {
+  const arr = recoveryAttempts.get(accountId) ?? [];
+  arr.push(Date.now());
+  recoveryAttempts.set(accountId, arr);
+}
+
+async function recoverStuckSync(token: string, accountId: string): Promise<void> {
+  if (!canAttemptRecovery(accountId)) {
+    console.warn(`[sync-recovery] ${accountId} — recovery rate-limit reached (>${MAX_RECOVERIES_PER_WINDOW} in 2h), skipping`);
+    return;
+  }
+  recordRecoveryAttempt(accountId);
+  console.warn(`[sync-recovery] ${accountId} — sync stuck, starting undeploy→redeploy cycle to clear MetaAPI session state`);
+  try {
+    // 1. Tear down our local streaming connection so the watchdog won't
+    //    fight the recovery by reconnecting mid-cycle.
+    await stopStreaming(accountId);
+    // 2. Undeploy on MetaAPI's side — this kills the stuck sync session.
+    await undeployAccount(token, accountId);
+    console.log(`[sync-recovery] ${accountId} — undeploy requested, waiting for UNDEPLOYED state...`);
+    // 3. Poll until UNDEPLOYED confirmed (up to 60 s).
+    const sdk = getSdk(token);
+    const undeployStart = Date.now();
+    while (Date.now() - undeployStart < 60_000) {
+      await new Promise(r => setTimeout(r, 3000));
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const acct = await sdk.metatraderAccountApi.getAccount(accountId) as any;
+      if (acct.state === "UNDEPLOYED") {
+        console.log(`[sync-recovery] ${accountId} — confirmed UNDEPLOYED after ${Math.round((Date.now() - undeployStart) / 1000)}s`);
+        break;
+      }
+    }
+    // 4. Redeploy and let the watchdog (30 s) pick it up to reconnect.
+    await deployAccount(token, accountId);
+    console.log(`[sync-recovery] ${accountId} — redeploy requested, watchdog will reconnect within 30 s`);
+  } catch (err) {
+    console.error(`[sync-recovery] ${accountId} — recovery cycle failed:`, (err as Error).message);
+    // Don't leave activeStreams marked — let watchdog retry the connect.
+    activeStreams.delete(accountId);
   }
 }
 
