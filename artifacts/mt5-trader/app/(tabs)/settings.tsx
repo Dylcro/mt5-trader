@@ -707,43 +707,6 @@ export default function SettingsScreen() {
               </Text>
             </View>
 
-            {/* ── Failsafe SL safety net ── */}
-            <View style={styles.cascadeDivider} />
-
-            <View style={styles.settingRow}>
-              <Switch
-                value={cs.mt5FailsafeEnabled}
-                onValueChange={(v) => {
-                  void Haptics.selectionAsync();
-                  updateSettings({ mt5FailsafeEnabled: v });
-                }}
-                trackColor={{ false: C.border, true: "rgba(34,197,94,0.5)" }}
-                thumbColor={cs.mt5FailsafeEnabled ? "#22c55e" : C.textMuted}
-              />
-              <View style={{ marginLeft: 10, flex: 1 }}>
-                <Text style={styles.settingLabel}>
-                  Failsafe SL{" "}
-                  {cs.mt5FailsafeEnabled && (
-                    <Text style={{ color: "#22c55e", fontSize: 11 }}>● ON</Text>
-                  )}
-                </Text>
-                <Text style={styles.settingHint}>
-                  Server scans every 10 s. Any XAUUSD position without a stop loss gets an emergency SL attached at the distance below from current price. Recommended ON.
-                </Text>
-              </View>
-            </View>
-
-            <SliderSetting
-              label="Failsafe distance"
-              value={cs.mt5FailsafePips}
-              min={50}
-              max={500}
-              step={10}
-              onChange={(v) => updateSettings({ mt5FailsafePips: v })}
-              displayValue={`${cs.mt5FailsafePips} pips`}
-              hint={`Emergency SL placed ${(cs.mt5FailsafePips * 0.10).toFixed(2)} away from market when a naked position is detected`}
-            />
-
             <Pressable
               style={({ pressed }) => [
                 styles.saveBtn,
