@@ -660,6 +660,14 @@ export default function TradeScreen() {
           )}
         </View>
 
+        {/* Volatility advisory — always visible above mode toggle */}
+        <View style={styles.advisoryBanner}>
+          <Feather name="alert-triangle" size={14} color={C.gold} style={{ marginTop: 1 }} />
+          <Text style={styles.advisoryText}>
+            <Text style={styles.advisoryTextBold}>Tip:</Text> During fast or volatile markets, place trades from this app rather than MT5. MT5 orders can lag and may not trigger the cascade in time.
+          </Text>
+        </View>
+
         {/* Mode Toggle */}
         <View style={styles.modeToggle}>
           <Pressable
@@ -1054,6 +1062,28 @@ const styles = StyleSheet.create({
     elevation: 8,
   },
   toastText: { fontSize: 15, fontFamily: "Inter_600SemiBold", color: "#fff", flex: 1 },
+  advisoryBanner: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 8,
+    backgroundColor: "rgba(201,168,76,0.08)",
+    borderWidth: 1,
+    borderColor: "rgba(201,168,76,0.35)",
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  advisoryText: {
+    flex: 1,
+    fontSize: 12,
+    lineHeight: 16,
+    fontFamily: "Inter_400Regular",
+    color: C.textSecondary,
+  },
+  advisoryTextBold: {
+    fontFamily: "Inter_600SemiBold",
+    color: C.gold,
+  },
   modeToggle: {
     flexDirection: "row",
     backgroundColor: C.card,
