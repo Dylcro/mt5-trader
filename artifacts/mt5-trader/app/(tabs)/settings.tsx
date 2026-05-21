@@ -513,6 +513,9 @@ export default function SettingsScreen() {
               <Text style={[styles.settingsTabBtnText, settingsTab === "mt5" && styles.settingsTabBtnTextActive]}>
                 MT5 settings
               </Text>
+              {cs.mt5SlEnabled && (
+                <View style={[styles.activeDot, settingsTab === "mt5" && styles.activeDotOnActiveTab]} />
+              )}
             </Pressable>
             <Pressable
               style={[styles.settingsTabBtn, settingsTab === "inapp" && styles.settingsTabBtnActive]}
@@ -642,6 +645,12 @@ export default function SettingsScreen() {
               <View style={[styles.sourceBadge, styles.sourceBadgeMt5]}>
                 <Text style={styles.sourceBadgeText}>FROM MT5</Text>
               </View>
+              {cs.mt5SlEnabled && (
+                <View style={styles.activeBadge}>
+                  <View style={styles.activeBadgeDot} />
+                  <Text style={styles.activeBadgeText}>ACTIVE</Text>
+                </View>
+              )}
             </View>
             <Text style={styles.cascadeCardDesc}>
               Only applies to buys/sells you place directly inside the MT5 platform — NOT trades placed from this app. A stop loss is attached automatically and a "zone" is created from your entry down (or up for sells) by the distance below. Any further MT5 trade in the same direction that lands inside that zone gets the SAME stop loss. The zone ends the moment ANY position in it closes (TP, SL, or manual) — the next MT5 trade then starts a fresh zone.
@@ -1083,6 +1092,44 @@ const styles = StyleSheet.create({
   },
   settingsTabBtnTextActive: {
     color: "#000",
+  },
+  activeDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: "#22c55e",
+    marginLeft: 2,
+    shadowColor: "#22c55e",
+    shadowOpacity: 0.8,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 0 },
+  },
+  activeDotOnActiveTab: {
+    backgroundColor: "#15803d",
+    shadowColor: "#15803d",
+  },
+  activeBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 6,
+    backgroundColor: "rgba(34,197,94,0.15)",
+    borderWidth: 1,
+    borderColor: "rgba(34,197,94,0.5)",
+  },
+  activeBadgeDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: "#22c55e",
+  },
+  activeBadgeText: {
+    fontSize: 9,
+    fontFamily: "Inter_700Bold",
+    color: "#22c55e",
+    letterSpacing: 0.5,
   },
   sectionHeader: {
     flexDirection: "row",
