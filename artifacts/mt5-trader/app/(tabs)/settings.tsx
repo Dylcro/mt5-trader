@@ -606,7 +606,7 @@ export default function SettingsScreen() {
               <Text style={styles.cascadeCardTitle}>MT5 Auto Stop-Loss</Text>
             </View>
             <Text style={styles.cascadeCardDesc}>
-              When you place a buy or sell directly in the MT5 app, automatically attach a stop loss. The same SL is applied to the next N trades; a new batch only starts after all those trades have closed (TP or SL).
+              When you place a buy or sell in the MT5 app, a stop loss is attached and a "zone" is created from your entry down (or up for sells) by the distance below. Any further MT5 trade in the same direction that lands inside that zone gets the SAME stop loss. The zone ends the moment ANY position in it closes (TP, SL, or manual) — the next trade then starts a fresh zone.
             </Text>
 
             <View style={styles.cascadeDivider} />
@@ -624,41 +624,31 @@ export default function SettingsScreen() {
               <View style={{ marginLeft: 10, flex: 1 }}>
                 <Text style={styles.settingLabel}>Enable MT5 auto SL</Text>
                 <Text style={styles.settingHint}>
-                  Off by default. Cascade limit orders for MT5 trades are no longer placed — only the auto-SL.
+                  Off by default. Cascade limit orders for MT5 trades are no longer placed — only the zone-based auto-SL.
                 </Text>
               </View>
             </View>
 
             <View style={styles.cascadeDivider} />
 
-            <PillSelector
-              label="Number of positions"
-              hint="How many MT5 trades in a row get the auto-SL"
-              options={[1, 2, 3, 4, 5, 6]}
-              value={cs.mt5SlNumPositions}
-              onChange={(v) => updateSettings({ mt5SlNumPositions: v })}
-              suffix=""
-            />
-
-            <View style={styles.cascadeDivider} />
-
             <SliderSetting
-              label="Stop loss distance"
+              label="Zone size / SL distance"
               value={cs.mt5SlPips}
               min={10}
               max={200}
               step={5}
               onChange={(v) => updateSettings({ mt5SlPips: v })}
               displayValue={`${cs.mt5SlPips} pips`}
-              hint={`${(cs.mt5SlPips * 0.10).toFixed(2)} away from entry — applied to every trade in the batch`}
+              hint={`${(cs.mt5SlPips * 0.10).toFixed(2)} from the anchor entry`}
             />
 
             <View style={styles.cascadePreviewBox}>
               <Text style={styles.cascadePreviewTitle}>Preview (buy at 5500)</Text>
               <Text style={styles.cascadePreviewText}>
-                {`Entry  @ 5500.00\n`}
-                {`SL     @ ${(5500 - cs.mt5SlPips * 0.10).toFixed(2)}  ← ${cs.mt5SlPips} pips below\n`}
-                {`Applies to next ${cs.mt5SlNumPositions} MT5 trade${cs.mt5SlNumPositions === 1 ? "" : "s"}, then waits for all to close before resetting.`}
+                {`Anchor entry  @ 5500.00\n`}
+                {`Zone range    ${(5500 - cs.mt5SlPips * 0.10).toFixed(2)} – 5500.00\n`}
+                {`SL            ${(5500 - cs.mt5SlPips * 0.10).toFixed(2)}  ← ${cs.mt5SlPips} pips below\n`}
+                {`Any further buy in that range gets the same SL. Zone ends when any position closes.`}
               </Text>
             </View>
 

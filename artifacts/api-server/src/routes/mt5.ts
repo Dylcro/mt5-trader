@@ -347,17 +347,60 @@ function isDuplicate(dealId: string): boolean {
 }
 
 // ── MT5 Auto-SL batch state ──────────────────────────────────────────────
-// For each account, tracks positionIds opened directly in MT5 that have had
-// an auto-SL applied and are still open. A new batch can only start when this
-// set is empty (i.e. all previously-auto-SL'd positions have closed). While
-// open positions exist in the set, new MT5 trades fill remaining slots up to
-// `mt5SlNumPositions`. Once the set hits N, no further SLs are placed until
-// every tracked position closes (TP, SL hit, or manual close).
-const mt5AutoSlOpen = new Map<string, Set<string>>(); // accountId → Set<positionId>
-function mt5SlSet(accountId: string): Set<string> {
-  let set = mt5AutoSlOpen.get(accountId);
-  if (!set) { set = new Set(); mt5AutoSlOpen.set(accountId, set); }
-  return set;
+// MT5 auto-SL "zones": when a trade is opened directly in MT5, we create a
+// zone anchored at that entry with an SL `mt5SlPips` pips away. Any subsequent
+// MT5 trade in the SAME direction whose entry falls inside that zone (between
+// the SL price and the anchor entry) gets the SAME SL price applied. A trade
+// outside every active zone creates a new zone. A zone is invalidated the
+// moment ANY position in it closes (TP, SL, or manual) — surviving positions
+// keep their SL, and new MT5 trades inside that range start a fresh zone.
+interface SlZone {
+  id: string;
+  direction: "buy" | "sell";
+  anchorEntry: number;
+  slPrice: number;
+  positionIds: Set<string>;
+  active: boolean;
+  createdAt: number;
+}
+const mt5SlZones = new Map<string, SlZone[]>(); // accountId → zones (active + recent)
+function mt5ZonesFor(accountId: string): SlZone[] {
+  let arr = mt5SlZones.get(accountId);
+  if (!arr) { arr = []; mt5SlZones.set(accountId, arr); }
+  return arr;
+}
+function findActiveZone(accountId: string, direction: "buy" | "sell", entryPrice: number): SlZone | null {
+  for (const z of mt5ZonesFor(accountId)) {
+    if (!z.active || z.direction !== direction) continue;
+    if (direction === "buy") {
+      if (entryPrice >= z.slPrice && entryPrice <= z.anchorEntry) return z;
+    } else {
+      if (entryPrice <= z.slPrice && entryPrice >= z.anchorEntry) return z;
+    }
+  }
+  return null;
+}
+function invalidateZoneByPosition(accountId: string, positionId: string): SlZone | null {
+  for (const z of mt5ZonesFor(accountId)) {
+    if (z.positionIds.has(positionId) && z.active) {
+      z.active = false;
+      return z;
+    }
+  }
+  return null;
+}
+// Cap stored zones per account to avoid unbounded memory growth. We keep
+// inactive zones around briefly so we don't lose context for in-flight events,
+// but old ones get pruned.
+function pruneZones(accountId: string): void {
+  const arr = mt5ZonesFor(accountId);
+  if (arr.length <= 50) return;
+  // Drop oldest inactive first; keep all active.
+  const sorted = [...arr].sort((a, b) => {
+    if (a.active !== b.active) return a.active ? 1 : -1; // inactive first
+    return a.createdAt - b.createdAt;
+  });
+  mt5SlZones.set(accountId, sorted.slice(Math.max(0, sorted.length - 50)));
 }
 
 // Tracks positionIds that have already been auto-cascaded (per account).
@@ -458,12 +501,12 @@ function makeDealListener(accountId: string) {
       console.log(`[stream ${accountId}] WebSocket disconnected — watchdog will reconnect`);
     },
     // Fires when a position closes (TP hit, SL hit, or manual close).
-    // We use this to clear the MT5 auto-SL batch slot so the next batch can
-    // start once all tracked positions are gone.
+    // ANY close invalidates the zone that position belonged to — surviving
+    // positions keep their SL, but no new trades will join that zone.
     async onPositionRemoved(_instanceIndex: string, positionId: string): Promise<void> {
-      const set = mt5SlSet(accountId);
-      if (set.delete(positionId)) {
-        console.log(`[mt5-sl] position closed posId=${positionId} remaining=${set.size}`);
+      const z = invalidateZoneByPosition(accountId, positionId);
+      if (z) {
+        console.log(`[mt5-sl] zone ${z.id} invalidated by close of posId=${positionId} (${z.positionIds.size} position(s) in zone)`);
       }
     },
     // onDealsSynchronized fires after all historical deals have been replayed.
@@ -480,14 +523,14 @@ function makeDealListener(accountId: string) {
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async onDealAdded(_instanceIndex: string, deal: any): Promise<void> {
-      // Position-close deals clear the MT5 auto-SL batch slot. Backup signal
-      // alongside onPositionRemoved so we don't miss closures.
+      // Position-close deals invalidate the zone (backup signal alongside
+      // onPositionRemoved so we don't miss closures).
       if (deal?.entryType === "DEAL_ENTRY_OUT") {
         const posId = String(deal.positionId ?? "");
         if (posId) {
-          const set = mt5SlSet(accountId);
-          if (set.delete(posId)) {
-            console.log(`[mt5-sl] position closed (deal-out) posId=${posId} remaining=${set.size}`);
+          const z = invalidateZoneByPosition(accountId, posId);
+          if (z) {
+            console.log(`[mt5-sl] zone ${z.id} invalidated by deal-out posId=${posId}`);
           }
         }
         return;
@@ -573,49 +616,70 @@ function makeDealListener(accountId: string) {
         if (!acctCascadeCfg.mt5SlEnabled) {
           // Feature disabled — nothing to do.
         } else {
-          const slCfg = {
-            n: acctCascadeCfg.mt5SlNumPositions,
-            pips: acctCascadeCfg.mt5SlPips,
-          };
-          const set = mt5SlSet(accountId);
-          if (set.size >= slCfg.n) {
-            console.log(`[mt5-sl] SKIP posId=${evt.positionId} — batch full (${set.size}/${slCfg.n}); waiting for all to close before new batch`);
+          const direction: "buy" | "sell" = evt.type === "DEAL_TYPE_BUY" ? "buy" : "sell";
+          const slPips = acctCascadeCfg.mt5SlPips;
+          const slDistance = slPips * MT5_SL_PIP;
+
+          // Try to join an existing active zone (same direction, entry inside zone range).
+          let zone = findActiveZone(accountId, direction, evt.openPrice);
+          let slPrice: number;
+          let zoneAction: "join" | "new";
+
+          if (zone) {
+            zone.positionIds.add(evt.positionId);
+            slPrice = zone.slPrice;
+            zoneAction = "join";
+            console.log(`[mt5-sl] posId=${evt.positionId} dir=${direction} entry=${evt.openPrice} JOIN zone ${zone.id} (anchor=${zone.anchorEntry} sl=${slPrice}, now ${zone.positionIds.size} positions)`);
           } else {
-            const direction: "buy" | "sell" = evt.type === "DEAL_TYPE_BUY" ? "buy" : "sell";
-            const slDistance = slCfg.pips * MT5_SL_PIP;
-            const slPrice = direction === "buy"
+            slPrice = direction === "buy"
               ? parseFloat((evt.openPrice - slDistance).toFixed(2))
               : parseFloat((evt.openPrice + slDistance).toFixed(2));
-            // Reserve the slot synchronously so concurrent deals don't overfill the batch.
-            set.add(evt.positionId);
-            const slot = set.size;
-            console.log(`[mt5-sl] posId=${evt.positionId} dir=${direction} entry=${evt.openPrice} sl=${slPrice} slot=${slot}/${slCfg.n}`);
-            void (async () => {
-              const conn = activeConnections.get(accountId);
-              if (!conn || typeof conn.modifyPosition !== "function") {
-                console.error(`[mt5-sl] no active connection for ${accountId} — cannot modify position ${evt.positionId}`);
-                set.delete(evt.positionId); // free slot so a retry/next trade can use it
-                return;
-              }
-              const t0 = Date.now();
-              try {
-                await conn.modifyPosition(evt.positionId, slPrice);
-                console.log(`[mt5-sl] applied SL ${slPrice} to posId=${evt.positionId} (${Date.now() - t0}ms)`);
-                // Surface to the app via a synthetic deal event (so it can toast).
-                const syntheticEvt: DealEvent = {
-                  ...evt,
-                  dealId: `mt5sl-${evt.dealId}`,
-                  time: Date.now(),
-                  autoCascade: true,
-                  autoCascadeCount: 1,
-                };
-                storeDealEvent(accountId, syntheticEvt);
-              } catch (err) {
-                console.error(`[mt5-sl] failed to modify posId=${evt.positionId} (${Date.now() - t0}ms):`, (err as Error).message);
-                set.delete(evt.positionId); // free slot — the SL didn't actually go on
-              }
-            })();
+            zone = {
+              id: `z${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+              direction,
+              anchorEntry: evt.openPrice,
+              slPrice,
+              positionIds: new Set([evt.positionId]),
+              active: true,
+              createdAt: Date.now(),
+            };
+            mt5ZonesFor(accountId).push(zone);
+            pruneZones(accountId);
+            zoneAction = "new";
+            console.log(`[mt5-sl] posId=${evt.positionId} dir=${direction} entry=${evt.openPrice} NEW zone ${zone.id} sl=${slPrice} (${slPips} pips)`);
           }
+
+          const zoneRef = zone;
+          void (async () => {
+            const conn = activeConnections.get(accountId);
+            if (!conn || typeof conn.modifyPosition !== "function") {
+              console.error(`[mt5-sl] no active connection for ${accountId} — cannot modify position ${evt.positionId}`);
+              zoneRef.positionIds.delete(evt.positionId);
+              if (zoneAction === "new" && zoneRef.positionIds.size === 0) {
+                zoneRef.active = false; // dead zone, never had its anchor SL applied
+              }
+              return;
+            }
+            const t0 = Date.now();
+            try {
+              await conn.modifyPosition(evt.positionId, slPrice);
+              console.log(`[mt5-sl] applied SL ${slPrice} to posId=${evt.positionId} (${Date.now() - t0}ms, zone ${zoneRef.id})`);
+              const syntheticEvt: DealEvent = {
+                ...evt,
+                dealId: `mt5sl-${evt.dealId}`,
+                time: Date.now(),
+                autoCascade: true,
+                autoCascadeCount: 1,
+              };
+              storeDealEvent(accountId, syntheticEvt);
+            } catch (err) {
+              console.error(`[mt5-sl] failed to modify posId=${evt.positionId} (${Date.now() - t0}ms):`, (err as Error).message);
+              zoneRef.positionIds.delete(evt.positionId);
+              if (zoneAction === "new" && zoneRef.positionIds.size === 0) {
+                zoneRef.active = false;
+              }
+            }
+          })();
         }
       }
     },
@@ -644,7 +708,7 @@ async function stopStreaming(accountId: string): Promise<void> {
   syncReady.delete(accountId);
   syncReadyAt.delete(accountId);
   cascadeConfigs.delete(accountId);
-  mt5AutoSlOpen.delete(accountId);
+  mt5SlZones.delete(accountId);
   console.log(`[stream ${accountId}] stopped and cleaned up`);
 }
 
