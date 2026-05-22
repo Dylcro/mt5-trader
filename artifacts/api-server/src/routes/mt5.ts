@@ -941,17 +941,31 @@ export function startAutoSlSafetyNet(): void {
 interface MetaApiPosition { id: string; symbol: string; type: string; openPrice: number; stopLoss?: number | null; volume?: number; }
 async function scanAccountForNakedPositions(token: string, accountId: string, userId: string | undefined, region: string): Promise<void> {
   const cfg = getCascadeConfig(accountId, userId);
-  if (!cfg.mt5SlEnabled) return; // user doesn't want auto-SL — leave naked positions alone
+  if (!cfg.mt5SlEnabled) return;
 
-  // Fetch open positions with retries and a hard per-attempt timeout.
-  // MetaAPI's REST /positions returns 504 frequently — without a timeout
-  // a hanging request blocks the tick for 20+ seconds causing SL delays.
+  // PRIMARY: read positions from the SDK connection's in-memory terminal state.
+  // This is instant (no network call) and is kept current by the streaming
+  // connection — no dependency on the unreliable REST /positions endpoint.
   let positions: MetaApiPosition[] | null = null;
-  const FETCH_TIMEOUT_MS = 12_000;
-  const FETCH_ATTEMPTS = 3;
-  for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt++) {
+  const conn = activeConnections.get(accountId);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const sdkPositions: any[] = conn?.terminalState?.positions ?? [];
+  if (sdkPositions.length > 0 || conn?.terminalState) {
+    // Connection is live — use its cached positions (may be empty = no open trades)
+    positions = sdkPositions.map((p: any) => ({
+      id:        String(p.id ?? p.positionId ?? ""),
+      symbol:    String(p.symbol ?? ""),
+      type:      String(p.type ?? ""),
+      openPrice: Number(p.openPrice ?? 0),
+      stopLoss:  p.stopLoss != null ? Number(p.stopLoss) : null,
+      volume:    Number(p.volume ?? 0),
+    }));
+  } else {
+    // FALLBACK: SDK not connected — attempt REST fetch with a tight timeout.
+    // This branch is rarely reached; it exists only for the window between
+    // reconnects when terminalState is unavailable.
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), 8_000);
     try {
       const resp = await fetch(
         `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
@@ -960,20 +974,13 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
       clearTimeout(timer);
       if (resp.ok) {
         positions = await resp.json() as MetaApiPosition[];
-        break;
-      }
-      if (resp.status === 404) { clearTimeout(timer); return; } // not deployed yet — skip silently
-      if (attempt === FETCH_ATTEMPTS) {
-        console.warn(`[mt5-sl-safety] ${accountId} positions fetch ${resp.status} (attempt ${attempt}/${FETCH_ATTEMPTS})`);
+      } else if (resp.status !== 404) {
+        console.warn(`[mt5-sl-safety] ${accountId} REST fallback ${resp.status}`);
       }
     } catch (err) {
       clearTimeout(timer);
-      const msg = (err as Error).message ?? "";
-      if (attempt === FETCH_ATTEMPTS) {
-        console.warn(`[mt5-sl-safety] ${accountId} positions fetch failed: ${msg}`);
-      }
+      // REST is down — skip this tick silently; next tick will retry
     }
-    if (attempt < FETCH_ATTEMPTS) await new Promise(r => setTimeout(r, 500));
   }
   if (!positions) return;
 
