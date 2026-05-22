@@ -353,25 +353,61 @@ function isDuplicate(dealId: string): boolean {
   return false;
 }
 
-// ── Auto-SL state ────────────────────────────────────────────────────────────
-// Tracks positions where auto-SL has been applied this session.
-// Key = `${accountId}:${positionId}`, value = timestamp of application.
-// Entries expire after SL_APPLIED_TTL_MS — if MetaAPI still shows the
-// position as naked after that window it means our call failed, so retry.
-const slApplied = new Map<string, number>();
-const SL_APPLIED_TTL_MS = 90_000;
-function hasSLApplied(accountId: string, posId: string): boolean {
-  const key = `${accountId}:${posId}`;
-  const ts = slApplied.get(key);
-  if (!ts) return false;
-  if (Date.now() - ts > SL_APPLIED_TTL_MS) { slApplied.delete(key); return false; }
-  return true;
+// ── MT5 Auto-SL batch state ──────────────────────────────────────────────
+// MT5 auto-SL "zones": when a trade is opened directly in MT5, we create a
+// zone anchored at that entry with an SL `mt5SlPips` pips away. Any subsequent
+// MT5 trade in the SAME direction whose entry falls inside that zone (between
+// the SL price and the anchor entry) gets the SAME SL price applied. A trade
+// outside every active zone creates a new zone. A zone is invalidated the
+// moment ANY position in it closes (TP, SL, or manual) — surviving positions
+// keep their SL, and new MT5 trades inside that range start a fresh zone.
+interface SlZone {
+  id: string;
+  direction: "buy" | "sell";
+  anchorEntry: number;
+  slPrice: number;
+  positionIds: Set<string>;
+  active: boolean;
+  createdAt: number;
 }
-function markSLApplied(accountId: string, posId: string): void {
-  slApplied.set(`${accountId}:${posId}`, Date.now());
+const mt5SlZones = new Map<string, SlZone[]>(); // accountId → zones (active + recent)
+function mt5ZonesFor(accountId: string): SlZone[] {
+  let arr = mt5SlZones.get(accountId);
+  if (!arr) { arr = []; mt5SlZones.set(accountId, arr); }
+  return arr;
 }
-function clearSLApplied(accountId: string, posId: string): void {
-  slApplied.delete(`${accountId}:${posId}`);
+function findActiveZone(accountId: string, direction: "buy" | "sell", entryPrice: number): SlZone | null {
+  for (const z of mt5ZonesFor(accountId)) {
+    if (!z.active || z.direction !== direction) continue;
+    if (direction === "buy") {
+      if (entryPrice >= z.slPrice && entryPrice <= z.anchorEntry) return z;
+    } else {
+      if (entryPrice <= z.slPrice && entryPrice >= z.anchorEntry) return z;
+    }
+  }
+  return null;
+}
+function invalidateZoneByPosition(accountId: string, positionId: string): SlZone | null {
+  for (const z of mt5ZonesFor(accountId)) {
+    if (z.positionIds.has(positionId) && z.active) {
+      z.active = false;
+      return z;
+    }
+  }
+  return null;
+}
+// Cap stored zones per account to avoid unbounded memory growth. We keep
+// inactive zones around briefly so we don't lose context for in-flight events,
+// but old ones get pruned.
+function pruneZones(accountId: string): void {
+  const arr = mt5ZonesFor(accountId);
+  if (arr.length <= 50) return;
+  // Drop oldest inactive first; keep all active.
+  const sorted = [...arr].sort((a, b) => {
+    if (a.active !== b.active) return a.active ? 1 : -1; // inactive first
+    return a.createdAt - b.createdAt;
+  });
+  mt5SlZones.set(accountId, sorted.slice(Math.max(0, sorted.length - 50)));
 }
 
 // Tracks positionIds that have already been auto-cascaded (per account).
@@ -479,8 +515,13 @@ function makeDealListener(accountId: string) {
       console.log(`[stream ${accountId}] WebSocket disconnected — watchdog will reconnect`);
     },
     // Fires when a position closes (TP hit, SL hit, or manual close).
-    async onPositionRemoved(_instanceIndex: string, _positionId: string): Promise<void> {
-      // Position closed — SL TTL map self-expires; nothing to clean up here.
+    // ANY close invalidates the zone that position belonged to — surviving
+    // positions keep their SL, but no new trades will join that zone.
+    async onPositionRemoved(_instanceIndex: string, positionId: string): Promise<void> {
+      const z = invalidateZoneByPosition(accountId, positionId);
+      if (z) {
+        console.log(`[mt5-sl] zone ${z.id} invalidated by close of posId=${positionId} (${z.positionIds.size} position(s) in zone)`);
+      }
     },
     // onDealsSynchronized fires after all historical deals have been replayed.
     // Any onDealAdded call AFTER this point is a live event — safe to cascade.
@@ -502,7 +543,18 @@ function makeDealListener(accountId: string) {
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async onDealAdded(_instanceIndex: string, deal: any): Promise<void> {
-      if (deal?.entryType === "DEAL_ENTRY_OUT") return; // position closed — nothing to do for SL
+      // Position-close deals invalidate the zone (backup signal alongside
+      // onPositionRemoved so we don't miss closures).
+      if (deal?.entryType === "DEAL_ENTRY_OUT") {
+        const posId = String(deal.positionId ?? "");
+        if (posId) {
+          const z = invalidateZoneByPosition(accountId, posId);
+          if (z) {
+            console.log(`[mt5-sl] zone ${z.id} invalidated by deal-out posId=${posId}`);
+          }
+        }
+        return;
+      }
       if (deal?.entryType !== "DEAL_ENTRY_IN") return;
       if (!deal?.symbol) return;
       if (isDuplicate(String(deal.id ?? ""))) return;
@@ -619,7 +671,7 @@ async function stopStreaming(accountId: string): Promise<void> {
   // stream state. Deleting it caused auto-SL to silently skip live deals on
   // reconnect because the lookup fell back to the global default which has
   // mt5_sl_enabled=false, with no log line to indicate the skip.
-  // slApplied TTL map is global and self-expiring — no per-account cleanup needed.
+  mt5SlZones.delete(accountId);
   const pending = recoveryTimers.get(accountId);
   if (pending) {
     clearTimeout(pending);
@@ -892,21 +944,46 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
     if (!pos.openPrice || pos.openPrice <= 0) continue;
     if (pos.type !== "POSITION_TYPE_BUY" && pos.type !== "POSITION_TYPE_SELL") continue;
 
-    // Skip if we already applied SL recently — MetaAPI REST /positions data
-    // stays stale for up to 30s after modification, so without this guard
-    // every tick would re-fire until the response refreshes.
-    // Mark BEFORE the REST call so overlapping ticks also skip immediately.
-    // Entry expires after 90s — if the position is still naked then our call
-    // failed and we should retry.
-    if (hasSLApplied(accountId, pos.id)) continue;
-    markSLApplied(accountId, pos.id);
+    // In-memory guard: MetaAPI's REST /positions response can be stale for
+    // many seconds after we apply an SL. Without this check, every tick would
+    // see the position as naked and re-fire the REST call — producing 3-4
+    // duplicate SL requests per position. hasBeenCascaded is also what blocks
+    // concurrent ticks that overlap while a slow REST call is in-flight.
+    if (hasBeenCascaded(accountId, pos.id)) continue;
 
-    const isBuy = pos.type === "POSITION_TYPE_BUY";
-    const slPrice = parseFloat((isBuy
-      ? pos.openPrice - slDistance
-      : pos.openPrice + slDistance
-    ).toFixed(2));
+    const direction: "buy" | "sell" = pos.type === "POSITION_TYPE_BUY" ? "buy" : "sell";
 
+    let zone = findActiveZone(accountId, direction, pos.openPrice);
+    let slPrice: number;
+    if (zone) {
+      zone.positionIds.add(pos.id);
+      slPrice = zone.slPrice;
+    } else {
+      slPrice = direction === "buy"
+        ? parseFloat((pos.openPrice - slDistance).toFixed(2))
+        : parseFloat((pos.openPrice + slDistance).toFixed(2));
+      zone = {
+        id: `z${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+        direction,
+        anchorEntry: pos.openPrice,
+        slPrice,
+        positionIds: new Set([pos.id]),
+        active: true,
+        createdAt: Date.now(),
+      };
+      mt5ZonesFor(accountId).push(zone);
+      pruneZones(accountId);
+    }
+    const zoneRef = zone;
+
+    // Mark BEFORE the REST call — this is the key fix.
+    // If we mark after, concurrent ticks (fired every 5s while the REST call
+    // takes 10-20s) all see the position as unprocessed and stack up duplicate
+    // requests. Marking first means every subsequent tick skips this position
+    // immediately. On failure we unmark so the next tick can retry.
+    markCascaded(accountId, pos.id);
+
+    // Always use REST for SL — never the WebSocket/SDK connection.
     const t0 = Date.now();
     try {
       const tradeController = new AbortController();
@@ -925,15 +1002,18 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
         const txt = await resp.text().catch(() => "");
         throw new Error(`REST ${resp.status}: ${txt.slice(0, 200)}`);
       }
-      console.log(`[auto-sl] applied SL ${slPrice} to posId=${pos.id} acct=${accountId} (${Date.now() - t0}ms)`);
+      console.log(`[mt5-sl-safety] applied SL ${slPrice} to posId=${pos.id} acct=${accountId} (${Date.now() - t0}ms, zone ${zoneRef.id})`);
     } catch (err) {
       const msg = (err as Error).message ?? "";
       if (/market is closed/i.test(msg)) {
-        console.log(`[auto-sl] market closed, will retry on open — posId=${pos.id} acct=${accountId}`);
+        console.log(`[mt5-sl-safety] market closed, will retry on open — posId=${pos.id} acct=${accountId}`);
       } else {
-        console.warn(`[auto-sl] failed posId=${pos.id} acct=${accountId}: ${msg}`);
+        console.warn(`[mt5-sl-safety] failed to SL posId=${pos.id} acct=${accountId}: ${msg}`);
       }
-      clearSLApplied(accountId, pos.id); // unmark so next tick retries
+      // Unmark so the next tick can retry. Also roll back zone membership.
+      unmarkCascaded(accountId, pos.id);
+      zoneRef.positionIds.delete(pos.id);
+      if (zoneRef.positionIds.size === 0) zoneRef.active = false;
     }
   }
 }
