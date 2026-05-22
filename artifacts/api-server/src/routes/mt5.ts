@@ -557,8 +557,19 @@ function makeDealListener(accountId: string) {
           recoveryTimers.delete(accountId);
         }
         console.log(`[stream ${accountId}] deals sync complete — auto-SL armed for live deals`);
-        // Note: post-sync catch-up cascade removed — MT5-initiated trades no
-        // longer get cascade limits, only an auto-SL (handled per live deal).
+        // Post-sync catch-up: scan immediately for any XAUUSD positions that
+        // are naked. Catches trades placed during the reconnect/sync window
+        // (when the deal handler was offline) without waiting for the next
+        // 5 s safety-net tick.
+        setTimeout(() => {
+          try {
+            const tok = getToken();
+            const { userId, region } = knownAccounts.get(accountId) ?? { region: DEFAULT_REGION };
+            void scanAccountForNakedPositions(tok, accountId, userId, region);
+          } catch {
+            // best-effort — regular safety net will pick it up on next tick
+          }
+        }, 1_000); // 1 s delay so terminalState is fully populated
       }
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
