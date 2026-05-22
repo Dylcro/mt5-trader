@@ -952,27 +952,23 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
     }
     const zoneRef = zone;
 
-    // Prefer the streaming connection (faster, no extra HTTP) but fall back to
-    // REST when the stream is down — REST is exactly why this safety net works
-    // when the deal stream is wedged.
-    const conn = activeConnections.get(accountId);
+    // Always use REST for SL — never the WebSocket/SDK connection.
+    // The whole point of this poller is to be independent of WebSocket
+    // reliability. Using conn.modifyPosition here would reintroduce the
+    // exact WebSocket timeout failures we moved away from.
     const t0 = Date.now();
     try {
-      if (conn && typeof conn.modifyPosition === "function") {
-        await conn.modifyPosition(pos.id, slPrice);
-      } else {
-        const resp = await fetch(
-          `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
-          {
-            method: "POST",
-            headers: authHeaders(token),
-            body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: pos.id, stopLoss: slPrice }),
-          },
-        );
-        if (!resp.ok) {
-          const txt = await resp.text().catch(() => "");
-          throw new Error(`REST ${resp.status}: ${txt.slice(0, 200)}`);
-        }
+      const resp = await fetch(
+        `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
+        {
+          method: "POST",
+          headers: authHeaders(token),
+          body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: pos.id, stopLoss: slPrice }),
+        },
+      );
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => "");
+        throw new Error(`REST ${resp.status}: ${txt.slice(0, 200)}`);
       }
       console.log(`[mt5-sl-safety] applied SL ${slPrice} to naked posId=${pos.id} acct=${accountId} (${Date.now() - t0}ms, zone ${zoneRef.id})`);
       markCascaded(accountId, pos.id);
