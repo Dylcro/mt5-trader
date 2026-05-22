@@ -537,62 +537,8 @@ function makeDealListener(accountId: string) {
           recoveryTimers.delete(accountId);
         }
         console.log(`[stream ${accountId}] deals sync complete — auto-SL armed for live deals`);
-
-        // Startup gap scan: apply SL to any naked XAUUSD positions that were
-        // open when the server restarted (no deal event fires for pre-existing
-        // positions). Uses terminalState from the streaming connection — no
-        // REST /positions fetch needed.
-        void (async () => {
-          try {
-            const cfg = getCascadeConfig(accountId);
-            if (!cfg.mt5SlEnabled) return;
-            const conn = activeConnections.get(accountId);
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const positions: any[] = (conn as any)?.terminalState?.positions ?? [];
-            const token = getToken();
-            const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
-            const slDistance = cfg.mt5SlPips * MT5_SL_PIP;
-            for (const pos of positions) {
-              if (pos.symbol !== "XAUUSD") continue;
-              if (pos.stopLoss && pos.stopLoss > 0) continue;
-              if (hasBeenCascaded(accountId, String(pos.id))) continue;
-              const isBuy = pos.type === "POSITION_TYPE_BUY";
-              if (!isBuy && pos.type !== "POSITION_TYPE_SELL") continue;
-              const openPrice = pos.openPrice ?? 0;
-              if (openPrice <= 0) continue;
-              const slPrice = isBuy
-                ? Math.round((openPrice - slDistance) * 100) / 100
-                : Math.round((openPrice + slDistance) * 100) / 100;
-              markCascaded(accountId, String(pos.id));
-              console.log(`[auto-sl-startup] applying SL ${slPrice} to posId=${pos.id} (${isBuy ? "BUY" : "SELL"} @ ${openPrice}, ${cfg.mt5SlPips} pips)`);
-              const ctrl = new AbortController();
-              const timer = setTimeout(() => ctrl.abort(), 15_000);
-              try {
-                const resp = await fetch(
-                  `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
-                  {
-                    method: "POST",
-                    headers: authHeaders(token),
-                    body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: pos.id, stopLoss: slPrice }),
-                    signal: ctrl.signal,
-                  },
-                );
-                clearTimeout(timer);
-                if (!resp.ok) {
-                  const txt = await resp.text().catch(() => "");
-                  throw new Error(`REST ${resp.status}: ${txt.slice(0, 200)}`);
-                }
-                console.log(`[auto-sl-startup] SL set ✓ posId=${pos.id} sl=${slPrice}`);
-              } catch (err) {
-                clearTimeout(timer);
-                unmarkCascaded(accountId, String(pos.id));
-                console.warn(`[auto-sl-startup] SL failed posId=${pos.id}: ${(err as Error).message} — safety-net will retry`);
-              }
-            }
-          } catch (err) {
-            console.warn(`[auto-sl-startup] scan error: ${(err as Error).message}`);
-          }
-        })();
+        // Note: post-sync catch-up cascade removed — MT5-initiated trades no
+        // longer get cascade limits, only an auto-SL (handled per live deal).
       }
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -808,13 +754,13 @@ async function startStreaming(token: string, accountId: string, region: string =
     // causing subscribe timeouts and a permanent reconnect loop on the
     // london region. Starting from "now" makes sync near-instant.
     const conn = account.getStreamingConnection(undefined, new Date());
-    // Store BEFORE connect so onDealsSynchronized (which fires during connect)
-    // can access conn.terminalState to scan for naked positions on startup.
-    activeConnections.set(accountId, conn);
-    activeRegions.set(accountId, region);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (conn as any).addSynchronizationListener(makeDealListener(accountId));
     await conn.connect();
+    // Store connection so the trade endpoint can reuse this WebSocket
+    // instead of making new HTTP calls to MetaAPI REST for every order.
+    activeConnections.set(accountId, conn);
+    activeRegions.set(accountId, region);
     // Keep the in-memory registry current so the watchdog/safety-net can work
     // even when the DB is temporarily unavailable.
     knownAccounts.set(accountId, { accountId, userId, region });
@@ -864,15 +810,10 @@ async function startStreaming(token: string, accountId: string, region: string =
     activeStreams.delete(accountId); // allow retry on next poll
     activeConnections.delete(accountId);
     const msg = (err as Error).message ?? "";
-    // MetaAPI auto-undeploys accounts during inactivity, or the broker
-    // connection drops and subscribe times out. Detect both and re-deploy
-    // so the stream resumes without manual intervention.
-    const needsRedeploy = msg.includes("no accounts deployed")
-      || msg.includes("deploy an account first")
-      || msg.includes("not connected to broker")
-      || (msg.includes("subscribe timed out") && msg.includes("connected to broker"));
-    if (needsRedeploy) {
-      console.warn(`[stream ${accountId}] broker not connected — triggering re-deploy...`);
+    // MetaAPI auto-undeploys accounts during inactivity. Detect the error and
+    // re-deploy automatically so the stream resumes without user intervention.
+    if (msg.includes("no accounts deployed") || msg.includes("deploy an account first")) {
+      console.warn(`[stream ${accountId}] account undeployed — triggering re-deploy...`);
       try {
         await deployAccount(token, accountId);
         console.log(`[stream ${accountId}] re-deploy requested — watchdog will retry stream in 30 s`);
@@ -1002,25 +943,37 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
   const cfg = getCascadeConfig(accountId, userId);
   if (!cfg.mt5SlEnabled) return; // user doesn't want auto-SL — leave naked positions alone
 
-  // Fetch open positions — no abort timeout. MetaAPI's /positions endpoint
-  // requires the account to be broker-connected; when reconnecting it can
-  // legitimately take 20-40s. Aborting at 12s was killing every request.
-  // Each tick runs per-account in its own void call so a slow fetch for
-  // one account never blocks another account's scan.
+  // Fetch open positions with retries and a hard per-attempt timeout.
+  // MetaAPI's REST /positions returns 504 frequently — without a timeout
+  // a hanging request blocks the tick for 20+ seconds causing SL delays.
   let positions: MetaApiPosition[] | null = null;
-  try {
-    const resp = await fetch(
-      `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
-      { headers: authHeaders(token) },
-    );
-    if (!resp.ok) {
-      if (resp.status !== 404) console.warn(`[mt5-sl-safety] ${accountId} positions fetch ${resp.status}`);
-      return;
+  const FETCH_TIMEOUT_MS = 12_000;
+  const FETCH_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const resp = await fetch(
+        `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
+        { headers: authHeaders(token), signal: controller.signal },
+      );
+      clearTimeout(timer);
+      if (resp.ok) {
+        positions = await resp.json() as MetaApiPosition[];
+        break;
+      }
+      if (resp.status === 404) { clearTimeout(timer); return; } // not deployed yet — skip silently
+      if (attempt === FETCH_ATTEMPTS) {
+        console.warn(`[mt5-sl-safety] ${accountId} positions fetch ${resp.status} (attempt ${attempt}/${FETCH_ATTEMPTS})`);
+      }
+    } catch (err) {
+      clearTimeout(timer);
+      const msg = (err as Error).message ?? "";
+      if (attempt === FETCH_ATTEMPTS) {
+        console.warn(`[mt5-sl-safety] ${accountId} positions fetch failed: ${msg}`);
+      }
     }
-    positions = await resp.json() as MetaApiPosition[];
-  } catch (err) {
-    console.warn(`[mt5-sl-safety] ${accountId} positions fetch failed: ${(err as Error).message}`);
-    return;
+    if (attempt < FETCH_ATTEMPTS) await new Promise(r => setTimeout(r, 500));
   }
   if (!positions) return;
 
