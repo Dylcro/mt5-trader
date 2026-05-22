@@ -1050,16 +1050,19 @@ export function startPositionPoller(): void {
       // Fire-and-forget per account; errors are swallowed so one bad account
       // doesn't block the others.
       void (async () => {
-        // No timeout — positionPollInFlight prevents concurrent pileup.
-        // Without a timeout the fetch waits as long as MetaAPI needs (even 20-30s
-        // during slow periods), which is exactly how the app's GET /positions
-        // works. A 9s abort was causing the cache to stay empty whenever MetaAPI
-        // was slow, making the safety net blind to trades placed directly in MT5.
+        // 30s timeout — long enough to survive slow MetaAPI responses (which
+        // often take 20-30s during bad periods) while still preventing infinite
+        // hangs. The 9s timeout that was here before was too short; infinite
+        // was too long (held connections open and degraded server performance).
+        // positionPollInFlight prevents a second fetch starting while this waits.
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 30_000);
         try {
           const resp = await fetch(
             `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
-            { headers: authHeaders(token) },
+            { headers: authHeaders(token), signal: controller.signal },
           );
+          clearTimeout(timer);
           if (resp.ok) {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const body = await resp.json() as any[];
@@ -1072,6 +1075,7 @@ export function startPositionPoller(): void {
             console.warn(`[position-poller] ${accountId.slice(0,8)} — HTTP ${resp.status}`);
           }
         } catch (err) {
+          clearTimeout(timer);
           const msg = (err as Error).message ?? "unknown";
           console.warn(`[position-poller] ${accountId.slice(0,8)} — failed: ${msg}`);
         } finally {
@@ -1090,6 +1094,13 @@ export function startPositionPoller(): void {
 // reliable even when MetaAPI's streaming sync is slow, stuck, or churning
 // through a recovery cycle — the deal stream is the fast path (sub-second),
 // the safety net is the guarantee (≤30 s).
+// Per-account in-flight guard for the safety net scan.
+// Without this, the 2s tick fires a new scanAccountForNakedPositions for every
+// account on every tick even when the previous scan is still awaiting an 8s
+// REST call — producing up to 4 concurrent REST fetches per account and ~12
+// total, degrading the whole server. One scan per account at a time is enough.
+const scanInFlight = new Set<string>();
+
 export function startAutoSlSafetyNet(): void {
   const INTERVAL_MS = 2_000;
   setInterval(async () => {
@@ -1115,9 +1126,12 @@ export function startAutoSlSafetyNet(): void {
         }
       }
       for (const { accountId, userId, region } of accounts) {
+        if (scanInFlight.has(accountId)) continue; // previous scan still running
+        scanInFlight.add(accountId);
         // Fire each account scan independently so a slow REST call for one
         // user can't hold up another user's SL.
-        void scanAccountForNakedPositions(token, accountId, userId, region);
+        void scanAccountForNakedPositions(token, accountId, userId, region)
+          .finally(() => scanInFlight.delete(accountId));
         // Phase 2: zone correction — runs after initial SL is set.
         // Adjusts any position whose SL was placed at the flat pip distance
         // but belongs to an active zone (should be at the zone anchor SL).
@@ -1127,7 +1141,7 @@ export function startAutoSlSafetyNet(): void {
       console.warn("[mt5-sl-safety] tick error:", (err as Error).message);
     }
   }, INTERVAL_MS);
-  console.log("[mt5-sl-safety] auto-SL safety net started (5 s interval — REST-only SL path)");
+  console.log("[mt5-sl-safety] auto-SL safety net started (2 s interval)");
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
