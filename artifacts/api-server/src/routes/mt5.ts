@@ -519,9 +519,15 @@ function makeDealListener(accountId: string) {
       syncReadyAt.delete(accountId);
       skipLogged.delete(accountId);
       activeStreams.delete(accountId);
-      activeConnections.delete(accountId);
-      console.log(`[stream ${accountId}] WebSocket disconnected — reconnecting in 3 s`);
-      // Don't wait for the 30 s watchdog — reconnect immediately (3 s delay
+      // NOTE: intentionally NOT clearing activeConnections here.
+      // The old connection's terminalState (in-memory cache) stays intact
+      // across brief disconnects — positions synced before the drop are
+      // still visible. This lets the safety net keep reading positions
+      // during the full reconnect+resync window (~54 s) instead of going
+      // blind and missing trades placed during that gap.
+      // startStreaming() will replace activeConnections with the new conn.
+      console.log(`[stream ${accountId}] WebSocket disconnected — reconnecting in 3 s (terminalState preserved)`);
+      // Don't wait for the 10 s watchdog — reconnect immediately (3 s delay
       // to avoid a tight loop if the broker endpoint is briefly down).
       setTimeout(() => {
         if (activeStreams.has(accountId)) return; // already reconnected
