@@ -520,7 +520,19 @@ function makeDealListener(accountId: string) {
       skipLogged.delete(accountId);
       activeStreams.delete(accountId);
       activeConnections.delete(accountId);
-      console.log(`[stream ${accountId}] WebSocket disconnected — watchdog will reconnect`);
+      console.log(`[stream ${accountId}] WebSocket disconnected — reconnecting in 3 s`);
+      // Don't wait for the 30 s watchdog — reconnect immediately (3 s delay
+      // to avoid a tight loop if the broker endpoint is briefly down).
+      setTimeout(() => {
+        if (activeStreams.has(accountId)) return; // already reconnected
+        const { region } = knownAccounts.get(accountId) ?? { region: DEFAULT_REGION };
+        try {
+          const tok = getToken();
+          void startStreaming(tok, accountId, region);
+        } catch {
+          // getToken() can throw if env var missing — watchdog will retry
+        }
+      }, 3_000);
     },
     // Fires when a position closes (TP hit, SL hit, or manual close).
     // ANY close invalidates the zone that position belonged to — surviving
@@ -900,7 +912,7 @@ export async function startAutoConnect(): Promise<void> {
 }
 
 export function startConnectionWatchdog(): void {
-  const INTERVAL_MS = 30_000;
+  const INTERVAL_MS = 10_000;
   setInterval(async () => {
     try {
       const token = getToken();
