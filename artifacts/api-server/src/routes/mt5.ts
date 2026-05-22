@@ -537,8 +537,62 @@ function makeDealListener(accountId: string) {
           recoveryTimers.delete(accountId);
         }
         console.log(`[stream ${accountId}] deals sync complete — auto-SL armed for live deals`);
-        // Note: post-sync catch-up cascade removed — MT5-initiated trades no
-        // longer get cascade limits, only an auto-SL (handled per live deal).
+
+        // Startup gap scan: apply SL to any naked XAUUSD positions that were
+        // open when the server restarted (no deal event fires for pre-existing
+        // positions). Uses terminalState from the streaming connection — no
+        // REST /positions fetch needed.
+        void (async () => {
+          try {
+            const cfg = getCascadeConfig(accountId);
+            if (!cfg.mt5SlEnabled) return;
+            const conn = activeConnections.get(accountId);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const positions: any[] = (conn as any)?.terminalState?.positions ?? [];
+            const token = getToken();
+            const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
+            const slDistance = cfg.mt5SlPips * MT5_SL_PIP;
+            for (const pos of positions) {
+              if (pos.symbol !== "XAUUSD") continue;
+              if (pos.stopLoss && pos.stopLoss > 0) continue;
+              if (hasBeenCascaded(accountId, String(pos.id))) continue;
+              const isBuy = pos.type === "POSITION_TYPE_BUY";
+              if (!isBuy && pos.type !== "POSITION_TYPE_SELL") continue;
+              const openPrice = pos.openPrice ?? 0;
+              if (openPrice <= 0) continue;
+              const slPrice = isBuy
+                ? Math.round((openPrice - slDistance) * 100) / 100
+                : Math.round((openPrice + slDistance) * 100) / 100;
+              markCascaded(accountId, String(pos.id));
+              console.log(`[auto-sl-startup] applying SL ${slPrice} to posId=${pos.id} (${isBuy ? "BUY" : "SELL"} @ ${openPrice}, ${cfg.mt5SlPips} pips)`);
+              const ctrl = new AbortController();
+              const timer = setTimeout(() => ctrl.abort(), 15_000);
+              try {
+                const resp = await fetch(
+                  `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
+                  {
+                    method: "POST",
+                    headers: authHeaders(token),
+                    body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: pos.id, stopLoss: slPrice }),
+                    signal: ctrl.signal,
+                  },
+                );
+                clearTimeout(timer);
+                if (!resp.ok) {
+                  const txt = await resp.text().catch(() => "");
+                  throw new Error(`REST ${resp.status}: ${txt.slice(0, 200)}`);
+                }
+                console.log(`[auto-sl-startup] SL set ✓ posId=${pos.id} sl=${slPrice}`);
+              } catch (err) {
+                clearTimeout(timer);
+                unmarkCascaded(accountId, String(pos.id));
+                console.warn(`[auto-sl-startup] SL failed posId=${pos.id}: ${(err as Error).message} — safety-net will retry`);
+              }
+            }
+          } catch (err) {
+            console.warn(`[auto-sl-startup] scan error: ${(err as Error).message}`);
+          }
+        })();
       }
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -754,13 +808,13 @@ async function startStreaming(token: string, accountId: string, region: string =
     // causing subscribe timeouts and a permanent reconnect loop on the
     // london region. Starting from "now" makes sync near-instant.
     const conn = account.getStreamingConnection(undefined, new Date());
+    // Store BEFORE connect so onDealsSynchronized (which fires during connect)
+    // can access conn.terminalState to scan for naked positions on startup.
+    activeConnections.set(accountId, conn);
+    activeRegions.set(accountId, region);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (conn as any).addSynchronizationListener(makeDealListener(accountId));
     await conn.connect();
-    // Store connection so the trade endpoint can reuse this WebSocket
-    // instead of making new HTTP calls to MetaAPI REST for every order.
-    activeConnections.set(accountId, conn);
-    activeRegions.set(accountId, region);
     // Keep the in-memory registry current so the watchdog/safety-net can work
     // even when the DB is temporarily unavailable.
     knownAccounts.set(accountId, { accountId, userId, region });
