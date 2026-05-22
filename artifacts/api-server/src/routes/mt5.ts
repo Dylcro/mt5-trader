@@ -1010,7 +1010,7 @@ export function startConnectionWatchdog(): void {
 // through a recovery cycle — the deal stream is the fast path (sub-second),
 // the safety net is the guarantee (≤30 s).
 export function startAutoSlSafetyNet(): void {
-  const INTERVAL_MS = 5_000;
+  const INTERVAL_MS = 2_000;
   setInterval(async () => {
     try {
       const token = getToken();
@@ -1083,7 +1083,7 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
     // This branch is rarely reached; it exists only for the window between
     // reconnects when terminalState is unavailable.
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8_000);
+    const timer = setTimeout(() => controller.abort(), 3_000);
     try {
       const resp = await fetch(
         `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
