@@ -634,11 +634,54 @@ function makeDealListener(accountId: string) {
       }
       else {
         // ── MT5-initiated trade ───────────────────────────────────────────
-        // DO NOT call markCascaded here. The REST safety-net poller is the
-        // only thing that applies the SL — it marks the position as cascaded
-        // just before firing the POSITION_MODIFY call. If we mark it here,
-        // hasBeenCascaded() returns true and the safety net skips it forever.
-        console.log(`[auto-cascade] MT5 trade posId=${evt.positionId} — queued for REST safety-net SL`);
+        // We already have everything needed: positionId, openPrice, type.
+        // Apply the SL immediately via a direct REST POSITION_MODIFY call —
+        // no /positions fetch needed at all.  The safety-net remains as a
+        // backup for positions missed during reconnect windows.
+        void (async () => {
+          try {
+            const cfg = getCascadeConfig(accountId);
+            if (!cfg.mt5SlEnabled) return;
+            const token = getToken();
+            const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
+            const slDistance = cfg.mt5SlPips * MT5_SL_PIP;
+            const isBuy = evt.type === "DEAL_TYPE_BUY";
+            const slPrice = isBuy
+              ? Math.round((evt.openPrice - slDistance) * 100) / 100
+              : Math.round((evt.openPrice + slDistance) * 100) / 100;
+
+            // Optimistic mark before REST call — prevents safety-net duplication.
+            markCascaded(accountId, evt.positionId);
+            console.log(`[auto-sl] applying SL ${slPrice} to posId=${evt.positionId} (${isBuy ? "BUY" : "SELL"} @ ${evt.openPrice}, ${cfg.mt5SlPips} pips)`);
+
+            const t0 = Date.now();
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 15_000);
+            try {
+              const resp = await fetch(
+                `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
+                {
+                  method: "POST",
+                  headers: authHeaders(token),
+                  body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: evt.positionId, stopLoss: slPrice }),
+                  signal: ctrl.signal,
+                },
+              );
+              clearTimeout(timer);
+              if (!resp.ok) {
+                const txt = await resp.text().catch(() => "");
+                throw new Error(`REST ${resp.status}: ${txt.slice(0, 200)}`);
+              }
+              console.log(`[auto-sl] SL set ✓ posId=${evt.positionId} sl=${slPrice} (${Date.now() - t0}ms)`);
+            } catch (err) {
+              clearTimeout(timer);
+              unmarkCascaded(accountId, evt.positionId);
+              console.warn(`[auto-sl] SL failed posId=${evt.positionId}: ${(err as Error).message} — safety-net will retry`);
+            }
+          } catch (err) {
+            console.warn(`[auto-sl] setup error posId=${evt.positionId}: ${(err as Error).message}`);
+          }
+        })();
       }
     },
   };
