@@ -136,6 +136,10 @@ const CASCADE_DEFAULTS: CascadeConfig = {
 
 // MT5 auto-SL: 1 "pip" = $0.10 of price movement on XAUUSD (matches cascade convention).
 const MT5_SL_PIP = 0.10;
+// Initial SL applied the moment a trade opens — wide enough to survive
+// normal spread/spike noise. Phase 2 (adjustZoneSls) tightens it to
+// the user's slider setting within the next few seconds.
+const MT5_INITIAL_SL_PIPS = 120;
 
 // In-memory cache: accountId (or "" for global) → config.
 const cascadeConfigs = new Map<string, CascadeConfig>();
@@ -648,46 +652,47 @@ function makeDealListener(accountId: string) {
             if (!cfg.mt5SlEnabled) return;
             const token = getToken();
             const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
-            const slDistance = cfg.mt5SlPips * MT5_SL_PIP;
             const isBuy = evt.type === "DEAL_TYPE_BUY";
-
-            // Phase 1: always apply the flat pip-distance SL immediately.
-            // This guarantees protection within seconds regardless of zone state.
-            // The safety net's zone-correction pass (Phase 2) will then adjust
-            // to the zone SL level within the next 5 s tick if needed.
             const direction: "buy" | "sell" = isBuy ? "buy" : "sell";
-            const flatSl = isBuy
-              ? Math.round((evt.openPrice - slDistance) * 100) / 100
-              : Math.round((evt.openPrice + slDistance) * 100) / 100;
+
+            // Immediate SL: always 120 pips — goes in the moment the deal fires.
+            // Wide enough to survive spread/spike noise but guarantees protection.
+            const initialSlDistance = MT5_INITIAL_SL_PIPS * MT5_SL_PIP;
+            const immediateSl = isBuy
+              ? Math.round((evt.openPrice - initialSlDistance) * 100) / 100
+              : Math.round((evt.openPrice + initialSlDistance) * 100) / 100;
+
+            // Target SL: the user's slider value — Phase 2 (adjustZoneSls) will
+            // move the SL here within the next 5 s tick. This is also what the
+            // zone stores so all positions in the same zone converge to it.
+            const targetSlDistance = cfg.mt5SlPips * MT5_SL_PIP;
+            const targetSl = isBuy
+              ? Math.round((evt.openPrice - targetSlDistance) * 100) / 100
+              : Math.round((evt.openPrice + targetSlDistance) * 100) / 100;
 
             // Register zone NOW so Phase 2 can find it on the next safety-net tick.
-            // If a zone already exists for this direction + price range, join it.
-            // If not, create a new one anchored at this entry.
-            // The zone anchor SL (flatSl for first trade) is what Phase 2 will
-            // move ALL positions in the zone to — subsequent trades that fall
-            // inside the range will have their flat SL corrected to this anchor.
             let zone = findActiveZone(accountId, direction, evt.openPrice);
             if (zone) {
               zone.positionIds.add(evt.positionId);
-              console.log(`[auto-sl] posId=${evt.positionId} joins zone ${zone.id} (anchor ${zone.anchorEntry}, zone SL ${zone.slPrice})`);
+              console.log(`[auto-sl] posId=${evt.positionId} joins zone ${zone.id} (anchor ${zone.anchorEntry}, target SL ${zone.slPrice})`);
             } else {
               zone = {
                 id: `z${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
                 direction,
                 anchorEntry: evt.openPrice,
-                slPrice: flatSl,
+                slPrice: targetSl,   // slider value — Phase 2 corrects to this
                 positionIds: new Set([evt.positionId]),
                 active: true,
                 createdAt: Date.now(),
               };
               mt5ZonesFor(accountId).push(zone);
               pruneZones(accountId);
-              console.log(`[auto-sl] new zone ${zone.id} — anchor=${evt.openPrice} zoneSL=${flatSl} (${cfg.mt5SlPips} pips)`);
+              console.log(`[auto-sl] new zone ${zone.id} — anchor=${evt.openPrice} immediateSL=${immediateSl} (120 pips) → targetSL=${targetSl} (${cfg.mt5SlPips} pips)`);
             }
 
             // Optimistic mark before REST call — prevents safety-net duplication.
             markCascaded(accountId, evt.positionId);
-            console.log(`[auto-sl] applying flat SL ${flatSl} to posId=${evt.positionId} (${isBuy ? "BUY" : "SELL"} @ ${evt.openPrice})`);
+            console.log(`[auto-sl] applying immediate SL ${immediateSl} (120 pips) to posId=${evt.positionId} (${isBuy ? "BUY" : "SELL"} @ ${evt.openPrice})`);
 
             const t0 = Date.now();
             const ctrl = new AbortController();
@@ -698,7 +703,7 @@ function makeDealListener(accountId: string) {
                 {
                   method: "POST",
                   headers: authHeaders(token),
-                  body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: evt.positionId, stopLoss: flatSl }),
+                  body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: evt.positionId, stopLoss: immediateSl }),
                   signal: ctrl.signal,
                 },
               );
@@ -707,7 +712,7 @@ function makeDealListener(accountId: string) {
                 const txt = await resp.text().catch(() => "");
                 throw new Error(`REST ${resp.status}: ${txt.slice(0, 200)}`);
               }
-              console.log(`[auto-sl] SL set ✓ posId=${evt.positionId} sl=${flatSl} zone=${zone.id} (${Date.now() - t0}ms)`);
+              console.log(`[auto-sl] SL set ✓ posId=${evt.positionId} immediate=${immediateSl} target=${targetSl} zone=${zone.id} (${Date.now() - t0}ms) — Phase 2 will tighten`);
             } catch (err) {
               clearTimeout(timer);
               unmarkCascaded(accountId, evt.positionId);
@@ -1025,8 +1030,8 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
   }
   if (!positions) return;
 
-  const slPips = cfg.mt5SlPips;
-  const slDistance = slPips * MT5_SL_PIP;
+  const targetSlDistance = cfg.mt5SlPips * MT5_SL_PIP;
+  const initialSlDistance = MT5_INITIAL_SL_PIPS * MT5_SL_PIP;
   for (const pos of positions) {
     if (pos.symbol !== "XAUUSD") continue;
     if (pos.stopLoss && pos.stopLoss > 0) continue; // already protected per broker
@@ -1042,20 +1047,25 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
 
     const direction: "buy" | "sell" = pos.type === "POSITION_TYPE_BUY" ? "buy" : "sell";
 
+    // Immediate SL: 120 pips — same as deal handler fast path.
+    // Phase 2 (adjustZoneSls) will tighten to the user's slider value.
+    const immediateSl = direction === "buy"
+      ? parseFloat((pos.openPrice - initialSlDistance).toFixed(2))
+      : parseFloat((pos.openPrice + initialSlDistance).toFixed(2));
+
     let zone = findActiveZone(accountId, direction, pos.openPrice);
-    let slPrice: number;
     if (zone) {
       zone.positionIds.add(pos.id);
-      slPrice = zone.slPrice;
     } else {
-      slPrice = direction === "buy"
-        ? parseFloat((pos.openPrice - slDistance).toFixed(2))
-        : parseFloat((pos.openPrice + slDistance).toFixed(2));
+      // Zone target SL = slider value; Phase 2 corrects to this.
+      const targetSl = direction === "buy"
+        ? parseFloat((pos.openPrice - targetSlDistance).toFixed(2))
+        : parseFloat((pos.openPrice + targetSlDistance).toFixed(2));
       zone = {
         id: `z${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
         direction,
         anchorEntry: pos.openPrice,
-        slPrice,
+        slPrice: targetSl,
         positionIds: new Set([pos.id]),
         active: true,
         createdAt: Date.now(),
@@ -1082,7 +1092,7 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
         {
           method: "POST",
           headers: authHeaders(token),
-          body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: pos.id, stopLoss: slPrice }),
+          body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: pos.id, stopLoss: immediateSl }),
           signal: tradeController.signal,
         },
       );
@@ -1091,7 +1101,7 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
         const txt = await resp.text().catch(() => "");
         throw new Error(`REST ${resp.status}: ${txt.slice(0, 200)}`);
       }
-      console.log(`[mt5-sl-safety] applied SL ${slPrice} to posId=${pos.id} acct=${accountId} (${Date.now() - t0}ms, zone ${zoneRef.id})`);
+      console.log(`[mt5-sl-safety] applied immediate SL ${immediateSl} (120 pips) posId=${pos.id} acct=${accountId} (${Date.now() - t0}ms, zone ${zoneRef.id}) — Phase 2 will tighten to ${zoneRef.slPrice}`);
     } catch (err) {
       const msg = (err as Error).message ?? "";
       if (/market is closed/i.test(msg)) {
