@@ -856,7 +856,15 @@ async function startStreaming(token: string, accountId: string, region: string =
     const conn = account.getStreamingConnection(undefined, new Date());
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (conn as any).addSynchronizationListener(makeDealListener(accountId));
-    await conn.connect();
+    // Hard cap: if connect() hangs (MetaAPI server-side issue), abort after
+    // 30 s so the watchdog can retry rather than leaving the account dark for
+    // 175 s+. The SDK's own internal timeout can be much longer.
+    await Promise.race([
+      conn.connect(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("connect() timed out after 30 s")), 30_000),
+      ),
+    ]);
     // Store connection so the trade endpoint can reuse this WebSocket
     // instead of making new HTTP calls to MetaAPI REST for every order.
     activeConnections.set(accountId, conn);
@@ -1054,7 +1062,13 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
   const conn = activeConnections.get(accountId);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const sdkPositions: any[] = conn?.terminalState?.positions ?? [];
-  if (sdkPositions.length > 0 || conn?.terminalState) {
+  // Only trust terminalState when syncReady is set (onDealsSynchronized has fired)
+  // OR when we already have positions in it (populated by a prior sync that has
+  // since drifted). Without this guard, a freshly-created (but not-yet-synced)
+  // connection object returns an empty array — which the safety net
+  // misreads as "no open trades", skipping the REST fallback entirely.
+  const terminalStateReady = syncReady.has(accountId) || sdkPositions.length > 0;
+  if (terminalStateReady && conn?.terminalState) {
     // Connection is live — use its cached positions (may be empty = no open trades)
     positions = sdkPositions.map((p: any) => ({
       id:        String(p.id ?? p.positionId ?? ""),
