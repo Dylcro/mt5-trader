@@ -604,12 +604,7 @@ function makeDealListener(accountId: string) {
           console.log(`[auto-cascade] SKIP posId=${evt.positionId} — stale deal (dealTime=${deal.time})`);
         }
       }
-      // Layer 2: irrelevant symbol or invalid price — skip silently. NOTE: we
-      // intentionally do NOT gate on cascade.enabled here. The else-branch
-      // below only handles auto-SL (cascade-limit placement was removed), and
-      // auto-SL is an independent feature with its own mt5SlEnabled flag.
-      // Coupling the two caused Gethin's MT5 trades to receive no SL because
-      // his cascade.enabled=false short-circuited the whole branch.
+      // Layer 2: irrelevant symbol or invalid price — skip silently.
       else if (evt.symbol !== "XAUUSD" || evt.openPrice <= 0) { /* skip — irrelevant */ }
       // Layer 3: positionId already cascaded (covers app-placed market orders pre-marked above)
       else if (hasBeenCascaded(accountId, evt.positionId)) {
@@ -635,101 +630,14 @@ function makeDealListener(accountId: string) {
         console.log(`[auto-cascade] SKIP posId=${evt.positionId} price=${evt.openPrice} — rapid duplicate (Layer 6)`);
       }
       else {
-        // ── MT5-initiated trade — apply auto-SL (no cascade limits) ───────
-        // Only XAUUSD trades with a valid execution price qualify.
-        markCascaded(accountId, evt.positionId); // prevent re-processing on duplicate events
-
-        if (!acctCascadeCfg.mt5SlEnabled) {
-          // Feature disabled — log once per posId so silent skips are debuggable.
-          console.log(`[mt5-sl] SKIP posId=${evt.positionId} — mt5SlEnabled=false for ${accountId}`);
-        } else {
-          const direction: "buy" | "sell" = evt.type === "DEAL_TYPE_BUY" ? "buy" : "sell";
-          const slPips = acctCascadeCfg.mt5SlPips;
-          const slDistance = slPips * MT5_SL_PIP;
-
-          // Try to join an existing active zone (same direction, entry inside zone range).
-          let zone = findActiveZone(accountId, direction, evt.openPrice);
-          let slPrice: number;
-          let zoneAction: "join" | "new";
-
-          if (zone) {
-            zone.positionIds.add(evt.positionId);
-            slPrice = zone.slPrice;
-            zoneAction = "join";
-            console.log(`[mt5-sl] posId=${evt.positionId} dir=${direction} entry=${evt.openPrice} JOIN zone ${zone.id} (anchor=${zone.anchorEntry} sl=${slPrice}, now ${zone.positionIds.size} positions)`);
-          } else {
-            slPrice = direction === "buy"
-              ? parseFloat((evt.openPrice - slDistance).toFixed(2))
-              : parseFloat((evt.openPrice + slDistance).toFixed(2));
-            zone = {
-              id: `z${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
-              direction,
-              anchorEntry: evt.openPrice,
-              slPrice,
-              positionIds: new Set([evt.positionId]),
-              active: true,
-              createdAt: Date.now(),
-            };
-            mt5ZonesFor(accountId).push(zone);
-            pruneZones(accountId);
-            zoneAction = "new";
-            console.log(`[mt5-sl] posId=${evt.positionId} dir=${direction} entry=${evt.openPrice} NEW zone ${zone.id} sl=${slPrice} (${slPips} pips)`);
-          }
-
-          const zoneRef = zone;
-          // Fire the SL apply ASAP — start the network call BEFORE doing the
-          // local bookkeeping/logging below. The IIAF returns immediately so
-          // the streaming SDK can move on to the next event.
-          const conn = activeConnections.get(accountId);
-          if (!conn || typeof conn.modifyPosition !== "function") {
-            console.error(`[mt5-sl] no active connection for ${accountId} — cannot modify position ${evt.positionId}`);
-            zoneRef.positionIds.delete(evt.positionId);
-            if (zoneAction === "new" && zoneRef.positionIds.size === 0) {
-              zoneRef.active = false; // dead zone, never had its anchor SL applied
-            }
-          } else {
-            // Kick off the network call synchronously (no async wrapper / no
-            // extra microtask) so the request hits the wire as early as possible.
-            const t0 = Date.now();
-            const attemptModify = async (): Promise<void> => {
-              // Up to 3 attempts with tight backoff. In volatile markets the
-              // first attempt occasionally fails with a transient WebSocket
-              // error or a broker "trade context busy" — without retries the
-              // SL would simply be dropped. Total worst-case extra latency
-              // ~550ms only when retries are actually needed.
-              const delays = [0, 150, 400];
-              let lastErr: unknown = null;
-              for (let i = 0; i < delays.length; i++) {
-                if (delays[i] > 0) await new Promise((r) => setTimeout(r, delays[i]));
-                try {
-                  await conn.modifyPosition(evt.positionId, slPrice);
-                  const tag = i === 0 ? "" : ` (retry ${i})`;
-                  console.log(`[mt5-sl] applied SL ${slPrice} to posId=${evt.positionId} (${Date.now() - t0}ms${tag}, zone ${zoneRef.id})`);
-                  const syntheticEvt: DealEvent = {
-                    ...evt,
-                    dealId: `mt5sl-${evt.dealId}`,
-                    time: Date.now(),
-                    autoCascade: true,
-                    autoCascadeCount: 1,
-                  };
-                  storeDealEvent(accountId, syntheticEvt);
-                  return;
-                } catch (err) {
-                  lastErr = err;
-                  console.warn(`[mt5-sl] attempt ${i + 1}/${delays.length} failed for posId=${evt.positionId} (${Date.now() - t0}ms): ${(err as Error).message}`);
-                }
-              }
-              console.error(`[mt5-sl] GIVING UP on posId=${evt.positionId} after ${delays.length} attempts (${Date.now() - t0}ms):`, (lastErr as Error).message);
-              zoneRef.positionIds.delete(evt.positionId);
-              if (zoneAction === "new" && zoneRef.positionIds.size === 0) {
-                zoneRef.active = false;
-              }
-            };
-            // Fire and forget — do NOT await, so the streaming SDK can process
-            // the next deal event immediately.
-            void attemptModify();
-          }
-        }
+        // ── MT5-initiated trade ───────────────────────────────────────────
+        // Mark cascaded to prevent re-processing on duplicate deal events.
+        // Auto-SL is NOT applied here — it is handled exclusively by the
+        // REST safety-net poller (startAutoSlSafetyNet) which runs every 10s
+        // independently of the WebSocket. This removes all WebSocket
+        // reliability concerns from the SL path.
+        markCascaded(accountId, evt.positionId);
+        console.log(`[auto-cascade] MT5 trade posId=${evt.positionId} noted — SL will be applied by REST poller`);
       }
     },
   };
@@ -950,7 +858,7 @@ export function startConnectionWatchdog(): void {
 // through a recovery cycle — the deal stream is the fast path (sub-second),
 // the safety net is the guarantee (≤30 s).
 export function startAutoSlSafetyNet(): void {
-  const INTERVAL_MS = 30_000;
+  const INTERVAL_MS = 10_000;
   setInterval(async () => {
     try {
       const token = getToken();
@@ -982,7 +890,7 @@ export function startAutoSlSafetyNet(): void {
       console.warn("[mt5-sl-safety] tick error:", (err as Error).message);
     }
   }, INTERVAL_MS);
-  console.log("[mt5-sl-safety] auto-SL safety net started (30 s interval)");
+  console.log("[mt5-sl-safety] auto-SL safety net started (10 s interval — REST-only SL path)");
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
