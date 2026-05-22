@@ -655,13 +655,39 @@ function makeDealListener(accountId: string) {
             // This guarantees protection within seconds regardless of zone state.
             // The safety net's zone-correction pass (Phase 2) will then adjust
             // to the zone SL level within the next 5 s tick if needed.
-            const slPrice = isBuy
+            const direction: "buy" | "sell" = isBuy ? "buy" : "sell";
+            const flatSl = isBuy
               ? Math.round((evt.openPrice - slDistance) * 100) / 100
               : Math.round((evt.openPrice + slDistance) * 100) / 100;
 
+            // Register zone NOW so Phase 2 can find it on the next safety-net tick.
+            // If a zone already exists for this direction + price range, join it.
+            // If not, create a new one anchored at this entry.
+            // The zone anchor SL (flatSl for first trade) is what Phase 2 will
+            // move ALL positions in the zone to — subsequent trades that fall
+            // inside the range will have their flat SL corrected to this anchor.
+            let zone = findActiveZone(accountId, direction, evt.openPrice);
+            if (zone) {
+              zone.positionIds.add(evt.positionId);
+              console.log(`[auto-sl] posId=${evt.positionId} joins zone ${zone.id} (anchor ${zone.anchorEntry}, zone SL ${zone.slPrice})`);
+            } else {
+              zone = {
+                id: `z${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+                direction,
+                anchorEntry: evt.openPrice,
+                slPrice: flatSl,
+                positionIds: new Set([evt.positionId]),
+                active: true,
+                createdAt: Date.now(),
+              };
+              mt5ZonesFor(accountId).push(zone);
+              pruneZones(accountId);
+              console.log(`[auto-sl] new zone ${zone.id} — anchor=${evt.openPrice} zoneSL=${flatSl} (${cfg.mt5SlPips} pips)`);
+            }
+
             // Optimistic mark before REST call — prevents safety-net duplication.
             markCascaded(accountId, evt.positionId);
-            console.log(`[auto-sl] applying flat SL ${slPrice} to posId=${evt.positionId} (${isBuy ? "BUY" : "SELL"} @ ${evt.openPrice}, ${cfg.mt5SlPips} pips)`);
+            console.log(`[auto-sl] applying flat SL ${flatSl} to posId=${evt.positionId} (${isBuy ? "BUY" : "SELL"} @ ${evt.openPrice})`);
 
             const t0 = Date.now();
             const ctrl = new AbortController();
@@ -672,7 +698,7 @@ function makeDealListener(accountId: string) {
                 {
                   method: "POST",
                   headers: authHeaders(token),
-                  body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: evt.positionId, stopLoss: slPrice }),
+                  body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: evt.positionId, stopLoss: flatSl }),
                   signal: ctrl.signal,
                 },
               );
@@ -681,10 +707,12 @@ function makeDealListener(accountId: string) {
                 const txt = await resp.text().catch(() => "");
                 throw new Error(`REST ${resp.status}: ${txt.slice(0, 200)}`);
               }
-              console.log(`[auto-sl] SL set ✓ posId=${evt.positionId} sl=${slPrice} (${Date.now() - t0}ms) — zone correction will follow if applicable`);
+              console.log(`[auto-sl] SL set ✓ posId=${evt.positionId} sl=${flatSl} zone=${zone.id} (${Date.now() - t0}ms)`);
             } catch (err) {
               clearTimeout(timer);
               unmarkCascaded(accountId, evt.positionId);
+              zone.positionIds.delete(evt.positionId);
+              if (zone.positionIds.size === 0) zone.active = false;
               console.warn(`[auto-sl] SL failed posId=${evt.positionId}: ${(err as Error).message} — safety-net will retry`);
             }
           } catch (err) {
