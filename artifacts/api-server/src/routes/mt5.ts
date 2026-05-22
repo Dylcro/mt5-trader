@@ -388,6 +388,22 @@ const zoneAdjusted = new Set<string>();
 interface CachedPosition { id: string; symbol: string; type: string; openPrice: number; stopLoss?: number | null; volume?: number; }
 const positionCache = new Map<string, { positions: CachedPosition[]; ts: number }>();
 const POSITION_CACHE_TTL_MS = 15_000; // treat cache as stale after 15 s
+
+// Fast-retry queue for POSITION_MODIFY.
+// When the safety net finds a naked position but POSITION_MODIFY times out,
+// we keep the position in this map and retry every 2 s (the safety net tick
+// rate) WITHOUT re-fetching positions. This breaks the ~20 s retry cycle
+// (8 s positions fetch + 8 s trade timeout) down to a pure 2 s retry loop.
+// positionId stays in hasBeenCascaded while queued so no duplicate attempts.
+interface PendingSlRetry { sl: number; zoneRef: SlZone; failCount: number; firstFailedAt: number; }
+const pendingSlRetries = new Map<string, Map<string, PendingSlRetry>>(); // accountId → posId → retry
+const PENDING_SL_MAX_RETRIES = 90; // ~3 min at 2s tick before giving up entirely
+
+function getPendingRetries(accountId: string): Map<string, PendingSlRetry> {
+  let m = pendingSlRetries.get(accountId);
+  if (!m) { m = new Map(); pendingSlRetries.set(accountId, m); }
+  return m;
+}
 function mt5ZonesFor(accountId: string): SlZone[] {
   let arr = mt5SlZones.get(accountId);
   if (!arr) { arr = []; mt5SlZones.set(accountId, arr); }
@@ -1022,10 +1038,14 @@ const positionPollInFlight = new Set<string>(); // accountIds currently being fe
 export function startPositionPoller(): void {
   const INTERVAL_MS = 10_000;
   setInterval(async () => {
-    const token = getToken();
+    let token: string;
+    try { token = getToken(); } catch { return; }
     const accounts = Array.from(knownAccounts.values());
     for (const { accountId, region } of accounts) {
-      if (positionPollInFlight.has(accountId)) continue; // previous fetch still running
+      if (positionPollInFlight.has(accountId)) {
+        console.log(`[position-poller] ${accountId.slice(0,8)} — skipped (previous fetch in-flight)`);
+        continue;
+      }
       positionPollInFlight.add(accountId);
       // Fire-and-forget per account; errors are swallowed so one bad account
       // doesn't block the others.
@@ -1043,11 +1063,16 @@ export function startPositionPoller(): void {
             const body = await resp.json() as any[];
             if (Array.isArray(body)) {
               positionCache.set(accountId, { positions: body as CachedPosition[], ts: Date.now() });
+              const naked = body.filter((p: CachedPosition) => p.symbol === "XAUUSD" && (p.stopLoss == null || p.stopLoss === 0));
+              console.log(`[position-poller] ${accountId.slice(0,8)} — ok: ${body.length} position(s), ${naked.length} naked XAUUSD`);
             }
+          } else {
+            console.warn(`[position-poller] ${accountId.slice(0,8)} — HTTP ${resp.status}`);
           }
-        } catch {
+        } catch (err) {
           clearTimeout(timer);
-          // Timeout or network error — skip; next tick will retry
+          const msg = (err as Error).message ?? "unknown";
+          console.warn(`[position-poller] ${accountId.slice(0,8)} — failed: ${msg}`);
         } finally {
           positionPollInFlight.delete(accountId);
         }
@@ -1106,14 +1131,79 @@ export function startAutoSlSafetyNet(): void {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 interface MetaApiPosition { id: string; symbol: string; type: string; openPrice: number; stopLoss?: number | null; volume?: number; }
+async function applySafetyNetSl(token: string, accountId: string, region: string, posId: string, sl: number): Promise<void> {
+  // Use 3 s timeout — fail fast so the retry queue can cycle at 2 s.
+  // The MetaAPI trade endpoint almost always responds in < 1.5 s when healthy.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3_000);
+  const resp = await fetch(
+    `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
+    {
+      method: "POST",
+      headers: authHeaders(token),
+      body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: posId, stopLoss: sl }),
+      signal: controller.signal,
+    },
+  );
+  clearTimeout(timer);
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => "");
+    throw new Error(`REST ${resp.status}: ${txt.slice(0, 200)}`);
+  }
+  // Persist to cascade history (best-effort — DB may be unavailable)
+  try {
+    await db.insert(cascadeHistoryTable).values({ accountId, positionId: posId, createdAt: Date.now() }).onConflictDoNothing();
+  } catch { /* non-critical */ }
+}
+
 async function scanAccountForNakedPositions(token: string, accountId: string, userId: string | undefined, region: string): Promise<void> {
   const cfg = getCascadeConfig(accountId, userId);
-  if (!cfg.mt5SlEnabled) return;
+  if (!cfg.mt5SlEnabled) {
+    console.log(`[mt5-sl-safety] ${accountId.slice(0,8)} — skipped (mt5SlEnabled=false userId=${userId})`);
+    return;
+  }
+
+  // ── Fast-retry queue ─────────────────────────────────────────────────────
+  // Drain positions that were already identified as naked but whose
+  // POSITION_MODIFY call timed out. Retrying here (every 2 s) without
+  // re-fetching positions turns the ~20 s retry cycle into a 2 s one.
+  const retries = getPendingRetries(accountId);
+  for (const [posId, retry] of Array.from(retries.entries())) {
+    const elapsed = Math.round((Date.now() - retry.firstFailedAt) / 1000);
+    if (retry.failCount >= PENDING_SL_MAX_RETRIES) {
+      // Give up — unmark so a fresh scan can pick it up
+      retries.delete(posId);
+      unmarkCascaded(accountId, posId);
+      retry.zoneRef.positionIds.delete(posId);
+      if (retry.zoneRef.positionIds.size === 0) retry.zoneRef.active = false;
+      console.warn(`[mt5-sl-safety] gave up on posId=${posId} after ${retry.failCount} retries (${elapsed}s)`);
+      continue;
+    }
+    const t0 = Date.now();
+    try {
+      await applySafetyNetSl(token, accountId, region, posId, retry.sl);
+      retries.delete(posId);
+      console.log(`[mt5-sl-safety] fast-retry SL applied ${retry.sl} posId=${posId} acct=${accountId.slice(0,8)} (${Date.now()-t0}ms, attempt #${retry.failCount+1}, ${elapsed}s after first fail)`);
+    } catch (err) {
+      const msg = (err as Error).message ?? "";
+      retry.failCount++;
+      // Non-transient errors (position closed, invalid): give up immediately
+      if (/position.*not found|closed|invalid/i.test(msg) && !msg.includes("abort")) {
+        retries.delete(posId);
+        unmarkCascaded(accountId, posId);
+        retry.zoneRef.positionIds.delete(posId);
+        if (retry.zoneRef.positionIds.size === 0) retry.zoneRef.active = false;
+        console.log(`[mt5-sl-safety] fast-retry giving up (non-transient: ${msg.slice(0,60)}) posId=${posId}`);
+      }
+      // Transient (timeout, network): keep in queue, next tick retries
+    }
+  }
 
   // PRIMARY: read positions from the SDK connection's in-memory terminal state.
   // This is instant (no network call) and is kept current by the streaming
   // connection — no dependency on the unreliable REST /positions endpoint.
   let positions: MetaApiPosition[] | null = null;
+  let posSource = "none";
   const conn = activeConnections.get(accountId);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const sdkPositions: any[] = conn?.terminalState?.positions ?? [];
@@ -1125,6 +1215,7 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
   const terminalStateReady = syncReady.has(accountId) || sdkPositions.length > 0;
   if (terminalStateReady && conn?.terminalState) {
     // Connection is live — use its cached positions (may be empty = no open trades)
+    posSource = "terminalState";
     positions = sdkPositions.map((p: any) => ({
       id:        String(p.id ?? p.positionId ?? ""),
       symbol:    String(p.symbol ?? ""),
@@ -1140,7 +1231,9 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
     // the app polling is the most reliable position source we have — bridge
     // that data into the safety net so opening the app instantly feeds it.
     const cached = positionCache.get(accountId);
+    const cacheAge = cached ? Math.round((Date.now() - cached.ts) / 1000) : -1;
     if (cached && (Date.now() - cached.ts) < POSITION_CACHE_TTL_MS) {
+      posSource = `cache(${cacheAge}s old)`;
       positions = cached.positions.map((p) => ({
         id:        String(p.id ?? ""),
         symbol:    String(p.symbol ?? ""),
@@ -1154,8 +1247,10 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
       // unreliable from Replit (frequent timeouts), so use a generous timeout
       // and rely on concurrent ticks to retry — hasBeenCascaded prevents
       // duplicate SL applications if multiple ticks succeed at once.
+      posSource = "REST(fetching)";
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 8_000);
+      const t0 = Date.now();
       try {
         const resp = await fetch(
           `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
@@ -1166,17 +1261,28 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const fetched = await resp.json() as any[];
           positions = fetched as MetaApiPosition[];
+          posSource = `REST(${Date.now() - t0}ms)`;
           // Populate cache so subsequent ticks and the app both benefit
           positionCache.set(accountId, { positions: fetched as CachedPosition[], ts: Date.now() });
-        } else if (resp.status !== 404) {
-          console.warn(`[mt5-sl-safety] ${accountId} REST fallback ${resp.status}`);
+        } else {
+          posSource = `REST-err(${resp.status})`;
+          if (resp.status !== 404) {
+            console.warn(`[mt5-sl-safety] ${accountId.slice(0,8)} REST fallback ${resp.status}`);
+          }
         }
       } catch (err) {
         clearTimeout(timer);
+        const msg = (err as Error).message ?? "";
+        posSource = msg.includes("abort") ? `REST-timeout(${Date.now()-t0}ms)` : `REST-err(${msg.slice(0,30)})`;
         // REST timed out — skip this tick; next tick will retry or use cache
       }
     }
   }
+
+  const xauPositions = (positions ?? []).filter(p => p.symbol === "XAUUSD");
+  const nakedXau = xauPositions.filter(p => !p.stopLoss || p.stopLoss === 0);
+  console.log(`[mt5-sl-safety] ${accountId.slice(0,8)} src=${posSource} total=${positions?.length ?? "null"} xau=${xauPositions.length} naked=${nakedXau.length} syncReady=${syncReady.has(accountId)} sdkLen=${sdkPositions.length}`);
+
   if (!positions) return;
 
   const targetSlDistance = cfg.mt5SlPips * MT5_SL_PIP;
@@ -1224,44 +1330,31 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
     }
     const zoneRef = zone;
 
-    // Mark BEFORE the REST call — this is the key fix.
-    // If we mark after, concurrent ticks (fired every 5s while the REST call
-    // takes 10-20s) all see the position as unprocessed and stack up duplicate
-    // requests. Marking first means every subsequent tick skips this position
-    // immediately. On failure we unmark so the next tick can retry.
+    // Mark BEFORE the trade call so concurrent ticks skip this position
+    // immediately. On failure we add to the fast-retry queue (not unmark)
+    // so the next 2 s tick retries POSITION_MODIFY without re-fetching positions.
     markCascaded(accountId, pos.id);
 
-    // Always use REST for SL — never the WebSocket/SDK connection.
     const t0 = Date.now();
     try {
-      const tradeController = new AbortController();
-      const tradeTimer = setTimeout(() => tradeController.abort(), 8_000);
-      const resp = await fetch(
-        `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
-        {
-          method: "POST",
-          headers: authHeaders(token),
-          body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: pos.id, stopLoss: immediateSl }),
-          signal: tradeController.signal,
-        },
-      );
-      clearTimeout(tradeTimer);
-      if (!resp.ok) {
-        const txt = await resp.text().catch(() => "");
-        throw new Error(`REST ${resp.status}: ${txt.slice(0, 200)}`);
-      }
+      await applySafetyNetSl(token, accountId, region, pos.id, immediateSl);
       console.log(`[mt5-sl-safety] applied immediate SL ${immediateSl} (120 pips) posId=${pos.id} acct=${accountId} (${Date.now() - t0}ms, zone ${zoneRef.id}) — Phase 2 will tighten to ${zoneRef.slPrice}`);
     } catch (err) {
       const msg = (err as Error).message ?? "";
       if (/market is closed/i.test(msg)) {
-        console.log(`[mt5-sl-safety] market closed, will retry on open — posId=${pos.id} acct=${accountId}`);
+        console.log(`[mt5-sl-safety] market closed — queuing fast-retry posId=${pos.id} acct=${accountId.slice(0,8)}`);
       } else {
-        console.warn(`[mt5-sl-safety] failed to SL posId=${pos.id} acct=${accountId}: ${msg}`);
+        console.warn(`[mt5-sl-safety] failed to SL posId=${pos.id} acct=${accountId}: ${msg} — adding to fast-retry queue`);
       }
-      // Unmark so the next tick can retry. Also roll back zone membership.
-      unmarkCascaded(accountId, pos.id);
-      zoneRef.positionIds.delete(pos.id);
-      if (zoneRef.positionIds.size === 0) zoneRef.active = false;
+      // Add to fast-retry queue. The position stays marked in hasBeenCascaded
+      // so the scan loop doesn't re-process it. The retry queue drains it every
+      // 2 s without going through the slow positions-fetch path again.
+      getPendingRetries(accountId).set(pos.id, {
+        sl: immediateSl,
+        zoneRef,
+        failCount: 1,
+        firstFailedAt: Date.now(),
+      });
     }
   }
 }
