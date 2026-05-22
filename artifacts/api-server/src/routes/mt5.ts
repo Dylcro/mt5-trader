@@ -646,13 +646,40 @@ function makeDealListener(accountId: string) {
             const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
             const slDistance = cfg.mt5SlPips * MT5_SL_PIP;
             const isBuy = evt.type === "DEAL_TYPE_BUY";
-            const slPrice = isBuy
-              ? Math.round((evt.openPrice - slDistance) * 100) / 100
-              : Math.round((evt.openPrice + slDistance) * 100) / 100;
+            const direction: "buy" | "sell" = isBuy ? "buy" : "sell";
+
+            // Zone logic: if this trade falls inside an existing active zone,
+            // use that zone's SL price (e.g. 5550) instead of the raw pip
+            // distance from this entry (e.g. 5549). This anchors all positions
+            // in the zone to the same SL level. If no active zone exists,
+            // create a new one anchored at this entry price.
+            let zone = findActiveZone(accountId, direction, evt.openPrice);
+            let slPrice: number;
+            if (zone) {
+              zone.positionIds.add(evt.positionId);
+              slPrice = zone.slPrice;
+              console.log(`[auto-sl] posId=${evt.positionId} joins zone ${zone.id} → SL=${slPrice} (anchor ${zone.anchorEntry})`);
+            } else {
+              slPrice = isBuy
+                ? Math.round((evt.openPrice - slDistance) * 100) / 100
+                : Math.round((evt.openPrice + slDistance) * 100) / 100;
+              zone = {
+                id: `z${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+                direction,
+                anchorEntry: evt.openPrice,
+                slPrice,
+                positionIds: new Set([evt.positionId]),
+                active: true,
+                createdAt: Date.now(),
+              };
+              mt5ZonesFor(accountId).push(zone);
+              pruneZones(accountId);
+              console.log(`[auto-sl] new zone ${zone.id} created — anchor=${evt.openPrice} SL=${slPrice} (${cfg.mt5SlPips} pips)`);
+            }
+            const zoneRef = zone;
 
             // Optimistic mark before REST call — prevents safety-net duplication.
             markCascaded(accountId, evt.positionId);
-            console.log(`[auto-sl] applying SL ${slPrice} to posId=${evt.positionId} (${isBuy ? "BUY" : "SELL"} @ ${evt.openPrice}, ${cfg.mt5SlPips} pips)`);
 
             const t0 = Date.now();
             const ctrl = new AbortController();
@@ -672,10 +699,12 @@ function makeDealListener(accountId: string) {
                 const txt = await resp.text().catch(() => "");
                 throw new Error(`REST ${resp.status}: ${txt.slice(0, 200)}`);
               }
-              console.log(`[auto-sl] SL set ✓ posId=${evt.positionId} sl=${slPrice} (${Date.now() - t0}ms)`);
+              console.log(`[auto-sl] SL set ✓ posId=${evt.positionId} sl=${slPrice} zone=${zoneRef.id} (${Date.now() - t0}ms)`);
             } catch (err) {
               clearTimeout(timer);
               unmarkCascaded(accountId, evt.positionId);
+              zoneRef.positionIds.delete(evt.positionId);
+              if (zoneRef.positionIds.size === 0) zoneRef.active = false;
               console.warn(`[auto-sl] SL failed posId=${evt.positionId}: ${(err as Error).message} — safety-net will retry`);
             }
           } catch (err) {
