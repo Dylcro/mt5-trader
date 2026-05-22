@@ -419,6 +419,9 @@ const cascadedPositions = new Map<string, Set<string>>(); // accountId → Set<p
 function hasBeenCascaded(accountId: string, positionId: string): boolean {
   return cascadedPositions.get(accountId)?.has(positionId) ?? false;
 }
+function unmarkCascaded(accountId: string, positionId: string): void {
+  cascadedPositions.get(accountId)?.delete(positionId);
+}
 function markCascaded(accountId: string, positionId: string): void {
   let set = cascadedPositions.get(accountId);
   if (!set) { set = new Set(); cascadedPositions.set(accountId, set); }
@@ -920,15 +923,19 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
   const slDistance = slPips * MT5_SL_PIP;
   for (const pos of positions) {
     if (pos.symbol !== "XAUUSD") continue;
-    if (pos.stopLoss && pos.stopLoss > 0) continue; // already protected
+    if (pos.stopLoss && pos.stopLoss > 0) continue; // already protected per broker
     if (!pos.openPrice || pos.openPrice <= 0) continue;
     if (pos.type !== "POSITION_TYPE_BUY" && pos.type !== "POSITION_TYPE_SELL") continue;
 
+    // In-memory guard: MetaAPI's REST /positions response can be stale for
+    // many seconds after we apply an SL. Without this check, every tick would
+    // see the position as naked and re-fire the REST call — producing 3-4
+    // duplicate SL requests per position. hasBeenCascaded is also what blocks
+    // concurrent ticks that overlap while a slow REST call is in-flight.
+    if (hasBeenCascaded(accountId, pos.id)) continue;
+
     const direction: "buy" | "sell" = pos.type === "POSITION_TYPE_BUY" ? "buy" : "sell";
 
-    // Join an existing zone if entry is inside it; otherwise create a new one.
-    // Uses the same logic as the live deal handler so streamed and polled SLs
-    // are consistent.
     let zone = findActiveZone(accountId, direction, pos.openPrice);
     let slPrice: number;
     if (zone) {
@@ -952,10 +959,14 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
     }
     const zoneRef = zone;
 
+    // Mark BEFORE the REST call — this is the key fix.
+    // If we mark after, concurrent ticks (fired every 5s while the REST call
+    // takes 10-20s) all see the position as unprocessed and stack up duplicate
+    // requests. Marking first means every subsequent tick skips this position
+    // immediately. On failure we unmark so the next tick can retry.
+    markCascaded(accountId, pos.id);
+
     // Always use REST for SL — never the WebSocket/SDK connection.
-    // The whole point of this poller is to be independent of WebSocket
-    // reliability. Using conn.modifyPosition here would reintroduce the
-    // exact WebSocket timeout failures we moved away from.
     const t0 = Date.now();
     try {
       const resp = await fetch(
@@ -970,17 +981,16 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
         const txt = await resp.text().catch(() => "");
         throw new Error(`REST ${resp.status}: ${txt.slice(0, 200)}`);
       }
-      console.log(`[mt5-sl-safety] applied SL ${slPrice} to naked posId=${pos.id} acct=${accountId} (${Date.now() - t0}ms, zone ${zoneRef.id})`);
-      markCascaded(accountId, pos.id);
+      console.log(`[mt5-sl-safety] applied SL ${slPrice} to posId=${pos.id} acct=${accountId} (${Date.now() - t0}ms, zone ${zoneRef.id})`);
     } catch (err) {
       const msg = (err as Error).message ?? "";
       if (/market is closed/i.test(msg)) {
-        // Expected outside trading hours — log quietly so it doesn't look alarming.
         console.log(`[mt5-sl-safety] market closed, will retry on open — posId=${pos.id} acct=${accountId}`);
       } else {
         console.warn(`[mt5-sl-safety] failed to SL posId=${pos.id} acct=${accountId}: ${msg}`);
       }
-      // Roll back zone membership so a retry next tick can recompute cleanly.
+      // Unmark so the next tick can retry. Also roll back zone membership.
+      unmarkCascaded(accountId, pos.id);
       zoneRef.positionIds.delete(pos.id);
       if (zoneRef.positionIds.size === 0) zoneRef.active = false;
     }
