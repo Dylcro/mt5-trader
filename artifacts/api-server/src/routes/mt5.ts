@@ -99,6 +99,13 @@ const activeStreams = new Set<string>();           // accountIds with live conne
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const activeConnections = new Map<string, any>(); // accountId → StreamingMetaApiConnectionInstance (for SDK trades)
 const activeRegions = new Map<string, string>();  // accountId → region (used for REST fallback in auto-cascade)
+
+// ── In-memory account registry ────────────────────────────────────────────────
+// Mirrors the stored_accounts table in memory. Seeded at startup from DB, then
+// kept up-to-date whenever an account connects. The watchdog and safety-net use
+// this as their primary source so a DB blip can NEVER knock out SL coverage.
+interface KnownAccount { accountId: string; userId?: string; region: string; }
+const knownAccounts = new Map<string, KnownAccount>(); // accountId → KnownAccount
 let sdkInstance: InstanceType<typeof MetaApi> | null = null;
 
 // ── Cascade Config ────────────────────────────────────────────────────────────
@@ -802,6 +809,9 @@ async function startStreaming(token: string, accountId: string, region: string =
     // instead of making new HTTP calls to MetaAPI REST for every order.
     activeConnections.set(accountId, conn);
     activeRegions.set(accountId, region);
+    // Keep the in-memory registry current so the watchdog/safety-net can work
+    // even when the DB is temporarily unavailable.
+    knownAccounts.set(accountId, { accountId, userId, region });
     console.log(`[stream ${accountId}] streaming connection established — SDK trade path armed`);
     // Sync-stuck recovery: if `onDealsSynchronized` hasn't fired within 150s,
     // the account's sync session on MetaAPI is wedged (the "synchronization
@@ -880,9 +890,15 @@ export async function startAutoConnect(): Promise<void> {
       console.log("[auto-connect] no stored accounts with bound users — waiting for first app connect");
       return;
     }
-    for (const { accountId, region } of rows) {
+    // Seed the in-memory registry NOW, before any streaming starts.
+    // This guarantees the watchdog and safety-net always have a non-empty
+    // account list even if the DB becomes unavailable during the first tick.
+    for (const { accountId, userId, region } of rows) {
+      knownAccounts.set(accountId, { accountId, userId: userId ?? undefined, region });
+    }
+    for (const { accountId, region, userId } of rows) {
       console.log(`[auto-connect] reconnecting accountId=${accountId} region=${region}`);
-      void startStreaming(token, accountId, region);
+      void startStreaming(token, accountId, region, userId ?? undefined);
     }
   } catch (err) {
     console.error("[auto-connect] failed:", (err as Error).message);
@@ -894,11 +910,26 @@ export function startConnectionWatchdog(): void {
   setInterval(async () => {
     try {
       const token = getToken();
-      const rows = await db
-        .select()
-        .from(storedAccountsTable)
-        .where(isNotNull(storedAccountsTable.userId));
-      for (const { accountId, region } of rows) {
+      // Try to refresh the in-memory registry from DB. If DB is unavailable,
+      // fall back to the existing cache — never skip reconnects due to a DB blip.
+      let accounts: KnownAccount[];
+      try {
+        const rows = await db
+          .select()
+          .from(storedAccountsTable)
+          .where(isNotNull(storedAccountsTable.userId));
+        // Refresh cache with latest DB state while we have it.
+        for (const { accountId, userId, region } of rows) {
+          knownAccounts.set(accountId, { accountId, userId: userId ?? undefined, region });
+        }
+        accounts = rows.map(r => ({ accountId: r.accountId, userId: r.userId ?? undefined, region: r.region }));
+      } catch {
+        accounts = Array.from(knownAccounts.values());
+        if (accounts.length > 0) {
+          console.log(`[watchdog] DB unavailable — using in-memory cache (${accounts.length} accounts)`);
+        }
+      }
+      for (const { accountId, region } of accounts) {
         if (!activeStreams.has(accountId)) {
           console.log(`[watchdog] ${accountId} not streaming — reconnecting`);
           void startStreaming(token, accountId, region);
@@ -908,7 +939,7 @@ export function startConnectionWatchdog(): void {
       console.warn("[watchdog] error:", (err as Error).message);
     }
   }, INTERVAL_MS);
-  console.log("[watchdog] connection watchdog started (60 s interval)");
+  console.log("[watchdog] connection watchdog started (30 s interval)");
 }
 
 // ── Auto-SL safety net ───────────────────────────────────────────────────────
@@ -923,14 +954,29 @@ export function startAutoSlSafetyNet(): void {
   setInterval(async () => {
     try {
       const token = getToken();
-      const rows = await db
-        .select()
-        .from(storedAccountsTable)
-        .where(isNotNull(storedAccountsTable.userId));
-      for (const { accountId, userId, region } of rows) {
+      // Try to refresh from DB; if unavailable fall back to in-memory cache.
+      // This is the whole point of the safety net — it must NEVER fail silently
+      // just because the DB had a momentary hiccup.
+      let accounts: KnownAccount[];
+      try {
+        const rows = await db
+          .select()
+          .from(storedAccountsTable)
+          .where(isNotNull(storedAccountsTable.userId));
+        for (const { accountId, userId, region } of rows) {
+          knownAccounts.set(accountId, { accountId, userId: userId ?? undefined, region });
+        }
+        accounts = rows.map(r => ({ accountId: r.accountId, userId: r.userId ?? undefined, region: r.region }));
+      } catch {
+        accounts = Array.from(knownAccounts.values());
+        if (accounts.length > 0) {
+          console.log(`[mt5-sl-safety] DB unavailable — using in-memory cache (${accounts.length} accounts)`);
+        }
+      }
+      for (const { accountId, userId, region } of accounts) {
         // Fire each account scan independently so a slow REST call for one
         // user can't hold up another user's SL.
-        void scanAccountForNakedPositions(token, accountId, userId ?? undefined, region);
+        void scanAccountForNakedPositions(token, accountId, userId, region);
       }
     } catch (err) {
       console.warn("[mt5-sl-safety] tick error:", (err as Error).message);

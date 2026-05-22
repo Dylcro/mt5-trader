@@ -12,10 +12,15 @@ if (!process.env.DATABASE_URL) {
 
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  // Keep TCP connections alive so the DB server doesn't silently drop them.
   keepAlive: true,
-  idleTimeoutMillis: 60_000,
-  connectionTimeoutMillis: 5_000,
-  max: 10,
+  keepAliveInitialDelayMillis: 10_000,
+  // Release idle connections after 30 s — well before the DB server's own
+  // idle-connection timeout fires and sends a "terminating connection" kill.
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 8_000,
+  // Small pool: the server is I/O bound, not query-heavy.
+  max: 5,
 });
 
 pool.on("error", (err) => {
