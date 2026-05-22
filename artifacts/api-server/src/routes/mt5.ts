@@ -741,7 +741,36 @@ function makeDealListener(accountId: string) {
                 const txt = await resp.text().catch(() => "");
                 throw new Error(`REST ${resp.status}: ${txt.slice(0, 200)}`);
               }
-              console.log(`[auto-sl] SL set ✓ posId=${evt.positionId} immediate=${immediateSl} target=${targetSl} zone=${zone.id} (${Date.now() - t0}ms) — Phase 2 will tighten`);
+              const elapsed = Date.now() - t0;
+              console.log(`[auto-sl] SL set ✓ posId=${evt.positionId} immediate=${immediateSl} zone=${zone.id} (${elapsed}ms) — tightening to ${targetSl} now`);
+              // Apply zone SL immediately now that the initial SL is confirmed at
+              // the broker. Doing it here (not via Phase 2) avoids the race where
+              // Phase 2 fires before the initial SL is acknowledged and then has
+              // to retry 30 s later. Only skip if already at target.
+              if (Math.abs(immediateSl - zone.slPrice) >= 0.02) {
+                const adjKey = `${evt.positionId}:${zone.id}`;
+                zoneAdjusted.add(adjKey); // block Phase 2 from double-firing
+                const t1 = Date.now();
+                try {
+                  const c2 = new AbortController();
+                  const t2 = setTimeout(() => c2.abort(), 10_000);
+                  const r2 = await fetch(
+                    `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
+                    {
+                      method: "POST",
+                      headers: authHeaders(token),
+                      body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: evt.positionId, stopLoss: zone.slPrice }),
+                      signal: c2.signal,
+                    },
+                  );
+                  clearTimeout(t2);
+                  if (!r2.ok) throw new Error(`REST ${r2.status}`);
+                  console.log(`[auto-sl] tightened ✓ posId=${evt.positionId} sl=${zone.slPrice} (${Date.now() - t1}ms)`);
+                } catch (tightenErr) {
+                  zoneAdjusted.delete(adjKey); // Phase 2 will retry
+                  console.warn(`[auto-sl] tighten failed posId=${evt.positionId}: ${(tightenErr as Error).message} — Phase 2 will retry`);
+                }
+              }
             } catch (err) {
               clearTimeout(timer);
               unmarkCascaded(accountId, evt.positionId);
