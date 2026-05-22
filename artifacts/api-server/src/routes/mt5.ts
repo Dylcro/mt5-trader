@@ -1144,27 +1144,52 @@ async function adjustZoneSls(token: string, accountId: string, region: string): 
   const sdkPositions: any[] = conn?.terminalState?.positions ?? [];
   if (!conn?.terminalState) return; // no live data — skip this tick
 
+  // Build a set of every positionId that currently belongs to an active zone.
+  // Any XAUUSD position NOT in this set is an orphan (its old zone died when
+  // a position inside it closed). Orphans are adopted by the active zone of
+  // the same direction so their SL moves with the new zone.
+  const positionsInAnyActiveZone = new Set<string>();
+  for (const z of zones) {
+    for (const id of z.positionIds) positionsInAnyActiveZone.add(id);
+  }
+
   for (const zone of zones) {
     for (const p of sdkPositions) {
       if ((p.symbol ?? "") !== "XAUUSD") continue;
       const posDir = p.type === "POSITION_TYPE_BUY" ? "buy" : p.type === "POSITION_TYPE_SELL" ? "sell" : null;
       if (posDir !== zone.direction) continue;
 
+      const posId = String(p.id ?? p.positionId ?? "");
+      if (!posId) continue;
+
       const entry = Number(p.openPrice ?? 0);
       if (entry <= 0) continue;
 
-      // Is this position's entry inside the zone?
-      const inZone = zone.direction === "buy"
+      // Determine if this position belongs to this zone.
+      // A position is "in zone" if:
+      //   (a) it's explicitly tracked in zone.positionIds (deal handler added it), OR
+      //   (b) its entry falls within the zone's price range, OR
+      //   (c) it's an orphan (not in any active zone) — adopt it so that
+      //       when the previous zone died and a new one started, surviving
+      //       positions from the dead zone get pulled into the new zone
+      //       and their SL moves with it.
+      const inPriceRange = zone.direction === "buy"
         ? entry >= zone.slPrice && entry <= zone.anchorEntry
         : entry <= zone.slPrice && entry >= zone.anchorEntry;
-      if (!inZone) continue;
+      const isOrphan = !positionsInAnyActiveZone.has(posId);
+      const belongsToZone = zone.positionIds.has(posId) || inPriceRange || isOrphan;
+      if (!belongsToZone) continue;
 
-      // Track it in the zone
-      const posId = String(p.id ?? p.positionId ?? "");
-      if (!posId) continue;
-      zone.positionIds.add(posId);
+      // Adopt into zone (idempotent)
+      if (isOrphan) {
+        zone.positionIds.add(posId);
+        positionsInAnyActiveZone.add(posId); // prevent double-adoption across zones
+        console.log(`[mt5-sl-zone] orphaned posId=${posId} (entry ${entry}) adopted into zone ${zone.id} → target SL ${zone.slPrice}`);
+      } else {
+        zone.positionIds.add(posId);
+      }
 
-      // Is the SL already at the zone level? (±0.01 tolerance for float rounding)
+      // Is the SL already at the zone level? (±0.02 tolerance for float rounding)
       const currentSl = Number(p.stopLoss ?? 0);
       if (currentSl > 0 && Math.abs(currentSl - zone.slPrice) < 0.02) continue;
       if (currentSl <= 0) continue; // naked — Phase 1 will handle this
