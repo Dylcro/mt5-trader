@@ -858,7 +858,7 @@ export function startConnectionWatchdog(): void {
 // through a recovery cycle — the deal stream is the fast path (sub-second),
 // the safety net is the guarantee (≤30 s).
 export function startAutoSlSafetyNet(): void {
-  const INTERVAL_MS = 10_000;
+  const INTERVAL_MS = 5_000;
   setInterval(async () => {
     try {
       const token = getToken();
@@ -890,7 +890,7 @@ export function startAutoSlSafetyNet(): void {
       console.warn("[mt5-sl-safety] tick error:", (err as Error).message);
     }
   }, INTERVAL_MS);
-  console.log("[mt5-sl-safety] auto-SL safety net started (10 s interval — REST-only SL path)");
+  console.log("[mt5-sl-safety] auto-SL safety net started (5 s interval — REST-only SL path)");
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
