@@ -634,13 +634,11 @@ function makeDealListener(accountId: string) {
       }
       else {
         // ── MT5-initiated trade ───────────────────────────────────────────
-        // Mark cascaded to prevent re-processing on duplicate deal events.
-        // Auto-SL is NOT applied here — it is handled exclusively by the
-        // REST safety-net poller (startAutoSlSafetyNet) which runs every 10s
-        // independently of the WebSocket. This removes all WebSocket
-        // reliability concerns from the SL path.
-        markCascaded(accountId, evt.positionId);
-        console.log(`[auto-cascade] MT5 trade posId=${evt.positionId} noted — SL will be applied by REST poller`);
+        // DO NOT call markCascaded here. The REST safety-net poller is the
+        // only thing that applies the SL — it marks the position as cascaded
+        // just before firing the POSITION_MODIFY call. If we mark it here,
+        // hasBeenCascaded() returns true and the safety net skips it forever.
+        console.log(`[auto-cascade] MT5 trade posId=${evt.positionId} — queued for REST safety-net SL`);
       }
     },
   };
@@ -906,7 +904,7 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
   // MetaAPI's REST /positions returns 504 frequently — without a timeout
   // a hanging request blocks the tick for 20+ seconds causing SL delays.
   let positions: MetaApiPosition[] | null = null;
-  const FETCH_TIMEOUT_MS = 4_000;
+  const FETCH_TIMEOUT_MS = 12_000;
   const FETCH_ATTEMPTS = 3;
   for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt++) {
     const controller = new AbortController();
