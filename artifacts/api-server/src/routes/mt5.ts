@@ -379,6 +379,15 @@ const mt5SlZones = new Map<string, SlZone[]>(); // accountId → zones (active +
 // Prevents Phase 2 from firing a REST call every 5 s once the correction
 // has been applied. Keyed as "positionId:zoneId".
 const zoneAdjusted = new Set<string>();
+
+// Server-side position cache — populated whenever the app successfully polls
+// GET /positions or the safety net fetches via REST. The safety net reads this
+// as a middle tier between terminalState and a fresh REST call, so positions
+// visible to the app are instantly visible to the safety net even when
+// terminalState is unavailable (stream not yet synced after restart).
+interface CachedPosition { id: string; symbol: string; type: string; openPrice: number; stopLoss?: number | null; volume?: number; }
+const positionCache = new Map<string, { positions: CachedPosition[]; ts: number }>();
+const POSITION_CACHE_TTL_MS = 15_000; // treat cache as stale after 15 s
 function mt5ZonesFor(accountId: string): SlZone[] {
   let arr = mt5SlZones.get(accountId);
   if (!arr) { arr = []; mt5SlZones.set(accountId, arr); }
@@ -1079,25 +1088,47 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
       volume:    Number(p.volume ?? 0),
     }));
   } else {
-    // FALLBACK: SDK not connected — attempt REST fetch with a tight timeout.
-    // This branch is rarely reached; it exists only for the window between
-    // reconnects when terminalState is unavailable.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3_000);
-    try {
-      const resp = await fetch(
-        `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
-        { headers: authHeaders(token), signal: controller.signal },
-      );
-      clearTimeout(timer);
-      if (resp.ok) {
-        positions = await resp.json() as MetaApiPosition[];
-      } else if (resp.status !== 404) {
-        console.warn(`[mt5-sl-safety] ${accountId} REST fallback ${resp.status}`);
+    // MIDDLE TIER: check the server-side position cache.
+    // This is populated whenever the app polls GET /positions (which has no
+    // timeout and goes through MetaAPI's full REST path). During stream outages
+    // the app polling is the most reliable position source we have — bridge
+    // that data into the safety net so opening the app instantly feeds it.
+    const cached = positionCache.get(accountId);
+    if (cached && (Date.now() - cached.ts) < POSITION_CACHE_TTL_MS) {
+      positions = cached.positions.map((p) => ({
+        id:        String(p.id ?? ""),
+        symbol:    String(p.symbol ?? ""),
+        type:      String(p.type ?? ""),
+        openPrice: Number(p.openPrice ?? 0),
+        stopLoss:  p.stopLoss != null ? Number(p.stopLoss) : null,
+        volume:    Number(p.volume ?? 0),
+      }));
+    } else {
+      // FALLBACK: attempt a direct REST fetch. MetaAPI's /positions endpoint is
+      // unreliable from Replit (frequent timeouts), so use a generous timeout
+      // and rely on concurrent ticks to retry — hasBeenCascaded prevents
+      // duplicate SL applications if multiple ticks succeed at once.
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8_000);
+      try {
+        const resp = await fetch(
+          `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
+          { headers: authHeaders(token), signal: controller.signal },
+        );
+        clearTimeout(timer);
+        if (resp.ok) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const fetched = await resp.json() as any[];
+          positions = fetched as MetaApiPosition[];
+          // Populate cache so subsequent ticks and the app both benefit
+          positionCache.set(accountId, { positions: fetched as CachedPosition[], ts: Date.now() });
+        } else if (resp.status !== 404) {
+          console.warn(`[mt5-sl-safety] ${accountId} REST fallback ${resp.status}`);
+        }
+      } catch (err) {
+        clearTimeout(timer);
+        // REST timed out — skip this tick; next tick will retry or use cache
       }
-    } catch (err) {
-      clearTimeout(timer);
-      // REST is down — skip this tick silently; next tick will retry
     }
   }
   if (!positions) return;
@@ -2211,12 +2242,20 @@ router.get("/mt5/account/:accountId/positions", checkOwner, async (req: Request,
   try {
     const token = getToken();
     const region = qstr(req.query.region) || DEFAULT_REGION;
+    const { accountId } = req.params as { accountId: string };
     const posRes = await fetch(
-      `${clientBase(region)}/users/current/accounts/${req.params.accountId}/positions`,
+      `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
       { headers: authHeaders(token) }
     );
     if (!posRes.ok) return res.status(posRes.status).json({ error: "Positions fetch failed" });
-    return res.json(await posRes.json());
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const body = await posRes.json() as any[];
+    // Populate the server-side cache so the safety net can use this data
+    // immediately — even when the streaming connection is not yet synced.
+    if (Array.isArray(body)) {
+      positionCache.set(accountId, { positions: body as CachedPosition[], ts: Date.now() });
+    }
+    return res.json(body);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
   }
@@ -2311,11 +2350,11 @@ const TRADE_ERROR_MESSAGES: Record<number, string> = {
 // Tries the SDK WebSocket path first (reuses existing stream connection → no new TCP/TLS to MetaAPI).
 // Falls back to REST if the connection is unavailable or the SDK call throws.
 router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, res: Response) => {
+  const accountId = String(req.params.accountId);
   try {
     const token = getToken();
     const region = qstr(req.query.region) || DEFAULT_REGION;
     const body = req.body as Record<string, unknown>;
-    const accountId = String(req.params.accountId);
     let code: number;
     let data: { numericCode?: number; message?: string; orderId?: string; positionId?: string };
     let httpStatus = 200;
