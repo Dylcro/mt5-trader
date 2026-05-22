@@ -1011,6 +1011,52 @@ export function startConnectionWatchdog(): void {
   console.log("[watchdog] connection watchdog started (30 s interval)");
 }
 
+// ── Proactive position poller ─────────────────────────────────────────────────
+// Every 10 s, fetch positions from MetaAPI REST for every known account and
+// keep positionCache warm. This makes the safety net's middle-tier cache work
+// even when the app is closed — the server "pokes itself awake" rather than
+// waiting for the app to poll. Uses a per-account in-flight guard so a slow
+// MetaAPI response doesn't stack up concurrent fetches for the same account.
+const positionPollInFlight = new Set<string>(); // accountIds currently being fetched
+
+export function startPositionPoller(): void {
+  const INTERVAL_MS = 10_000;
+  setInterval(async () => {
+    const token = getToken();
+    const accounts = Array.from(knownAccounts.values());
+    for (const { accountId, region } of accounts) {
+      if (positionPollInFlight.has(accountId)) continue; // previous fetch still running
+      positionPollInFlight.add(accountId);
+      // Fire-and-forget per account; errors are swallowed so one bad account
+      // doesn't block the others.
+      void (async () => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 9_000);
+        try {
+          const resp = await fetch(
+            `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
+            { headers: authHeaders(token), signal: controller.signal },
+          );
+          clearTimeout(timer);
+          if (resp.ok) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const body = await resp.json() as any[];
+            if (Array.isArray(body)) {
+              positionCache.set(accountId, { positions: body as CachedPosition[], ts: Date.now() });
+            }
+          }
+        } catch {
+          clearTimeout(timer);
+          // Timeout or network error — skip; next tick will retry
+        } finally {
+          positionPollInFlight.delete(accountId);
+        }
+      })();
+    }
+  }, INTERVAL_MS);
+  console.log("[position-poller] started (10 s interval)");
+}
+
 // ── Auto-SL safety net ───────────────────────────────────────────────────────
 // Runs every 30 s, completely independent of the streaming deal feed. For each
 // connected account it fetches open positions via REST and applies the user's
