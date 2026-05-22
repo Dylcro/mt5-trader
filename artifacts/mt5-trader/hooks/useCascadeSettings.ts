@@ -20,11 +20,6 @@ export interface CascadeSettings {
   takeProfitEnabled: boolean;
   takeProfitPips: number;
   autoCascadeEnabled: boolean;
-  // MT5 auto-SL — applied when a buy/sell is placed directly in MT5 (not the app).
-  // Replaces the old auto-cascade-MT5 feature.
-  mt5SlEnabled: boolean;
-  mt5SlNumPositions: number; // 1-6
-  mt5SlPips: number;          // 10-200 ($ from entry — 1 pip = $1 on XAUUSD)
 }
 
 const DEFAULTS: CascadeSettings = {
@@ -34,18 +29,11 @@ const DEFAULTS: CascadeSettings = {
   takeProfitEnabled: false,
   takeProfitPips: 30,
   autoCascadeEnabled: false,
-  mt5SlEnabled: false,
-  mt5SlNumPositions: 3,
-  mt5SlPips: 50,
 };
 
 const VALID_PIPS_BETWEEN = [5, 10, 15, 20];
 
-// autoCascadeEnabled is a device-level toggle — stored under a fixed global key
-// so it is never reset when the accountId changes on first connect.
 const GLOBAL_AUTO_CASCADE_KEY = "cascade_auto_enabled_global";
-// MT5 auto-SL toggle — also device-global for the same reason.
-const GLOBAL_MT5_SL_ENABLED_KEY = "mt5_sl_enabled_global";
 
 function storageKeys(accountId: string) {
   const prefix = accountId ? `cascade_${accountId}_` : "cascade_";
@@ -55,8 +43,6 @@ function storageKeys(accountId: string) {
     slPips:            `${prefix}sl_pips`,
     takeProfitEnabled: `${prefix}tp_enabled`,
     takeProfitPips:    `${prefix}tp_pips`,
-    mt5SlNumPositions: `${prefix}mt5_sl_num_positions`,
-    mt5SlPips:         `${prefix}mt5_sl_pips`,
   };
 }
 
@@ -82,9 +68,6 @@ async function pushToServer(s: CascadeSettings, accountId: string): Promise<void
         numPositions: s.numPositions,
         pipsBetween: s.pipsBetween,
         slPips: s.slPips,
-        mt5SlEnabled: s.mt5SlEnabled,
-        mt5SlNumPositions: s.mt5SlNumPositions,
-        mt5SlPips: s.mt5SlPips,
       }),
     });
   } catch {
@@ -101,17 +84,14 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
     const load = async () => {
       try {
         const keys = storageKeys(accountId);
-        // Fetch per-account keys + global autoCascadeEnabled in one call
-        const allKeys = [...Object.values(keys), GLOBAL_AUTO_CASCADE_KEY, GLOBAL_MT5_SL_ENABLED_KEY];
+        const allKeys = [...Object.values(keys), GLOBAL_AUTO_CASCADE_KEY];
         const pairs = await AsyncStorage.multiGet(allKeys);
-        const [num, between, sl, tpEnabled, tpPips, mt5SlN, mt5SlP, globalAutoEnabled, globalMt5SlEnabled] = pairs.map((p) => p[1]);
+        const [num, between, sl, tpEnabled, tpPips, globalAutoEnabled] = pairs.map((p) => p[1]);
 
-        // Resolve autoCascadeEnabled: prefer global key, fall back to legacy per-account key
         let autoCascadeEnabled = DEFAULTS.autoCascadeEnabled;
         if (globalAutoEnabled !== null) {
           autoCascadeEnabled = globalAutoEnabled === "true";
         } else {
-          // Migration: read old per-account key once, then write to global key
           const legacyKey = accountId ? `cascade_${accountId}_auto_enabled` : "cascade_auto_enabled";
           const [[, legacy]] = await AsyncStorage.multiGet([legacyKey]);
           autoCascadeEnabled = legacy === "true";
@@ -123,15 +103,11 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         const storedPips = between ? parseFloat(between) : DEFAULTS.pipsBetween;
         const local: CascadeSettings = {
           numPositions: num ? parseFloat(num) : DEFAULTS.numPositions,
-          // Migrate: if stored value is not one of the valid pill options (e.g. old default of 50), reset to 10
           pipsBetween: VALID_PIPS_BETWEEN.includes(storedPips) ? storedPips : DEFAULTS.pipsBetween,
           slPips: sl ? parseFloat(sl) : DEFAULTS.slPips,
           takeProfitEnabled: tpEnabled === "true",
           takeProfitPips: tpPips ? parseFloat(tpPips) : DEFAULTS.takeProfitPips,
           autoCascadeEnabled,
-          mt5SlEnabled: globalMt5SlEnabled === "true",
-          mt5SlNumPositions: mt5SlN ? parseFloat(mt5SlN) : DEFAULTS.mt5SlNumPositions,
-          mt5SlPips: mt5SlP ? parseFloat(mt5SlP) : DEFAULTS.mt5SlPips,
         };
         setSettings(local);
         void pushToServer(local, accountId);
@@ -153,18 +129,12 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         [keys.slPips, String(next.slPips)],
         [keys.takeProfitEnabled, String(next.takeProfitEnabled)],
         [keys.takeProfitPips, String(next.takeProfitPips)],
-        [keys.mt5SlNumPositions, String(next.mt5SlNumPositions)],
-        [keys.mt5SlPips, String(next.mt5SlPips)],
-        // device-global toggles
         [GLOBAL_AUTO_CASCADE_KEY, String(next.autoCascadeEnabled)],
-        [GLOBAL_MT5_SL_ENABLED_KEY, String(next.mt5SlEnabled)],
       ]);
       return next;
     });
   }, [accountId]);
 
-  // Explicit save to server — returns true on success, false on failure.
-  // Called by the Save Settings button so the user gets clear feedback.
   const saveToServer = useCallback(async (): Promise<boolean> => {
     if (!API_BASE) return false;
     const url = accountId
@@ -179,9 +149,6 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
           numPositions: settings.numPositions,
           pipsBetween: settings.pipsBetween,
           slPips: settings.slPips,
-          mt5SlEnabled: settings.mt5SlEnabled,
-          mt5SlNumPositions: settings.mt5SlNumPositions,
-          mt5SlPips: settings.mt5SlPips,
         }),
       });
       return res.ok;

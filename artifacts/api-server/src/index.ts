@@ -1,6 +1,6 @@
 import app from "./app";
 import { pool } from "@workspace/db";
-import { loadCascadeConfig, startAutoConnect, startConnectionWatchdog, startAutoSlSafetyNet, startPositionPoller } from "./routes/mt5";
+import { loadCascadeConfig, startAutoConnect, startConnectionWatchdog } from "./routes/mt5";
 
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err);
@@ -76,16 +76,6 @@ async function main() {
   // Watchdog: every 30 s, reconnect any account whose stream has dropped.
   startConnectionWatchdog();
 
-  // Safety net: every 30 s, scan open positions via REST and apply SL to any
-  // XAUUSD position that's still naked. Independent of the streaming feed, so
-  // auto-SL keeps working even when MetaAPI sync is slow, stuck, or recovering.
-  startAutoSlSafetyNet();
-
-  // Position poller: every 10 s, proactively fetch positions from MetaAPI REST
-  // for every known account and keep the position cache warm. This means the
-  // safety net always has fresh data regardless of whether the app is open,
-  // removing the "opening the app triggers SL" timing effect entirely.
-  startPositionPoller();
 }
 
 main().catch((err) => {
