@@ -371,6 +371,10 @@ interface SlZone {
   createdAt: number;
 }
 const mt5SlZones = new Map<string, SlZone[]>(); // accountId → zones (active + recent)
+// Tracks positions that have already had their SL moved to the zone level.
+// Prevents Phase 2 from firing a REST call every 5 s once the correction
+// has been applied. Keyed as "positionId:zoneId".
+const zoneAdjusted = new Set<string>();
 function mt5ZonesFor(accountId: string): SlZone[] {
   let arr = mt5SlZones.get(accountId);
   if (!arr) { arr = []; mt5SlZones.set(accountId, arr); }
@@ -646,40 +650,18 @@ function makeDealListener(accountId: string) {
             const region = activeRegions.get(accountId) ?? DEFAULT_REGION;
             const slDistance = cfg.mt5SlPips * MT5_SL_PIP;
             const isBuy = evt.type === "DEAL_TYPE_BUY";
-            const direction: "buy" | "sell" = isBuy ? "buy" : "sell";
 
-            // Zone logic: if this trade falls inside an existing active zone,
-            // use that zone's SL price (e.g. 5550) instead of the raw pip
-            // distance from this entry (e.g. 5549). This anchors all positions
-            // in the zone to the same SL level. If no active zone exists,
-            // create a new one anchored at this entry price.
-            let zone = findActiveZone(accountId, direction, evt.openPrice);
-            let slPrice: number;
-            if (zone) {
-              zone.positionIds.add(evt.positionId);
-              slPrice = zone.slPrice;
-              console.log(`[auto-sl] posId=${evt.positionId} joins zone ${zone.id} → SL=${slPrice} (anchor ${zone.anchorEntry})`);
-            } else {
-              slPrice = isBuy
-                ? Math.round((evt.openPrice - slDistance) * 100) / 100
-                : Math.round((evt.openPrice + slDistance) * 100) / 100;
-              zone = {
-                id: `z${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
-                direction,
-                anchorEntry: evt.openPrice,
-                slPrice,
-                positionIds: new Set([evt.positionId]),
-                active: true,
-                createdAt: Date.now(),
-              };
-              mt5ZonesFor(accountId).push(zone);
-              pruneZones(accountId);
-              console.log(`[auto-sl] new zone ${zone.id} created — anchor=${evt.openPrice} SL=${slPrice} (${cfg.mt5SlPips} pips)`);
-            }
-            const zoneRef = zone;
+            // Phase 1: always apply the flat pip-distance SL immediately.
+            // This guarantees protection within seconds regardless of zone state.
+            // The safety net's zone-correction pass (Phase 2) will then adjust
+            // to the zone SL level within the next 5 s tick if needed.
+            const slPrice = isBuy
+              ? Math.round((evt.openPrice - slDistance) * 100) / 100
+              : Math.round((evt.openPrice + slDistance) * 100) / 100;
 
             // Optimistic mark before REST call — prevents safety-net duplication.
             markCascaded(accountId, evt.positionId);
+            console.log(`[auto-sl] applying flat SL ${slPrice} to posId=${evt.positionId} (${isBuy ? "BUY" : "SELL"} @ ${evt.openPrice}, ${cfg.mt5SlPips} pips)`);
 
             const t0 = Date.now();
             const ctrl = new AbortController();
@@ -699,12 +681,10 @@ function makeDealListener(accountId: string) {
                 const txt = await resp.text().catch(() => "");
                 throw new Error(`REST ${resp.status}: ${txt.slice(0, 200)}`);
               }
-              console.log(`[auto-sl] SL set ✓ posId=${evt.positionId} sl=${slPrice} zone=${zoneRef.id} (${Date.now() - t0}ms)`);
+              console.log(`[auto-sl] SL set ✓ posId=${evt.positionId} sl=${slPrice} (${Date.now() - t0}ms) — zone correction will follow if applicable`);
             } catch (err) {
               clearTimeout(timer);
               unmarkCascaded(accountId, evt.positionId);
-              zoneRef.positionIds.delete(evt.positionId);
-              if (zoneRef.positionIds.size === 0) zoneRef.active = false;
               console.warn(`[auto-sl] SL failed posId=${evt.positionId}: ${(err as Error).message} — safety-net will retry`);
             }
           } catch (err) {
@@ -958,6 +938,10 @@ export function startAutoSlSafetyNet(): void {
         // Fire each account scan independently so a slow REST call for one
         // user can't hold up another user's SL.
         void scanAccountForNakedPositions(token, accountId, userId, region);
+        // Phase 2: zone correction — runs after initial SL is set.
+        // Adjusts any position whose SL was placed at the flat pip distance
+        // but belongs to an active zone (should be at the zone anchor SL).
+        void adjustZoneSls(token, accountId, region);
       }
     } catch (err) {
       console.warn("[mt5-sl-safety] tick error:", (err as Error).message);
@@ -1091,6 +1075,79 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
       unmarkCascaded(accountId, pos.id);
       zoneRef.positionIds.delete(pos.id);
       if (zoneRef.positionIds.size === 0) zoneRef.active = false;
+    }
+  }
+}
+
+// ── Phase 2: zone SL correction ──────────────────────────────────────────────
+// Runs every 5 s alongside the naked-position scan. For each active zone,
+// finds all open XAUUSD positions whose entry price falls within the zone range
+// and whose SL is not yet at the zone anchor level. Adjusts those positions
+// to the zone SL. This decouples "position is protected" (flat SL, instant)
+// from "SL is at the correct zone level" (correction, within 5 s).
+async function adjustZoneSls(token: string, accountId: string, region: string): Promise<void> {
+  const zones = mt5ZonesFor(accountId).filter(z => z.active);
+  if (zones.length === 0) return;
+
+  const conn = activeConnections.get(accountId);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const sdkPositions: any[] = conn?.terminalState?.positions ?? [];
+  if (!conn?.terminalState) return; // no live data — skip this tick
+
+  for (const zone of zones) {
+    for (const p of sdkPositions) {
+      if ((p.symbol ?? "") !== "XAUUSD") continue;
+      const posDir = p.type === "POSITION_TYPE_BUY" ? "buy" : p.type === "POSITION_TYPE_SELL" ? "sell" : null;
+      if (posDir !== zone.direction) continue;
+
+      const entry = Number(p.openPrice ?? 0);
+      if (entry <= 0) continue;
+
+      // Is this position's entry inside the zone?
+      const inZone = zone.direction === "buy"
+        ? entry >= zone.slPrice && entry <= zone.anchorEntry
+        : entry <= zone.slPrice && entry >= zone.anchorEntry;
+      if (!inZone) continue;
+
+      // Track it in the zone
+      const posId = String(p.id ?? p.positionId ?? "");
+      if (!posId) continue;
+      zone.positionIds.add(posId);
+
+      // Is the SL already at the zone level? (±0.01 tolerance for float rounding)
+      const currentSl = Number(p.stopLoss ?? 0);
+      if (currentSl > 0 && Math.abs(currentSl - zone.slPrice) < 0.02) continue;
+      if (currentSl <= 0) continue; // naked — Phase 1 will handle this
+
+      // Already sent a correction for this position+zone combo?
+      const adjKey = `${posId}:${zone.id}`;
+      if (zoneAdjusted.has(adjKey)) continue;
+      zoneAdjusted.add(adjKey);
+
+      console.log(`[mt5-sl-zone] correcting posId=${posId} SL ${currentSl} → ${zone.slPrice} (zone ${zone.id}, entry ${entry})`);
+      const t0 = Date.now();
+      try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 8_000);
+        const resp = await fetch(
+          `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
+          {
+            method: "POST",
+            headers: authHeaders(token),
+            body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: posId, stopLoss: zone.slPrice }),
+            signal: ctrl.signal,
+          },
+        );
+        clearTimeout(timer);
+        if (!resp.ok) {
+          const txt = await resp.text().catch(() => "");
+          throw new Error(`REST ${resp.status}: ${txt.slice(0, 100)}`);
+        }
+        console.log(`[mt5-sl-zone] ✓ SL moved to ${zone.slPrice} for posId=${posId} (${Date.now() - t0}ms)`);
+      } catch (err) {
+        zoneAdjusted.delete(adjKey); // allow retry on next tick
+        console.warn(`[mt5-sl-zone] correction failed posId=${posId}: ${(err as Error).message}`);
+      }
     }
   }
 }
