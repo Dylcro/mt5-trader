@@ -864,10 +864,15 @@ async function startStreaming(token: string, accountId: string, region: string =
     activeStreams.delete(accountId); // allow retry on next poll
     activeConnections.delete(accountId);
     const msg = (err as Error).message ?? "";
-    // MetaAPI auto-undeploys accounts during inactivity. Detect the error and
-    // re-deploy automatically so the stream resumes without user intervention.
-    if (msg.includes("no accounts deployed") || msg.includes("deploy an account first")) {
-      console.warn(`[stream ${accountId}] account undeployed — triggering re-deploy...`);
+    // MetaAPI auto-undeploys accounts during inactivity, or the broker
+    // connection drops and subscribe times out. Detect both and re-deploy
+    // so the stream resumes without manual intervention.
+    const needsRedeploy = msg.includes("no accounts deployed")
+      || msg.includes("deploy an account first")
+      || msg.includes("not connected to broker")
+      || (msg.includes("subscribe timed out") && msg.includes("connected to broker"));
+    if (needsRedeploy) {
+      console.warn(`[stream ${accountId}] broker not connected — triggering re-deploy...`);
       try {
         await deployAccount(token, accountId);
         console.log(`[stream ${accountId}] re-deploy requested — watchdog will retry stream in 30 s`);
@@ -997,37 +1002,25 @@ async function scanAccountForNakedPositions(token: string, accountId: string, us
   const cfg = getCascadeConfig(accountId, userId);
   if (!cfg.mt5SlEnabled) return; // user doesn't want auto-SL — leave naked positions alone
 
-  // Fetch open positions with retries and a hard per-attempt timeout.
-  // MetaAPI's REST /positions returns 504 frequently — without a timeout
-  // a hanging request blocks the tick for 20+ seconds causing SL delays.
+  // Fetch open positions — no abort timeout. MetaAPI's /positions endpoint
+  // requires the account to be broker-connected; when reconnecting it can
+  // legitimately take 20-40s. Aborting at 12s was killing every request.
+  // Each tick runs per-account in its own void call so a slow fetch for
+  // one account never blocks another account's scan.
   let positions: MetaApiPosition[] | null = null;
-  const FETCH_TIMEOUT_MS = 12_000;
-  const FETCH_ATTEMPTS = 3;
-  for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const resp = await fetch(
-        `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
-        { headers: authHeaders(token), signal: controller.signal },
-      );
-      clearTimeout(timer);
-      if (resp.ok) {
-        positions = await resp.json() as MetaApiPosition[];
-        break;
-      }
-      if (resp.status === 404) { clearTimeout(timer); return; } // not deployed yet — skip silently
-      if (attempt === FETCH_ATTEMPTS) {
-        console.warn(`[mt5-sl-safety] ${accountId} positions fetch ${resp.status} (attempt ${attempt}/${FETCH_ATTEMPTS})`);
-      }
-    } catch (err) {
-      clearTimeout(timer);
-      const msg = (err as Error).message ?? "";
-      if (attempt === FETCH_ATTEMPTS) {
-        console.warn(`[mt5-sl-safety] ${accountId} positions fetch failed: ${msg}`);
-      }
+  try {
+    const resp = await fetch(
+      `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
+      { headers: authHeaders(token) },
+    );
+    if (!resp.ok) {
+      if (resp.status !== 404) console.warn(`[mt5-sl-safety] ${accountId} positions fetch ${resp.status}`);
+      return;
     }
-    if (attempt < FETCH_ATTEMPTS) await new Promise(r => setTimeout(r, 500));
+    positions = await resp.json() as MetaApiPosition[];
+  } catch (err) {
+    console.warn(`[mt5-sl-safety] ${accountId} positions fetch failed: ${(err as Error).message}`);
+    return;
   }
   if (!positions) return;
 
