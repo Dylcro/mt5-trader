@@ -387,7 +387,7 @@ const zoneAdjusted = new Set<string>();
 // terminalState is unavailable (stream not yet synced after restart).
 interface CachedPosition { id: string; symbol: string; type: string; openPrice: number; stopLoss?: number | null; volume?: number; }
 const positionCache = new Map<string, { positions: CachedPosition[]; ts: number }>();
-const POSITION_CACHE_TTL_MS = 15_000; // treat cache as stale after 15 s
+const POSITION_CACHE_TTL_MS = 60_000; // treat cache as stale after 60 s
 
 // Fast-retry queue for POSITION_MODIFY.
 // When the safety net finds a naked position but POSITION_MODIFY times out,
@@ -1050,14 +1050,16 @@ export function startPositionPoller(): void {
       // Fire-and-forget per account; errors are swallowed so one bad account
       // doesn't block the others.
       void (async () => {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 9_000);
+        // No timeout — positionPollInFlight prevents concurrent pileup.
+        // Without a timeout the fetch waits as long as MetaAPI needs (even 20-30s
+        // during slow periods), which is exactly how the app's GET /positions
+        // works. A 9s abort was causing the cache to stay empty whenever MetaAPI
+        // was slow, making the safety net blind to trades placed directly in MT5.
         try {
           const resp = await fetch(
             `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
-            { headers: authHeaders(token), signal: controller.signal },
+            { headers: authHeaders(token) },
           );
-          clearTimeout(timer);
           if (resp.ok) {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const body = await resp.json() as any[];
@@ -1070,7 +1072,6 @@ export function startPositionPoller(): void {
             console.warn(`[position-poller] ${accountId.slice(0,8)} — HTTP ${resp.status}`);
           }
         } catch (err) {
-          clearTimeout(timer);
           const msg = (err as Error).message ?? "unknown";
           console.warn(`[position-poller] ${accountId.slice(0,8)} — failed: ${msg}`);
         } finally {
