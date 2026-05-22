@@ -574,6 +574,48 @@ function makeDealListener(accountId: string) {
         console.log(`[mt5-sl] zone ${z.id} invalidated by close of posId=${positionId} (${z.positionIds.size} position(s) in zone)`);
       }
     },
+    // Fires for every currently-open position when the stream re-syncs,
+    // AND immediately when a new position opens during normal operation.
+    // This is the critical complement to onDealAdded: deals are one-time
+    // historical events (skipped as stale on reconnect), but positions are
+    // current state — if a position is naked NOW it needs SL NOW regardless
+    // of when it was opened or whether the stream was up at that moment.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    async onPositionAdded(_instanceIndex: string, position: any): Promise<void> {
+      if (!position) return;
+      if (position.symbol !== "XAUUSD") return;
+      if (position.type !== "POSITION_TYPE_BUY" && position.type !== "POSITION_TYPE_SELL") return;
+      if (position.stopLoss && Number(position.stopLoss) > 0) return; // already protected
+      const posId = String(position.id ?? position.positionId ?? "");
+      if (!posId) return;
+      if (hasBeenCascaded(accountId, posId)) return; // already being handled
+      const cfg = getCascadeConfig(accountId);
+      if (!cfg.mt5SlEnabled) return;
+      const openPrice = Number(position.openPrice ?? 0);
+      if (openPrice <= 0) return;
+      const isBuy = position.type === "POSITION_TYPE_BUY";
+      const initialSlDistance = MT5_INITIAL_SL_PIPS * MT5_SL_PIP;
+      const immediateSl = isBuy
+        ? parseFloat((openPrice - initialSlDistance).toFixed(2))
+        : parseFloat((openPrice + initialSlDistance).toFixed(2));
+      markCascaded(accountId, posId);
+      const { region } = knownAccounts.get(accountId) ?? { region: DEFAULT_REGION };
+      let token: string;
+      try { token = getToken(); } catch { unmarkCascaded(accountId, posId); return; }
+      console.log(`[onPositionAdded] naked XAUUSD posId=${posId} price=${openPrice} — applying immediate SL ${immediateSl}`);
+      try {
+        await applySafetyNetSl(token, accountId, region, posId, immediateSl);
+        console.log(`[onPositionAdded] SL applied ${immediateSl} posId=${posId} acct=${accountId.slice(0,8)}`);
+      } catch (err) {
+        console.warn(`[onPositionAdded] SL failed posId=${posId}: ${(err as Error).message} — queuing fast-retry`);
+        getPendingRetries(accountId).set(posId, {
+          sl: immediateSl,
+          zoneRef: { id: `pos-${posId}`, active: true, positionIds: new Set([posId]), slPrice: immediateSl, entryPrice: openPrice, direction: isBuy ? "buy" : "sell" },
+          failCount: 1,
+          firstFailedAt: Date.now(),
+        });
+      }
+    },
     // onDealsSynchronized fires after all historical deals have been replayed.
     // Any onDealAdded call AFTER this point is a live event — safe to cascade.
     async onDealsSynchronized(_instanceIndex: string, _synchronizationId: string): Promise<void> {
