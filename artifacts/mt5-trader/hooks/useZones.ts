@@ -19,6 +19,11 @@ export interface Zone {
   closedAt?: number | null;
   finalTpReached?: 0 | 1 | 2 | 3;
   positionCount: number;
+  currentPrice?: number | null;
+  nextTp?: 0 | 1 | 2 | 3;
+  nextTpPrice?: number | null;
+  pipsToNextTp?: number | null;
+  progressPct?: number | null;
 }
 
 async function authFetch(url: string, options: RequestInit = {}): Promise<Response> {

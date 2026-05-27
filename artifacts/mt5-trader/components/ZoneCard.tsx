@@ -117,6 +117,40 @@ export default function ZoneCard({ zone, onRiskFree, historical = false }: ZoneC
         </View>
       </View>
 
+      {!historical && zone.status !== "CLOSED" && zone.nextTp && zone.nextTp > 0 && (
+        <View style={styles.progressBlock}>
+          <View style={styles.progressHeader}>
+            <Text style={styles.progressLabel} numberOfLines={1}>
+              {typeof zone.currentPrice === "number" ? formatPrice(zone.currentPrice) : "—"}
+              <Text style={styles.progressLabelMuted}>{"  \u2192  TP" + zone.nextTp}</Text>
+              {typeof zone.nextTpPrice === "number" ? (
+                <Text style={styles.progressLabelMuted}>{"  " + formatPrice(zone.nextTpPrice)}</Text>
+              ) : null}
+            </Text>
+            <Text
+              style={[
+                styles.progressDistance,
+                typeof zone.pipsToNextTp === "number" && zone.pipsToNextTp <= 0 && { color: C.buy },
+              ]}
+            >
+              {typeof zone.pipsToNextTp === "number"
+                ? zone.pipsToNextTp <= 0
+                  ? "ready"
+                  : `${zone.pipsToNextTp.toFixed(1)}p away`
+                : "—"}
+            </Text>
+          </View>
+          <View style={styles.progressTrack}>
+            <View
+              style={[
+                styles.progressFill,
+                { width: `${typeof zone.progressPct === "number" ? zone.progressPct : 0}%` },
+              ]}
+            />
+          </View>
+        </View>
+      )}
+
       {historical && (
         <View style={styles.histRow}>
           <View style={styles.histItem}>
@@ -259,6 +293,42 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_600SemiBold",
     color: C.textSecondary,
     letterSpacing: 0.3,
+  },
+  progressBlock: {
+    gap: 6,
+  },
+  progressHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  progressLabel: {
+    fontSize: 12,
+    fontFamily: "Inter_600SemiBold",
+    color: C.text,
+    flexShrink: 1,
+  },
+  progressLabelMuted: {
+    fontSize: 11,
+    fontFamily: "Inter_500Medium",
+    color: C.textSecondary,
+  },
+  progressDistance: {
+    fontSize: 11,
+    fontFamily: "Inter_700Bold",
+    color: C.textSecondary,
+    letterSpacing: 0.3,
+  },
+  progressTrack: {
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: C.border,
+    overflow: "hidden",
+  },
+  progressFill: {
+    height: "100%",
+    backgroundColor: C.gold,
   },
   histRow: {
     flexDirection: "row",

@@ -1560,23 +1560,66 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
     const includeClosed = qstr(req.query.includeClosed) === "true";
     const zones = await db.select().from(cascadeZonesTable)
       .where(eq(cascadeZonesTable.accountId, accountId));
+    // Reuse the cached tick from the existing /price poll — no extra backend load.
+    const price = latestPrice(accountId);
     const out = [];
     for (const z of zones) {
       if (!includeClosed && z.status === "CLOSED") continue;
       const openPositions = await db.select().from(zonePositionsTable)
         .where(and(eq(zonePositionsTable.zoneId, z.zoneId), eq(zonePositionsTable.status, "OPEN")));
       const finalTpReached = z.tp3Hit ? 3 : z.tp2Hit ? 2 : z.tp1Hit ? 1 : 0;
+
+      const dir = z.direction === "sell" ? "sell" : "buy";
+      const anchor = Number(z.anchorPrice);
+      const tp1Pips = Number(z.tp1Pips);
+      const tp2Pips = Number(z.tp2Pips);
+      const tp3Pips = Number(z.tp3Pips);
+
+      let nextTp: 0 | 1 | 2 | 3 = 0;
+      if (!z.tp1Hit) nextTp = 1;
+      else if (!z.tp2Hit) nextTp = 2;
+      else if (!z.tp3Hit) nextTp = 3;
+
+      let currentPrice: number | null = null;
+      let nextTpPrice: number | null = null;
+      let pipsToNextTp: number | null = null;
+      let progressPct: number | null = null;
+
+      if (price && anchor > 0 && z.status !== "CLOSED" && nextTp > 0) {
+        // Match evaluateZone semantics: BUY closes on bid, SELL on ask.
+        const cmp = dir === "buy" ? price.bid : price.ask;
+        currentPrice = cmp;
+        const nextPips = nextTp === 1 ? tp1Pips : nextTp === 2 ? tp2Pips : tp3Pips;
+        const prevPips = nextTp === 1 ? 0 : nextTp === 2 ? tp1Pips : tp2Pips;
+        const sign = dir === "buy" ? 1 : -1;
+        const nextPx = anchor + sign * nextPips * PIP;
+        const prevPx = anchor + sign * prevPips * PIP;
+        nextTpPrice = parseFloat(nextPx.toFixed(2));
+        const remaining = (nextPx - cmp) / PIP * sign;
+        pipsToNextTp = Math.round(remaining * 10) / 10;
+        const span = (nextPx - prevPx) * sign;
+        if (span > 0) {
+          const travelled = (cmp - prevPx) * sign;
+          progressPct = Math.max(0, Math.min(100, (travelled / span) * 100));
+        }
+      }
+
       out.push({
         zoneId: z.zoneId,
         direction: z.direction,
-        anchorPrice: Number(z.anchorPrice),
-        tp1Pips: Number(z.tp1Pips), tp2Pips: Number(z.tp2Pips), tp3Pips: Number(z.tp3Pips),
+        anchorPrice: anchor,
+        tp1Pips, tp2Pips, tp3Pips,
         tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit,
         status: z.status,
         createdAt: Number(z.createdAt),
         closedAt: z.closedAt != null ? Number(z.closedAt) : null,
         finalTpReached,
         positionCount: openPositions.length,
+        currentPrice,
+        nextTp,
+        nextTpPrice,
+        pipsToNextTp,
+        progressPct,
       });
     }
     res.json(out);
