@@ -1116,16 +1116,26 @@ function newZoneId(): string {
 // Sync prep — reserve a zoneId + pending association so cascade limits
 // submitted *immediately* after the market order can attach without waiting
 // for the anchor lookup / DB inserts. Returns the prepared zone state.
+//
+// `overrides` lets the caller supply per-trade TP1/2/3 distances. When any
+// override is missing/invalid the corresponding cascade-config value (and
+// finally the hardcoded default) is used instead. Strict ordering
+// (tp1 < tp2 < tp3) is enforced by the caller before reaching this function.
 function prepareZoneForCascade(
   accountId: string, direction: "buy" | "sell", userId?: string,
+  overrides?: { tp1Pips?: number; tp2Pips?: number; tp3Pips?: number },
 ): ZoneState {
   const zoneId = newZoneId();
   const cfg = getCascadeConfig(accountId, userId);
+  const pickTp = (override: number | undefined, fromCfg: number, fallback: number): number => {
+    if (typeof override === "number" && override > 0) return override;
+    return fromCfg > 0 ? fromCfg : fallback;
+  };
   const state: ZoneState = {
     zoneId, accountId, direction, anchorPrice: 0,
-    tp1Pips: cfg.tp1Pips > 0 ? cfg.tp1Pips : ZONE_TP1_PIPS_DEFAULT,
-    tp2Pips: cfg.tp2Pips > 0 ? cfg.tp2Pips : ZONE_TP2_PIPS_DEFAULT,
-    tp3Pips: cfg.tp3Pips > 0 ? cfg.tp3Pips : ZONE_TP3_PIPS_DEFAULT,
+    tp1Pips: pickTp(overrides?.tp1Pips, cfg.tp1Pips, ZONE_TP1_PIPS_DEFAULT),
+    tp2Pips: pickTp(overrides?.tp2Pips, cfg.tp2Pips, ZONE_TP2_PIPS_DEFAULT),
+    tp3Pips: pickTp(overrides?.tp3Pips, cfg.tp3Pips, ZONE_TP3_PIPS_DEFAULT),
     tp1Hit: false, tp2Hit: false, tp3Hit: false,
     status: "OPEN", busy: false,
   };
@@ -2499,10 +2509,39 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
             const positionId = data.positionId;
             const volume = Number((req.body as Record<string, unknown>).volume ?? 0) || 0;
             const uId = (req as Record<string, unknown>)["userId"] as string | undefined;
+            // Per-trade TP overrides: caller may supply tp1Pips/tp2Pips/tp3Pips on
+            // the trade body to override the global cascade config for this zone
+            // only. Any field omitted falls back to the user/account cascade config.
+            // Strict ordering (tp1 < tp2 < tp3) is enforced; an invalid override
+            // set is logged and ignored entirely (cascade config is used instead).
+            const rawBody = req.body as Record<string, unknown>;
+            const pickOverride = (v: unknown): number | undefined =>
+              typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
+            const overridesIn = {
+              tp1Pips: pickOverride(rawBody.tp1Pips),
+              tp2Pips: pickOverride(rawBody.tp2Pips),
+              tp3Pips: pickOverride(rawBody.tp3Pips),
+            };
+            const anyOverride = overridesIn.tp1Pips != null || overridesIn.tp2Pips != null || overridesIn.tp3Pips != null;
+            let overrides: typeof overridesIn | undefined = overridesIn;
+            if (anyOverride) {
+              const baseCfg = getCascadeConfig(accountId, uId);
+              const t1 = overridesIn.tp1Pips ?? baseCfg.tp1Pips;
+              const t2 = overridesIn.tp2Pips ?? baseCfg.tp2Pips;
+              const t3 = overridesIn.tp3Pips ?? baseCfg.tp3Pips;
+              if (!(t1 < t2 && t2 < t3)) {
+                console.warn(`[trade] ignoring TP overrides for ${accountId} — non-increasing: tp1=${t1} tp2=${t2} tp3=${t3}`);
+                overrides = undefined;
+              } else {
+                console.log(`[trade] using TP overrides for new zone: tp1=${t1} tp2=${t2} tp3=${t3}`);
+              }
+            } else {
+              overrides = undefined;
+            }
             // SYNCHRONOUS: reserve zone + pending association *before* the
             // trade response returns, so any companion cascade limit that
             // arrives immediately after will find a zoneId to attach to.
-            const zoneState = prepareZoneForCascade(accountId, direction, uId);
+            const zoneState = prepareZoneForCascade(accountId, direction, uId, overrides);
             // Seed best-known anchor from caller-provided value / cached tick;
             // the actual fill price will replace it async below.
             const bodyAnchor = Number((req.body as Record<string, unknown>).anchorPrice ?? 0) || 0;

@@ -355,6 +355,29 @@ export default function TradeScreen() {
     void AsyncStorage.setItem(LOT_SIZE_CASCADE_KEY, String(v));
   }, []);
 
+  // Per-zone TP override (applied to the NEXT cascade only).
+  // Off by default → server falls back to the user's cascade-config TPs.
+  // When enabled, the StepInputs seed from the current cascadeSettings so the
+  // user has a sensible starting point to tweak.
+  const [tpOverrideEnabled, setTpOverrideEnabled] = useState(false);
+  const [tpOverride1, setTpOverride1] = useState<number>(cascadeSettings.tp1Pips);
+  const [tpOverride2, setTpOverride2] = useState<number>(cascadeSettings.tp2Pips);
+  const [tpOverride3, setTpOverride3] = useState<number>(cascadeSettings.tp3Pips);
+  const tpOverrideRef = useRef({ enabled: tpOverrideEnabled, tp1: tpOverride1, tp2: tpOverride2, tp3: tpOverride3 });
+  useEffect(() => {
+    tpOverrideRef.current = { enabled: tpOverrideEnabled, tp1: tpOverride1, tp2: tpOverride2, tp3: tpOverride3 };
+  }, [tpOverrideEnabled, tpOverride1, tpOverride2, tpOverride3]);
+  // Re-seed override values whenever the saved cascade settings change, but only
+  // while the override is OFF — once the user has dialed in custom values we
+  // don't want to clobber them.
+  useEffect(() => {
+    if (tpOverrideEnabled) return;
+    setTpOverride1(cascadeSettings.tp1Pips);
+    setTpOverride2(cascadeSettings.tp2Pips);
+    setTpOverride3(cascadeSettings.tp3Pips);
+  }, [cascadeSettings.tp1Pips, cascadeSettings.tp2Pips, cascadeSettings.tp3Pips, tpOverrideEnabled]);
+  const tpOverrideValid = tpOverride1 > 0 && tpOverride1 < tpOverride2 && tpOverride2 < tpOverride3;
+
   const [isPlacing, setIsPlacing] = useState(false);
 
   // Visible watcher state — mirrors tpWatchersRef so the UI can show what's armed
@@ -577,11 +600,14 @@ export default function TradeScreen() {
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
     console.log("[cascade] placing dir=" + dir + " vol=" + String(cascadeLotSize) + " entries=[" + levels.limitEntries.join(",") + "] sl=" + String(levels.stopLoss));
     try {
+      const tpOv = tpOverrideRef.current;
+      const useOverride = tpOv.enabled && tpOv.tp1 > 0 && tpOv.tp1 < tpOv.tp2 && tpOv.tp2 < tpOv.tp3;
       const result = await placeCascadeOrders({
         direction: dir,
         volume: cascadeLotSize,
         limitEntries: levels.limitEntries,
         stopLoss: levels.stopLoss,
+        ...(useOverride ? { tp1Pips: tpOv.tp1, tp2Pips: tpOv.tp2, tp3Pips: tpOv.tp3 } : null),
       });
       console.log("[cascade] done placed=" + String(result.placed) + " failed=" + String(result.failed) + " success=" + String(result.success) + " msg=" + result.message);
       if (result.success) {
@@ -826,6 +852,55 @@ export default function TradeScreen() {
                 <Text style={styles.sectionHint}>1 lot = 100 oz gold</Text>
               </View>
               <StepInput value={cascadeLotSize} onChange={setCascadeLotSize} step={0.01} min={0.01} max={100} decimals={2} />
+            </View>
+
+            {/* Per-zone TP overrides — applied to the NEXT cascade only.
+                When off, the server uses the user's saved cascade-config TPs. */}
+            <View style={styles.sectionCard}>
+              <View style={styles.sectionHeader}>
+                <Text style={styles.sectionTitle}>Custom Take Profits</Text>
+                <Pressable
+                  onPress={() => { setTpOverrideEnabled((v) => !v); Haptics.selectionAsync(); }}
+                  style={[styles.modeBtn, tpOverrideEnabled && styles.modeBtnActive, { paddingHorizontal: 12, paddingVertical: 6 }]}
+                  hitSlop={8}
+                >
+                  <Feather
+                    name={tpOverrideEnabled ? "check-circle" : "circle"}
+                    size={14}
+                    color={tpOverrideEnabled ? C.gold : C.textSecondary}
+                  />
+                  <Text style={[styles.modeBtnText, tpOverrideEnabled && styles.modeBtnTextActive]}>
+                    {tpOverrideEnabled ? "On (this trade)" : "Use defaults"}
+                  </Text>
+                </Pressable>
+              </View>
+              {tpOverrideEnabled ? (
+                <>
+                  <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={[styles.cascadeSummaryLabel, { marginBottom: 6 }]}>TP1 PIPS</Text>
+                      <StepInput value={tpOverride1} onChange={setTpOverride1} step={1} min={1} max={5000} decimals={0} />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={[styles.cascadeSummaryLabel, { marginBottom: 6 }]}>TP2 PIPS</Text>
+                      <StepInput value={tpOverride2} onChange={setTpOverride2} step={1} min={1} max={5000} decimals={0} />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={[styles.cascadeSummaryLabel, { marginBottom: 6 }]}>TP3 PIPS</Text>
+                      <StepInput value={tpOverride3} onChange={setTpOverride3} step={1} min={1} max={5000} decimals={0} />
+                    </View>
+                  </View>
+                  {!tpOverrideValid && (
+                    <Text style={[styles.sectionHint, { color: C.sell, marginTop: 8 }]}>
+                      TP1 &lt; TP2 &lt; TP3 required — values will be ignored.
+                    </Text>
+                  )}
+                </>
+              ) : (
+                <Text style={[styles.sectionHint, { marginTop: 6 }]}>
+                  Currently {cascadeSettings.tp1Pips} / {cascadeSettings.tp2Pips} / {cascadeSettings.tp3Pips} pips from Settings. Turn on to override for this trade.
+                </Text>
+              )}
             </View>
 
             {/* Cascade Ladder Preview — updates direction based on last button pressed */}

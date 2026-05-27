@@ -104,6 +104,10 @@ export interface PlaceTradeParams {
   takeProfit?: number;
   comment?: string;
   limitPrice?: number;
+  /** Per-trade TP override (pips). Only attached to the market leg of a cascade. */
+  tp1Pips?: number;
+  tp2Pips?: number;
+  tp3Pips?: number;
 }
 
 export interface CascadeOrderParams {
@@ -113,6 +117,10 @@ export interface CascadeOrderParams {
   stopLoss: number;
   /** If set, skip the market order and use this position ID as the market leg */
   existingPositionId?: string;
+  /** Optional per-zone TP overrides (pips). Validated server-side. */
+  tp1Pips?: number;
+  tp2Pips?: number;
+  tp3Pips?: number;
 }
 
 // Determine the API base URL.
@@ -641,6 +649,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       if (params.limitPrice != null) body.openPrice = params.limitPrice;
       if (params.stopLoss != null) body.stopLoss = params.stopLoss;
       if (params.takeProfit != null) body.takeProfit = params.takeProfit;
+      // Per-trade zone TP overrides — server only honours these on the cascade
+      // market leg, but it's harmless to send them on any order body.
+      if (params.tp1Pips != null) body.tp1Pips = params.tp1Pips;
+      if (params.tp2Pips != null) body.tp2Pips = params.tp2Pips;
+      if (params.tp3Pips != null) body.tp3Pips = params.tp3Pips;
 
       const isTransient = (msg?: string) =>
         msg?.toLowerCase().includes("failed to execute a callable") ||
@@ -734,6 +747,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
               volume: params.volume,
               stopLoss: params.stopLoss,
               comment: `Cascade 1/${total}`,
+              // TP overrides only ride along on the market leg — that's the trade
+              // that triggers zone creation server-side.
+              tp1Pips: params.tp1Pips,
+              tp2Pips: params.tp2Pips,
+              tp3Pips: params.tp3Pips,
             }),
             ...params.limitEntries.map((limitPrice, i) =>
               submitOrderRaw({
