@@ -660,14 +660,6 @@ export default function TradeScreen() {
           )}
         </View>
 
-        {/* Volatility advisory — always visible above mode toggle */}
-        <View style={styles.advisoryBanner}>
-          <Feather name="alert-triangle" size={14} color={C.gold} style={{ marginTop: 1 }} />
-          <Text style={styles.advisoryText}>
-            <Text style={styles.advisoryTextBold}>Tip:</Text> During fast or volatile markets, place trades from this app rather than MT5. MT5 orders can lag and may not trigger the cascade in time.
-          </Text>
-        </View>
-
         {/* Mode Toggle */}
         <View style={styles.modeToggle}>
           <Pressable
