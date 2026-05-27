@@ -16,6 +16,8 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import Colors from "@/constants/colors";
 import { useTrading, type PendingOrder, type Position } from "@/context/TradingContext";
+import { useZones } from "@/hooks/useZones";
+import ZoneCard from "@/components/ZoneCard";
 
 const C = Colors.dark;
 
@@ -193,7 +195,12 @@ function PendingOrderCard({ order, onCancel }: { order: PendingOrder; onCancel: 
 
 export default function PositionsScreen() {
   const insets = useSafeAreaInsets();
-  const { positions, pendingOrders, status, refreshPositions, closePosition, cancelOrder, accountInfo } = useTrading();
+  const { positions, pendingOrders, status, refreshPositions, closePosition, cancelOrder, accountInfo, accountId } = useTrading();
+  const { zones } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000 });
+  const pastZones = zones
+    .filter((z) => z.status === "CLOSED" || z.status === "RISK_FREE")
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, 25);
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
 
@@ -370,6 +377,17 @@ export default function PositionsScreen() {
                 ))}
               </>
             )}
+          </>
+        )}
+
+        {status === "connected" && pastZones.length > 0 && (
+          <>
+            <Text style={[styles.sectionLabel, { marginTop: hasAnything ? 20 : 0 }]}>
+              PAST ZONES  ·  {pastZones.length}
+            </Text>
+            {pastZones.map((z) => (
+              <ZoneCard key={z.zoneId} zone={z} historical />
+            ))}
           </>
         )}
       </ScrollView>

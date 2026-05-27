@@ -118,6 +118,9 @@ interface CascadeConfig {
   numPositions: number;
   pipsBetween: number;
   slPips: number;
+  tp1Pips: number;
+  tp2Pips: number;
+  tp3Pips: number;
 }
 
 const CASCADE_DEFAULTS: CascadeConfig = {
@@ -125,6 +128,9 @@ const CASCADE_DEFAULTS: CascadeConfig = {
   numPositions: 3,
   pipsBetween: 10,
   slPips: 100,
+  tp1Pips: 20,
+  tp2Pips: 50,
+  tp3Pips: 90,
 };
 
 // In-memory cache: accountId (or "" for global) → config.
@@ -154,6 +160,9 @@ async function attemptLoadCascadeConfig(): Promise<void> {
         numPositions:      row.numPositions,
         pipsBetween:       row.pipsBetween,
         slPips:            row.slPips,
+        tp1Pips:           row.tp1Pips,
+        tp2Pips:           row.tp2Pips,
+        tp3Pips:           row.tp3Pips,
       };
       cascadeConfigs.set(key, cfg);
       // Also cache under the MetaAPI accountId so the auto-cascade background
@@ -228,6 +237,9 @@ async function saveCascadeConfig(config: CascadeConfig, accountId: string): Prom
           numPositions:      config.numPositions,
           pipsBetween:       config.pipsBetween,
           slPips:            config.slPips,
+          tp1Pips:           config.tp1Pips,
+          tp2Pips:           config.tp2Pips,
+          tp3Pips:           config.tp3Pips,
         },
       });
     return true;
@@ -1104,13 +1116,16 @@ function newZoneId(): string {
 // Sync prep — reserve a zoneId + pending association so cascade limits
 // submitted *immediately* after the market order can attach without waiting
 // for the anchor lookup / DB inserts. Returns the prepared zone state.
-function prepareZoneForCascade(accountId: string, direction: "buy" | "sell"): ZoneState {
+function prepareZoneForCascade(
+  accountId: string, direction: "buy" | "sell", userId?: string,
+): ZoneState {
   const zoneId = newZoneId();
+  const cfg = getCascadeConfig(accountId, userId);
   const state: ZoneState = {
     zoneId, accountId, direction, anchorPrice: 0,
-    tp1Pips: ZONE_TP1_PIPS_DEFAULT,
-    tp2Pips: ZONE_TP2_PIPS_DEFAULT,
-    tp3Pips: ZONE_TP3_PIPS_DEFAULT,
+    tp1Pips: cfg.tp1Pips > 0 ? cfg.tp1Pips : ZONE_TP1_PIPS_DEFAULT,
+    tp2Pips: cfg.tp2Pips > 0 ? cfg.tp2Pips : ZONE_TP2_PIPS_DEFAULT,
+    tp3Pips: cfg.tp3Pips > 0 ? cfg.tp3Pips : ZONE_TP3_PIPS_DEFAULT,
     tp1Hit: false, tp2Hit: false, tp3Hit: false,
     status: "OPEN", busy: false,
   };
@@ -1538,11 +1553,12 @@ export async function loadZoneState(): Promise<void> {
 router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res: Response) => {
   try {
     const { accountId } = req.params as { accountId: string };
+    const includeClosed = qstr(req.query.includeClosed) === "true";
     const zones = await db.select().from(cascadeZonesTable)
       .where(eq(cascadeZonesTable.accountId, accountId));
     const out = [];
     for (const z of zones) {
-      if (z.status === "CLOSED") continue;
+      if (!includeClosed && z.status === "CLOSED") continue;
       const openPositions = await db.select().from(zonePositionsTable)
         .where(and(eq(zonePositionsTable.zoneId, z.zoneId), eq(zonePositionsTable.status, "OPEN")));
       out.push({
@@ -1602,9 +1618,12 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       const ok = await closeZonePosition(token, region, accountId, p.id);
       if (!ok) failed.push(p.id);
     }
+    // "Risk free" = move stop loss 10 pips INTO PROFIT from the best entry.
+    // BUY profits when price rises → SL goes ABOVE entry.
+    // SELL profits when price falls → SL goes BELOW entry.
     const sl = st.direction === "buy"
-      ? parseFloat((best.openPrice - ZONE_RISK_FREE_PIPS * PIP).toFixed(2))
-      : parseFloat((best.openPrice + ZONE_RISK_FREE_PIPS * PIP).toFixed(2));
+      ? parseFloat((best.openPrice + ZONE_RISK_FREE_PIPS * PIP).toFixed(2))
+      : parseFloat((best.openPrice - ZONE_RISK_FREE_PIPS * PIP).toFixed(2));
     const slOk = await modifyZonePositionSl(token, region, accountId, best.id, sl);
     await cancelZoneLimits(token, region, accountId, zoneId);
     if (failed.length > 0 || !slOk) {
@@ -2433,7 +2452,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
             // SYNCHRONOUS: reserve zone + pending association *before* the
             // trade response returns, so any companion cascade limit that
             // arrives immediately after will find a zoneId to attach to.
-            const zoneState = prepareZoneForCascade(accountId, direction);
+            const zoneState = prepareZoneForCascade(accountId, direction, uId);
             // Seed best-known anchor from caller-provided value / cached tick;
             // the actual fill price will replace it async below.
             const bodyAnchor = Number((req.body as Record<string, unknown>).anchorPrice ?? 0) || 0;
@@ -2513,7 +2532,17 @@ router.put("/cascade-config", async (req: Request, res: Response) => {
     numPositions: typeof body.numPositions === "number"  ? body.numPositions : current.numPositions,
     pipsBetween:  typeof body.pipsBetween  === "number"  ? body.pipsBetween  : current.pipsBetween,
     slPips:       typeof body.slPips       === "number"  ? body.slPips       : current.slPips,
+    tp1Pips:      typeof body.tp1Pips      === "number" && body.tp1Pips > 0 ? Math.round(body.tp1Pips) : current.tp1Pips,
+    tp2Pips:      typeof body.tp2Pips      === "number" && body.tp2Pips > 0 ? Math.round(body.tp2Pips) : current.tp2Pips,
+    tp3Pips:      typeof body.tp3Pips      === "number" && body.tp3Pips > 0 ? Math.round(body.tp3Pips) : current.tp3Pips,
   };
+  // Enforce strict ordering: TP1 < TP2 < TP3 (zone TP stages must fire in sequence).
+  if (!(nextConfig.tp1Pips < nextConfig.tp2Pips && nextConfig.tp2Pips < nextConfig.tp3Pips)) {
+    return res.status(400).json({
+      error: "Take Profit levels must be strictly increasing (TP1 < TP2 < TP3)",
+      tp1Pips: nextConfig.tp1Pips, tp2Pips: nextConfig.tp2Pips, tp3Pips: nextConfig.tp3Pips,
+    });
+  }
   // Persist first — only commit to in-memory state when DB write succeeds.
   const saved = await saveCascadeConfig(nextConfig, saveKey);
   if (!saved) {

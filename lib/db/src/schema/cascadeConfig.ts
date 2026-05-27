@@ -7,6 +7,10 @@ export const cascadeConfigTable = pgTable("cascade_config", {
   numPositions: integer("num_positions").notNull().default(3),
   pipsBetween:  integer("pips_between").notNull().default(50),
   slPips:       integer("sl_pips").notNull().default(100),
+  // Zone TP — pip distances from the zone anchor for TP1/TP2/TP3 hits.
+  tp1Pips:      integer("tp1_pips").notNull().default(20),
+  tp2Pips:      integer("tp2_pips").notNull().default(50),
+  tp3Pips:      integer("tp3_pips").notNull().default(90),
   // MT5 auto-SL: when a trade is opened directly in MT5, automatically attach
   // a stop loss. `mt5SlEnabled` toggles the feature. `mt5SlNumPositions` is
   // the size of the auto-SL batch (1-6). `mt5SlPips` is the SL distance in

@@ -12,6 +12,11 @@ process.on("unhandledRejection", (reason) => {
 
 async function ensureTables(): Promise<void> {
   await pool.query(`
+    ALTER TABLE cascade_config ADD COLUMN IF NOT EXISTS tp1_pips INTEGER NOT NULL DEFAULT 20;
+    ALTER TABLE cascade_config ADD COLUMN IF NOT EXISTS tp2_pips INTEGER NOT NULL DEFAULT 50;
+    ALTER TABLE cascade_config ADD COLUMN IF NOT EXISTS tp3_pips INTEGER NOT NULL DEFAULT 90;
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS support_tickets (
       id            SERIAL PRIMARY KEY,
       name          TEXT    NOT NULL,

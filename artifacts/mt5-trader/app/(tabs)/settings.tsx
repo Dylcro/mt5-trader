@@ -602,6 +602,58 @@ export default function SettingsScreen() {
             </Pressable>
           </View>
 
+          {/* Zone Take Profit Levels */}
+          <View style={styles.cascadeCard}>
+            <View style={styles.cascadeCardHeader}>
+              <Feather name="target" size={16} color={C.gold} />
+              <Text style={styles.cascadeCardTitle}>Take Profit Levels</Text>
+              <View style={styles.sourceBadge}>
+                <Text style={styles.sourceBadgeText}>ZONES</Text>
+              </View>
+            </View>
+            <Text style={styles.cascadeCardDesc}>
+              Pip distances from the zone anchor for the staged TP exits. TP1 closes the worst entry, TP2 the next, TP3 the final position. Tap Save below to push these to the server.
+            </Text>
+
+            <View style={styles.cascadeDivider} />
+
+            <SettingRow
+              label="TP1 (pips)"
+              hint={`Closes the first (worst-priced) position when price moves ${cs.tp1Pips} pips into profit.`}
+              value={cs.tp1Pips}
+              display={`${cs.tp1Pips}p`}
+              onDec={() => updateSettings({ tp1Pips: Math.max(1, cs.tp1Pips - 5) })}
+              onInc={() => updateSettings({ tp1Pips: Math.min(500, cs.tp1Pips + 5) })}
+            />
+            <View style={styles.cascadeDivider} />
+            <SettingRow
+              label="TP2 (pips)"
+              hint={`Closes the next position once price reaches ${cs.tp2Pips} pips from the anchor.`}
+              value={cs.tp2Pips}
+              display={`${cs.tp2Pips}p`}
+              onDec={() => updateSettings({ tp2Pips: Math.max(cs.tp1Pips + 1, cs.tp2Pips - 5) })}
+              onInc={() => updateSettings({ tp2Pips: Math.min(900, cs.tp2Pips + 5) })}
+            />
+            <View style={styles.cascadeDivider} />
+            <SettingRow
+              label="TP3 (pips)"
+              hint={`Final exit — closes the remaining position at ${cs.tp3Pips} pips of profit.`}
+              value={cs.tp3Pips}
+              display={`${cs.tp3Pips}p`}
+              onDec={() => updateSettings({ tp3Pips: Math.max(cs.tp2Pips + 1, cs.tp3Pips - 5) })}
+              onInc={() => updateSettings({ tp3Pips: Math.min(1500, cs.tp3Pips + 5) })}
+            />
+
+            {(cs.tp2Pips <= cs.tp1Pips || cs.tp3Pips <= cs.tp2Pips) && (
+              <View style={styles.cascadeWarningBox}>
+                <Feather name="alert-triangle" size={14} color="#f59e0b" />
+                <Text style={styles.cascadeWarningText}>
+                  TP levels must be strictly increasing (TP1 &lt; TP2 &lt; TP3).
+                </Text>
+              </View>
+            )}
+          </View>
+
           {/* Help & Support */}
           <Pressable
             style={({ pressed }) => [styles.supportBtn, pressed && { opacity: 0.8 }]}
