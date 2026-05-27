@@ -1,0 +1,46 @@
+name: api-server tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'artifacts/api-server/**'
+      - 'lib/db/**'
+      - 'lib/api-zod/**'
+      - 'pnpm-workspace.yaml'
+      - 'pnpm-lock.yaml'
+      - 'package.json'
+      - '.github/workflows/api-server-tests.yml'
+  pull_request:
+    paths:
+      - 'artifacts/api-server/**'
+      - 'lib/db/**'
+      - 'lib/api-zod/**'
+      - 'pnpm-workspace.yaml'
+      - 'pnpm-lock.yaml'
+      - 'package.json'
+      - '.github/workflows/api-server-tests.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --config.minimumReleaseAge=0
+
+      - name: Typecheck api-server
+        run: pnpm --filter @workspace/api-server run typecheck
+
+      - name: Run api-server tests
+        run: pnpm --filter @workspace/api-server run test

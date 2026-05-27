@@ -224,6 +224,45 @@ export async function loadCascadeConfig(): Promise<void> {
   }
 }
 
+// Pure helper: validate and merge a PUT /cascade-config request body against the
+// current persisted config. Returns either the next config to save, or a 400
+// response payload explaining what was rejected.
+// Exported so regression tests can lock the TP-ordering rule in (it was once
+// unenforced, allowing TP2 < TP1 / TP3 < TP2 to reach the staged-exit logic).
+export type CascadeConfigUpdateResult =
+  | { ok: true; config: CascadeConfig }
+  | { ok: false; status: 400; body: { error: string; tp1Pips: number; tp2Pips: number; tp3Pips: number } };
+
+export function buildCascadeConfigUpdate(
+  body: Partial<CascadeConfig> | null | undefined,
+  current: CascadeConfig,
+): CascadeConfigUpdateResult {
+  const b = body ?? {};
+  const nextConfig: CascadeConfig = {
+    enabled:      typeof b.enabled      === "boolean" ? b.enabled      : current.enabled,
+    numPositions: typeof b.numPositions === "number"  ? b.numPositions : current.numPositions,
+    pipsBetween:  typeof b.pipsBetween  === "number"  ? b.pipsBetween  : current.pipsBetween,
+    slPips:       typeof b.slPips       === "number"  ? b.slPips       : current.slPips,
+    tp1Pips:      typeof b.tp1Pips      === "number" && b.tp1Pips > 0 ? Math.round(b.tp1Pips) : current.tp1Pips,
+    tp2Pips:      typeof b.tp2Pips      === "number" && b.tp2Pips > 0 ? Math.round(b.tp2Pips) : current.tp2Pips,
+    tp3Pips:      typeof b.tp3Pips      === "number" && b.tp3Pips > 0 ? Math.round(b.tp3Pips) : current.tp3Pips,
+  };
+  // Enforce strict ordering: TP1 < TP2 < TP3 (zone TP stages must fire in sequence).
+  if (!(nextConfig.tp1Pips < nextConfig.tp2Pips && nextConfig.tp2Pips < nextConfig.tp3Pips)) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: "Take Profit levels must be strictly increasing (TP1 < TP2 < TP3)",
+        tp1Pips: nextConfig.tp1Pips,
+        tp2Pips: nextConfig.tp2Pips,
+        tp3Pips: nextConfig.tp3Pips,
+      },
+    };
+  }
+  return { ok: true, config: nextConfig };
+}
+
 // Returns true on success, false on DB failure.
 // accountId="" means the global (fallback) config.
 async function saveCascadeConfig(config: CascadeConfig, accountId: string): Promise<boolean> {
@@ -1101,7 +1140,22 @@ interface ZoneState {
 const ZONE_TP1_PIPS_DEFAULT = 20;
 const ZONE_TP2_PIPS_DEFAULT = 50;
 const ZONE_TP3_PIPS_DEFAULT = 90;
-const ZONE_RISK_FREE_PIPS   = 10;
+export const ZONE_RISK_FREE_PIPS   = 10;
+
+// Pure helper: compute the "risk free" stop-loss price for a zone's surviving
+// entry. Risk free means moving SL `pips` INTO PROFIT from the entry price.
+//   BUY  profits when price rises → SL goes ABOVE entry.
+//   SELL profits when price falls → SL goes BELOW entry.
+// Exported so regression tests can lock the direction in (it was once inverted).
+export function computeRiskFreeSl(
+  direction: "buy" | "sell",
+  entryPrice: number,
+  pips: number = ZONE_RISK_FREE_PIPS,
+): number {
+  const offset = pips * PIP;
+  const raw = direction === "buy" ? entryPrice + offset : entryPrice - offset;
+  return parseFloat(raw.toFixed(2));
+}
 const ZONE_ASSOC_WINDOW_MS  = 30_000; // limits placed within 30s of market attach to the same zone
 
 // In-memory state, hydrated from DB on startup.
@@ -1678,12 +1732,8 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       const ok = await closeZonePosition(token, region, accountId, p.id);
       if (!ok) failed.push(p.id);
     }
-    // "Risk free" = move stop loss 10 pips INTO PROFIT from the best entry.
-    // BUY profits when price rises → SL goes ABOVE entry.
-    // SELL profits when price falls → SL goes BELOW entry.
-    const sl = st.direction === "buy"
-      ? parseFloat((best.openPrice + ZONE_RISK_FREE_PIPS * PIP).toFixed(2))
-      : parseFloat((best.openPrice - ZONE_RISK_FREE_PIPS * PIP).toFixed(2));
+    // "Risk free" = move stop loss ZONE_RISK_FREE_PIPS INTO PROFIT from the best entry.
+    const sl = computeRiskFreeSl(st.direction, best.openPrice);
     const slOk = await modifyZonePositionSl(token, region, accountId, best.id, sl);
     await cancelZoneLimits(token, region, accountId, zoneId);
     if (failed.length > 0 || !slOk) {
@@ -2615,23 +2665,11 @@ router.put("/cascade-config", async (req: Request, res: Response) => {
   const saveKey = userId ?? accountId;
   const body = req.body as Partial<CascadeConfig>;
   const current = getCascadeConfig(accountId, userId);
-  // Build the candidate config without mutating in-memory state yet.
-  const nextConfig: CascadeConfig = {
-    enabled:      typeof body.enabled      === "boolean" ? body.enabled      : current.enabled,
-    numPositions: typeof body.numPositions === "number"  ? body.numPositions : current.numPositions,
-    pipsBetween:  typeof body.pipsBetween  === "number"  ? body.pipsBetween  : current.pipsBetween,
-    slPips:       typeof body.slPips       === "number"  ? body.slPips       : current.slPips,
-    tp1Pips:      typeof body.tp1Pips      === "number" && body.tp1Pips > 0 ? Math.round(body.tp1Pips) : current.tp1Pips,
-    tp2Pips:      typeof body.tp2Pips      === "number" && body.tp2Pips > 0 ? Math.round(body.tp2Pips) : current.tp2Pips,
-    tp3Pips:      typeof body.tp3Pips      === "number" && body.tp3Pips > 0 ? Math.round(body.tp3Pips) : current.tp3Pips,
-  };
-  // Enforce strict ordering: TP1 < TP2 < TP3 (zone TP stages must fire in sequence).
-  if (!(nextConfig.tp1Pips < nextConfig.tp2Pips && nextConfig.tp2Pips < nextConfig.tp3Pips)) {
-    return res.status(400).json({
-      error: "Take Profit levels must be strictly increasing (TP1 < TP2 < TP3)",
-      tp1Pips: nextConfig.tp1Pips, tp2Pips: nextConfig.tp2Pips, tp3Pips: nextConfig.tp3Pips,
-    });
+  const result = buildCascadeConfigUpdate(body, current);
+  if (!result.ok) {
+    return res.status(result.status).json(result.body);
   }
+  const nextConfig = result.config;
   // Persist first — only commit to in-memory state when DB write succeeds.
   const saved = await saveCascadeConfig(nextConfig, saveKey);
   if (!saved) {
