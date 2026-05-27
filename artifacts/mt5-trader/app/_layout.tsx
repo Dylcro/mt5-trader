@@ -19,12 +19,15 @@ import { AuthProvider } from "@/context/AuthContext";
 import { TradingProvider } from "@/context/TradingContext";
 import { CascadeSettingsProvider } from "@/hooks/useCascadeSettings";
 import { HapticSettingsProvider } from "@/hooks/useHapticSettings";
+import { NotificationSettingsProvider } from "@/hooks/useNotificationSettings";
+import { useNotificationDeepLink } from "@/hooks/useNotificationDeepLink";
 
 SplashScreen.preventAutoHideAsync();
 
 const queryClient = new QueryClient();
 
 function RootLayoutNav() {
+  useNotificationDeepLink();
   return (
     <Stack screenOptions={{ headerShown: false }}>
       <Stack.Screen name="(auth)" options={{ headerShown: false }} />
@@ -67,8 +70,10 @@ export default function RootLayout() {
                 <TradingProvider>
                   <HapticSettingsProvider>
                     <CascadeSettingsProvider>
-                      <RootLayoutNav />
-                      <CascadeToast />
+                      <NotificationSettingsProvider>
+                        <RootLayoutNav />
+                        <CascadeToast />
+                      </NotificationSettingsProvider>
                     </CascadeSettingsProvider>
                   </HapticSettingsProvider>
                 </TradingProvider>

@@ -1,7 +1,7 @@
 import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { createRequire } from "module";
-import { db, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable, cascadeZonesTable, zonePositionsTable, zoneOrdersTable } from "@workspace/db";
+import { db, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable, cascadeZonesTable, zonePositionsTable, zoneOrdersTable, notificationPrefsTable } from "@workspace/db";
 import { and, eq, isNotNull } from "drizzle-orm";
 import { JWT_SECRET } from "./auth";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
@@ -1231,6 +1231,7 @@ async function persistPreparedZone(
       zoneId: state.zoneId, positionId, entryPrice: state.anchorPrice, volume,
       status: "OPEN", createdAt: now,
     }).onConflictDoNothing();
+    if (userId) zoneIdToUserId.set(state.zoneId, userId);
     console.log(`[zone ${state.zoneId}] persisted ${state.direction.toUpperCase()} anchor=${state.anchorPrice} posId=${positionId} vol=${volume}`);
   } catch (e) {
     console.error(`[zone ${state.zoneId}] create persist error:`, (e as Error).message);
@@ -1526,6 +1527,42 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       }
     }
 
+    // "Near next TP" detection — fire a push once per TP step when the live
+    // distance crosses the user's threshold. Runs before the hit branches so a
+    // near-then-hit on the same tick still fires both events in order. Uses
+    // the absolute TP prices on `st` (the cascade refactor moved away from pip
+    // distances), and skips silently if the next TP price isn't set yet.
+    {
+      const nextTpIdx: 0 | 1 | 2 | 3 =
+        !st.tp1Hit ? 1 : !st.tp2Hit ? 2 : !st.tp3Hit ? 3 : 0;
+      const nextTpPrice =
+        nextTpIdx === 1 ? st.tp1Price :
+        nextTpIdx === 2 ? st.tp2Price :
+        nextTpIdx === 3 ? st.tp3Price : null;
+      if (nextTpIdx > 0 && nextTpPrice != null) {
+        const userId = zoneIdToUserId.get(zoneId);
+        const prefs = userId ? notificationPrefs.get(userId) : undefined;
+        const threshold = prefs?.thresholdPips ?? 0;
+        const sign = st.direction === "buy" ? 1 : -1;
+        const remaining = (nextTpPrice - cmpPrice) / PIP * sign;
+        const lastNotified = zoneNearNotifiedTp.get(zoneId) ?? 0;
+        // Reset the "near" gate whenever the zone advances to a new TP step.
+        if (lastNotified > 0 && lastNotified !== nextTpIdx) {
+          zoneNearNotifiedTp.set(zoneId, 0);
+        }
+        if (
+          prefs?.nearEnabled &&
+          prefs.expoPushToken &&
+          remaining > 0 &&
+          remaining <= threshold &&
+          (zoneNearNotifiedTp.get(zoneId) ?? 0) !== nextTpIdx
+        ) {
+          zoneNearNotifiedTp.set(zoneId, nextTpIdx);
+          notifyZoneEvent(zoneId, "near", nextTpIdx as 1 | 2 | 3, remaining, st.direction);
+        }
+      }
+    }
+
     // ── Step 2-5: TP1-4 on the best entry (25% partial each) ─────────────
     // Best entry = most profitable: BUY → lowest entry; SELL → highest entry.
     const dbSorted = zps.slice().sort((a, b) =>
@@ -1550,6 +1587,8 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       if (allOk) {
         st.tp1Hit = true;
         await db.update(cascadeZonesTable).set({ tp1Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        zoneNearNotifiedTp.set(zoneId, 0);
+        notifyZoneEvent(zoneId, "hit", 1, 0, st.direction);
         console.log(`[zone ${zoneId}] TP1 complete`);
       } else {
         console.warn(`[zone ${zoneId}] TP1 partial failure — will retry next tick`);
@@ -1571,6 +1610,8 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       if (allOk) {
         st.tp2Hit = true;
         await db.update(cascadeZonesTable).set({ tp2Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        zoneNearNotifiedTp.set(zoneId, 0);
+        notifyZoneEvent(zoneId, "hit", 2, 0, st.direction);
         console.log(`[zone ${zoneId}] TP2 complete — SL→BE @${liveBest.openPrice} + limits cancelled`);
       } else {
         console.warn(`[zone ${zoneId}] TP2 partial failure — will retry next tick`);
@@ -1588,6 +1629,8 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       if (allOk) {
         st.tp3Hit = true;
         await db.update(cascadeZonesTable).set({ tp3Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        zoneNearNotifiedTp.set(zoneId, 0);
+        notifyZoneEvent(zoneId, "hit", 3, 0, st.direction);
         console.log(`[zone ${zoneId}] TP3 complete`);
       } else {
         console.warn(`[zone ${zoneId}] TP3 partial failure — will retry next tick`);
@@ -1658,6 +1701,189 @@ export async function loadZoneState(): Promise<void> {
     console.error("[zone] hydrate error:", (e as Error).message);
   }
 }
+
+// ── Notification prefs + push delivery ───────────────────────────────────────
+// Per-user prefs let the mobile app opt in to push alerts when an OPEN zone
+// is approaching its next TP ("near") or has just hit one ("hit"). Tokens are
+// Expo push tokens registered by the client. Detection runs inside
+// `evaluateZone` so alerts fire even when the app is backgrounded.
+
+interface NotificationPrefs {
+  nearEnabled: boolean;
+  hitEnabled: boolean;
+  thresholdPips: number;
+  expoPushToken: string | null;
+}
+
+const notificationPrefs = new Map<string, NotificationPrefs>(); // userId → prefs
+const zoneIdToUserId = new Map<string, string>();                // zoneId → userId
+// Per-zone: highest TP index for which a "near" alert has already been sent.
+// Reset to 0 when the zone advances to the next TP, so each TP step alerts once.
+const zoneNearNotifiedTp = new Map<string, number>();
+
+export async function loadNotificationPrefs(): Promise<void> {
+  try {
+    const rows = await db.select().from(notificationPrefsTable);
+    for (const r of rows) {
+      notificationPrefs.set(r.userId, {
+        nearEnabled: r.nearEnabled,
+        hitEnabled: r.hitEnabled,
+        thresholdPips: r.thresholdPips,
+        expoPushToken: r.expoPushToken,
+      });
+    }
+    if (rows.length > 0) console.log(`[notif] loaded ${rows.length} pref row(s)`);
+    // Also hydrate zoneId→userId so the monitor can find the recipient.
+    const zones = await db.select({ zoneId: cascadeZonesTable.zoneId, userId: cascadeZonesTable.userId })
+      .from(cascadeZonesTable);
+    for (const z of zones) {
+      if (z.userId) zoneIdToUserId.set(z.zoneId, z.userId);
+    }
+  } catch (e) {
+    console.error("[notif] hydrate error:", (e as Error).message);
+  }
+}
+
+async function sendExpoPush(
+  token: string,
+  title: string,
+  body: string,
+  data: Record<string, unknown> = {},
+): Promise<void> {
+  if (!token.startsWith("ExponentPushToken[") && !token.startsWith("ExpoPushToken[")) {
+    // Reject malformed tokens early — Expo will 400 otherwise.
+    console.warn(`[notif] skipping invalid token shape: ${token.slice(0, 20)}…`);
+    return;
+  }
+  try {
+    const res = await fetch("https://exp.host/--/api/v2/push/send", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
+      },
+      body: JSON.stringify({
+        to: token, title, body, data,
+        sound: "default", priority: "high", channelId: "tp-alerts",
+      }),
+    });
+    if (!res.ok) {
+      console.warn(`[notif] push HTTP ${res.status}: ${await res.text().catch(() => "")}`);
+    }
+  } catch (e) {
+    console.warn(`[notif] push error: ${(e as Error).message}`);
+  }
+}
+
+function notifyZoneEvent(
+  zoneId: string,
+  kind: "near" | "hit",
+  tp: 1 | 2 | 3,
+  pipsToNextTp: number | null,
+  direction: "buy" | "sell",
+): void {
+  const userId = zoneIdToUserId.get(zoneId);
+  if (!userId) return;
+  const prefs = notificationPrefs.get(userId);
+  if (!prefs?.expoPushToken) return;
+  if (kind === "near" && !prefs.nearEnabled) return;
+  if (kind === "hit" && !prefs.hitEnabled) return;
+  const dir = direction.toUpperCase();
+  const title = kind === "hit"
+    ? `TP${tp} hit (${dir})`
+    : `TP${tp} approaching (${dir})`;
+  const body = kind === "hit"
+    ? `Your ${dir} zone just hit TP${tp}.`
+    : pipsToNextTp != null
+      ? `${pipsToNextTp.toFixed(1)} pips away from TP${tp}.`
+      : `Closing in on TP${tp}.`;
+  void sendExpoPush(prefs.expoPushToken, title, body, { zoneId, kind, tp });
+}
+
+// ── Notification prefs routes ────────────────────────────────────────────────
+// GET /api/mt5/notifications/prefs
+router.get("/mt5/notifications/prefs", async (req: Request, res: Response) => {
+  const userId = (req as Record<string, unknown>)["userId"] as string;
+  const cached = notificationPrefs.get(userId);
+  if (cached) {
+    res.json({
+      nearEnabled: cached.nearEnabled,
+      hitEnabled: cached.hitEnabled,
+      thresholdPips: cached.thresholdPips,
+      hasToken: !!cached.expoPushToken,
+    });
+    return;
+  }
+  try {
+    const [row] = await db.select().from(notificationPrefsTable)
+      .where(eq(notificationPrefsTable.userId, userId)).limit(1);
+    if (!row) {
+      res.json({ nearEnabled: false, hitEnabled: false, thresholdPips: 3, hasToken: false });
+      return;
+    }
+    notificationPrefs.set(userId, {
+      nearEnabled: row.nearEnabled, hitEnabled: row.hitEnabled,
+      thresholdPips: row.thresholdPips, expoPushToken: row.expoPushToken,
+    });
+    res.json({
+      nearEnabled: row.nearEnabled, hitEnabled: row.hitEnabled,
+      thresholdPips: row.thresholdPips, hasToken: !!row.expoPushToken,
+    });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// PUT /api/mt5/notifications/prefs
+// Body: { nearEnabled?, hitEnabled?, thresholdPips?, expoPushToken? (null clears) }
+router.put("/mt5/notifications/prefs", async (req: Request, res: Response) => {
+  const userId = (req as Record<string, unknown>)["userId"] as string;
+  const body = (req.body ?? {}) as {
+    nearEnabled?: unknown; hitEnabled?: unknown;
+    thresholdPips?: unknown; expoPushToken?: unknown;
+  };
+  const existing = notificationPrefs.get(userId) ?? {
+    nearEnabled: false, hitEnabled: false, thresholdPips: 3, expoPushToken: null,
+  };
+  const next: NotificationPrefs = {
+    nearEnabled: typeof body.nearEnabled === "boolean" ? body.nearEnabled : existing.nearEnabled,
+    hitEnabled:  typeof body.hitEnabled  === "boolean" ? body.hitEnabled  : existing.hitEnabled,
+    thresholdPips: typeof body.thresholdPips === "number" && body.thresholdPips > 0 && body.thresholdPips <= 50
+      ? Math.round(body.thresholdPips) : existing.thresholdPips,
+    expoPushToken:
+      body.expoPushToken === null ? null
+      : typeof body.expoPushToken === "string" && body.expoPushToken.length > 0
+        ? body.expoPushToken
+        : existing.expoPushToken,
+  };
+  try {
+    await db.insert(notificationPrefsTable).values({
+      userId,
+      nearEnabled:   next.nearEnabled,
+      hitEnabled:    next.hitEnabled,
+      thresholdPips: next.thresholdPips,
+      expoPushToken: next.expoPushToken,
+      updatedAt:     Date.now(),
+    }).onConflictDoUpdate({
+      target: notificationPrefsTable.userId,
+      set: {
+        nearEnabled:   next.nearEnabled,
+        hitEnabled:    next.hitEnabled,
+        thresholdPips: next.thresholdPips,
+        expoPushToken: next.expoPushToken,
+        updatedAt:     Date.now(),
+      },
+    });
+    notificationPrefs.set(userId, next);
+    res.json({
+      nearEnabled: next.nearEnabled, hitEnabled: next.hitEnabled,
+      thresholdPips: next.thresholdPips, hasToken: !!next.expoPushToken,
+    });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
 
 // ── Zone routes ──────────────────────────────────────────────────────────────
 

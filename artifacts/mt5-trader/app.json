@@ -58,6 +58,14 @@
       "expo-font",
       "expo-web-browser",
       [
+        "expo-notifications",
+        {
+          "icon": "./assets/images/icon.png",
+          "color": "#C9A84C",
+          "defaultChannel": "tp-alerts"
+        }
+      ],
+      [
         "expo-splash-screen",
         {
           "backgroundColor": "#0A0A0F",

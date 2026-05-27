@@ -21,6 +21,7 @@ export * from "./cascadeConfig";
 export * from "./cascadeHistory";
 export * from "./cascadeOrders";
 export * from "./cascadeZones";
+export * from "./notificationPrefs";
 export * from "./storedAccounts";
 export * from "./supportTickets";
 export * from "./users";

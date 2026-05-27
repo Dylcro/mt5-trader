@@ -22,6 +22,7 @@ import Colors from "@/constants/colors";
 import { useTrading } from "@/context/TradingContext";
 import { useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useHapticSettings } from "@/hooks/useHapticSettings";
+import { useNotificationSettings } from "@/hooks/useNotificationSettings";
 
 const C = Colors.dark;
 
@@ -210,6 +211,19 @@ export default function SettingsScreen() {
   const { settings: cs, updateSettings, saveToServer } = useCascadeSettings();
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const { hapticEnabled, setHapticEnabled } = useHapticSettings();
+  const { prefs: notif, loading: notifLoading, updatePrefs: updateNotif } = useNotificationSettings();
+  const [notifBusy, setNotifBusy] = useState(false);
+  const [notifError, setNotifError] = useState<string | null>(null);
+
+  const handleNotifUpdate = async (
+    patch: Partial<{ nearEnabled: boolean; hitEnabled: boolean; thresholdPips: number }>,
+  ) => {
+    setNotifBusy(true);
+    setNotifError(null);
+    const result = await updateNotif(patch);
+    setNotifBusy(false);
+    if (!result.ok) setNotifError(result.message ?? "Couldn't save");
+  };
 
   const [login, setLogin] = useState(credentials.login);
   const [password, setPassword] = useState("");
@@ -497,6 +511,82 @@ export default function SettingsScreen() {
                 </Text>
               </View>
             </View>
+          </View>
+
+          {/* TP Alerts */}
+          <View style={styles.cascadeCard}>
+            <View style={styles.cascadeCardHeader}>
+              <Feather name="bell" size={16} color={C.gold} />
+              <Text style={styles.cascadeCardTitle}>TP Alerts</Text>
+            </View>
+            <Text style={styles.cascadeCardDesc}>
+              Get a push notification when an active zone is about to hit its next take-profit, or when it actually hits. Works while the app is closed.
+            </Text>
+
+            <View style={styles.cascadeDivider} />
+
+            <View style={styles.settingRow}>
+              <Switch
+                value={notif.nearEnabled}
+                disabled={notifBusy || notifLoading}
+                onValueChange={(v) => { void handleNotifUpdate({ nearEnabled: v }); }}
+                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
+                thumbColor={notif.nearEnabled ? C.gold : C.textMuted}
+              />
+              <View style={{ marginLeft: 10, flex: 1 }}>
+                <Text style={styles.settingLabel}>Alert when near next TP</Text>
+                <Text style={styles.settingHint}>
+                  Fires once per TP level when price gets within the threshold below.
+                </Text>
+              </View>
+            </View>
+
+            <View style={styles.cascadeDivider} />
+
+            <View style={styles.settingRow}>
+              <Switch
+                value={notif.hitEnabled}
+                disabled={notifBusy || notifLoading}
+                onValueChange={(v) => { void handleNotifUpdate({ hitEnabled: v }); }}
+                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
+                thumbColor={notif.hitEnabled ? C.gold : C.textMuted}
+              />
+              <View style={{ marginLeft: 10, flex: 1 }}>
+                <Text style={styles.settingLabel}>Alert when TP hits</Text>
+                <Text style={styles.settingHint}>
+                  Fires the moment a TP is reached and your zone advances.
+                </Text>
+              </View>
+            </View>
+
+            {notif.nearEnabled && (
+              <>
+                <View style={styles.cascadeDivider} />
+                <SliderSetting
+                  label="Near-TP threshold"
+                  value={notif.thresholdPips}
+                  min={1}
+                  max={20}
+                  step={1}
+                  onChange={(v) => { void handleNotifUpdate({ thresholdPips: v }); }}
+                  displayValue={`${notif.thresholdPips} pips`}
+                  hint="distance before alert"
+                />
+              </>
+            )}
+
+            {notifError && (
+              <View style={styles.cascadeWarningBox}>
+                <Feather name="alert-triangle" size={14} color="#f59e0b" />
+                <Text style={styles.cascadeWarningText}>{notifError}</Text>
+              </View>
+            )}
+            {notifBusy && (
+              <View style={styles.settingRow}>
+                <ActivityIndicator size="small" color={C.gold} />
+                <Text style={[styles.settingHint, { marginLeft: 10 }]}>Saving…</Text>
+              </View>
+            )}
           </View>
 
           {/* In-app cascade settings */}

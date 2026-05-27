@@ -1,6 +1,6 @@
 import app from "./app";
 import { pool } from "@workspace/db";
-import { loadCascadeConfig, startAutoConnect, startConnectionWatchdog, loadZoneState, startZoneTpMonitor } from "./routes/mt5";
+import { loadCascadeConfig, startAutoConnect, startConnectionWatchdog, loadZoneState, startZoneTpMonitor, loadNotificationPrefs } from "./routes/mt5";
 
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err);
@@ -96,6 +96,16 @@ async function ensureTables(): Promise<void> {
       ON zone_positions (zone_id, status);
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS notification_prefs (
+      user_id         TEXT    PRIMARY KEY,
+      near_enabled    BOOLEAN NOT NULL DEFAULT FALSE,
+      hit_enabled     BOOLEAN NOT NULL DEFAULT FALSE,
+      threshold_pips  INTEGER NOT NULL DEFAULT 3,
+      expo_push_token TEXT,
+      updated_at      BIGINT  NOT NULL DEFAULT 0
+    );
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS zone_orders (
       id         SERIAL PRIMARY KEY,
       zone_id    TEXT   NOT NULL,
@@ -140,6 +150,7 @@ async function main() {
 
   // Hydrate in-memory zone state from DB and start the 3 s TP monitor.
   await loadZoneState();
+  await loadNotificationPrefs();
   startZoneTpMonitor();
 
 }
