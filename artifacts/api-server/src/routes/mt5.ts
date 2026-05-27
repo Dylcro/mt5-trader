@@ -1204,7 +1204,11 @@ async function markZonePositionClosed(accountId: string, positionId: string): Pr
 
     await db.update(zonePositionsTable)
       .set({ status: "CLOSED" })
-      .where(and(eq(zonePositionsTable.positionId, positionId), eq(zonePositionsTable.status, "OPEN")));
+      .where(and(
+        eq(zonePositionsTable.zoneId, zoneId),
+        eq(zonePositionsTable.positionId, positionId),
+        eq(zonePositionsTable.status, "OPEN"),
+      ));
 
     const openInZone = await db.select().from(zonePositionsTable)
       .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
@@ -1374,7 +1378,11 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         if (!allLiveIds.has(zp.positionId)) {
           await db.update(zonePositionsTable)
             .set({ status: "CLOSED" })
-            .where(and(eq(zonePositionsTable.positionId, zp.positionId), eq(zonePositionsTable.status, "OPEN")));
+            .where(and(
+              eq(zonePositionsTable.zoneId, zoneId),
+              eq(zonePositionsTable.positionId, zp.positionId),
+              eq(zonePositionsTable.status, "OPEN"),
+            ));
         }
       }
       const stillOpen = await db.select().from(zonePositionsTable)
@@ -1561,9 +1569,23 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
   try {
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
-    const st = zoneStates.get(zoneId);
+    // Prefer in-memory state; fall back to DB so a missed hydration doesn't
+    // 404 a still-valid zone.
+    let st = zoneStates.get(zoneId);
     if (!st || st.accountId !== accountId) {
-      res.status(404).json({ error: "Zone not found" }); return;
+      const [zr] = await db.select().from(cascadeZonesTable)
+        .where(and(eq(cascadeZonesTable.zoneId, zoneId), eq(cascadeZonesTable.accountId, accountId)))
+        .limit(1);
+      if (!zr || zr.status === "CLOSED") { res.status(404).json({ error: "Zone not found" }); return; }
+      st = {
+        zoneId: zr.zoneId, accountId: zr.accountId,
+        direction: zr.direction === "sell" ? "sell" : "buy",
+        anchorPrice: Number(zr.anchorPrice),
+        tp1Pips: Number(zr.tp1Pips), tp2Pips: Number(zr.tp2Pips), tp3Pips: Number(zr.tp3Pips),
+        tp1Hit: zr.tp1Hit, tp2Hit: zr.tp2Hit, tp3Hit: zr.tp3Hit,
+        status: zr.status === "RISK_FREE" ? "RISK_FREE" : "OPEN", busy: false,
+      };
+      zoneStates.set(zoneId, st);
     }
     const zps = await db.select().from(zonePositionsTable)
       .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
