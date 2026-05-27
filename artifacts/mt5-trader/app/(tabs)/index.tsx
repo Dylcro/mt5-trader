@@ -503,7 +503,8 @@ export default function TradeScreen() {
     ? buildCascadeLevels(cascadeMarketPrice, cascadeDirection, cascadeSettings)
     : null;
 
-  const handleSingleTrade = useCallback(async () => {
+  const handleSingleTrade = useCallback(async (dir?: Direction) => {
+    const resolvedDir = dir ?? direction;
     if (isPlacingRef.current) return;
     if (statusRef.current !== "connected") {
       Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
@@ -513,12 +514,13 @@ export default function TradeScreen() {
     isPlacingRef.current = true;
     setIsPlacing(true);
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    const result = await placeTrade({ direction, volume: lotSize, stopLoss: slRef.current });
+    if (dir) setDirection(dir);
+    const result = await placeTrade({ direction: resolvedDir, volume: lotSize, stopLoss: slRef.current });
     isPlacingRef.current = false;
     setIsPlacing(false);
     if (result.success) {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      showToast(`${direction.toUpperCase()} order placed ✓  ${lotSize} lot XAUUSD`, "success", true);
+      showToast(`${resolvedDir.toUpperCase()} order placed ✓  ${lotSize} lot XAUUSD`, "success", true);
     } else {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       showToast(result.message, "error");
@@ -660,6 +662,86 @@ export default function TradeScreen() {
           )}
         </View>
 
+        {/* BUY / SELL — always visible, above mode toggle */}
+        {(() => {
+          const tradeReady = status === "connected" && !!price;
+          return (
+            <View style={styles.cascadeExecRow}>
+              <Pressable
+                style={({ pressed }) => [
+                  styles.cascadeExecBtn,
+                  styles.cascadeExecBtnBuy,
+                  !tradeReady && !isPlacing && { opacity: 0.5 },
+                  pressed && { opacity: 0.8, transform: [{ scale: 0.97 }] },
+                  isPlacing && { opacity: 0.6 },
+                ]}
+                onPress={() => {
+                  if (tradeMode === "cascade") {
+                    setCascadeDirection("buy");
+                    void handleCascadeTrade("buy");
+                  } else {
+                    void handleSingleTrade("buy");
+                  }
+                }}
+                disabled={isPlacing}
+              >
+                {isPlacing && (tradeMode === "cascade" ? cascadeDirection === "buy" : direction === "buy") ? (
+                  <ActivityIndicator color="#000" />
+                ) : (
+                  <>
+                    <Feather name="trending-up" size={20} color="#000" />
+                    <Text style={[styles.cascadeExecLabel, { color: "#000" }]}>BUY</Text>
+                    {price && (
+                      <Text style={[styles.cascadeExecPrice, { color: "#000" }]}>
+                        {formatPrice(price.ask)}
+                      </Text>
+                    )}
+                  </>
+                )}
+              </Pressable>
+
+              <Pressable
+                style={({ pressed }) => [
+                  styles.cascadeExecBtn,
+                  styles.cascadeExecBtnSell,
+                  !tradeReady && !isPlacing && { opacity: 0.5 },
+                  pressed && { opacity: 0.8, transform: [{ scale: 0.97 }] },
+                  isPlacing && { opacity: 0.6 },
+                ]}
+                onPress={() => {
+                  if (tradeMode === "cascade") {
+                    setCascadeDirection("sell");
+                    void handleCascadeTrade("sell");
+                  } else {
+                    void handleSingleTrade("sell");
+                  }
+                }}
+                disabled={isPlacing}
+              >
+                {isPlacing && (tradeMode === "cascade" ? cascadeDirection === "sell" : direction === "sell") ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <>
+                    <Feather name="trending-down" size={20} color="#fff" />
+                    <Text style={[styles.cascadeExecLabel, { color: "#fff" }]}>SELL</Text>
+                    {price && (
+                      <Text style={[styles.cascadeExecPrice, { color: "#fff" }]}>
+                        {formatPrice(price.bid)}
+                      </Text>
+                    )}
+                  </>
+                )}
+              </Pressable>
+            </View>
+          );
+        })()}
+
+        {status !== "connected" && (
+          <Text style={styles.cascadeStatusHint}>
+            Connect your MT5 account in Settings to trade
+          </Text>
+        )}
+
         {/* Mode Toggle */}
         <View style={styles.modeToggle}>
           <Pressable
@@ -737,79 +819,6 @@ export default function TradeScreen() {
               </View>
             )}
 
-            {/* BUY / SELL execution buttons — tap executes cascade immediately */}
-            {(() => {
-              const cascadeReady = status === "connected" && !!price && cascadeMarketPrice > 0;
-              return (
-                <View style={styles.cascadeExecRow}>
-                  <Pressable
-                    style={({ pressed }) => [
-                      styles.cascadeExecBtn,
-                      styles.cascadeExecBtnBuy,
-                      !cascadeReady && !isPlacing && { opacity: 0.5 },
-                      pressed && { opacity: 0.8, transform: [{ scale: 0.97 }] },
-                      isPlacing && { opacity: 0.6 },
-                    ]}
-                    onPress={() => {
-                      setCascadeDirection("buy");
-                      void handleCascadeTrade("buy");
-                    }}
-                    disabled={isPlacing}
-                  >
-                    {isPlacing && cascadeDirection === "buy" ? (
-                      <ActivityIndicator color="#000" />
-                    ) : (
-                      <>
-                        <Feather name="trending-up" size={20} color="#000" />
-                        <Text style={[styles.cascadeExecLabel, { color: "#000" }]}>BUY</Text>
-                        {price && (
-                          <Text style={[styles.cascadeExecPrice, { color: "#000" }]}>
-                            {formatPrice(price.ask)}
-                          </Text>
-                        )}
-                      </>
-                    )}
-                  </Pressable>
-
-                  <Pressable
-                    style={({ pressed }) => [
-                      styles.cascadeExecBtn,
-                      styles.cascadeExecBtnSell,
-                      !cascadeReady && !isPlacing && { opacity: 0.5 },
-                      pressed && { opacity: 0.8, transform: [{ scale: 0.97 }] },
-                      isPlacing && { opacity: 0.6 },
-                    ]}
-                    onPress={() => {
-                      setCascadeDirection("sell");
-                      void handleCascadeTrade("sell");
-                    }}
-                    disabled={isPlacing}
-                  >
-                    {isPlacing && cascadeDirection === "sell" ? (
-                      <ActivityIndicator color="#fff" />
-                    ) : (
-                      <>
-                        <Feather name="trending-down" size={20} color="#fff" />
-                        <Text style={[styles.cascadeExecLabel, { color: "#fff" }]}>SELL</Text>
-                        {price && (
-                          <Text style={[styles.cascadeExecPrice, { color: "#fff" }]}>
-                            {formatPrice(price.bid)}
-                          </Text>
-                        )}
-                      </>
-                    )}
-                  </Pressable>
-                </View>
-              );
-            })()}
-
-            {/* Status hint below buttons */}
-            {status !== "connected" && (
-              <Text style={styles.cascadeStatusHint}>
-                Connect your MT5 account in Settings to trade
-              </Text>
-            )}
-
             {/* Armed watcher badge — confirms the limit-cancel watcher is active */}
             {armedWatchers.map((w) => (
               <View key={w.id} style={styles.watcherBadge}>
@@ -830,28 +839,6 @@ export default function TradeScreen() {
         {/* ═══ SINGLE MODE ════════════════════════════════════════════════════ */}
         {tradeMode === "single" && (
           <>
-            {/* Direction Toggle */}
-            <View style={styles.directionRow}>
-              <Pressable
-                style={[styles.dirBtn, direction === "buy" && styles.dirBtnBuyActive]}
-                onPress={() => { setDirection("buy"); Haptics.selectionAsync(); }}
-              >
-                <Feather name="trending-up" size={18} color={direction === "buy" ? "#000" : C.buy} />
-                <Text style={[styles.dirLabel, direction === "buy" ? styles.dirLabelActiveBuy : { color: C.buy }]}>
-                  BUY
-                </Text>
-              </Pressable>
-              <Pressable
-                style={[styles.dirBtn, direction === "sell" && styles.dirBtnSellActive]}
-                onPress={() => { setDirection("sell"); Haptics.selectionAsync(); }}
-              >
-                <Feather name="trending-down" size={18} color={direction === "sell" ? "#fff" : C.sell} />
-                <Text style={[styles.dirLabel, direction === "sell" ? styles.dirLabelActiveSell : { color: C.sell }]}>
-                  SELL
-                </Text>
-              </Pressable>
-            </View>
-
             {/* Lot Size */}
             <View style={styles.sectionCard}>
               <View style={styles.sectionHeader}>
@@ -955,32 +942,6 @@ export default function TradeScreen() {
               </View>
             )}
 
-            {/* Trade Button */}
-            <Pressable
-              style={({ pressed }) => [
-                styles.tradeBtn,
-                direction === "buy" ? styles.tradeBtnBuy : styles.tradeBtnSell,
-                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
-                isPlacing && { opacity: 0.6 },
-              ]}
-              onPress={handleSingleTrade}
-              disabled={isPlacing}
-            >
-              {isPlacing ? (
-                <ActivityIndicator color={direction === "buy" ? "#000" : "#fff"} />
-              ) : (
-                <>
-                  <Feather
-                    name={direction === "buy" ? "trending-up" : "trending-down"}
-                    size={20}
-                    color={direction === "buy" ? "#000" : "#fff"}
-                  />
-                  <Text style={[styles.tradeBtnText, direction === "buy" ? { color: "#000" } : { color: "#fff" }]}>
-                    {direction === "buy" ? "BUY XAUUSD" : "SELL XAUUSD"}
-                  </Text>
-                </>
-              )}
-            </Pressable>
           </>
         )}
       </ScrollView>
