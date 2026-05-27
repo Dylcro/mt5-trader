@@ -1,7 +1,7 @@
 import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { createRequire } from "module";
-import { db, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable, cascadeZonesTable, zonePositionsTable } from "@workspace/db";
+import { db, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable, cascadeZonesTable, zonePositionsTable, zoneOrdersTable } from "@workspace/db";
 import { and, eq, isNotNull } from "drizzle-orm";
 import { JWT_SECRET } from "./auth";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
@@ -1137,11 +1137,18 @@ async function createZoneOnMarketCascade(
   return zoneId;
 }
 
-function attachLimitOrderToZone(accountId: string, orderId: string): void {
+async function attachLimitOrderToZone(accountId: string, orderId: string): Promise<void> {
   const pending = pendingZoneAssoc.get(accountId);
   if (!pending) return;
   if (Date.now() > pending.expiresAt) { pendingZoneAssoc.delete(accountId); return; }
   zoneLimitOrders.set(orderId, pending.zoneId);
+  try {
+    await db.insert(zoneOrdersTable).values({
+      zoneId: pending.zoneId, orderId, createdAt: Date.now(),
+    }).onConflictDoNothing();
+  } catch (e) {
+    console.warn(`[zone ${pending.zoneId}] persist order=${orderId} failed:`, (e as Error).message);
+  }
   console.log(`[zone ${pending.zoneId}] tracking limit orderId=${orderId}`);
 }
 
@@ -1253,13 +1260,14 @@ async function cancelZoneLimits(
     console.warn(`[zone ${zoneId}] orders fetch error during cancel:`, (e as Error).message);
   }
   await Promise.all(orderIds.map(async (oid) => {
-    if (pending.size > 0 && !pending.has(oid)) {
+    const forget = async () => {
       zoneLimitOrders.delete(oid);
-      return;
-    }
+      try { await db.delete(zoneOrdersTable).where(eq(zoneOrdersTable.orderId, oid)); } catch { /* ignore */ }
+    };
+    if (pending.size > 0 && !pending.has(oid)) { await forget(); return; }
     const r = await tradeAction(token, region, accountId, { actionType: "ORDER_CANCEL", orderId: oid });
     if (r.ok || r.code === 10036 /* already closed */) {
-      zoneLimitOrders.delete(oid);
+      await forget();
       console.log(`[zone ${zoneId}] cancelled limit orderId=${oid}`);
     } else {
       console.warn(`[zone ${zoneId}] cancel limit orderId=${oid} failed code=${r.code}`);
@@ -1363,37 +1371,72 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     const worstLive = live.filter(p => p.id !== dbBest.positionId);
     const partialOf25 = Math.max(0.01, parseFloat((originalBestVol * 0.25).toFixed(2)));
 
+    // Each TP step gates state advancement on every required action succeeding.
+    // Re-running is idempotent: already-closed worst entries drop out of `live`,
+    // and a successful partial leaves `liveBest.volume` at ~0.75/0.5/0.25 ×
+    // original, so the volume-tolerance guards skip the partial on retry. A
+    // failed close (broker reject, requote, transient network) leaves tpXHit
+    // false so the next 3 s tick retries cleanly.
     if (!st.tp1Hit && hit(tp1)) {
-      console.log(`[zone ${zoneId}] TP1 hit @${cmpPrice} (anchor=${st.anchorPrice}, tp1=${tp1})`);
-      st.tp1Hit = true;
-      await db.update(cascadeZonesTable).set({ tp1Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+      console.log(`[zone ${zoneId}] TP1 trigger @${cmpPrice} (anchor=${st.anchorPrice}, tp1=${tp1})`);
+      let allOk = true;
       for (const p of worstLive) {
-        await closeZonePosition(token, region, st.accountId, p.id);
+        const ok = await closeZonePosition(token, region, st.accountId, p.id);
+        if (!ok) allOk = false;
       }
-      const vol = Math.min(partialOf25, liveBest.volume);
-      if (vol < liveBest.volume) {
-        await closeZonePosition(token, region, st.accountId, liveBest.id, vol);
+      // Skip partial if it already happened on a prior tick (best is already ≤75%).
+      if (liveBest.volume > originalBestVol * 0.76) {
+        const vol = Math.min(partialOf25, liveBest.volume);
+        const ok = vol < liveBest.volume
+          ? await closeZonePosition(token, region, st.accountId, liveBest.id, vol)
+          : await closeZonePosition(token, region, st.accountId, liveBest.id);
+        if (!ok) allOk = false;
+      }
+      if (allOk) {
+        st.tp1Hit = true;
+        await db.update(cascadeZonesTable).set({ tp1Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        console.log(`[zone ${zoneId}] TP1 complete`);
       } else {
-        await closeZonePosition(token, region, st.accountId, liveBest.id);
+        console.warn(`[zone ${zoneId}] TP1 partial failure — will retry next tick`);
       }
     } else if (!st.tp2Hit && st.tp1Hit && hit(tp2)) {
-      console.log(`[zone ${zoneId}] TP2 hit @${cmpPrice} (tp2=${tp2})`);
-      st.tp2Hit = true;
-      await db.update(cascadeZonesTable).set({ tp2Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-      const vol = Math.min(partialOf25, liveBest.volume);
-      if (vol < liveBest.volume) {
-        await closeZonePosition(token, region, st.accountId, liveBest.id, vol);
+      console.log(`[zone ${zoneId}] TP2 trigger @${cmpPrice} (tp2=${tp2})`);
+      let allOk = true;
+      if (liveBest.volume > originalBestVol * 0.51) {
+        const vol = Math.min(partialOf25, liveBest.volume);
+        if (vol < liveBest.volume) {
+          const ok = await closeZonePosition(token, region, st.accountId, liveBest.id, vol);
+          if (!ok) allOk = false;
+        }
       }
-      // Move SL on remaining best to break-even (its original entry price).
-      await modifyZonePositionSl(token, region, st.accountId, liveBest.id, liveBest.openPrice);
+      // SL-to-BE: setting again to the same value is a no-op for the broker.
+      const slOk = await modifyZonePositionSl(token, region, st.accountId, liveBest.id, liveBest.openPrice);
+      if (!slOk) allOk = false;
+      // cancelZoneLimits is idempotent (skips already-cancelled orders).
       await cancelZoneLimits(token, region, st.accountId, zoneId);
+      if (allOk) {
+        st.tp2Hit = true;
+        await db.update(cascadeZonesTable).set({ tp2Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        console.log(`[zone ${zoneId}] TP2 complete`);
+      } else {
+        console.warn(`[zone ${zoneId}] TP2 partial failure — will retry next tick`);
+      }
     } else if (!st.tp3Hit && st.tp2Hit && hit(tp3)) {
-      console.log(`[zone ${zoneId}] TP3 hit @${cmpPrice} (tp3=${tp3})`);
-      st.tp3Hit = true;
-      await db.update(cascadeZonesTable).set({ tp3Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-      const vol = Math.min(partialOf25, liveBest.volume);
-      if (vol < liveBest.volume) {
-        await closeZonePosition(token, region, st.accountId, liveBest.id, vol);
+      console.log(`[zone ${zoneId}] TP3 trigger @${cmpPrice} (tp3=${tp3})`);
+      let allOk = true;
+      if (liveBest.volume > originalBestVol * 0.26) {
+        const vol = Math.min(partialOf25, liveBest.volume);
+        if (vol < liveBest.volume) {
+          const ok = await closeZonePosition(token, region, st.accountId, liveBest.id, vol);
+          if (!ok) allOk = false;
+        }
+      }
+      if (allOk) {
+        st.tp3Hit = true;
+        await db.update(cascadeZonesTable).set({ tp3Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        console.log(`[zone ${zoneId}] TP3 complete`);
+      } else {
+        console.warn(`[zone ${zoneId}] TP3 partial failure — will retry next tick`);
       }
     }
   } catch (e) {
@@ -1433,6 +1476,10 @@ export async function loadZoneState(): Promise<void> {
       });
     }
     if (zones.length > 0) console.log(`[zone] hydrated ${zones.length} OPEN zone(s) from db`);
+    // Rehydrate zone↔limit-order mappings so pre-restart limits still resolve.
+    const orders = await db.select().from(zoneOrdersTable);
+    for (const o of orders) zoneLimitOrders.set(o.orderId, o.zoneId);
+    if (orders.length > 0) console.log(`[zone] hydrated ${orders.length} zone limit-order link(s) from db`);
   } catch (e) {
     console.error("[zone] hydrate error:", (e as Error).message);
   }
@@ -1489,14 +1536,29 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     const sorted = sortZonePositions(live, st.direction); // worst → best
     const best = sorted[sorted.length - 1]!;
     const others = sorted.slice(0, -1);
+    const failed: string[] = [];
     for (const p of others) {
-      await closeZonePosition(token, region, accountId, p.id);
+      const ok = await closeZonePosition(token, region, accountId, p.id);
+      if (!ok) failed.push(p.id);
     }
     const sl = st.direction === "buy"
       ? parseFloat((best.openPrice - ZONE_RISK_FREE_PIPS * PIP).toFixed(2))
       : parseFloat((best.openPrice + ZONE_RISK_FREE_PIPS * PIP).toFixed(2));
-    await modifyZonePositionSl(token, region, accountId, best.id, sl);
+    const slOk = await modifyZonePositionSl(token, region, accountId, best.id, sl);
     await cancelZoneLimits(token, region, accountId, zoneId);
+    if (failed.length > 0 || !slOk) {
+      // Don't flip status — caller can retry. Surface what's still broken.
+      console.warn(`[zone ${zoneId}] risk-free partial: failedCloses=${failed.length} slOk=${slOk}`);
+      res.status(207).json({
+        ok: false,
+        bestPositionId: best.id,
+        sl, slOk,
+        closedCount: others.length - failed.length,
+        failedPositionIds: failed,
+        message: "Some operations failed — zone NOT marked risk-free. Retry to clear remaining issues.",
+      });
+      return;
+    }
     st.status = "RISK_FREE";
     await db.update(cascadeZonesTable).set({ status: "RISK_FREE" }).where(eq(cascadeZonesTable.zoneId, zoneId));
     console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl}`);
@@ -2291,7 +2353,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
           console.log(`[trade] tracked cascade limit orderId=${data.orderId}`);
           // Attach this limit to the most recently created zone for this account
           // (if any limit-association window is still open).
-          attachLimitOrderToZone(accountId, data.orderId);
+          void attachLimitOrderToZone(accountId, data.orderId);
         }
         // Market order placed by the app: mark its positionId immediately so the
         // hasBeenCascaded guard blocks it even if the comment is later stripped.

@@ -30,3 +30,14 @@ export const zonePositionsTable = pgTable("zone_positions", {
 });
 
 export type ZonePositionRow = typeof zonePositionsTable.$inferSelect;
+
+// Persistent zone↔order mapping so cascade limit fills (and TP2 cancellations)
+// still find their zone after a server restart.
+export const zoneOrdersTable = pgTable("zone_orders", {
+  id:        serial("id").primaryKey(),
+  zoneId:    text("zone_id").notNull(),
+  orderId:   text("order_id").notNull().unique(),
+  createdAt: bigint("created_at", { mode: "number" }).notNull(),
+});
+
+export type ZoneOrderRow = typeof zoneOrdersTable.$inferSelect;

@@ -77,6 +77,15 @@ async function ensureTables(): Promise<void> {
     CREATE INDEX IF NOT EXISTS zone_positions_zone_status
       ON zone_positions (zone_id, status);
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS zone_orders (
+      id         SERIAL PRIMARY KEY,
+      zone_id    TEXT   NOT NULL,
+      order_id   TEXT   NOT NULL UNIQUE,
+      created_at BIGINT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS zone_orders_zone ON zone_orders (zone_id);
+  `);
 }
 
 async function main() {
