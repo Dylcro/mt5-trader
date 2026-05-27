@@ -9,20 +9,22 @@ const PIP = 0.10;
 const EXPECTED_OFFSET = ZONE_RISK_FREE_PIPS * PIP;
 
 describe("computeRiskFreeSl (POST /risk-free SL placement)", () => {
-  it("BUY: moves SL ABOVE entry by exactly ZONE_RISK_FREE_PIPS * PIP", () => {
+  // Per spec: risk-free SL is PROTECTIVE — sits on the LOSING side of the
+  // entry so a reversal closes for ~10p loss instead of running through SL.
+  it("BUY: moves SL BELOW entry by exactly ZONE_RISK_FREE_PIPS * PIP", () => {
     const entry = 3120.55;
     const sl = computeRiskFreeSl("buy", entry);
-    expect(sl).toBeGreaterThan(entry);
-    expect(sl).toBeCloseTo(entry + EXPECTED_OFFSET, 2);
-    expect(sl - entry).toBeCloseTo(EXPECTED_OFFSET, 6);
-  });
-
-  it("SELL: moves SL BELOW entry by exactly ZONE_RISK_FREE_PIPS * PIP", () => {
-    const entry = 3120.55;
-    const sl = computeRiskFreeSl("sell", entry);
     expect(sl).toBeLessThan(entry);
     expect(sl).toBeCloseTo(entry - EXPECTED_OFFSET, 2);
     expect(entry - sl).toBeCloseTo(EXPECTED_OFFSET, 6);
+  });
+
+  it("SELL: moves SL ABOVE entry by exactly ZONE_RISK_FREE_PIPS * PIP", () => {
+    const entry = 3120.55;
+    const sl = computeRiskFreeSl("sell", entry);
+    expect(sl).toBeGreaterThan(entry);
+    expect(sl).toBeCloseTo(entry + EXPECTED_OFFSET, 2);
+    expect(sl - entry).toBeCloseTo(EXPECTED_OFFSET, 6);
   });
 
   it("rounds to 2 decimal places (XAUUSD price precision)", () => {
@@ -34,13 +36,13 @@ describe("computeRiskFreeSl (POST /risk-free SL placement)", () => {
     const entry = 2987.42;
     const buySl = computeRiskFreeSl("buy", entry);
     const sellSl = computeRiskFreeSl("sell", entry);
-    expect(buySl - entry).toBeCloseTo(entry - sellSl, 6);
+    expect(entry - buySl).toBeCloseTo(sellSl - entry, 6);
   });
 
   it("honours a custom pip count when provided", () => {
     const entry = 3000.00;
     const sl = computeRiskFreeSl("buy", entry, 25);
-    expect(sl).toBeCloseTo(entry + 25 * PIP, 2);
+    expect(sl).toBeCloseTo(entry - 25 * PIP, 2);
   });
 });
 

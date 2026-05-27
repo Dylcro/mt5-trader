@@ -104,10 +104,16 @@ export interface PlaceTradeParams {
   takeProfit?: number;
   comment?: string;
   limitPrice?: number;
-  /** Per-trade TP override (pips). Only attached to the market leg of a cascade. */
-  tp1Pips?: number;
-  tp2Pips?: number;
-  tp3Pips?: number;
+  /** Per-trade absolute zone TP prices. Only the market leg of a cascade actually
+   *  creates a zone server-side, so these are no-ops on plain single orders. */
+  tp1Price?: number;
+  tp2Price?: number;
+  tp3Price?: number;
+  /** TP4 is optional — when omitted the remaining 25% is left for manual close. */
+  tp4Price?: number;
+  /** Anchor hint = the live market price observed when the user tapped BUY/SELL.
+   *  Server uses this to seed the zone before the real fill price arrives. */
+  anchorPrice?: number;
 }
 
 export interface CascadeOrderParams {
@@ -117,10 +123,14 @@ export interface CascadeOrderParams {
   stopLoss: number;
   /** If set, skip the market order and use this position ID as the market leg */
   existingPositionId?: string;
-  /** Optional per-zone TP overrides (pips). Validated server-side. */
-  tp1Pips?: number;
-  tp2Pips?: number;
-  tp3Pips?: number;
+  /** Per-zone absolute TP prices. tp1-3 required for the zone monitor to fire;
+   *  tp4 optional (omit = manual close of the remaining 25%). */
+  tp1Price: number;
+  tp2Price: number;
+  tp3Price: number;
+  tp4Price?: number;
+  /** Live anchor hint for the new zone (market price at user tap). */
+  anchorPrice?: number;
 }
 
 // Determine the API base URL.
@@ -649,11 +659,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       if (params.limitPrice != null) body.openPrice = params.limitPrice;
       if (params.stopLoss != null) body.stopLoss = params.stopLoss;
       if (params.takeProfit != null) body.takeProfit = params.takeProfit;
-      // Per-trade zone TP overrides — server only honours these on the cascade
-      // market leg, but it's harmless to send them on any order body.
-      if (params.tp1Pips != null) body.tp1Pips = params.tp1Pips;
-      if (params.tp2Pips != null) body.tp2Pips = params.tp2Pips;
-      if (params.tp3Pips != null) body.tp3Pips = params.tp3Pips;
+      // Per-trade zone TP prices — server only honours these on the cascade
+      // market leg (it triggers zone creation), harmless on other orders.
+      if (params.tp1Price != null) body.tp1Price = params.tp1Price;
+      if (params.tp2Price != null) body.tp2Price = params.tp2Price;
+      if (params.tp3Price != null) body.tp3Price = params.tp3Price;
+      if (params.tp4Price != null) body.tp4Price = params.tp4Price;
+      if (params.anchorPrice != null) body.anchorPrice = params.anchorPrice;
 
       const isTransient = (msg?: string) =>
         msg?.toLowerCase().includes("failed to execute a callable") ||
@@ -747,11 +759,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
               volume: params.volume,
               stopLoss: params.stopLoss,
               comment: `Cascade 1/${total}`,
-              // TP overrides only ride along on the market leg — that's the trade
-              // that triggers zone creation server-side.
-              tp1Pips: params.tp1Pips,
-              tp2Pips: params.tp2Pips,
-              tp3Pips: params.tp3Pips,
+              // Absolute TP prices ride along on the market leg — that's the
+              // trade that triggers zone creation server-side.
+              tp1Price: params.tp1Price,
+              tp2Price: params.tp2Price,
+              tp3Price: params.tp3Price,
+              tp4Price: params.tp4Price,
+              anchorPrice: params.anchorPrice,
             }),
             ...params.limitEntries.map((limitPrice, i) =>
               submitOrderRaw({

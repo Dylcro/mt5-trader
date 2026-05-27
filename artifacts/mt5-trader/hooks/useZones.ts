@@ -8,19 +8,23 @@ export interface Zone {
   zoneId: string;
   direction: "buy" | "sell";
   anchorPrice: number;
-  tp1Pips: number;
-  tp2Pips: number;
-  tp3Pips: number;
+  // Absolute TP prices (tp4 optional — null = left for manual close).
+  tp1Price: number | null;
+  tp2Price: number | null;
+  tp3Price: number | null;
+  tp4Price: number | null;
   tp1Hit: boolean;
   tp2Hit: boolean;
   tp3Hit: boolean;
+  tp4Hit: boolean;
+  cashoutDone: boolean;
   status: "OPEN" | "RISK_FREE" | "CLOSED";
   createdAt: number;
   closedAt?: number | null;
-  finalTpReached?: 0 | 1 | 2 | 3;
+  finalTpReached?: 0 | 1 | 2 | 3 | 4;
   positionCount: number;
   currentPrice?: number | null;
-  nextTp?: 0 | 1 | 2 | 3;
+  nextTp?: 0 | 1 | 2 | 3 | 4;
   nextTpPrice?: number | null;
   pipsToNextTp?: number | null;
   progressPct?: number | null;

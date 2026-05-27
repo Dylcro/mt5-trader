@@ -20,9 +20,6 @@ export interface CascadeSettings {
   takeProfitEnabled: boolean;
   takeProfitPips: number;
   autoCascadeEnabled: boolean;
-  tp1Pips: number;
-  tp2Pips: number;
-  tp3Pips: number;
 }
 
 const DEFAULTS: CascadeSettings = {
@@ -32,9 +29,6 @@ const DEFAULTS: CascadeSettings = {
   takeProfitEnabled: false,
   takeProfitPips: 30,
   autoCascadeEnabled: false,
-  tp1Pips: 20,
-  tp2Pips: 50,
-  tp3Pips: 90,
 };
 
 const VALID_PIPS_BETWEEN = [5, 10, 15, 20];
@@ -49,9 +43,6 @@ function storageKeys(accountId: string) {
     slPips:            `${prefix}sl_pips`,
     takeProfitEnabled: `${prefix}tp_enabled`,
     takeProfitPips:    `${prefix}tp_pips`,
-    tp1Pips:           `${prefix}zone_tp1`,
-    tp2Pips:           `${prefix}zone_tp2`,
-    tp3Pips:           `${prefix}zone_tp3`,
   };
 }
 
@@ -77,9 +68,6 @@ async function pushToServer(s: CascadeSettings, accountId: string): Promise<void
         numPositions: s.numPositions,
         pipsBetween: s.pipsBetween,
         slPips: s.slPips,
-        tp1Pips: s.tp1Pips,
-        tp2Pips: s.tp2Pips,
-        tp3Pips: s.tp3Pips,
       }),
     });
   } catch {
@@ -98,7 +86,7 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         const keys = storageKeys(accountId);
         const allKeys = [...Object.values(keys), GLOBAL_AUTO_CASCADE_KEY];
         const pairs = await AsyncStorage.multiGet(allKeys);
-        const [num, between, sl, tpEnabled, tpPips, tp1, tp2, tp3, globalAutoEnabled] = pairs.map((p) => p[1]);
+        const [num, between, sl, tpEnabled, tpPips, globalAutoEnabled] = pairs.map((p) => p[1]);
 
         let autoCascadeEnabled = DEFAULTS.autoCascadeEnabled;
         if (globalAutoEnabled !== null) {
@@ -120,9 +108,6 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
           takeProfitEnabled: tpEnabled === "true",
           takeProfitPips: tpPips ? parseFloat(tpPips) : DEFAULTS.takeProfitPips,
           autoCascadeEnabled,
-          tp1Pips: tp1 ? parseFloat(tp1) : DEFAULTS.tp1Pips,
-          tp2Pips: tp2 ? parseFloat(tp2) : DEFAULTS.tp2Pips,
-          tp3Pips: tp3 ? parseFloat(tp3) : DEFAULTS.tp3Pips,
         };
         setSettings(local);
         void pushToServer(local, accountId);
@@ -144,9 +129,6 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         [keys.slPips, String(next.slPips)],
         [keys.takeProfitEnabled, String(next.takeProfitEnabled)],
         [keys.takeProfitPips, String(next.takeProfitPips)],
-        [keys.tp1Pips, String(next.tp1Pips)],
-        [keys.tp2Pips, String(next.tp2Pips)],
-        [keys.tp3Pips, String(next.tp3Pips)],
         [GLOBAL_AUTO_CASCADE_KEY, String(next.autoCascadeEnabled)],
       ]);
       return next;
@@ -167,9 +149,6 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
           numPositions: settings.numPositions,
           pipsBetween: settings.pipsBetween,
           slPips: settings.slPips,
-          tp1Pips: settings.tp1Pips,
-          tp2Pips: settings.tp2Pips,
-          tp3Pips: settings.tp3Pips,
         }),
       });
       return res.ok;

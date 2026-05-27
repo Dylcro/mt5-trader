@@ -67,7 +67,18 @@ async function ensureTables(): Promise<void> {
     CREATE INDEX IF NOT EXISTS cascade_zones_acct_status
       ON cascade_zones (account_id, status);
     ALTER TABLE cascade_zones
-      ADD COLUMN IF NOT EXISTS closed_at BIGINT;
+      ADD COLUMN IF NOT EXISTS closed_at BIGINT,
+      ADD COLUMN IF NOT EXISTS tp1_price DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS tp2_price DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS tp3_price DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS tp4_price DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS tp4_hit BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS original_volume DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS cashout_pips DOUBLE PRECISION NOT NULL DEFAULT 5,
+      ADD COLUMN IF NOT EXISTS cashout_done BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE cascade_zones ALTER COLUMN tp1_pips DROP NOT NULL;
+    ALTER TABLE cascade_zones ALTER COLUMN tp2_pips DROP NOT NULL;
+    ALTER TABLE cascade_zones ALTER COLUMN tp3_pips DROP NOT NULL;
   `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS zone_positions (

@@ -48,7 +48,7 @@ export default function ZoneCard({ zone, onRiskFree, historical = false }: ZoneC
     if (!onRiskFree) return;
     Alert.alert(
       "Lock in Risk Free?",
-      `Close all but the best entry in this ${isBuy ? "BUY" : "SELL"} zone and move its stop loss 10 pips into profit. Pending limit orders for this zone will be cancelled.`,
+      `Close all but the best entry in this ${isBuy ? "BUY" : "SELL"} zone and place a protective stop loss 10 pips on the losing side of the surviving entry. Pending limit orders for this zone will be cancelled.`,
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -111,9 +111,22 @@ export default function ZoneCard({ zone, onRiskFree, historical = false }: ZoneC
           </Text>
         </View>
         <View style={styles.chipsRow}>
-          <TpChip label={`TP1 ${zone.tp1Pips}p`} hit={zone.tp1Hit} />
-          <TpChip label={`TP2 ${zone.tp2Pips}p`} hit={zone.tp2Hit} />
-          <TpChip label={`TP3 ${zone.tp3Pips}p`} hit={zone.tp3Hit} />
+          <TpChip
+            label={zone.tp1Price != null ? `TP1 ${formatPrice(zone.tp1Price)}` : "TP1 —"}
+            hit={zone.tp1Hit}
+          />
+          <TpChip
+            label={zone.tp2Price != null ? `TP2 ${formatPrice(zone.tp2Price)}` : "TP2 —"}
+            hit={zone.tp2Hit}
+          />
+          <TpChip
+            label={zone.tp3Price != null ? `TP3 ${formatPrice(zone.tp3Price)}` : "TP3 —"}
+            hit={zone.tp3Hit}
+          />
+          <TpChip
+            label={zone.tp4Price != null ? `TP4 ${formatPrice(zone.tp4Price)}` : "TP4 manual"}
+            hit={zone.tp4Hit}
+          />
         </View>
       </View>
 

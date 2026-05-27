@@ -355,28 +355,42 @@ export default function TradeScreen() {
     void AsyncStorage.setItem(LOT_SIZE_CASCADE_KEY, String(v));
   }, []);
 
-  // Per-zone TP override (applied to the NEXT cascade only).
-  // Off by default → server falls back to the user's cascade-config TPs.
-  // When enabled, the StepInputs seed from the current cascadeSettings so the
-  // user has a sensible starting point to tweak.
-  const [tpOverrideEnabled, setTpOverrideEnabled] = useState(false);
-  const [tpOverride1, setTpOverride1] = useState<number>(cascadeSettings.tp1Pips);
-  const [tpOverride2, setTpOverride2] = useState<number>(cascadeSettings.tp2Pips);
-  const [tpOverride3, setTpOverride3] = useState<number>(cascadeSettings.tp3Pips);
-  const tpOverrideRef = useRef({ enabled: tpOverrideEnabled, tp1: tpOverride1, tp2: tpOverride2, tp3: tpOverride3 });
+  // Per-trade absolute TP prices. TP1-3 required, TP4 optional (0 = manual close).
+  // Auto-seeded from live price when blank — see effect below.
+  const [tp1Price, setTp1Price] = useState<number>(0);
+  const [tp2Price, setTp2Price] = useState<number>(0);
+  const [tp3Price, setTp3Price] = useState<number>(0);
+  const [tp4Price, setTp4Price] = useState<number>(0);
+  const tpPricesRef = useRef({ tp1: tp1Price, tp2: tp2Price, tp3: tp3Price, tp4: tp4Price });
   useEffect(() => {
-    tpOverrideRef.current = { enabled: tpOverrideEnabled, tp1: tpOverride1, tp2: tpOverride2, tp3: tpOverride3 };
-  }, [tpOverrideEnabled, tpOverride1, tpOverride2, tpOverride3]);
-  // Re-seed override values whenever the saved cascade settings change, but only
-  // while the override is OFF — once the user has dialed in custom values we
-  // don't want to clobber them.
+    tpPricesRef.current = { tp1: tp1Price, tp2: tp2Price, tp3: tp3Price, tp4: tp4Price };
+  }, [tp1Price, tp2Price, tp3Price, tp4Price]);
   useEffect(() => {
-    if (tpOverrideEnabled) return;
-    setTpOverride1(cascadeSettings.tp1Pips);
-    setTpOverride2(cascadeSettings.tp2Pips);
-    setTpOverride3(cascadeSettings.tp3Pips);
-  }, [cascadeSettings.tp1Pips, cascadeSettings.tp2Pips, cascadeSettings.tp3Pips, tpOverrideEnabled]);
-  const tpOverrideValid = tpOverride1 > 0 && tpOverride1 < tpOverride2 && tpOverride2 < tpOverride3;
+    // Auto-suggest sensible TP defaults seeded from the current price.
+    // BUY → ladder above the ask; SELL → ladder below the bid. Only fill blanks
+    // (0) so user edits aren't overwritten.
+    const p = priceRef.current;
+    if (!p) return;
+    const seed = cascadeDirection === "buy" ? p.ask : p.bid;
+    if (!(seed > 0)) return;
+    const sign = cascadeDirection === "buy" ? 1 : -1;
+    const round2 = (v: number) => parseFloat(v.toFixed(2));
+    if (tp1Price <= 0) setTp1Price(round2(seed + sign * 20 * 0.10));
+    if (tp2Price <= 0) setTp2Price(round2(seed + sign * 50 * 0.10));
+    if (tp3Price <= 0) setTp3Price(round2(seed + sign * 90 * 0.10));
+    // TP4 deliberately left at 0 = manual.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cascadeDirection, price?.ask, price?.bid]);
+  // Validation: TP1<TP2<TP3 (BUY) on profitable side; TP4 optional & must extend.
+  const tpAnchor = cascadeDirection === "buy" ? (price?.ask ?? 0) : (price?.bid ?? 0);
+  const cmpTp = cascadeDirection === "buy"
+    ? (a: number, b: number) => a > b
+    : (a: number, b: number) => a < b;
+  const tpPricesValid =
+    tp1Price > 0 && tp2Price > 0 && tp3Price > 0 &&
+    (tpAnchor <= 0 || cmpTp(tp1Price, tpAnchor)) &&
+    cmpTp(tp2Price, tp1Price) && cmpTp(tp3Price, tp2Price) &&
+    (tp4Price <= 0 || cmpTp(tp4Price, tp3Price));
 
   const [isPlacing, setIsPlacing] = useState(false);
 
@@ -600,14 +614,35 @@ export default function TradeScreen() {
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
     console.log("[cascade] placing dir=" + dir + " vol=" + String(cascadeLotSize) + " entries=[" + levels.limitEntries.join(",") + "] sl=" + String(levels.stopLoss));
     try {
-      const tpOv = tpOverrideRef.current;
-      const useOverride = tpOv.enabled && tpOv.tp1 > 0 && tpOv.tp1 < tpOv.tp2 && tpOv.tp2 < tpOv.tp3;
+      const tps = tpPricesRef.current;
+      // Re-validate at submit time (state may have changed since render).
+      const cmpFn = dir === "buy" ? (a: number, b: number) => a > b : (a: number, b: number) => a < b;
+      const tpsOk =
+        tps.tp1 > 0 && tps.tp2 > 0 && tps.tp3 > 0 &&
+        cmpFn(tps.tp1, mktPrice) && cmpFn(tps.tp2, tps.tp1) && cmpFn(tps.tp3, tps.tp2) &&
+        (tps.tp4 <= 0 || cmpFn(tps.tp4, tps.tp3));
+      if (!tpsOk) {
+        isPlacingRef.current = false;
+        setIsPlacing(false);
+        Alert.alert("Invalid TP Prices", `Set TP1, TP2 and TP3 on the profitable side of the entry, in strictly ${dir === "buy" ? "ascending" : "descending"} order. TP4 is optional.`);
+        return;
+      }
+      if (cascadeLotSize < 0.04) {
+        isPlacingRef.current = false;
+        setIsPlacing(false);
+        Alert.alert("Lot Too Small", "Cascade lot size must be at least 0.04 — the zone closes 25% of the best entry at each of TP1-4, which requires 4 × 0.01 broker minimum.");
+        return;
+      }
       const result = await placeCascadeOrders({
         direction: dir,
         volume: cascadeLotSize,
         limitEntries: levels.limitEntries,
         stopLoss: levels.stopLoss,
-        ...(useOverride ? { tp1Pips: tpOv.tp1, tp2Pips: tpOv.tp2, tp3Pips: tpOv.tp3 } : null),
+        tp1Price: tps.tp1,
+        tp2Price: tps.tp2,
+        tp3Price: tps.tp3,
+        tp4Price: tps.tp4 > 0 ? tps.tp4 : undefined,
+        anchorPrice: mktPrice,
       });
       console.log("[cascade] done placed=" + String(result.placed) + " failed=" + String(result.failed) + " success=" + String(result.success) + " msg=" + result.message);
       if (result.success) {
@@ -854,51 +889,42 @@ export default function TradeScreen() {
               <StepInput value={cascadeLotSize} onChange={setCascadeLotSize} step={0.01} min={0.01} max={100} decimals={2} />
             </View>
 
-            {/* Per-zone TP overrides — applied to the NEXT cascade only.
-                When off, the server uses the user's saved cascade-config TPs. */}
+            {/* Per-trade absolute TP prices. TP1-3 required, TP4 optional. */}
             <View style={styles.sectionCard}>
               <View style={styles.sectionHeader}>
-                <Text style={styles.sectionTitle}>Custom Take Profits</Text>
-                <Pressable
-                  onPress={() => { setTpOverrideEnabled((v) => !v); Haptics.selectionAsync(); }}
-                  style={[styles.modeBtn, tpOverrideEnabled && styles.modeBtnActive, { paddingHorizontal: 12, paddingVertical: 6 }]}
-                  hitSlop={8}
-                >
-                  <Feather
-                    name={tpOverrideEnabled ? "check-circle" : "circle"}
-                    size={14}
-                    color={tpOverrideEnabled ? C.gold : C.textSecondary}
-                  />
-                  <Text style={[styles.modeBtnText, tpOverrideEnabled && styles.modeBtnTextActive]}>
-                    {tpOverrideEnabled ? "On (this trade)" : "Use defaults"}
-                  </Text>
-                </Pressable>
+                <Text style={styles.sectionTitle}>Take Profit Prices</Text>
+                <Text style={styles.sectionHint}>
+                  {cascadeDirection === "buy" ? "Above entry" : "Below entry"}
+                </Text>
               </View>
-              {tpOverrideEnabled ? (
-                <>
-                  <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={[styles.cascadeSummaryLabel, { marginBottom: 6 }]}>TP1 PIPS</Text>
-                      <StepInput value={tpOverride1} onChange={setTpOverride1} step={1} min={1} max={5000} decimals={0} />
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={[styles.cascadeSummaryLabel, { marginBottom: 6 }]}>TP2 PIPS</Text>
-                      <StepInput value={tpOverride2} onChange={setTpOverride2} step={1} min={1} max={5000} decimals={0} />
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={[styles.cascadeSummaryLabel, { marginBottom: 6 }]}>TP3 PIPS</Text>
-                      <StepInput value={tpOverride3} onChange={setTpOverride3} step={1} min={1} max={5000} decimals={0} />
-                    </View>
-                  </View>
-                  {!tpOverrideValid && (
-                    <Text style={[styles.sectionHint, { color: C.sell, marginTop: 8 }]}>
-                      TP1 &lt; TP2 &lt; TP3 required — values will be ignored.
-                    </Text>
-                  )}
-                </>
-              ) : (
-                <Text style={[styles.sectionHint, { marginTop: 6 }]}>
-                  Currently {cascadeSettings.tp1Pips} / {cascadeSettings.tp2Pips} / {cascadeSettings.tp3Pips} pips from Settings. Turn on to override for this trade.
+              <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.cascadeSummaryLabel, { marginBottom: 6 }]}>TP1 PRICE</Text>
+                  <StepInput value={tp1Price} onChange={setTp1Price} step={0.10} min={0} max={100000} decimals={2} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.cascadeSummaryLabel, { marginBottom: 6 }]}>TP2 PRICE</Text>
+                  <StepInput value={tp2Price} onChange={setTp2Price} step={0.10} min={0} max={100000} decimals={2} />
+                </View>
+              </View>
+              <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.cascadeSummaryLabel, { marginBottom: 6 }]}>TP3 PRICE</Text>
+                  <StepInput value={tp3Price} onChange={setTp3Price} step={0.10} min={0} max={100000} decimals={2} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.cascadeSummaryLabel, { marginBottom: 6 }]}>TP4 PRICE (opt)</Text>
+                  <StepInput value={tp4Price} onChange={setTp4Price} step={0.10} min={0} max={100000} decimals={2} />
+                </View>
+              </View>
+              {!tpPricesValid && (
+                <Text style={[styles.sectionHint, { color: C.sell, marginTop: 8 }]}>
+                  TP1, TP2, TP3 must be {cascadeDirection === "buy" ? "above the ask in ascending" : "below the bid in descending"} order. TP4 optional, must extend further.
+                </Text>
+              )}
+              {cascadeLotSize < 0.04 && (
+                <Text style={[styles.sectionHint, { color: C.sell, marginTop: 6 }]}>
+                  Lot size must be at least 0.04 (25% of each TP partial = 0.01 broker minimum × 4 TPs).
                 </Text>
               )}
             </View>

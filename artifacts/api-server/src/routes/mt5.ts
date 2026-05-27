@@ -1127,25 +1127,36 @@ interface ZoneState {
   accountId: string;
   direction: "buy" | "sell";
   anchorPrice: number;
-  tp1Pips: number;
-  tp2Pips: number;
-  tp3Pips: number;
+  // Absolute TP prices typed per-trade. tp4Price null = TP4 left manual.
+  tp1Price: number | null;
+  tp2Price: number | null;
+  tp3Price: number | null;
+  tp4Price: number | null;
+  // Original best-entry volume — 25% slices are computed from this so
+  // partials stay consistent across TP1/2/3/4.
+  originalVolume: number;
+  // Cashout-at-anchor offset (pips into profit; 5p covers broker spread).
+  cashoutPips: number;
+  cashoutDone: boolean;
   tp1Hit: boolean;
   tp2Hit: boolean;
   tp3Hit: boolean;
+  tp4Hit: boolean;
   status: "OPEN" | "RISK_FREE" | "CLOSED";
   busy: boolean; // debounce: prevent overlapping monitor ticks for this zone
 }
 
-const ZONE_TP1_PIPS_DEFAULT = 20;
-const ZONE_TP2_PIPS_DEFAULT = 50;
-const ZONE_TP3_PIPS_DEFAULT = 90;
 export const ZONE_RISK_FREE_PIPS   = 10;
+const ZONE_CASHOUT_PIPS_DEFAULT = 5;   // anchor + 5p covers spread
+const ZONE_MIN_LOT_PER_ENTRY    = 0.04; // 4 × 0.01 broker minimum for 25% slices
 
 // Pure helper: compute the "risk free" stop-loss price for a zone's surviving
-// entry. Risk free means moving SL `pips` INTO PROFIT from the entry price.
-//   BUY  profits when price rises → SL goes ABOVE entry.
-//   SELL profits when price falls → SL goes BELOW entry.
+// entry. The PROTECTIVE stop sits on the LOSING side of the entry by `pips`
+// — small loss if reversed, but locks in most of the unrealised gain on the
+// remaining best entry (which is already deep in profit by the time the user
+// taps Risk Free).
+//   BUY  → SL goes BELOW entry (limits downside).
+//   SELL → SL goes ABOVE entry (limits upside).
 // Exported so regression tests can lock the direction in (it was once inverted).
 export function computeRiskFreeSl(
   direction: "buy" | "sell",
@@ -1153,7 +1164,7 @@ export function computeRiskFreeSl(
   pips: number = ZONE_RISK_FREE_PIPS,
 ): number {
   const offset = pips * PIP;
-  const raw = direction === "buy" ? entryPrice + offset : entryPrice - offset;
+  const raw = direction === "buy" ? entryPrice - offset : entryPrice + offset;
   return parseFloat(raw.toFixed(2));
 }
 const ZONE_ASSOC_WINDOW_MS  = 30_000; // limits placed within 30s of market attach to the same zone
@@ -1171,26 +1182,22 @@ function newZoneId(): string {
 // submitted *immediately* after the market order can attach without waiting
 // for the anchor lookup / DB inserts. Returns the prepared zone state.
 //
-// `overrides` lets the caller supply per-trade TP1/2/3 distances. When any
-// override is missing/invalid the corresponding cascade-config value (and
-// finally the hardcoded default) is used instead. Strict ordering
-// (tp1 < tp2 < tp3) is enforced by the caller before reaching this function.
+// `tps` carries the user-typed absolute TP prices. TP1-3 are required by the
+// trade endpoint validator; TP4 is optional (null = left manual).
 function prepareZoneForCascade(
-  accountId: string, direction: "buy" | "sell", userId?: string,
-  overrides?: { tp1Pips?: number; tp2Pips?: number; tp3Pips?: number },
+  accountId: string, direction: "buy" | "sell", userId: string | undefined,
+  tps: { tp1Price: number; tp2Price: number; tp3Price: number; tp4Price: number | null },
+  originalVolume: number,
 ): ZoneState {
+  void userId;
   const zoneId = newZoneId();
-  const cfg = getCascadeConfig(accountId, userId);
-  const pickTp = (override: number | undefined, fromCfg: number, fallback: number): number => {
-    if (typeof override === "number" && override > 0) return override;
-    return fromCfg > 0 ? fromCfg : fallback;
-  };
   const state: ZoneState = {
     zoneId, accountId, direction, anchorPrice: 0,
-    tp1Pips: pickTp(overrides?.tp1Pips, cfg.tp1Pips, ZONE_TP1_PIPS_DEFAULT),
-    tp2Pips: pickTp(overrides?.tp2Pips, cfg.tp2Pips, ZONE_TP2_PIPS_DEFAULT),
-    tp3Pips: pickTp(overrides?.tp3Pips, cfg.tp3Pips, ZONE_TP3_PIPS_DEFAULT),
-    tp1Hit: false, tp2Hit: false, tp3Hit: false,
+    tp1Price: tps.tp1Price, tp2Price: tps.tp2Price, tp3Price: tps.tp3Price, tp4Price: tps.tp4Price,
+    originalVolume,
+    cashoutPips: ZONE_CASHOUT_PIPS_DEFAULT,
+    cashoutDone: false,
+    tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
     status: "OPEN", busy: false,
   };
   zoneStates.set(zoneId, state);
@@ -1213,8 +1220,12 @@ async function persistPreparedZone(
     await db.insert(cascadeZonesTable).values({
       zoneId: state.zoneId, accountId: state.accountId, userId: userId ?? null,
       direction: state.direction, anchorPrice: state.anchorPrice,
-      tp1Pips: state.tp1Pips, tp2Pips: state.tp2Pips, tp3Pips: state.tp3Pips,
-      tp1Hit: false, tp2Hit: false, tp3Hit: false, status: "OPEN", createdAt: now,
+      tp1Price: state.tp1Price, tp2Price: state.tp2Price,
+      tp3Price: state.tp3Price, tp4Price: state.tp4Price,
+      originalVolume: state.originalVolume,
+      cashoutPips: state.cashoutPips, cashoutDone: false,
+      tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
+      status: "OPEN", createdAt: now,
     }).onConflictDoNothing();
     await db.insert(zonePositionsTable).values({
       zoneId: state.zoneId, positionId, entryPrice: state.anchorPrice, volume,
@@ -1483,38 +1494,52 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     // For BUY closes use bid; for SELL closes use ask. Skip if anchor is invalid.
     if (!(st.anchorPrice > 0)) return;
     const cmpPrice = st.direction === "buy" ? price.bid : price.ask;
-    const tp1 = st.direction === "buy" ? st.anchorPrice + st.tp1Pips * PIP : st.anchorPrice - st.tp1Pips * PIP;
-    const tp2 = st.direction === "buy" ? st.anchorPrice + st.tp2Pips * PIP : st.anchorPrice - st.tp2Pips * PIP;
-    const tp3 = st.direction === "buy" ? st.anchorPrice + st.tp3Pips * PIP : st.anchorPrice - st.tp3Pips * PIP;
     const hit = (tp: number) => st.direction === "buy" ? cmpPrice >= tp : cmpPrice <= tp;
 
+    // ── Step 1: cashout worst entries when price returns to anchor ± 5p ──
+    // After a cascade fans out (multiple entries filled lower for BUY / higher
+    // for SELL), the moment price rallies BACK to anchor ± 5p every worst
+    // entry is at least 5p in profit and the BEST entry sits ~spread+ in the
+    // green. Close all worst at market, keep the best for TP1-4 to run on.
+    if (!st.cashoutDone && live.length > 1) {
+      const cashoutTrigger = st.direction === "buy"
+        ? st.anchorPrice + st.cashoutPips * PIP
+        : st.anchorPrice - st.cashoutPips * PIP;
+      if (hit(cashoutTrigger)) {
+        console.log(`[zone ${zoneId}] CASHOUT trigger @${cmpPrice} (anchor=${st.anchorPrice} ±${st.cashoutPips}p → ${cashoutTrigger.toFixed(2)})`);
+        const sorted = sortZonePositions(live, st.direction); // worst → best
+        const best = sorted[sorted.length - 1]!;
+        const worst = sorted.slice(0, -1);
+        let allOk = true;
+        for (const p of worst) {
+          const ok = await closeZonePosition(token, region, st.accountId, p.id);
+          if (!ok) allOk = false;
+        }
+        if (allOk) {
+          st.cashoutDone = true;
+          await db.update(cascadeZonesTable).set({ cashoutDone: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+          console.log(`[zone ${zoneId}] CASHOUT complete — kept best posId=${best.id} @${best.openPrice}`);
+        } else {
+          console.warn(`[zone ${zoneId}] CASHOUT partial failure — will retry next tick`);
+        }
+        return; // next tick re-snapshots live positions
+      }
+    }
+
+    // ── Step 2-5: TP1-4 on the best entry (25% partial each) ─────────────
     // Best entry = most profitable: BUY → lowest entry; SELL → highest entry.
-    // Use DB rows (zps) for the *original* volume — `live.volume` shrinks after
-    // each partial close, so 25%-of-live would under-close on TP2/TP3.
     const dbSorted = zps.slice().sort((a, b) =>
       st.direction === "buy" ? Number(b.entryPrice) - Number(a.entryPrice)
                               : Number(a.entryPrice) - Number(b.entryPrice));
-    const dbBest = dbSorted[dbSorted.length - 1]!; // best per original entry prices
+    const dbBest = dbSorted[dbSorted.length - 1]!;
     const liveBest = live.find(p => p.id === dbBest.positionId);
-    if (!liveBest) return; // best entry already closed — wait for cleanup
-    const originalBestVol = Number(dbBest.volume);
-    const worstLive = live.filter(p => p.id !== dbBest.positionId);
+    if (!liveBest) return; // best already gone — wait for cleanup
+    const originalBestVol = st.originalVolume > 0 ? st.originalVolume : Number(dbBest.volume);
     const partialOf25 = Math.max(0.01, parseFloat((originalBestVol * 0.25).toFixed(2)));
 
-    // Each TP step gates state advancement on every required action succeeding.
-    // Re-running is idempotent: already-closed worst entries drop out of `live`,
-    // and a successful partial leaves `liveBest.volume` at ~0.75/0.5/0.25 ×
-    // original, so the volume-tolerance guards skip the partial on retry. A
-    // failed close (broker reject, requote, transient network) leaves tpXHit
-    // false so the next 3 s tick retries cleanly.
-    if (!st.tp1Hit && hit(tp1)) {
-      console.log(`[zone ${zoneId}] TP1 trigger @${cmpPrice} (anchor=${st.anchorPrice}, tp1=${tp1})`);
+    if (!st.tp1Hit && st.tp1Price != null && hit(st.tp1Price)) {
+      console.log(`[zone ${zoneId}] TP1 trigger @${cmpPrice} (tp1=${st.tp1Price})`);
       let allOk = true;
-      for (const p of worstLive) {
-        const ok = await closeZonePosition(token, region, st.accountId, p.id);
-        if (!ok) allOk = false;
-      }
-      // Skip partial if it already happened on a prior tick (best is already ≤75%).
       if (liveBest.volume > originalBestVol * 0.76) {
         const vol = Math.min(partialOf25, liveBest.volume);
         const ok = vol < liveBest.volume
@@ -1529,8 +1554,8 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       } else {
         console.warn(`[zone ${zoneId}] TP1 partial failure — will retry next tick`);
       }
-    } else if (!st.tp2Hit && st.tp1Hit && hit(tp2)) {
-      console.log(`[zone ${zoneId}] TP2 trigger @${cmpPrice} (tp2=${tp2})`);
+    } else if (!st.tp2Hit && st.tp1Hit && st.tp2Price != null && hit(st.tp2Price)) {
+      console.log(`[zone ${zoneId}] TP2 trigger @${cmpPrice} (tp2=${st.tp2Price})`);
       let allOk = true;
       if (liveBest.volume > originalBestVol * 0.51) {
         const vol = Math.min(partialOf25, liveBest.volume);
@@ -1539,20 +1564,19 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
           if (!ok) allOk = false;
         }
       }
-      // SL-to-BE: setting again to the same value is a no-op for the broker.
+      // SL-to-BE on the remaining best entry + cancel all unfilled cascade limits.
       const slOk = await modifyZonePositionSl(token, region, st.accountId, liveBest.id, liveBest.openPrice);
       if (!slOk) allOk = false;
-      // cancelZoneLimits is idempotent (skips already-cancelled orders).
       await cancelZoneLimits(token, region, st.accountId, zoneId);
       if (allOk) {
         st.tp2Hit = true;
         await db.update(cascadeZonesTable).set({ tp2Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-        console.log(`[zone ${zoneId}] TP2 complete`);
+        console.log(`[zone ${zoneId}] TP2 complete — SL→BE @${liveBest.openPrice} + limits cancelled`);
       } else {
         console.warn(`[zone ${zoneId}] TP2 partial failure — will retry next tick`);
       }
-    } else if (!st.tp3Hit && st.tp2Hit && hit(tp3)) {
-      console.log(`[zone ${zoneId}] TP3 trigger @${cmpPrice} (tp3=${tp3})`);
+    } else if (!st.tp3Hit && st.tp2Hit && st.tp3Price != null && hit(st.tp3Price)) {
+      console.log(`[zone ${zoneId}] TP3 trigger @${cmpPrice} (tp3=${st.tp3Price})`);
       let allOk = true;
       if (liveBest.volume > originalBestVol * 0.26) {
         const vol = Math.min(partialOf25, liveBest.volume);
@@ -1567,6 +1591,17 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         console.log(`[zone ${zoneId}] TP3 complete`);
       } else {
         console.warn(`[zone ${zoneId}] TP3 partial failure — will retry next tick`);
+      }
+    } else if (!st.tp4Hit && st.tp3Hit && st.tp4Price != null && hit(st.tp4Price)) {
+      // TP4 is optional. When set, close whatever's left of the best entry.
+      console.log(`[zone ${zoneId}] TP4 trigger @${cmpPrice} (tp4=${st.tp4Price})`);
+      const ok = await closeZonePosition(token, region, st.accountId, liveBest.id);
+      if (ok) {
+        st.tp4Hit = true;
+        await db.update(cascadeZonesTable).set({ tp4Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        console.log(`[zone ${zoneId}] TP4 complete — final exit`);
+      } else {
+        console.warn(`[zone ${zoneId}] TP4 close failed — will retry next tick`);
       }
     }
   } catch (e) {
@@ -1596,12 +1631,21 @@ export async function loadZoneState(): Promise<void> {
     const zones = await db.select().from(cascadeZonesTable)
       .where(eq(cascadeZonesTable.status, "OPEN"));
     for (const z of zones) {
+      const dir: "buy" | "sell" = z.direction === "sell" ? "sell" : "buy";
+      const anchor = Number(z.anchorPrice);
+      // Legacy zones (created before the rebuild) only have pip distances. Convert
+      // to absolute prices so the new monitor's hit() comparisons still fire.
+      const fromPips = (pips: number) => dir === "buy" ? anchor + pips * PIP : anchor - pips * PIP;
       zoneStates.set(z.zoneId, {
-        zoneId: z.zoneId, accountId: z.accountId,
-        direction: z.direction === "sell" ? "sell" : "buy",
-        anchorPrice: Number(z.anchorPrice),
-        tp1Pips: Number(z.tp1Pips), tp2Pips: Number(z.tp2Pips), tp3Pips: Number(z.tp3Pips),
-        tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit,
+        zoneId: z.zoneId, accountId: z.accountId, direction: dir, anchorPrice: anchor,
+        tp1Price: z.tp1Price != null ? Number(z.tp1Price) : (z.tp1Pips ? fromPips(Number(z.tp1Pips)) : null),
+        tp2Price: z.tp2Price != null ? Number(z.tp2Price) : (z.tp2Pips ? fromPips(Number(z.tp2Pips)) : null),
+        tp3Price: z.tp3Price != null ? Number(z.tp3Price) : (z.tp3Pips ? fromPips(Number(z.tp3Pips)) : null),
+        tp4Price: z.tp4Price != null ? Number(z.tp4Price) : null,
+        originalVolume: z.originalVolume != null ? Number(z.originalVolume) : 0,
+        cashoutPips: Number(z.cashoutPips ?? ZONE_CASHOUT_PIPS_DEFAULT),
+        cashoutDone: z.cashoutDone ?? false,
+        tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit, tp4Hit: z.tp4Hit ?? false,
         status: "OPEN", busy: false,
       });
     }
@@ -1631,18 +1675,22 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
       if (!includeClosed && z.status === "CLOSED") continue;
       const openPositions = await db.select().from(zonePositionsTable)
         .where(and(eq(zonePositionsTable.zoneId, z.zoneId), eq(zonePositionsTable.status, "OPEN")));
-      const finalTpReached = z.tp3Hit ? 3 : z.tp2Hit ? 2 : z.tp1Hit ? 1 : 0;
+      const finalTpReached = z.tp4Hit ? 4 : z.tp3Hit ? 3 : z.tp2Hit ? 2 : z.tp1Hit ? 1 : 0;
 
       const dir = z.direction === "sell" ? "sell" : "buy";
       const anchor = Number(z.anchorPrice);
-      const tp1Pips = Number(z.tp1Pips);
-      const tp2Pips = Number(z.tp2Pips);
-      const tp3Pips = Number(z.tp3Pips);
+      // Resolve absolute TP prices, falling back to anchor + legacy pip distance.
+      const fromPips = (pips: number) => dir === "buy" ? anchor + pips * PIP : anchor - pips * PIP;
+      const tp1Price = z.tp1Price != null ? Number(z.tp1Price) : (z.tp1Pips ? fromPips(Number(z.tp1Pips)) : null);
+      const tp2Price = z.tp2Price != null ? Number(z.tp2Price) : (z.tp2Pips ? fromPips(Number(z.tp2Pips)) : null);
+      const tp3Price = z.tp3Price != null ? Number(z.tp3Price) : (z.tp3Pips ? fromPips(Number(z.tp3Pips)) : null);
+      const tp4Price = z.tp4Price != null ? Number(z.tp4Price) : null;
 
-      let nextTp: 0 | 1 | 2 | 3 = 0;
+      let nextTp: 0 | 1 | 2 | 3 | 4 = 0;
       if (!z.tp1Hit) nextTp = 1;
       else if (!z.tp2Hit) nextTp = 2;
       else if (!z.tp3Hit) nextTp = 3;
+      else if (!z.tp4Hit && tp4Price != null) nextTp = 4;
 
       let currentPrice: number | null = null;
       let nextTpPrice: number | null = null;
@@ -1650,21 +1698,21 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
       let progressPct: number | null = null;
 
       if (price && anchor > 0 && z.status !== "CLOSED" && nextTp > 0) {
-        // Match evaluateZone semantics: BUY closes on bid, SELL on ask.
         const cmp = dir === "buy" ? price.bid : price.ask;
         currentPrice = cmp;
-        const nextPips = nextTp === 1 ? tp1Pips : nextTp === 2 ? tp2Pips : tp3Pips;
-        const prevPips = nextTp === 1 ? 0 : nextTp === 2 ? tp1Pips : tp2Pips;
-        const sign = dir === "buy" ? 1 : -1;
-        const nextPx = anchor + sign * nextPips * PIP;
-        const prevPx = anchor + sign * prevPips * PIP;
-        nextTpPrice = parseFloat(nextPx.toFixed(2));
-        const remaining = (nextPx - cmp) / PIP * sign;
-        pipsToNextTp = Math.round(remaining * 10) / 10;
-        const span = (nextPx - prevPx) * sign;
-        if (span > 0) {
-          const travelled = (cmp - prevPx) * sign;
-          progressPct = Math.max(0, Math.min(100, (travelled / span) * 100));
+        const tps = [tp1Price, tp2Price, tp3Price, tp4Price];
+        const nextPx = tps[nextTp - 1];
+        const prevPx = nextTp === 1 ? anchor : (tps[nextTp - 2] ?? anchor);
+        if (nextPx != null) {
+          nextTpPrice = parseFloat(nextPx.toFixed(2));
+          const sign = dir === "buy" ? 1 : -1;
+          const remaining = (nextPx - cmp) / PIP * sign;
+          pipsToNextTp = Math.round(remaining * 10) / 10;
+          const span = (nextPx - prevPx) * sign;
+          if (span > 0) {
+            const travelled = (cmp - prevPx) * sign;
+            progressPct = Math.max(0, Math.min(100, (travelled / span) * 100));
+          }
         }
       }
 
@@ -1672,8 +1720,9 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         zoneId: z.zoneId,
         direction: z.direction,
         anchorPrice: anchor,
-        tp1Pips, tp2Pips, tp3Pips,
-        tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit,
+        tp1Price, tp2Price, tp3Price, tp4Price,
+        tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit, tp4Hit: z.tp4Hit ?? false,
+        cashoutDone: z.cashoutDone ?? false,
         status: z.status,
         createdAt: Number(z.createdAt),
         closedAt: z.closedAt != null ? Number(z.closedAt) : null,
@@ -1707,12 +1756,19 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
         .where(and(eq(cascadeZonesTable.zoneId, zoneId), eq(cascadeZonesTable.accountId, accountId)))
         .limit(1);
       if (!zr || zr.status === "CLOSED") { res.status(404).json({ error: "Zone not found" }); return; }
+      const dir: "buy" | "sell" = zr.direction === "sell" ? "sell" : "buy";
+      const anchor = Number(zr.anchorPrice);
+      const fromPips = (pips: number) => dir === "buy" ? anchor + pips * PIP : anchor - pips * PIP;
       st = {
-        zoneId: zr.zoneId, accountId: zr.accountId,
-        direction: zr.direction === "sell" ? "sell" : "buy",
-        anchorPrice: Number(zr.anchorPrice),
-        tp1Pips: Number(zr.tp1Pips), tp2Pips: Number(zr.tp2Pips), tp3Pips: Number(zr.tp3Pips),
-        tp1Hit: zr.tp1Hit, tp2Hit: zr.tp2Hit, tp3Hit: zr.tp3Hit,
+        zoneId: zr.zoneId, accountId: zr.accountId, direction: dir, anchorPrice: anchor,
+        tp1Price: zr.tp1Price != null ? Number(zr.tp1Price) : (zr.tp1Pips ? fromPips(Number(zr.tp1Pips)) : null),
+        tp2Price: zr.tp2Price != null ? Number(zr.tp2Price) : (zr.tp2Pips ? fromPips(Number(zr.tp2Pips)) : null),
+        tp3Price: zr.tp3Price != null ? Number(zr.tp3Price) : (zr.tp3Pips ? fromPips(Number(zr.tp3Pips)) : null),
+        tp4Price: zr.tp4Price != null ? Number(zr.tp4Price) : null,
+        originalVolume: zr.originalVolume != null ? Number(zr.originalVolume) : 0,
+        cashoutPips: Number(zr.cashoutPips ?? ZONE_CASHOUT_PIPS_DEFAULT),
+        cashoutDone: zr.cashoutDone ?? false,
+        tp1Hit: zr.tp1Hit, tp2Hit: zr.tp2Hit, tp3Hit: zr.tp3Hit, tp4Hit: zr.tp4Hit ?? false,
         status: zr.status === "RISK_FREE" ? "RISK_FREE" : "OPEN", busy: false,
       };
       zoneStates.set(zoneId, st);
@@ -2487,6 +2543,44 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
     const _isAppMarketCascade =
       (_tradeComment.startsWith("Cascade") || _tradeComment === "XAUUSD Trader App") &&
       !_tradeActionType.endsWith("_LIMIT");
+
+    // For app-initiated cascade MARKET legs (the trade that creates the zone),
+    // reject up-front when TP prices / lot size are invalid — placing an
+    // untracked cascade trade silently violates the zone-engine spec.
+    if (_tradeComment.startsWith("Cascade") && !_tradeActionType.endsWith("_LIMIT")) {
+      const direction = _tradeActionType === "ORDER_TYPE_BUY" ? "buy"
+        : _tradeActionType === "ORDER_TYPE_SELL" ? "sell" : null;
+      if (direction) {
+        const pickP = (v: unknown): number | null =>
+          typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+        const tp1 = pickP(body.tp1Price);
+        const tp2 = pickP(body.tp2Price);
+        const tp3 = pickP(body.tp3Price);
+        const tp4 = pickP(body.tp4Price);
+        const anchor = Number(body.anchorPrice ?? 0) || 0;
+        const vol = Number(body.volume ?? 0) || 0;
+        const cmp = direction === "buy"
+          ? (a: number, b: number) => a > b
+          : (a: number, b: number) => a < b;
+        const tpsOk = tp1 != null && tp2 != null && tp3 != null
+          && (anchor <= 0 || cmp(tp1, anchor))
+          && cmp(tp2, tp1) && cmp(tp3, tp2)
+          && (tp4 == null || cmp(tp4, tp3));
+        if (!tpsOk) {
+          return res.status(400).json({
+            success: false, code: 0,
+            message: `Cascade requires TP1, TP2, TP3 absolute prices in strictly ${direction === "buy" ? "ascending" : "descending"} order on the profitable side of the entry. TP4 optional.`,
+          });
+        }
+        if (vol < ZONE_MIN_LOT_PER_ENTRY) {
+          return res.status(400).json({
+            success: false, code: 0,
+            message: `Cascade lot size must be at least ${ZONE_MIN_LOT_PER_ENTRY} (each TP closes 25% of the original lot, broker minimum is 0.01).`,
+          });
+        }
+      }
+    }
+
     if (_isAppMarketCascade) {
       pendingAppCascades.add(accountId);
     }
@@ -2559,53 +2653,55 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
             const positionId = data.positionId;
             const volume = Number((req.body as Record<string, unknown>).volume ?? 0) || 0;
             const uId = (req as Record<string, unknown>)["userId"] as string | undefined;
-            // Per-trade TP overrides: caller may supply tp1Pips/tp2Pips/tp3Pips on
-            // the trade body to override the global cascade config for this zone
-            // only. Any field omitted falls back to the user/account cascade config.
-            // Strict ordering (tp1 < tp2 < tp3) is enforced; an invalid override
-            // set is logged and ignored entirely (cascade config is used instead).
+            // Per-trade absolute TP prices typed by the user. TP1-3 required,
+            // TP4 optional (null/0 = left for manual close). Validation already
+            // happened client-side; we re-validate here so a bad request can't
+            // create a zone that never fires its TPs.
             const rawBody = req.body as Record<string, unknown>;
-            const pickOverride = (v: unknown): number | undefined =>
-              typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
-            const overridesIn = {
-              tp1Pips: pickOverride(rawBody.tp1Pips),
-              tp2Pips: pickOverride(rawBody.tp2Pips),
-              tp3Pips: pickOverride(rawBody.tp3Pips),
-            };
-            const anyOverride = overridesIn.tp1Pips != null || overridesIn.tp2Pips != null || overridesIn.tp3Pips != null;
-            let overrides: typeof overridesIn | undefined = overridesIn;
-            if (anyOverride) {
-              const baseCfg = getCascadeConfig(accountId, uId);
-              const t1 = overridesIn.tp1Pips ?? baseCfg.tp1Pips;
-              const t2 = overridesIn.tp2Pips ?? baseCfg.tp2Pips;
-              const t3 = overridesIn.tp3Pips ?? baseCfg.tp3Pips;
-              if (!(t1 < t2 && t2 < t3)) {
-                console.warn(`[trade] ignoring TP overrides for ${accountId} — non-increasing: tp1=${t1} tp2=${t2} tp3=${t3}`);
-                overrides = undefined;
-              } else {
-                console.log(`[trade] using TP overrides for new zone: tp1=${t1} tp2=${t2} tp3=${t3}`);
-              }
+            const pickPrice = (v: unknown): number | null =>
+              typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+            const tp1Price = pickPrice(rawBody.tp1Price);
+            const tp2Price = pickPrice(rawBody.tp2Price);
+            const tp3Price = pickPrice(rawBody.tp3Price);
+            const tp4Price = pickPrice(rawBody.tp4Price);
+            const anchorHint = Number(rawBody.anchorPrice ?? 0) || 0;
+            const cmp = direction === "buy"
+              ? (a: number, b: number) => a > b
+              : (a: number, b: number) => a < b;
+            // TP1<TP2<TP3 (BUY) on profitable side of anchor; reverse for SELL.
+            // TP4 optional but must extend the ordering when present.
+            const tpsValid =
+              tp1Price != null && tp2Price != null && tp3Price != null &&
+              (anchorHint <= 0 || cmp(tp1Price, anchorHint)) &&
+              cmp(tp2Price, tp1Price) && cmp(tp3Price, tp2Price) &&
+              (tp4Price == null || cmp(tp4Price, tp3Price));
+            if (!tpsValid) {
+              console.warn(`[trade] cascade has invalid/missing TP prices — zone will NOT be created: tp1=${tp1Price} tp2=${tp2Price} tp3=${tp3Price} tp4=${tp4Price}`);
+            } else if (volume < ZONE_MIN_LOT_PER_ENTRY) {
+              console.warn(`[trade] cascade lot ${volume} below ${ZONE_MIN_LOT_PER_ENTRY} minimum — zone will NOT be created`);
             } else {
-              overrides = undefined;
+              // SYNCHRONOUS: reserve zone + pending association *before* the
+              // trade response returns, so any companion cascade limit that
+              // arrives immediately after will find a zoneId to attach to.
+              const zoneState = prepareZoneForCascade(
+                accountId, direction, uId,
+                { tp1Price: tp1Price!, tp2Price: tp2Price!, tp3Price: tp3Price!, tp4Price },
+                volume,
+              );
+              // Seed best-known anchor from caller-provided value / cached tick;
+              // the actual fill price will replace it async below.
+              const tick = latestPrice(accountId);
+              if (anchorHint > 0) zoneState.anchorPrice = anchorHint;
+              else if (tick) zoneState.anchorPrice = direction === "buy" ? tick.ask : tick.bid;
+              void (async () => {
+                try {
+                  const positions = await fetchOpenPositions(getToken(), region, accountId);
+                  const me = positions.find(p => p.id === positionId);
+                  if (me && me.openPrice > 0) zoneState.anchorPrice = me.openPrice;
+                } catch { /* keep best-known anchor */ }
+                await persistPreparedZone(zoneState, uId, positionId, volume);
+              })();
             }
-            // SYNCHRONOUS: reserve zone + pending association *before* the
-            // trade response returns, so any companion cascade limit that
-            // arrives immediately after will find a zoneId to attach to.
-            const zoneState = prepareZoneForCascade(accountId, direction, uId, overrides);
-            // Seed best-known anchor from caller-provided value / cached tick;
-            // the actual fill price will replace it async below.
-            const bodyAnchor = Number((req.body as Record<string, unknown>).anchorPrice ?? 0) || 0;
-            const tick = latestPrice(accountId);
-            if (bodyAnchor > 0) zoneState.anchorPrice = bodyAnchor;
-            else if (tick) zoneState.anchorPrice = direction === "buy" ? tick.ask : tick.bid;
-            void (async () => {
-              try {
-                const positions = await fetchOpenPositions(getToken(), region, accountId);
-                const me = positions.find(p => p.id === positionId);
-                if (me && me.openPrice > 0) zoneState.anchorPrice = me.openPrice;
-              } catch { /* keep best-known anchor */ }
-              await persistPreparedZone(zoneState, uId, positionId, volume);
-            })();
           }
         }
       }
