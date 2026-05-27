@@ -12,6 +12,19 @@ function formatPrice(n: number) {
   return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+function formatClosedAt(ms: number): string {
+  const d = new Date(ms);
+  const now = new Date();
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  const time = d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
+  if (sameDay) return `today ${time}`;
+  const date = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  return `${date} ${time}`;
+}
+
 function TpChip({ label, hit }: { label: string; hit: boolean }) {
   return (
     <View style={[styles.tpChip, hit ? styles.tpChipHit : styles.tpChipPending]}>
@@ -103,6 +116,25 @@ export default function ZoneCard({ zone, onRiskFree, historical = false }: ZoneC
           <TpChip label={`TP3 ${zone.tp3Pips}p`} hit={zone.tp3Hit} />
         </View>
       </View>
+
+      {historical && (
+        <View style={styles.histRow}>
+          <View style={styles.histItem}>
+            <Feather name="clock" size={11} color={C.textMuted} />
+            <Text style={styles.histText}>
+              {zone.closedAt ? `closed ${formatClosedAt(zone.closedAt)}` : "closed"}
+            </Text>
+          </View>
+          <View style={styles.histItem}>
+            <Feather name="flag" size={11} color={C.textMuted} />
+            <Text style={styles.histText}>
+              {zone.finalTpReached && zone.finalTpReached > 0
+                ? `final: TP${zone.finalTpReached}`
+                : "no TP reached"}
+            </Text>
+          </View>
+        </View>
+      )}
 
       {canRiskFree && (
         <Pressable
@@ -227,6 +259,25 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_600SemiBold",
     color: C.textSecondary,
     letterSpacing: 0.3,
+  },
+  histRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 8,
+    paddingTop: 6,
+    borderTopWidth: 1,
+    borderTopColor: C.border,
+  },
+  histItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+  },
+  histText: {
+    fontSize: 11,
+    fontFamily: "Inter_500Medium",
+    color: C.textMuted,
   },
   rfBtn: {
     flexDirection: "row",

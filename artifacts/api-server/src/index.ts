@@ -66,6 +66,8 @@ async function ensureTables(): Promise<void> {
     );
     CREATE INDEX IF NOT EXISTS cascade_zones_acct_status
       ON cascade_zones (account_id, status);
+    ALTER TABLE cascade_zones
+      ADD COLUMN IF NOT EXISTS closed_at BIGINT;
   `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS zone_positions (

@@ -1228,7 +1228,9 @@ async function markZonePositionClosed(accountId: string, positionId: string): Pr
     const openInZone = await db.select().from(zonePositionsTable)
       .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
     if (openInZone.length === 0) {
-      await db.update(cascadeZonesTable).set({ status: "CLOSED" }).where(eq(cascadeZonesTable.zoneId, zoneId));
+      await db.update(cascadeZonesTable)
+        .set({ status: "CLOSED", closedAt: Date.now() })
+        .where(eq(cascadeZonesTable.zoneId, zoneId));
       if (st) st.status = "CLOSED";
       console.log(`[zone ${zoneId}] all positions closed — zone CLOSED`);
     }
@@ -1403,7 +1405,9 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       const stillOpen = await db.select().from(zonePositionsTable)
         .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
       if (stillOpen.length === 0) {
-        await db.update(cascadeZonesTable).set({ status: "CLOSED" }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        await db.update(cascadeZonesTable)
+          .set({ status: "CLOSED", closedAt: Date.now() })
+          .where(eq(cascadeZonesTable.zoneId, zoneId));
         st.status = "CLOSED";
         console.log(`[zone ${zoneId}] reconciliation: no live tracked positions — zone CLOSED`);
       }
@@ -1561,6 +1565,7 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
       if (!includeClosed && z.status === "CLOSED") continue;
       const openPositions = await db.select().from(zonePositionsTable)
         .where(and(eq(zonePositionsTable.zoneId, z.zoneId), eq(zonePositionsTable.status, "OPEN")));
+      const finalTpReached = z.tp3Hit ? 3 : z.tp2Hit ? 2 : z.tp1Hit ? 1 : 0;
       out.push({
         zoneId: z.zoneId,
         direction: z.direction,
@@ -1569,6 +1574,8 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit,
         status: z.status,
         createdAt: Number(z.createdAt),
+        closedAt: z.closedAt != null ? Number(z.closedAt) : null,
+        finalTpReached,
         positionCount: openPositions.length,
       });
     }

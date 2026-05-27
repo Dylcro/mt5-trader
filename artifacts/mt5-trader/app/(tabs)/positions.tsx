@@ -198,9 +198,10 @@ export default function PositionsScreen() {
   const { positions, pendingOrders, status, refreshPositions, closePosition, cancelOrder, accountInfo, accountId } = useTrading();
   const { zones } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000 });
   const pastZones = zones
-    .filter((z) => z.status === "CLOSED" || z.status === "RISK_FREE")
-    .sort((a, b) => b.createdAt - a.createdAt)
+    .filter((z) => z.status === "CLOSED")
+    .sort((a, b) => (b.closedAt ?? b.createdAt) - (a.closedAt ?? a.createdAt))
     .slice(0, 25);
+  const [pastExpanded, setPastExpanded] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
 
@@ -381,14 +382,29 @@ export default function PositionsScreen() {
         )}
 
         {status === "connected" && pastZones.length > 0 && (
-          <>
-            <Text style={[styles.sectionLabel, { marginTop: hasAnything ? 20 : 0 }]}>
-              PAST ZONES  ·  {pastZones.length}
-            </Text>
-            {pastZones.map((z) => (
-              <ZoneCard key={z.zoneId} zone={z} historical />
-            ))}
-          </>
+          <View style={{ marginTop: hasAnything ? 20 : 0 }}>
+            <Pressable
+              onPress={() => setPastExpanded((v) => !v)}
+              style={({ pressed }) => [styles.pastHeader, pressed && { opacity: 0.7 }]}
+              hitSlop={8}
+            >
+              <Text style={styles.sectionLabel}>
+                PAST ZONES  ·  {pastZones.length}
+              </Text>
+              <Feather
+                name={pastExpanded ? "chevron-up" : "chevron-down"}
+                size={16}
+                color={C.textSecondary}
+              />
+            </Pressable>
+            {pastExpanded && (
+              <View style={{ gap: 10, marginTop: 6 }}>
+                {pastZones.map((z) => (
+                  <ZoneCard key={z.zoneId} zone={z} historical />
+                ))}
+              </View>
+            )}
+          </View>
         )}
       </ScrollView>
     </View>
@@ -583,6 +599,12 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
     marginBottom: 4,
+  },
+  pastHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: 4,
   },
   sectionLabel: {
     fontSize: 10,

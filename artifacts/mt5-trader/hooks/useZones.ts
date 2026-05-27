@@ -16,6 +16,8 @@ export interface Zone {
   tp3Hit: boolean;
   status: "OPEN" | "RISK_FREE" | "CLOSED";
   createdAt: number;
+  closedAt?: number | null;
+  finalTpReached?: 0 | 1 | 2 | 3;
   positionCount: number;
 }
 

@@ -15,6 +15,7 @@ export const cascadeZonesTable = pgTable("cascade_zones", {
   tp3Hit:      boolean("tp3_hit").notNull().default(false),
   status:      text("status").notNull().default("OPEN"),
   createdAt:   bigint("created_at", { mode: "number" }).notNull(),
+  closedAt:    bigint("closed_at", { mode: "number" }),
 });
 
 export type CascadeZoneRow = typeof cascadeZonesTable.$inferSelect;
