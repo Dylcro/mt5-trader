@@ -1101,18 +1101,13 @@ function newZoneId(): string {
   return `z_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-async function createZoneOnMarketCascade(
-  accountId: string,
-  userId: string | undefined,
-  direction: "buy" | "sell",
-  anchorPrice: number,
-  positionId: string,
-  volume: number,
-): Promise<string> {
+// Sync prep — reserve a zoneId + pending association so cascade limits
+// submitted *immediately* after the market order can attach without waiting
+// for the anchor lookup / DB inserts. Returns the prepared zone state.
+function prepareZoneForCascade(accountId: string, direction: "buy" | "sell"): ZoneState {
   const zoneId = newZoneId();
-  const now = Date.now();
   const state: ZoneState = {
-    zoneId, accountId, direction, anchorPrice,
+    zoneId, accountId, direction, anchorPrice: 0,
     tp1Pips: ZONE_TP1_PIPS_DEFAULT,
     tp2Pips: ZONE_TP2_PIPS_DEFAULT,
     tp3Pips: ZONE_TP3_PIPS_DEFAULT,
@@ -1120,21 +1115,36 @@ async function createZoneOnMarketCascade(
     status: "OPEN", busy: false,
   };
   zoneStates.set(zoneId, state);
-  pendingZoneAssoc.set(accountId, { zoneId, direction, expiresAt: now + ZONE_ASSOC_WINDOW_MS });
+  pendingZoneAssoc.set(accountId, { zoneId, direction, expiresAt: Date.now() + ZONE_ASSOC_WINDOW_MS });
+  return state;
+}
+
+// Async finalization — persist the zone and its market position. Anchor may be
+// updated to the real fill price by the caller before this runs. evaluateZone
+// guards on `anchorPrice > 0`, so an unfilled anchor simply pauses TP checks
+// until this completes.
+async function persistPreparedZone(
+  state: ZoneState,
+  userId: string | undefined,
+  positionId: string,
+  volume: number,
+): Promise<void> {
+  const now = Date.now();
   try {
     await db.insert(cascadeZonesTable).values({
-      zoneId, accountId, userId: userId ?? null, direction, anchorPrice,
+      zoneId: state.zoneId, accountId: state.accountId, userId: userId ?? null,
+      direction: state.direction, anchorPrice: state.anchorPrice,
       tp1Pips: state.tp1Pips, tp2Pips: state.tp2Pips, tp3Pips: state.tp3Pips,
       tp1Hit: false, tp2Hit: false, tp3Hit: false, status: "OPEN", createdAt: now,
     }).onConflictDoNothing();
     await db.insert(zonePositionsTable).values({
-      zoneId, positionId, entryPrice: anchorPrice, volume, status: "OPEN", createdAt: now,
+      zoneId: state.zoneId, positionId, entryPrice: state.anchorPrice, volume,
+      status: "OPEN", createdAt: now,
     }).onConflictDoNothing();
-    console.log(`[zone ${zoneId}] created ${direction.toUpperCase()} anchor=${anchorPrice} posId=${positionId} vol=${volume}`);
+    console.log(`[zone ${state.zoneId}] persisted ${state.direction.toUpperCase()} anchor=${state.anchorPrice} posId=${positionId} vol=${volume}`);
   } catch (e) {
-    console.error(`[zone ${zoneId}] create persist error:`, (e as Error).message);
+    console.error(`[zone ${state.zoneId}] create persist error:`, (e as Error).message);
   }
-  return zoneId;
 }
 
 async function attachLimitOrderToZone(accountId: string, orderId: string): Promise<void> {
@@ -1171,7 +1181,14 @@ async function recordZonePositionFill(
 // no longer exists on MetaAPI before flipping the row.
 async function markZonePositionClosed(accountId: string, positionId: string): Promise<void> {
   try {
-    const rows = await db.select().from(zonePositionsTable).where(eq(zonePositionsTable.positionId, positionId)).limit(1);
+    // Join through cascade_zones so we only act on rows belonging to *this*
+    // account — MT5 position IDs can be reused across accounts/brokers.
+    const rows = await db
+      .select({ zoneId: zonePositionsTable.zoneId, zoneAccountId: cascadeZonesTable.accountId })
+      .from(zonePositionsTable)
+      .innerJoin(cascadeZonesTable, eq(zonePositionsTable.zoneId, cascadeZonesTable.zoneId))
+      .where(and(eq(zonePositionsTable.positionId, positionId), eq(cascadeZonesTable.accountId, accountId)))
+      .limit(1);
     const zoneId = rows[0]?.zoneId;
     if (!zoneId) return;
     const st = zoneStates.get(zoneId);
@@ -1345,8 +1362,30 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
     if (zps.length === 0) return;
     const trackedIds = new Set(zps.map(z => z.positionId));
-    const live = (await fetchOpenPositions(token, region, st.accountId)).filter(p => trackedIds.has(p.id));
-    if (live.length === 0) return;
+    const allLive = await fetchOpenPositions(token, region, st.accountId);
+    const live = allLive.filter(p => trackedIds.has(p.id));
+    if (live.length === 0) {
+      // Reconciliation: all tracked positions are gone (possibly closed during
+      // a server restart — DEAL_ENTRY_OUT events from that window are lost
+      // because the streaming connection starts from `new Date()`). Mark each
+      // missing row CLOSED, then close the zone.
+      const allLiveIds = new Set(allLive.map(p => p.id));
+      for (const zp of zps) {
+        if (!allLiveIds.has(zp.positionId)) {
+          await db.update(zonePositionsTable)
+            .set({ status: "CLOSED" })
+            .where(and(eq(zonePositionsTable.positionId, zp.positionId), eq(zonePositionsTable.status, "OPEN")));
+        }
+      }
+      const stillOpen = await db.select().from(zonePositionsTable)
+        .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
+      if (stillOpen.length === 0) {
+        await db.update(cascadeZonesTable).set({ status: "CLOSED" }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        st.status = "CLOSED";
+        console.log(`[zone ${zoneId}] reconciliation: no live tracked positions — zone CLOSED`);
+      }
+      return;
+    }
 
     const price = await fetchSymbolPrice(token, region, st.accountId, live[0]!.symbol || "XAUUSD");
     if (!price) return;
@@ -2369,21 +2408,23 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
             const positionId = data.positionId;
             const volume = Number((req.body as Record<string, unknown>).volume ?? 0) || 0;
             const uId = (req as Record<string, unknown>)["userId"] as string | undefined;
-            // Anchor = actual fill price from MetaAPI (most reliable). Falls back
-            // to body.anchorPrice, then latest tick. Runs async so the trade
-            // response isn't delayed by the position lookup.
+            // SYNCHRONOUS: reserve zone + pending association *before* the
+            // trade response returns, so any companion cascade limit that
+            // arrives immediately after will find a zoneId to attach to.
+            const zoneState = prepareZoneForCascade(accountId, direction);
+            // Seed best-known anchor from caller-provided value / cached tick;
+            // the actual fill price will replace it async below.
+            const bodyAnchor = Number((req.body as Record<string, unknown>).anchorPrice ?? 0) || 0;
+            const tick = latestPrice(accountId);
+            if (bodyAnchor > 0) zoneState.anchorPrice = bodyAnchor;
+            else if (tick) zoneState.anchorPrice = direction === "buy" ? tick.ask : tick.bid;
             void (async () => {
-              let anchorPrice = Number((req.body as Record<string, unknown>).anchorPrice ?? 0) || 0;
               try {
                 const positions = await fetchOpenPositions(getToken(), region, accountId);
                 const me = positions.find(p => p.id === positionId);
-                if (me && me.openPrice > 0) anchorPrice = me.openPrice;
-              } catch { /* fall through */ }
-              if (!(anchorPrice > 0)) {
-                const tick = latestPrice(accountId);
-                if (tick) anchorPrice = direction === "buy" ? tick.ask : tick.bid;
-              }
-              await createZoneOnMarketCascade(accountId, uId, direction, anchorPrice, positionId, volume);
+                if (me && me.openPrice > 0) zoneState.anchorPrice = me.openPrice;
+              } catch { /* keep best-known anchor */ }
+              await persistPreparedZone(zoneState, uId, positionId, volume);
             })();
           }
         }
