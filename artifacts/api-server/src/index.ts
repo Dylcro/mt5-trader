@@ -1,6 +1,6 @@
 import app from "./app";
 import { pool } from "@workspace/db";
-import { loadCascadeConfig, startAutoConnect, startConnectionWatchdog } from "./routes/mt5";
+import { loadCascadeConfig, startAutoConnect, startConnectionWatchdog, loadZoneState, startZoneTpMonitor } from "./routes/mt5";
 
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err);
@@ -42,6 +42,41 @@ async function ensureTables(): Promise<void> {
     CREATE INDEX IF NOT EXISTS cascade_orders_acct_created
       ON cascade_orders (account_id, created_at);
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cascade_zones (
+      id            SERIAL PRIMARY KEY,
+      zone_id       TEXT             NOT NULL UNIQUE,
+      account_id    TEXT             NOT NULL,
+      user_id       TEXT,
+      direction     TEXT             NOT NULL,
+      anchor_price  DOUBLE PRECISION NOT NULL,
+      tp1_pips      DOUBLE PRECISION NOT NULL DEFAULT 20,
+      tp2_pips      DOUBLE PRECISION NOT NULL DEFAULT 50,
+      tp3_pips      DOUBLE PRECISION NOT NULL DEFAULT 90,
+      tp1_hit       BOOLEAN          NOT NULL DEFAULT FALSE,
+      tp2_hit       BOOLEAN          NOT NULL DEFAULT FALSE,
+      tp3_hit       BOOLEAN          NOT NULL DEFAULT FALSE,
+      status        TEXT             NOT NULL DEFAULT 'OPEN',
+      created_at    BIGINT           NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS cascade_zones_acct_status
+      ON cascade_zones (account_id, status);
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS zone_positions (
+      id           SERIAL PRIMARY KEY,
+      zone_id      TEXT             NOT NULL,
+      position_id  TEXT             NOT NULL,
+      entry_price  DOUBLE PRECISION NOT NULL,
+      volume       DOUBLE PRECISION NOT NULL,
+      status       TEXT             NOT NULL DEFAULT 'OPEN',
+      created_at   BIGINT           NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS zone_positions_zone_pos
+      ON zone_positions (zone_id, position_id);
+    CREATE INDEX IF NOT EXISTS zone_positions_zone_status
+      ON zone_positions (zone_id, status);
+  `);
 }
 
 async function main() {
@@ -75,6 +110,10 @@ async function main() {
 
   // Watchdog: every 30 s, reconnect any account whose stream has dropped.
   startConnectionWatchdog();
+
+  // Hydrate in-memory zone state from DB and start the 3 s TP monitor.
+  await loadZoneState();
+  startZoneTpMonitor();
 
 }
 

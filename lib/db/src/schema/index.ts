@@ -20,6 +20,7 @@
 export * from "./cascadeConfig";
 export * from "./cascadeHistory";
 export * from "./cascadeOrders";
+export * from "./cascadeZones";
 export * from "./storedAccounts";
 export * from "./supportTickets";
 export * from "./users";
