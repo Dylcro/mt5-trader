@@ -53,10 +53,10 @@ interface UseZonesOptions {
 
 export function useZones(accountId: string, options: UseZonesOptions = {}) {
   const { includeClosed = false, pollIntervalMs = 5_000, sseConnected = false } = options;
-  // SSE is primary when connected — use a long safety-net interval so the
-  // endpoint is not hit on every tick. Fall back to the caller's interval
-  // when SSE is disconnected.
-  const effectivePollMs = sseConnected ? 60_000 : pollIntervalMs;
+  // SSE zone_update events are the primary source of zone changes.
+  // When connected: 60 s safety net (SSE handles all real-time updates).
+  // When disconnected: 15 s fallback cadence (aligned with SSE fallback contract).
+  const effectivePollMs = sseConnected ? 60_000 : 15_000;
   const [zones, setZones] = useState<Zone[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);

@@ -640,6 +640,9 @@ function makeDealListener(accountId: string) {
         } else if (deal.positionId) {
           console.warn(`[stream ${accountId}] cascade fill orderId=${deal.orderId} posId=${deal.positionId} could not be linked to any active zone — position will be orphaned`);
         }
+        // Always push a position-changed event so the client refreshes immediately
+        // after a cascade limit fills, regardless of zone linkage outcome.
+        broadcastToAccount(accountId, "deal", { type: "position_changed" });
         return;
       }
       const price = deal.price || deal.openPrice || 0;
