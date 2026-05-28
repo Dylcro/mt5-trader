@@ -60,8 +60,9 @@ test("Public: GET /status → 200 HTML dashboard with auto-refresh", async ({ re
   expect(r.ok()).toBe(true);
   expect(r.headers()["content-type"]).toMatch(/html/i);
   const html = await r.text();
-  expect(html).toContain("MT5 Trader");
-  // Auto-refresh meta tag confirms the dashboard refresh logic is intact
+  // The status dashboard renders under the "XAUUSD TRADER" brand name
+  expect(html).toMatch(/XAUUSD\s*TRADER/i);
+  // Auto-refresh logic is present in the page JS
   expect(html).toMatch(/refresh|auto/i);
 });
 
@@ -120,8 +121,8 @@ test("Admin: /api/admin/status guards with key and returns telemetry shape", asy
   const noKey = await request.get("/api/admin/status");
   expect(noKey.status()).toBe(401);
 
-  // Valid key → telemetry response
-  const r = await request.get(`/api/admin/status?key=${ADMIN_KEY}`);
+  // Valid key → telemetry response (percent-encode so proxy doesn't reject non-ASCII chars)
+  const r = await request.get(`/api/admin/status?key=${encodeURIComponent(ADMIN_KEY)}`);
   expect(r.status()).toBe(200);
   const body = await r.json() as Record<string, unknown>;
   // Exact fields from src/routes/admin.ts: { ts, streams, zones, recentTradeFailures, recentRateLimits }
@@ -167,7 +168,7 @@ test.describe("Cascade: end-to-end demo account flow", () => {
       data: {
         login: DEMO_LOGIN,
         password: DEMO_PASSWORD,
-        serverName: DEMO_SERVER,
+        server: DEMO_SERVER,
         platform: DEMO_PLATFORM,
         region: "new-york",
       },
@@ -179,30 +180,86 @@ test.describe("Cascade: end-to-end demo account flow", () => {
     accountId = body.accountId;
   });
 
-  test("connect — GET /api/mt5/account/:id/status confirms account is live", async ({ request }) => {
-    const r = await request.get(`/api/mt5/account/${accountId}/status`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    expect(r.status()).toBe(200);
-    const body = await r.json() as { connectionStatus: string };
-    expect(body.connectionStatus?.toUpperCase()).toMatch(/CONNECTED|DEPLOYED|DEPLOYING/);
+  test("connect — account reaches CONNECTED state within 60 s", async ({ request }) => {
+    // Poll /status until the account is CONNECTED or the deadline passes.
+    // Demo accounts can take 30-50 s to deploy on first connect.
+    const deadline = Date.now() + 60_000;
+    let connectionStatus = "";
+    while (Date.now() < deadline) {
+      const r = await request.get(`/api/mt5/account/${accountId}/status`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (r.ok()) {
+        const body = await r.json() as { connectionStatus?: string };
+        connectionStatus = (body.connectionStatus ?? "").toUpperCase();
+        if (connectionStatus === "CONNECTED") break;
+      }
+      await new Promise((res) => setTimeout(res, 5000));
+    }
+    expect(connectionStatus).toMatch(/CONNECTED|DEPLOYED|DEPLOYING/);
   });
 
-  // ── Scenario 4b: Single trade → zone created ─────────────────────────────
-  test("single trade — POST /api/mt5/account/:id/trade returns zoneId", async ({ request }) => {
+  // ── Scenario 4b: Cascade market trade → zone created ────────────────────
+  // The trade endpoint accepts the same actionType/TP-price shape the mobile
+  // app sends. After a successful trade the server asynchronously creates a
+  // zone; we confirm zone creation by polling /zones within the test timeout.
+  test("cascade trade — POST /api/mt5/account/:id/trade creates zone", async ({ request }) => {
+    // Fetch the current ask price so we can set realistic (but safe) TP prices.
+    // The /price endpoint returns { ask, bid, symbol } or 404 if no tick yet.
+    let anchor = 3200; // fallback if tick not yet available
+    try {
+      const priceR = await request.get(`/api/mt5/account/${accountId}/price`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (priceR.ok()) {
+        const tick = await priceR.json() as { ask?: number; bid?: number };
+        if (typeof tick.ask === "number" && tick.ask > 100) anchor = tick.ask;
+      }
+    } catch { /* use fallback */ }
+
+    // Cascade BUY: place 0.04 lot (minimum for 4 × 25% TP slices).
+    // TP prices must be strictly ascending above the ask price.
     const r = await request.post(`/api/mt5/account/${accountId}/trade`, {
       headers: { Authorization: `Bearer ${token}` },
-      data: { type: "market", symbol: "XAUUSD", direction: "buy" },
+      data: {
+        actionType: "ORDER_TYPE_BUY",
+        symbol: "XAUUSD",
+        volume: 0.04,
+        comment: "Cascade smoke test",
+        anchorPrice: anchor,
+        tp1Price: anchor + 3,
+        tp2Price: anchor + 6,
+        tp3Price: anchor + 9,
+      },
     });
     expect(r.status()).toBe(200);
-    const body = await r.json() as { zoneId: string };
-    expect(typeof body.zoneId).toBe("string");
-    expect(body.zoneId.length).toBeGreaterThan(0);
-    zoneId = body.zoneId;
+    const body = await r.json() as { success: boolean; positionId?: string; orderId?: string };
+    expect(body.success).toBe(true);
+
+    // Poll /zones until our zone appears (server writes it asynchronously
+    // after the position fills). Allow up to 30 s for demo account latency.
+    const deadline = Date.now() + 30_000;
+    let found: { zoneId: string; status: string; anchorPrice: number } | undefined;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const zonesR = await request.get(`/api/mt5/account/${accountId}/zones`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!zonesR.ok()) continue;
+      const zones = await zonesR.json() as Array<{ zoneId: string; status: string; anchorPrice: number; direction: string }>;
+      // Find the most recent BUY zone that isn't yet closed
+      found = zones.filter((z) => z.direction === "buy" && z.status !== "CLOSED")
+        .sort((a, b) => b.zoneId.localeCompare(a.zoneId))[0];
+      if (found) break;
+    }
+    expect(found).toBeDefined();
+    expect(found?.status).not.toBe("CLOSED");
+    expect(found?.anchorPrice).toBeGreaterThan(100);
+    zoneId = found!.zoneId;
   });
 
-  // ── Scenario 4c: TP progress — zone visible ──────────────────────────────
-  test("TP progress — zone appears in GET /api/mt5/account/:id/zones", async ({ request }) => {
+  // ── Scenario 4c: Zone visible in listing ─────────────────────────────────
+  test("zone listing — GET /api/mt5/account/:id/zones includes the new zone", async ({ request }) => {
     const r = await request.get(`/api/mt5/account/${accountId}/zones`, {
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -284,20 +341,24 @@ test.describe("Cascade: end-to-end demo account flow", () => {
     );
     expect(close.status()).toBe(200);
 
-    // Explicit state-transition assertion: zone must be CLOSED in DB with
-    // a valid closedAt timestamp and zero remaining open positions.
-    const zonesR = await request.get(
-      `/api/mt5/account/${accountId}/zones?includeClosed=true`,
-      { headers: { Authorization: `Bearer ${token}` } },
-    );
-    expect(zonesR.status()).toBe(200);
-    const zones = await zonesR.json() as Array<{
-      zoneId: string;
-      status: string;
-      closedAt: number | null;
-      positionCount: number;
-    }>;
-    const zone = zones.find((z) => z.zoneId === zoneId);
+    // Poll until zone is CLOSED with 0 open positions. The broker closes
+    // positions asynchronously so positionCount may briefly be > 0 right
+    // after the close call returns. Allow up to 20 s for broker confirmation.
+    const deadline = Date.now() + 20_000;
+    let zone: { zoneId: string; status: string; closedAt: number | null; positionCount: number } | undefined;
+    while (Date.now() < deadline) {
+      const zonesR = await request.get(
+        `/api/mt5/account/${accountId}/zones?includeClosed=true`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      expect(zonesR.status()).toBe(200);
+      const zones = await zonesR.json() as Array<{
+        zoneId: string; status: string; closedAt: number | null; positionCount: number;
+      }>;
+      zone = zones.find((z) => z.zoneId === zoneId);
+      if (zone?.status === "CLOSED" && zone.positionCount === 0) break;
+      await new Promise((r) => setTimeout(r, 2000));
+    }
     expect(zone).toBeDefined();
     expect(zone?.status).toBe("CLOSED");
     expect(zone?.closedAt).not.toBeNull();

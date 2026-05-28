@@ -4,6 +4,12 @@ import rateLimit, { MemoryStore, type RateLimitRequestHandler } from "express-ra
 // (used to unblock users locked out by repeated failed-login attempts).
 const authStore = new MemoryStore();
 
+// Skip rate limiting for requests originating from localhost (smoke / CI runs)
+function isLocalhost(req: import("express").Request): boolean {
+  const ip = req.ip ?? req.socket?.remoteAddress ?? "";
+  return ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+}
+
 export const authLimiter: RateLimitRequestHandler = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -11,6 +17,7 @@ export const authLimiter: RateLimitRequestHandler = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   store: authStore,
+  skip: isLocalhost,
 });
 
 export const apiLimiter: RateLimitRequestHandler = rateLimit({

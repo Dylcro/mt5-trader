@@ -2,6 +2,7 @@ import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
   globalSetup: "./test/smoke.setup.ts",
+  testMatch: ["**/test/smoke.spec.ts"],
 
   use: {
     baseURL: process.env.SMOKE_BASE_URL ?? "http://localhost:8080",

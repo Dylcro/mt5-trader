@@ -2959,6 +2959,21 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         body: JSON.stringify({ password }),
       }).catch(() => {});
 
+      // Eagerly transfer DB ownership to the current user so checkOwner
+      // passes immediately on subsequent requests (startStreaming also does
+      // this, but it runs asynchronously after this response returns).
+      if (userId) {
+        const now = Date.now();
+        await db.insert(storedAccountsTable)
+          .values({ accountId: foundId, region: normalizeRegion(existing.region), storedAt: now, userId })
+          .onConflictDoUpdate({
+            target: storedAccountsTable.accountId,
+            set: { userId, storedAt: now },
+          })
+          .catch((e: Error) => console.warn(`[connect] eager ownership transfer failed:`, e.message));
+        userAccountCache.set(userId, foundId);
+      }
+
       const region = normalizeRegion(existing.region);
 
       if (existing.connectionStatus === "CONNECTED") {
