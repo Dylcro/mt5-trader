@@ -191,13 +191,14 @@ app.get("/status", (_req: Request, res: Response) => {
     var rateLimits = d.recentRateLimits || [];
 
     var streamRows = streams.accounts.length === 0
-      ? '<tr><td colspan="3" class="empty">No accounts streaming yet</td></tr>'
+      ? '<tr><td colspan="4" class="empty">No accounts streaming yet</td></tr>'
       : streams.accounts.map(function(a) {
           var cls = a.stale ? 'err' : 'ok';
           var label = a.stale ? 'STALE' : 'LIVE';
           return '<tr><td class="mono">' + esc(a.accountId) + '</td>' +
             '<td class="' + cls + '">' + label + '</td>' +
-            '<td class="muted">' + a.silentForSec + 's silent</td></tr>';
+            '<td class="muted">' + a.silentForSec + 's silent</td>' +
+            '<td class="muted">' + (a.lastEventAt ? fmt(a.lastEventAt) : '\u2014') + '</td></tr>';
         }).join('');
 
     var failRows = failures.length === 0
@@ -223,13 +224,13 @@ app.get("/status", (_req: Request, res: Response) => {
       '<div class="section">' +
         '<div class="grid">' +
           '<div class="card"><div class="card-label">Stream Health</div><div class="card-value" style="font-size:18px;margin-top:4px">' + health + '</div><div class="card-sub">' + streams.accounts.length + ' account(s)</div></div>' +
-          '<div class="card"><div class="card-label">Open Zones</div><div class="card-value">' + zones.open + '</div><div class="card-sub">' + zones.riskFree + ' risk-free</div></div>' +
+          '<div class="card"><div class="card-label">Open Zones</div><div class="card-value">' + zones.open + '</div><div class="card-sub">' + zones.riskFree + ' risk-free \u2022 ' + (zones.closedLast24h ?? 0) + ' closed (24h)</div></div>' +
           '<div class="card"><div class="card-label">Trade Failures</div><div class="card-value">' + failures.length + '</div><div class="card-sub">in ring buffer</div></div>' +
           '<div class="card"><div class="card-label">Rate Limit Hits</div><div class="card-value">' + rateLimits.length + '</div><div class="card-sub">in ring buffer</div></div>' +
         '</div>' +
       '</div>' +
       '<div class="section"><h2>Streams <span class="badge">' + streams.accounts.length + '</span></h2>' +
-        '<table><thead><tr><th>Account ID</th><th>Status</th><th>Silence</th></tr></thead><tbody>' + streamRows + '</tbody></table>' +
+        '<table><thead><tr><th>Account ID</th><th>Status</th><th>Silence</th><th>Last Event</th></tr></thead><tbody>' + streamRows + '</tbody></table>' +
       '</div>' +
       '<div class="section"><h2>Recent Trade Failures <span class="badge">' + failures.length + '</span></h2>' +
         '<table><thead><tr><th>Time</th><th>Account</th><th>Code</th><th>Message</th></tr></thead><tbody>' + failRows + '</tbody></table>' +

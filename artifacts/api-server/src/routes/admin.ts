@@ -1,7 +1,7 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import bcrypt from "bcryptjs";
-import { db, storedAccountsTable, supportTicketsTable, usersTable } from "@workspace/db";
-import { desc, eq } from "drizzle-orm";
+import { db, storedAccountsTable, supportTicketsTable, usersTable, cascadeZonesTable } from "@workspace/db";
+import { desc, eq, sql } from "drizzle-orm";
 import { resetAuthLockouts } from "../lib/rateLimiters";
 import { getStreamHealth, getZoneCounts } from "./mt5";
 import { getTelemetry } from "../telemetry";
@@ -307,15 +307,21 @@ router.post("/users/update-name", async (req: Request, res: Response) => {
 });
 
 // GET /api/admin/status — machine-readable health snapshot for the /status page
-router.get("/status", (req: Request, res: Response) => {
+router.get("/status", async (req: Request, res: Response) => {
   if (!requireAdminKey(req, res)) return;
   const health = getStreamHealth();
   const zones = getZoneCounts();
   const { recentTradeFailures, recentRateLimits } = getTelemetry();
+  const since = Date.now() - 24 * 60 * 60 * 1000;
+  const [closedRow] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(cascadeZonesTable)
+    .where(sql`status = 'CLOSED' AND closed_at >= ${since}`);
+  const closedLast24h = closedRow?.count ?? 0;
   res.json({
     ts: Date.now(),
     streams: health,
-    zones,
+    zones: { ...zones, closedLast24h },
     recentTradeFailures,
     recentRateLimits,
   });

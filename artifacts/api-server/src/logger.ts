@@ -11,8 +11,18 @@ export type EventName =
 
 type EventData = Record<string, unknown>;
 
+const OUTCOME: Record<EventName, string> = {
+  "stream.connect":    "connected",
+  "stream.disconnect": "disconnected",
+  "trade.ok":          "ok",
+  "trade.fail":        "fail",
+  "zone.create":       "created",
+  "zone.close":        "closed",
+  "rate.hit":          "hit",
+};
+
 export function logEvent(event: EventName, data: EventData): void {
-  console.log(JSON.stringify({ event, ts: Date.now(), ...data }));
+  console.log(JSON.stringify({ event, ts: Date.now(), outcome: OUTCOME[event], ...data }));
 
   if (event === "trade.fail") {
     recordTradeFail({

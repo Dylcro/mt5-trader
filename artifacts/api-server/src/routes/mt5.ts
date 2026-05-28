@@ -432,6 +432,7 @@ export interface StreamHealthAccount {
   accountId: string;
   silentForSec: number;
   stale: boolean;
+  lastEventAt: number;
 }
 
 /** Returns the health of every currently-tracked streaming account.
@@ -446,7 +447,7 @@ export function getStreamHealth(): { healthy: boolean; accounts: StreamHealthAcc
     const silentForSec = Math.round((now - ts) / 1000);
     const stale = now - ts > STREAM_FRESHNESS_MS;
     if (stale) healthy = false;
-    accounts.push({ accountId, silentForSec, stale });
+    accounts.push({ accountId, silentForSec, stale, lastEventAt: ts });
   }
   return { healthy, accounts };
 }
