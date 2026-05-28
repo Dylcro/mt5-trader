@@ -1,5 +1,6 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import Constants from "expo-constants";
+import * as SecureStore from "expo-secure-store";
 import React, {
   createContext,
   useCallback,
@@ -8,8 +9,30 @@ import React, {
   useRef,
   useState,
 } from "react";
+import { Platform } from "react-native";
 
 import { getAuthToken } from "@/lib/authToken";
+
+// Secure credential helpers — used to silently re-establish the MetaAPI account
+// when the server tells us the previous accountId is dead (HTTP 410). The
+// password never leaves the device's hardware-backed keystore; on web (where
+// SecureStore is unavailable) we degrade to "prompt for reconnect" gracefully.
+const MT5_PASSWORD_KEY = "mt5_password_v1";
+const _secureAvailable = Platform.OS === "ios" || Platform.OS === "android";
+async function saveMt5Password(password: string): Promise<void> {
+  if (!_secureAvailable || !password) return;
+  try { await SecureStore.setItemAsync(MT5_PASSWORD_KEY, password); } catch (e) {
+    console.warn("[secureCreds] save failed:", (e as Error).message);
+  }
+}
+async function loadMt5Password(): Promise<string | null> {
+  if (!_secureAvailable) return null;
+  try { return await SecureStore.getItemAsync(MT5_PASSWORD_KEY); } catch { return null; }
+}
+async function clearMt5Password(): Promise<void> {
+  if (!_secureAvailable) return;
+  try { await SecureStore.deleteItemAsync(MT5_PASSWORD_KEY); } catch {}
+}
 
 export type ConnectionStatus = "disconnected" | "connecting" | "connected" | "error";
 
@@ -478,6 +501,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         return;
       }
       if (creds) setCredentials(creds);
+      // Persist password securely so we can transparently re-establish the
+      // MetaAPI account if it gets orphaned (no re-typing the password).
+      void saveMt5Password(useCreds.password.trim());
       setStatus("connecting");
       setErrorMsg("");
       try {
@@ -568,6 +594,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       } catch {}
     }
     await AsyncStorage.multiRemove(["mt5_account_id", "mt5_region"]);
+    await clearMt5Password();
     setAccountIdState("");
     setRegionState(DEFAULT_REGION);
     setStatus("disconnected");
@@ -640,6 +667,58 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     try { setAccountInfo(await fetchAccountInfoData(accountId, region)); } catch {}
   }, [status, accountId, region, fetchAccountInfoData]);
 
+  // Silently re-establish the MetaAPI account using credentials cached on this
+  // device (login/server in AsyncStorage, password in SecureStore). Returns
+  // the fresh {accountId, region} on success, or null if creds are missing /
+  // the connect call fails. Used by submitOrderRaw to auto-recover when the
+  // stored accountId is orphaned on MetaAPI's side — the user never has to
+  // re-type their password.
+  const silentReconnect = useCallback(async (): Promise<{ accountId: string; region: string } | null> => {
+    try {
+      const pairs = await AsyncStorage.multiGet(["mt5_login", "mt5_server"]);
+      const map = Object.fromEntries(pairs) as Record<string, string | null>;
+      const login = map["mt5_login"]?.trim();
+      const server = map["mt5_server"]?.trim();
+      const password = (await loadMt5Password())?.trim();
+      if (!login || !server || !password) {
+        console.warn("[silentReconnect] missing stored creds — cannot auto-reconnect");
+        return null;
+      }
+      console.log("[silentReconnect] re-provisioning account for login=" + login);
+      const res = await authFetch(`${API_BASE}/mt5/connect`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ login, password, server }),
+      });
+      const data = await safeJson<{ status?: string; accountId?: string; region?: string; error?: string }>(res);
+      if (!res.ok || data.error || !data.accountId) {
+        console.warn("[silentReconnect] connect failed:", data.error ?? res.status);
+        return null;
+      }
+      const newId = data.accountId;
+      const newRegion = data.region ?? DEFAULT_REGION;
+      // If the server says "deploying", poll status briefly until CONNECTED
+      // (≤30 s) so the immediate trade retry actually has a live connection.
+      if (data.status !== "connected") {
+        for (let i = 0; i < 15; i++) {
+          await new Promise((r) => setTimeout(r, 2000));
+          const sRes = await authFetch(`${API_BASE}/mt5/account/${newId}/status?region=${newRegion}`);
+          const sData = await safeJson<{ connectionStatus?: string }>(sRes);
+          if (sData.connectionStatus === "CONNECTED") break;
+        }
+      }
+      // Update local state + AsyncStorage so subsequent calls (positions/price/etc) use the new ID.
+      await AsyncStorage.multiSet([["mt5_account_id", newId], ["mt5_region", newRegion]]);
+      setAccountIdState(newId);
+      setRegionState(newRegion);
+      setStatus("connected");
+      return { accountId: newId, region: newRegion };
+    } catch (e) {
+      console.warn("[silentReconnect] error:", (e as Error).message);
+      return null;
+    }
+  }, []);
+
   // Raw order submission — no side-effect refreshes. Used by both placeTrade and placeCascadeOrders.
   // Retries up to 2 times on transient "not ready" errors (MetaAPI warming up after reconnect).
   const submitOrderRaw = useCallback(
@@ -672,10 +751,16 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         msg?.toLowerCase().includes("not connected to broker") ||
         msg?.toLowerCase().includes("account is not connected");
 
+      // Effective accountId/region for this trade — may be replaced mid-flight
+      // if the server reports the MetaAPI account is dead and we silently
+      // re-provision a fresh one (transparent to the user).
+      let liveAccountId = accountId;
+      let liveRegion = region;
+
       const MAX_ATTEMPTS = 2;
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         console.log("[submitOrderRaw] →", actionType, "vol=" + String(params.volume), params.limitPrice != null ? "openPrice=" + String(params.limitPrice) : "market", "sl=" + String(params.stopLoss ?? "none"), attempt > 1 ? `(attempt ${attempt})` : "");
-        const res = await authFetch(`${API_BASE}/mt5/account/${accountId}/trade?region=${region}`, {
+        const res = await authFetch(`${API_BASE}/mt5/account/${liveAccountId}/trade?region=${liveRegion}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
@@ -686,16 +771,20 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         if (res.ok && data.success !== false) {
           return { success: true, message: data.message ?? "Trade placed successfully", positionId: data.positionId, orderId: data.orderId };
         }
-        // Server signalled the MetaAPI account no longer exists — clear local
-        // accountId so the next app launch / connect screen forces a fresh
-        // reconnect with the user's MT5 password.
-        if (res.status === 410 || data.reconnectRequired) {
-          console.warn("[submitOrderRaw] reconnect required — clearing local accountId");
-          try {
-            await AsyncStorage.multiRemove(["mt5_account_id", "mt5_region"]);
-          } catch {}
-          setAccountIdState("");
-          setStatus("disconnected");
+        // Server signalled the MetaAPI account no longer exists. Silently
+        // re-establish it using the password held in the device's secure
+        // store, then retry the trade against the fresh accountId — the user
+        // never sees the hiccup.
+        if ((res.status === 410 || data.reconnectRequired) && attempt < MAX_ATTEMPTS) {
+          const newIds = await silentReconnect();
+          if (newIds) {
+            liveAccountId = newIds.accountId;
+            liveRegion = newIds.region;
+            console.log("[submitOrderRaw] silent reconnect ok — retrying trade with new accountId");
+            continue;
+          }
+          // Silent reconnect failed (no stored password / web platform / connect error)
+          // — surface a clear message so the UI can prompt for re-entry.
           return { success: false, message: errMsg ?? "Your MT5 connection has expired. Please reconnect with your MT5 password.", reconnectRequired: true } as { success: boolean; message: string; reconnectRequired?: boolean; positionId?: string; orderId?: string };
         }
         // Retry once on transient broker-not-ready errors with a short delay
@@ -708,7 +797,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       }
       return { success: false, message: "Trade failed after retries" };
     },
-    [accountId, region]
+    [accountId, region, silentReconnect]
   );
 
   const placeTrade = useCallback(
