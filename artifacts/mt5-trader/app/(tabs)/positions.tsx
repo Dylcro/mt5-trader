@@ -42,14 +42,45 @@ function ProfitBadge({ profit }: { profit: number }) {
   );
 }
 
-function PositionCard({ pos, onClose }: { pos: Position; isBusy: boolean; onClose: () => void }) {
-  const isBuy = pos.type === "POSITION_TYPE_BUY";
+// Groups one direction's worth of orphan positions (positions that aren't
+// tracked by any zone — typically a cascade whose zone wasn't created, or a
+// legacy trade) into a single zone-style card. The user explicitly does not
+// want per-position cards: every open trade is shown as a roll-up so the
+// Positions tab always looks like "N zones / N groups", never a flat list.
+function StandaloneGroupCard({
+  positions,
+  symbol,
+  direction,
+  onCloseAll,
+}: {
+  positions: Position[];
+  symbol: string;
+  direction: "buy" | "sell";
+  onCloseAll: (positions: Position[]) => void;
+}) {
+  const isBuy = direction === "buy";
   const [closing, setClosing] = useState(false);
+  const totalVolume = positions.reduce((s, p) => s + p.volume, 0);
+  const totalProfit = positions.reduce((s, p) => s + p.profit, 0);
+  // Volume-weighted average entry — the right number to show for a cascade
+  // where each leg has the same lot size but lands at different prices.
+  const avgEntry = totalVolume > 0
+    ? positions.reduce((s, p) => s + p.openPrice * p.volume, 0) / totalVolume
+    : 0;
+  const currentPrice = positions[0]?.currentPrice ?? 0;
+  // Show a single SL value only if every position shares it (the cascade
+  // case). Mixed SLs would be misleading rolled into one number.
+  const slValues = positions.map((p) => p.stopLoss).filter((sl): sl is number => sl != null);
+  const sharedSl = slValues.length === positions.length && slValues.length > 0
+    && slValues.every((sl) => Math.abs(sl - slValues[0]!) < 0.005)
+    ? slValues[0]!
+    : null;
 
   const handleClose = async () => {
+    if (closing) return;
     setClosing(true);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    onClose();
+    onCloseAll(positions);
     setClosing(false);
   };
 
@@ -67,30 +98,32 @@ function PositionCard({ pos, onClose }: { pos: Position; isBusy: boolean; onClos
               {isBuy ? "BUY" : "SELL"}
             </Text>
           </View>
-          <Text style={styles.posSymbol}>{pos.symbol}</Text>
-          <Text style={styles.posVol}>{pos.volume} lots</Text>
+          <Text style={styles.posSymbol}>{symbol}</Text>
+          <Text style={styles.posVol}>
+            {positions.length} {positions.length === 1 ? "position" : "positions"}  ·  {totalVolume.toFixed(2)} lots
+          </Text>
         </View>
-        <ProfitBadge profit={pos.profit} />
+        <ProfitBadge profit={totalProfit} />
       </View>
 
       <View style={styles.posPriceRow}>
         <View style={styles.posPriceItem}>
-          <Text style={styles.posPriceLabel}>OPEN</Text>
-          <Text style={styles.posPriceVal}>{formatPrice(pos.openPrice)}</Text>
+          <Text style={styles.posPriceLabel}>AVG ENTRY</Text>
+          <Text style={styles.posPriceVal}>{formatPrice(avgEntry)}</Text>
         </View>
         <View style={styles.posPriceDivider} />
         <View style={styles.posPriceItem}>
           <Text style={styles.posPriceLabel}>CURRENT</Text>
-          <Text style={[styles.posPriceVal, { color: pos.profit >= 0 ? C.buy : C.sell }]}>
-            {formatPrice(pos.currentPrice)}
+          <Text style={[styles.posPriceVal, { color: totalProfit >= 0 ? C.buy : C.sell }]}>
+            {formatPrice(currentPrice)}
           </Text>
         </View>
-        {pos.stopLoss != null && (
+        {sharedSl != null && (
           <>
             <View style={styles.posPriceDivider} />
             <View style={styles.posPriceItem}>
               <Text style={styles.posPriceLabel}>STOP LOSS</Text>
-              <Text style={[styles.posPriceVal, { color: C.sell }]}>{formatPrice(pos.stopLoss)}</Text>
+              <Text style={[styles.posPriceVal, { color: C.sell }]}>{formatPrice(sharedSl)}</Text>
             </View>
           </>
         )}
@@ -110,7 +143,9 @@ function PositionCard({ pos, onClose }: { pos: Position; isBusy: boolean; onClos
         ) : (
           <>
             <Feather name="x-circle" size={14} color={C.textSecondary} />
-            <Text style={styles.closeBtnText}>Close Position</Text>
+            <Text style={styles.closeBtnText}>
+              Close {positions.length === 1 ? "Position" : `All (${positions.length})`}
+            </Text>
           </>
         )}
       </Pressable>
@@ -241,24 +276,33 @@ export default function PositionsScreen() {
     [cancelOrder]
   );
 
-  const handleClose = useCallback(
-    async (pos: Position) => {
+  // Close every position in a standalone group in parallel — fires all the
+  // POSITION_CLOSE_ID calls together rather than serially, matching the same
+  // pattern used by the zone Close button server-side.
+  const handleCloseGroup = useCallback(
+    async (group: Position[]) => {
+      if (group.length === 0) return;
+      const totalLots = group.reduce((s, p) => s + p.volume, 0);
+      const totalProfit = group.reduce((s, p) => s + p.profit, 0);
+      const dir = group[0]!.type === "POSITION_TYPE_BUY" ? "BUY" : "SELL";
       Alert.alert(
-        "Close Position",
-        `Close ${pos.type === "POSITION_TYPE_BUY" ? "BUY" : "SELL"} ${pos.volume} lots @ ${formatPrice(pos.currentPrice)}?\n\nP&L: ${pos.profit >= 0 ? "+" : ""}${pos.profit.toFixed(2)}`,
+        group.length === 1 ? "Close Position" : `Close ${group.length} Positions`,
+        `Close ${dir} ${totalLots.toFixed(2)} lots${group.length > 1 ? ` across ${group.length} positions` : ""}?\n\nP&L: ${totalProfit >= 0 ? "+" : ""}${totalProfit.toFixed(2)}`,
         [
           { text: "Cancel", style: "cancel" },
           {
             text: "Close",
             style: "destructive",
             onPress: async () => {
-              setBusyId(pos.id);
-              const result = await closePosition(pos.id);
-              setBusyId(null);
-              if (!result.success) {
-                Alert.alert("Error", result.message);
-              } else {
+              const results = await Promise.all(group.map((p) => closePosition(p.id)));
+              const failed = results.filter((r) => !r.success);
+              if (failed.length === 0) {
                 await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+              } else {
+                Alert.alert(
+                  "Some Positions Failed",
+                  `${results.length - failed.length}/${results.length} closed. ${failed[0]!.message}`,
+                );
               }
             },
           },
@@ -362,19 +406,41 @@ export default function PositionsScreen() {
                 </View>
               </>
             )}
-            {showStandalone && (
-              <>
-                <Text style={styles.sectionLabel}>OPEN  ·  {positions.length}</Text>
-                {positions.map((pos) => (
-                  <PositionCard
-                    key={pos.id}
-                    pos={pos}
-                    isBusy={busyId === pos.id}
-                    onClose={() => handleClose(pos)}
-                  />
-                ))}
-              </>
-            )}
+            {showStandalone && (() => {
+              // Group standalone (non-zone) positions by symbol + direction so
+              // a cascade that wasn't successfully registered as a zone still
+              // shows as ONE roll-up card per side instead of N separate cards.
+              const groups = new Map<string, Position[]>();
+              for (const p of positions) {
+                const dir = p.type === "POSITION_TYPE_BUY" ? "buy" : "sell";
+                const key = `${p.symbol}|${dir}`;
+                const arr = groups.get(key) ?? [];
+                arr.push(p);
+                groups.set(key, arr);
+              }
+              const groupList = Array.from(groups.entries());
+              return (
+                <>
+                  <Text style={styles.sectionLabel}>
+                    OPEN  ·  {positions.length}
+                  </Text>
+                  <View style={{ gap: 10 }}>
+                    {groupList.map(([key, group]) => {
+                      const [symbol, dir] = key.split("|") as [string, "buy" | "sell"];
+                      return (
+                        <StandaloneGroupCard
+                          key={key}
+                          positions={group}
+                          symbol={symbol}
+                          direction={dir}
+                          onCloseAll={handleCloseGroup}
+                        />
+                      );
+                    })}
+                  </View>
+                </>
+              );
+            })()}
             {showStandalone && pendingOrders.length > 0 && (
               <>
                 <View style={[styles.sectionRow, { marginTop: positions.length > 0 ? 20 : 0 }]}>
