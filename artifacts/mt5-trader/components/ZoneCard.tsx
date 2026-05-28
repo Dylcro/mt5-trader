@@ -1,7 +1,7 @@
 import { Feather } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
 import React, { useState } from "react";
-import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Alert, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 
 import Colors from "@/constants/colors";
 import type { Zone } from "@/hooks/useZones";
@@ -46,29 +46,38 @@ export default function ZoneCard({ zone, onRiskFree, historical = false }: ZoneC
 
   const handleRiskFree = () => {
     if (!onRiskFree) return;
-    Alert.alert(
-      "Lock in Risk Free?",
-      `Close all but the best entry in this ${isBuy ? "BUY" : "SELL"} zone and place a protective stop loss 10 pips on the losing side of the surviving entry. Pending limit orders for this zone will be cancelled.`,
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Risk Free",
-          style: "default",
-          onPress: async () => {
-            setBusy(true);
-            await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-            const result = await onRiskFree(zone.zoneId);
-            setBusy(false);
-            if (result.ok) {
-              await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-            } else {
-              await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-              Alert.alert("Couldn't go risk-free", result.message ?? "Please try again.");
-            }
-          },
-        },
-      ],
-    );
+    const title = "Lock in Risk Free?";
+    const msg = `Close all but the best entry in this ${isBuy ? "BUY" : "SELL"} zone and place a protective stop loss 10 pips on the losing side of the surviving entry. Pending limit orders for this zone will be cancelled.`;
+    const proceed = async () => {
+      setBusy(true);
+      await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      const result = await onRiskFree(zone.zoneId);
+      setBusy(false);
+      if (result.ok) {
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      } else {
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+        // React Native Web's Alert.alert ignores button arrays — fall back to
+        // window.alert so the error is still surfaced.
+        if (Platform.OS === "web" && typeof window !== "undefined") {
+          window.alert(`Couldn't go risk-free\n\n${result.message ?? "Please try again."}`);
+        } else {
+          Alert.alert("Couldn't go risk-free", result.message ?? "Please try again.");
+        }
+      }
+    };
+    // On web, RN's Alert.alert renders only the title/message via window.alert
+    // and drops the action buttons entirely — so the user can never tap
+    // "Risk Free" and the action would silently do nothing. Use window.confirm
+    // there so the confirm flow actually fires.
+    if (Platform.OS === "web" && typeof window !== "undefined") {
+      if (window.confirm(`${title}\n\n${msg}`)) void proceed();
+      return;
+    }
+    Alert.alert(title, msg, [
+      { text: "Cancel", style: "cancel" },
+      { text: "Risk Free", style: "default", onPress: () => { void proceed(); } },
+    ]);
   };
 
   const statusLabel = zone.status === "RISK_FREE" ? "RISK-FREE" : zone.status === "CLOSED" ? "CLOSED" : "ACTIVE";
