@@ -1593,30 +1593,30 @@ async function persistPreparedZone(
   positionId: string,
   volume: number,
 ): Promise<void> {
+  // Intentionally no try/catch — DB errors are rethrown so the caller's
+  // async block can enforce DB-first ordering: zoneStates is updated only
+  // after this promise resolves successfully. Swallowing errors here was the
+  // root cause of zones entering memory without a DB row (restart-unsafe).
   const now = Date.now();
-  try {
-    await db.insert(cascadeZonesTable).values({
-      zoneId: state.zoneId, accountId: state.accountId, userId: userId ?? null,
-      direction: state.direction, anchorPrice: state.anchorPrice,
-      tp1Price: state.tp1Price, tp2Price: state.tp2Price,
-      tp3Price: state.tp3Price, tp4Price: state.tp4Price,
-      originalVolume: state.originalVolume,
-      cashoutPips: state.cashoutPips, cashoutDone: false,
-      tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
-      status: "OPEN", createdAt: now,
-    }).onConflictDoNothing();
-    await db.insert(zonePositionsTable).values({
-      zoneId: state.zoneId, positionId, entryPrice: state.anchorPrice, volume,
-      status: "OPEN", createdAt: now,
-    }).onConflictDoNothing();
-    // Seed the in-memory cache for the anchor leg so a DB blip immediately
-    // after zone creation can't blind evaluateZone to the market entry.
-    state.trackedPositions.set(positionId, { volume, entryPrice: state.anchorPrice });
-    if (userId) zoneIdToUserId.set(state.zoneId, userId);
-    console.log(`[zone ${state.zoneId}] persisted ${state.direction.toUpperCase()} anchor=${state.anchorPrice} posId=${positionId} vol=${volume}`);
-  } catch (e) {
-    console.error(`[zone ${state.zoneId}] create persist error:`, (e as Error).message);
-  }
+  await db.insert(cascadeZonesTable).values({
+    zoneId: state.zoneId, accountId: state.accountId, userId: userId ?? null,
+    direction: state.direction, anchorPrice: state.anchorPrice,
+    tp1Price: state.tp1Price, tp2Price: state.tp2Price,
+    tp3Price: state.tp3Price, tp4Price: state.tp4Price,
+    originalVolume: state.originalVolume,
+    cashoutPips: state.cashoutPips, cashoutDone: false,
+    tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
+    status: "OPEN", createdAt: now,
+  }).onConflictDoNothing();
+  await db.insert(zonePositionsTable).values({
+    zoneId: state.zoneId, positionId, entryPrice: state.anchorPrice, volume,
+    status: "OPEN", createdAt: now,
+  }).onConflictDoNothing();
+  // Seed the in-memory cache for the anchor leg so a DB blip immediately
+  // after zone creation can't blind evaluateZone to the market entry.
+  state.trackedPositions.set(positionId, { volume, entryPrice: state.anchorPrice });
+  if (userId) zoneIdToUserId.set(state.zoneId, userId);
+  console.log(`[zone ${state.zoneId}] persisted ${state.direction.toUpperCase()} anchor=${state.anchorPrice} posId=${positionId} vol=${volume}`);
 }
 
 async function attachLimitOrderToZone(accountId: string, orderId: string): Promise<void> {
@@ -3704,8 +3704,16 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
               // pauses TP checks until the refinement below completes.
               const earlyPersist = persistPreparedZone(zoneState, uId, positionId, volume);
               void (async () => {
-                await earlyPersist; // ensure initial row is committed first
-                // DB write succeeded — now safe to put zone in the in-memory map.
+                try {
+                  await earlyPersist; // throws on DB failure — rethrown by persistPreparedZone
+                } catch (e) {
+                  // DB insert failed — do NOT register the zone in memory.
+                  // The zone will not be tracked this session, which is correct:
+                  // a restart must not silently resume a zone that has no DB row.
+                  console.error(`[zone ${zoneState.zoneId}] zone creation persist FAILED — zone will not be tracked (restart-safe):`, (e as Error).message);
+                  return;
+                }
+                // DB write confirmed — now safe to put zone in the in-memory map.
                 // This is the DB-first ordering: DB row exists before monitor sees it.
                 zoneStates.set(zoneState.zoneId, zoneState);
                 try {
