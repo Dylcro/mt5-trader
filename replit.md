@@ -113,6 +113,26 @@ The API server proxies MetaTrader 5 operations through MetaAPI Cloud.
 - Region is returned from `/connect` and stored in AsyncStorage; passed as `?region=` query param on all subsequent calls
 - `METAAPI_TOKEN` env secret is required
 
+## Deployment
+
+### Target: Reserved VM (always-warm)
+
+The API server is deployed as a **Reserved VM** (`deploymentTarget = "vm"` in `artifacts/api-server/.replit-artifact/artifact.toml`). This keeps the Node process running 24/7 so:
+
+- MetaAPI streaming WebSockets stay connected between user sessions — no 30–50s cold-start reconnect on first request after idle.
+- In-memory state (`zoneStates`, `activeConnections`, rate counters) is preserved across requests.
+- Zone monitor ticks fire on a steady cadence even when no users are active.
+
+A Reserved VM costs more than Autoscale but is required for this app because it holds persistent WebSocket connections. The Autoscale target would scale the server to zero on idle, disconnecting all streams and losing in-memory state.
+
+### Health check
+
+`GET /api/healthz` is wired as the startup health check in `artifact.toml`. It returns `{ "status": "ok" }` when the server is up. A separate stream-health endpoint (`GET /api/healthz/stream`) is planned (Task #43) to auto-restart the pod when MetaAPI streaming goes silent.
+
+### Publish
+
+To publish a new version: verify workflows are running cleanly, then click **Publish** in the Replit UI. Publishing builds the esbuild bundle (`pnpm --filter @workspace/api-server run build`), then starts the VM with `node artifacts/api-server/dist/index.cjs`.
+
 ### `scripts` (`@workspace/scripts`)
 
 Utility scripts package. Each script is a `.ts` file in `src/` with a corresponding npm script in `package.json`. Run scripts via `pnpm --filter @workspace/scripts run <script>`. Scripts can import any workspace package (e.g., `@workspace/db`) by adding it as a dependency in `scripts/package.json`.
