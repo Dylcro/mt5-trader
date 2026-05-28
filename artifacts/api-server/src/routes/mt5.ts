@@ -388,6 +388,35 @@ function isDuplicate(dealId: string): boolean {
   return false;
 }
 
+// ── SSE fan-out ────────────────────────────────────────────────────────────────
+// Tracks connected SSE clients per accountId. Each entry is a write function
+// that pushes a pre-formatted SSE payload string to the HTTP response.
+// Entries are removed when the client disconnects (req.on("close")).
+const sseClients = new Map<string, Set<(payload: string) => void>>();
+
+function broadcastToAccount(accountId: string, event: string, data: unknown): void {
+  const clients = sseClients.get(accountId);
+  if (!clients?.size) return;
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const write of clients) {
+    try { write(payload); } catch { /* client gone — cleanup handled on req.close */ }
+  }
+}
+
+function broadcastZoneUpdate(zoneId: string): void {
+  const st = zoneStates.get(zoneId);
+  if (!st) return;
+  broadcastToAccount(st.accountId, "zone_update", {
+    zoneId,
+    status: st.status,
+    tp1Hit: st.tp1Hit,
+    tp2Hit: st.tp2Hit,
+    tp3Hit: st.tp3Hit,
+    tp4Hit: st.tp4Hit ?? false,
+    tp2SlIsBestEffort: (st as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
+  });
+}
+
 
 // Tracks positionIds that have already been auto-cascaded (per account).
 // Persisted to the cascade_history table so it survives server restarts —
@@ -495,6 +524,7 @@ function handleStreamingTick(accountId: string, price: any): void {
   // Cache the tick so latestPrice() / candle builders stay current even when
   // the mobile app isn't polling /price (e.g. backgrounded).
   storeTick(accountId, bid, ask);
+  broadcastToAccount(accountId, "price", { bid, ask });
   // Trigger evaluateZone for any OPEN zone on this account, throttled.
   let token: string;
   try { token = getToken(); } catch { return; }
@@ -562,6 +592,7 @@ function makeDealListener(accountId: string) {
       if (deal?.entryType === "DEAL_ENTRY_OUT") {
         const posId = String(deal.positionId ?? "");
         if (posId) void markZonePositionClosed(accountId, posId);
+        broadcastToAccount(accountId, "deal", { type: "position_changed" });
         return;
       }
       if (deal?.entryType !== "DEAL_ENTRY_IN") return;
@@ -625,6 +656,7 @@ function makeDealListener(accountId: string) {
       };
       console.log(`[stream ${accountId}] deal dealId=${evt.dealId} posId=${evt.positionId} type=${evt.type} sym=${evt.symbol} price=${evt.openPrice} comment="${evt.comment ?? ""}"`);
       storeDealEvent(accountId, evt);
+      broadcastToAccount(accountId, "deal", { type: "position_changed" });
     },
     // Streaming tick handlers — drive evaluateZone off real broker ticks so
     // TPs fire within ~100ms of the level being touched (vs the 3 s timer's
@@ -1853,6 +1885,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
             .where(eq(cascadeZonesTable.zoneId, zoneId))
         ).catch(() => {/* logged inside withDbRetry */});
         st.status = "CLOSED";
+        broadcastZoneUpdate(zoneId);
         console.log(`[zone ${zoneId}] reconciliation: no live tracked positions — zone CLOSED`);
       }
       return;
@@ -1957,6 +1990,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         await db.update(cascadeZonesTable).set({ tp1Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
         zoneNearNotifiedTp.set(zoneId, 0);
         notifyZoneEvent(zoneId, "hit", 1, 0, st.direction);
+        broadcastZoneUpdate(zoneId);
         console.log(`[zone ${zoneId}] TP1 complete`);
       } else {
         console.warn(`[zone ${zoneId}] TP1 partial failure — will retry next tick`);
@@ -1977,6 +2011,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         await db.update(cascadeZonesTable).set({ tp2Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
         zoneNearNotifiedTp.set(zoneId, 0);
         notifyZoneEvent(zoneId, "hit", 2, 0, st.direction);
+        broadcastZoneUpdate(zoneId);
         console.log(`[zone ${zoneId}] TP2 partial closed + limits cancelled — SL→BE will be attempted next`);
       } else {
         console.warn(`[zone ${zoneId}] TP2 partial close failed — will retry next tick`);
@@ -1989,6 +2024,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         await db.update(cascadeZonesTable).set({ tp3Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
         zoneNearNotifiedTp.set(zoneId, 0);
         notifyZoneEvent(zoneId, "hit", 3, 0, st.direction);
+        broadcastZoneUpdate(zoneId);
         console.log(`[zone ${zoneId}] TP3 complete`);
       } else {
         console.warn(`[zone ${zoneId}] TP3 partial failure — will retry next tick`);
@@ -2000,6 +2036,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       if (ok) {
         st.tp4Hit = true;
         await db.update(cascadeZonesTable).set({ tp4Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        broadcastZoneUpdate(zoneId);
         console.log(`[zone ${zoneId}] TP4 complete — final exit`);
       } else {
         console.warn(`[zone ${zoneId}] TP4 close failed — will retry next tick`);
@@ -2331,6 +2368,49 @@ router.put("/mt5/notifications/prefs", async (req: Request, res: Response) => {
   }
 });
 
+// ── SSE stream route ──────────────────────────────────────────────────────────
+
+// GET /api/mt5/account/:accountId/stream
+// Server-Sent Events: pushes live price ticks, deal signals (positions changed),
+// and zone-state updates to the client. Replaces REST polling for live data.
+// Auth: Authorization header (Bearer token) — same as all other endpoints.
+// The client reconnects automatically after a disconnect; the server broadcasts
+// a heartbeat comment every 15 s to keep connections alive through proxies.
+router.get("/mt5/account/:accountId/stream", checkOwner, (req: Request, res: Response) => {
+  const { accountId } = req.params as { accountId: string };
+
+  res.setHeader("Content-Type",   "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control",  "no-cache, no-store");
+  res.setHeader("Connection",     "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // disable nginx buffering
+  res.flushHeaders();
+
+  const write = (payload: string): void => { res.write(payload); };
+
+  // Register this client
+  if (!sseClients.has(accountId)) sseClients.set(accountId, new Set());
+  sseClients.get(accountId)!.add(write);
+
+  // Confirm connection and send latest cached price immediately
+  res.write(`event: connected\ndata: ${JSON.stringify({ accountId })}\n\n`);
+  const tick = latestPrice(accountId);
+  if (tick) {
+    res.write(`event: price\ndata: ${JSON.stringify({ bid: tick.bid, ask: tick.ask })}\n\n`);
+  }
+
+  // Heartbeat comment every 15 s — keeps the TCP connection alive through
+  // Replit's proxy and mobile carrier NATs that close idle connections.
+  const hb = setInterval(() => {
+    try { res.write(": hb\n\n"); } catch { clearInterval(hb); }
+  }, 15_000);
+
+  req.on("close", () => {
+    clearInterval(hb);
+    sseClients.get(accountId)?.delete(write);
+    if (!sseClients.get(accountId)?.size) sseClients.delete(accountId);
+  });
+});
+
 // ── Zone routes ──────────────────────────────────────────────────────────────
 
 // GET /api/mt5/account/:accountId/zones — list active + risk-free zones with live position count.
@@ -2502,6 +2582,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     }
     st.status = "RISK_FREE";
     await db.update(cascadeZonesTable).set({ status: "RISK_FREE" }).where(eq(cascadeZonesTable.zoneId, zoneId));
+    broadcastZoneUpdate(zoneId);
     console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl} (pips=${pips})`);
     res.json({ ok: true, bestPositionId: best.id, sl, pips, closedCount: others.length });
   } catch (err) {
@@ -2589,6 +2670,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
       .set({ status: "CLOSED", closedAt: Date.now() })
       .where(eq(cascadeZonesTable.zoneId, zoneId));
     if (st) st.status = "CLOSED";
+    broadcastZoneUpdate(zoneId);
     console.log(`[zone ${zoneId}] close: user-initiated, closedCount=${live.length}`);
     res.json({ ok: true, closedCount: live.length });
   } catch (err) {

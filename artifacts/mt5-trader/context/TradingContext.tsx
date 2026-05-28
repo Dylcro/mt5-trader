@@ -11,6 +11,7 @@ import React, {
 } from "react";
 import { Platform } from "react-native";
 
+import { emitAccountEvent } from "@/lib/accountEventBus";
 import { getAuthToken } from "@/lib/authToken";
 
 // Secure credential helpers — used to silently re-establish the MetaAPI account
@@ -229,6 +230,19 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const startPollingRef = useRef<((accId: string, accRegion: string) => void) | null>(null);
   const reconnectInProgressRef = useRef(false);
 
+  // Keeps current region readable from the SSE closure without adding region
+  // to the SSE effect's dependency array (which would reconnect on region change).
+  const regionRef = useRef(region);
+  useEffect(() => { regionRef.current = region; }, [region]);
+
+  // Updated every render (render-time ref mutation, no re-render triggered) so
+  // the SSE loop always calls the latest fetchPositionsData / fetchPendingOrdersData
+  // closures. Populated below — after those callbacks are declared.
+  const sseHandlersRef = useRef<{
+    onDeal: () => void;
+    onZoneUpdate: (data: unknown) => void;
+  }>({ onDeal: () => {}, onZoneUpdate: () => {} });
+
   const clearCascadeNotification = useCallback(() => setCascadeNotification(null), []);
 
 
@@ -433,6 +447,22 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  // Render-time ref update — no re-render triggered, no stale closure in SSE loop.
+  // Must be placed after fetchPositionsData and fetchPendingOrdersData are declared.
+  sseHandlersRef.current = {
+    onDeal: () => {
+      const r = regionRef.current;
+      const a = accountId;
+      void Promise.all([
+        fetchPositionsData(a, r).then(setPositions).catch(() => {}),
+        fetchPendingOrdersData(a, r).then(setPendingOrders).catch(() => {}),
+      ]);
+    },
+    onZoneUpdate: (data: unknown) => {
+      emitAccountEvent(accountId, "zone_update", data);
+    },
+  };
+
   const startPolling = useCallback(
     (accId: string, accRegion: string) => {
       if (priceIntervalRef.current) clearInterval(priceIntervalRef.current);
@@ -476,7 +506,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       pollPrice();
       pollPositions();
       void pollEvents();
-      priceIntervalRef.current = setInterval(pollPrice, 500);
+      // SSE delivers real-time price ticks; this interval is the fallback when SSE
+      // is disconnected or unavailable. 5 s is still fast enough for manual decisions.
+      priceIntervalRef.current = setInterval(pollPrice, 5_000);
       positionsIntervalRef.current = setInterval(pollPositions, 10000);
       eventsIntervalRef.current = setInterval(pollEvents, 5000);
     },
@@ -491,6 +523,96 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     if (positionsIntervalRef.current) clearInterval(positionsIntervalRef.current);
     if (eventsIntervalRef.current) clearInterval(eventsIntervalRef.current);
   }, []);
+
+  // ── SSE live stream ────────────────────────────────────────────────────────────
+  // Opens a Server-Sent Events connection when the account is connected.
+  // price events → update price state in real time (SSE supplements the 5 s poll).
+  // deal events  → immediately refresh positions + pending orders.
+  // zone_update  → emit to the module-level accountEventBus so useZones patches state.
+  // Reconnects with exponential back-off (2 s → 30 s) after a disconnect.
+  useEffect(() => {
+    if (status !== "connected" || !accountId || !API_BASE) return;
+    let mounted = true;
+    const controller = new AbortController();
+    let retryDelay = 2_000;
+
+    const run = async () => {
+      while (mounted && !controller.signal.aborted) {
+        try {
+          const token = await getAuthToken();
+          const headers: Record<string, string> = {};
+          if (token) headers["Authorization"] = `Bearer ${token}`;
+
+          const res = await fetch(
+            `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/stream`,
+            { headers, signal: controller.signal },
+          );
+          if (!res.ok) throw new Error(`SSE HTTP ${res.status}`);
+
+          const body = res.body;
+          if (!body) throw new Error("SSE streaming not supported on this platform");
+
+          const reader = body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+          let curEvent = "";
+          retryDelay = 2_000; // reset on successful connect
+
+          try {
+            while (mounted && !controller.signal.aborted) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              const parts = buffer.split("\n");
+              buffer = parts.pop() ?? "";
+
+              for (const line of parts) {
+                if (line.startsWith("event:")) {
+                  curEvent = line.slice(6).trim();
+                } else if (line.startsWith("data:") && curEvent) {
+                  try {
+                    const data = JSON.parse(line.slice(5).trim()) as Record<string, unknown>;
+                    if (curEvent === "price") {
+                      const bid = Number(data.bid ?? 0);
+                      const ask = Number(data.ask ?? 0);
+                      if (bid > 0 && ask > 0) {
+                        setPrice({ bid, ask, spread: Math.round((ask - bid) * 10), time: new Date().toISOString() });
+                        priceFailCountRef.current = 0;
+                        setPriceError(false);
+                      }
+                    } else if (curEvent === "deal") {
+                      sseHandlersRef.current.onDeal();
+                    } else if (curEvent === "zone_update") {
+                      sseHandlersRef.current.onZoneUpdate(data);
+                    }
+                  } catch { /* ignore parse errors */ }
+                  curEvent = "";
+                } else if (line === "") {
+                  curEvent = "";
+                }
+              }
+            }
+          } finally {
+            reader.releaseLock();
+          }
+        } catch (e) {
+          if (controller.signal.aborted || !mounted) break;
+          console.warn(`[SSE] disconnected (${(e as Error).message}), retrying in ${retryDelay}ms`);
+        }
+
+        if (!mounted || controller.signal.aborted) break;
+        await new Promise<void>(r => setTimeout(r, retryDelay));
+        retryDelay = Math.min(retryDelay * 2, 30_000);
+      }
+    };
+
+    void run();
+    return () => {
+      mounted = false;
+      controller.abort();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, accountId]);
 
   const connect = useCallback(
     async (creds?: Mt5Credentials) => {

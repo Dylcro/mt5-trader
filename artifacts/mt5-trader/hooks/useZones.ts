@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { subscribeAccountEvents } from "@/lib/accountEventBus";
 import { getAuthToken } from "@/lib/authToken";
 
 const API_BASE = process.env.EXPO_PUBLIC_API_URL ?? "";
@@ -84,6 +85,24 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     const id = setInterval(() => void refresh(), pollIntervalMs);
     return () => clearInterval(id);
   }, [accountId, pollIntervalMs, refresh]);
+
+  // Subscribe to SSE-driven zone events via the module-level accountEventBus.
+  // zone_update → patch the matching zone in-place for instant TP/status changes.
+  // deal        → re-fetch all zones so position counts stay accurate.
+  useEffect(() => {
+    if (!accountId) return;
+    return subscribeAccountEvents(accountId, (type, data) => {
+      if (type === "zone_update") {
+        const update = data as Partial<Zone> & { zoneId?: string };
+        if (!update.zoneId) return;
+        setZones(prev =>
+          prev.map(z => z.zoneId === update.zoneId ? { ...z, ...update } : z)
+        );
+      } else if (type === "deal") {
+        void refresh();
+      }
+    });
+  }, [accountId, refresh]);
 
   const riskFree = useCallback(async (
     zoneId: string,
