@@ -324,7 +324,7 @@ export default function TradeScreen() {
 
   // Cascade state
   const [cascadeDirection, setCascadeDirection] = useState<Direction>("buy");
-  const [cascadeLotSize, setCascadeLotSizeRaw] = useState(0.01);
+  const [cascadeLotSize, setCascadeLotSizeRaw] = useState(0.04);
   const setCascadeLotSize = useCallback((v: number) => {
     setCascadeLotSizeRaw(v);
     void AsyncStorage.setItem(LOT_SIZE_CASCADE_KEY, String(v));
@@ -361,7 +361,15 @@ export default function TradeScreen() {
     AsyncStorage.multiGet([LOT_SIZE_SINGLE_KEY, LOT_SIZE_CASCADE_KEY]).then((pairs) => {
       const [single, cascade] = pairs.map((p) => p[1]);
       if (single) setLotSizeRaw(parseFloat(single));
-      if (cascade) setCascadeLotSizeRaw(parseFloat(cascade));
+      if (cascade) {
+        // Cascade needs ≥0.04 (4 × 0.01 broker min for 25% partials at TP1-4).
+        // Snap any stored sub-0.04 value up so the Buy/Sell button can't be
+        // silently blocked by a stale value from before this minimum existed.
+        const parsed = parseFloat(cascade);
+        const safe = Number.isFinite(parsed) && parsed >= 0.04 ? parsed : 0.04;
+        setCascadeLotSizeRaw(safe);
+        if (safe !== parsed) void AsyncStorage.setItem(LOT_SIZE_CASCADE_KEY, String(safe));
+      }
     });
   }, []);
 
@@ -843,7 +851,7 @@ export default function TradeScreen() {
                 <Text style={styles.sectionTitle}>Lot Size (per order)</Text>
                 <Text style={styles.sectionHint}>1 lot = 100 oz gold</Text>
               </View>
-              <StepInput value={cascadeLotSize} onChange={setCascadeLotSize} step={0.01} min={0.01} max={100} decimals={2} />
+              <StepInput value={cascadeLotSize} onChange={setCascadeLotSize} step={0.01} min={0.04} max={100} decimals={2} />
             </View>
 
             {/* Zone TP summary — sourced from Settings. Read-only here. */}
