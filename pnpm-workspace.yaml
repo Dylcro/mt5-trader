@@ -26,6 +26,11 @@
 #
 # ============================================================================
 minimumReleaseAge: 1440
+minimumReleaseAgeExclude:
+  # react-native-gesture-handler v3.0.0 released today — trusted Software Mansion package; remove once >1440 min old
+  - react-native-gesture-handler
+  # expo next tag (54.0.35) released today — trusted Expo org package; remove once >1440 min old
+  - expo
 
 packages:
   - artifacts/*

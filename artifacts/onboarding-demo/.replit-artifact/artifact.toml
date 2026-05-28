@@ -1,0 +1,31 @@
+kind = "video"
+previewPath = "/onboarding-demo/"
+title = "MT5 Trader — New Client Demo"
+version = "1.0.0"
+id = "artifacts/onboarding-demo"
+router = "path"
+
+[[integratedSkills]]
+name = "video-js"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/onboarding-demo/" ]
+localPort = 24004
+
+[services.development]
+run = "pnpm --filter @workspace/onboarding-demo run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/onboarding-demo", "run", "build" ]
+publicDir = "artifacts/onboarding-demo/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "24004"
+BASE_PATH = "/onboarding-demo/"
