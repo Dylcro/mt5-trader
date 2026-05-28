@@ -2057,7 +2057,10 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       const ok = await closeZonePosition(token, region, accountId, p.id);
       if (!ok) failed.push(p.id);
     }
-    // "Risk free" = move stop loss ZONE_RISK_FREE_PIPS INTO PROFIT from the best entry.
+    // "Risk free" (misnomer — kept because the user calls it that): move SL
+    // ZONE_RISK_FREE_PIPS of DRAWDOWN under the best entry (BUY: below; SELL:
+    // above). Caps the loss on the remaining best entry to ~10p, much smaller
+    // than the original SL. See computeRiskFreeSl for direction math.
     const sl = computeRiskFreeSl(st.direction, best.openPrice);
     const slOk = await modifyZonePositionSl(token, region, accountId, best.id, sl);
     await cancelZoneLimits(token, region, accountId, zoneId);
