@@ -3,6 +3,8 @@ import bcrypt from "bcryptjs";
 import { db, storedAccountsTable, supportTicketsTable, usersTable } from "@workspace/db";
 import { desc, eq } from "drizzle-orm";
 import { resetAuthLockouts } from "../lib/rateLimiters";
+import { getStreamHealth, getZoneCounts } from "./mt5";
+import { getTelemetry } from "../telemetry";
 
 const router: IRouter = Router();
 
@@ -302,6 +304,21 @@ router.post("/users/update-name", async (req: Request, res: Response) => {
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }
+});
+
+// GET /api/admin/status — machine-readable health snapshot for the /status page
+router.get("/status", (req: Request, res: Response) => {
+  if (!requireAdminKey(req, res)) return;
+  const health = getStreamHealth();
+  const zones = getZoneCounts();
+  const { recentTradeFailures, recentRateLimits } = getTelemetry();
+  res.json({
+    ts: Date.now(),
+    streams: health,
+    zones,
+    recentTradeFailures,
+    recentRateLimits,
+  });
 });
 
 function escapeHtml(s: string): string {

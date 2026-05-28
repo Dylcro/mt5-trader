@@ -109,6 +109,168 @@ app.get("/privacy", (_req: Request, res: Response) => {
 
 app.use("/api", router);
 
+// ── Status page — admin-gated live health dashboard ──────────────────────────
+app.get("/status", (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XAUUSD Trader — Status</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0f; color: #e8e6de; min-height: 100vh; padding: 32px 24px; }
+  h1 { font-size: 22px; font-weight: 700; color: #c9a84c; letter-spacing: 2px; margin-bottom: 4px; }
+  .subtitle { font-size: 13px; color: #6e6e8a; margin-bottom: 32px; }
+  h2 { font-size: 13px; font-weight: 600; color: #c9a84c; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 12px; }
+  .section { margin-bottom: 36px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; margin-bottom: 0; }
+  .card { background: #111118; border: 1px solid #1e1e2e; border-radius: 10px; padding: 16px 20px; }
+  .card-label { font-size: 11px; color: #6e6e8a; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+  .card-value { font-size: 28px; font-weight: 700; color: #e8e6de; }
+  .card-sub { font-size: 12px; color: #6e6e8a; margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; background: #111118; border-radius: 10px; overflow: hidden; border: 1px solid #1e1e2e; font-size: 13px; }
+  thead { background: #1a1a28; }
+  th { padding: 10px 14px; text-align: left; font-size: 11px; font-weight: 600; color: #6e6e8a; letter-spacing: 0.5px; text-transform: uppercase; border-bottom: 1px solid #1e1e2e; }
+  td { padding: 11px 14px; border-bottom: 1px solid #1a1a28; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  .mono { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; color: #c9a84c; }
+  .muted { color: #6e6e8a; }
+  .ok { color: #2ed573; }
+  .warn { color: #ffa502; }
+  .err { color: #ff4757; }
+  .empty { color: #6e6e8a; font-style: italic; padding: 20px; text-align: center; }
+  .badge { display: inline-block; background: rgba(201,168,76,0.15); color: #c9a84c; border: 1px solid rgba(201,168,76,0.3); border-radius: 20px; font-size: 11px; font-weight: 600; padding: 3px 10px; margin-left: 8px; }
+  .key-form { background: #111118; border: 1px solid #1e1e2e; border-radius: 12px; padding: 28px; max-width: 400px; }
+  .key-form input { width: 100%; padding: 10px 14px; background: #0a0a0f; border: 1px solid #1e1e2e; color: #e8e6de; border-radius: 6px; font-family: inherit; font-size: 13px; margin-bottom: 12px; }
+  .key-form button { padding: 12px 20px; background: #c9a84c; color: #0a0a0f; border: 0; border-radius: 6px; font-weight: 700; cursor: pointer; font-size: 13px; width: 100%; }
+  #refresh-bar { font-size: 12px; color: #6e6e8a; margin-top: -20px; margin-bottom: 28px; }
+</style>
+</head>
+<body>
+<h1>XAUUSD TRADER</h1>
+<p class="subtitle">Live system status</p>
+<div id="root"></div>
+<script>
+(function() {
+  var key = new URLSearchParams(location.search).get('key') || '';
+  var root = document.getElementById('root');
+  var timer = null;
+  var countdown = 10;
+  var cdTimer = null;
+
+  function esc(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+  function fmt(ms) {
+    if (!ms) return '—';
+    return new Date(ms).toLocaleString('en-GB', { timeZone: 'UTC', dateStyle: 'short', timeStyle: 'medium' }) + ' UTC';
+  }
+  function ago(ms) {
+    var s = Math.round((Date.now() - ms) / 1000);
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.round(s/60) + 'm ago';
+    return Math.round(s/3600) + 'h ago';
+  }
+
+  if (!key) {
+    root.innerHTML = '<div class="key-form"><h2 style="margin-bottom:16px">Admin Key Required</h2><form id="kf"><input type="password" id="ki" placeholder="Enter admin key" autocomplete="off"><button type="submit">OPEN STATUS PAGE</button></form></div>';
+    document.getElementById('kf').addEventListener('submit', function(e) {
+      e.preventDefault();
+      var k = document.getElementById('ki').value.trim();
+      if (k) location.href = '/status?key=' + encodeURIComponent(k);
+    });
+    return;
+  }
+
+  function render(d) {
+    var streams = d.streams || { healthy: true, accounts: [] };
+    var zones = d.zones || { open: 0, riskFree: 0 };
+    var failures = d.recentTradeFailures || [];
+    var rateLimits = d.recentRateLimits || [];
+
+    var streamRows = streams.accounts.length === 0
+      ? '<tr><td colspan="3" class="empty">No accounts streaming yet</td></tr>'
+      : streams.accounts.map(function(a) {
+          var cls = a.stale ? 'err' : 'ok';
+          var label = a.stale ? 'STALE' : 'LIVE';
+          return '<tr><td class="mono">' + esc(a.accountId) + '</td>' +
+            '<td class="' + cls + '">' + label + '</td>' +
+            '<td class="muted">' + a.silentForSec + 's silent</td></tr>';
+        }).join('');
+
+    var failRows = failures.length === 0
+      ? '<tr><td colspan="4" class="empty">No trade failures recorded</td></tr>'
+      : failures.slice().reverse().map(function(f) {
+          return '<tr><td class="muted">' + fmt(f.ts) + '</td>' +
+            '<td class="mono">' + esc(f.accountId.slice(-8)) + '</td>' +
+            '<td><span class="err">' + esc(f.code) + '</span></td>' +
+            '<td class="muted" style="max-width:320px;word-break:break-word">' + esc(f.message) + '</td></tr>';
+        }).join('');
+
+    var rlRows = rateLimits.length === 0
+      ? '<tr><td colspan="2" class="empty">No rate-limit hits recorded</td></tr>'
+      : rateLimits.slice().reverse().map(function(r) {
+          return '<tr><td class="muted">' + fmt(r.ts) + '</td>' +
+            '<td class="mono">' + esc(r.accountId.slice(-8)) + '</td></tr>';
+        }).join('');
+
+    var health = streams.healthy ? '<span class="ok">HEALTHY</span>' : '<span class="err">DEGRADED</span>';
+
+    root.innerHTML =
+      '<div id="refresh-bar">Auto-refreshes every 10 s &mdash; last updated ' + ago(d.ts) + '</div>' +
+      '<div class="section">' +
+        '<div class="grid">' +
+          '<div class="card"><div class="card-label">Stream Health</div><div class="card-value" style="font-size:18px;margin-top:4px">' + health + '</div><div class="card-sub">' + streams.accounts.length + ' account(s)</div></div>' +
+          '<div class="card"><div class="card-label">Open Zones</div><div class="card-value">' + zones.open + '</div><div class="card-sub">' + zones.riskFree + ' risk-free</div></div>' +
+          '<div class="card"><div class="card-label">Trade Failures</div><div class="card-value">' + failures.length + '</div><div class="card-sub">in ring buffer</div></div>' +
+          '<div class="card"><div class="card-label">Rate Limit Hits</div><div class="card-value">' + rateLimits.length + '</div><div class="card-sub">in ring buffer</div></div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="section"><h2>Streams <span class="badge">' + streams.accounts.length + '</span></h2>' +
+        '<table><thead><tr><th>Account ID</th><th>Status</th><th>Silence</th></tr></thead><tbody>' + streamRows + '</tbody></table>' +
+      '</div>' +
+      '<div class="section"><h2>Recent Trade Failures <span class="badge">' + failures.length + '</span></h2>' +
+        '<table><thead><tr><th>Time</th><th>Account</th><th>Code</th><th>Message</th></tr></thead><tbody>' + failRows + '</tbody></table>' +
+      '</div>' +
+      '<div class="section"><h2>Rate Limit Hits <span class="badge">' + rateLimits.length + '</span></h2>' +
+        '<table><thead><tr><th>Time</th><th>Account</th></tr></thead><tbody>' + rlRows + '</tbody></table>' +
+      '</div>';
+  }
+
+  function startCountdown() {
+    countdown = 10;
+    clearInterval(cdTimer);
+    cdTimer = setInterval(function() {
+      countdown--;
+      var bar = document.getElementById('refresh-bar');
+      if (bar) bar.textContent = 'Auto-refreshes every 10 s — next in ' + countdown + 's';
+      if (countdown <= 0) clearInterval(cdTimer);
+    }, 1000);
+  }
+
+  function load() {
+    clearTimeout(timer);
+    fetch('/api/admin/status?key=' + encodeURIComponent(key))
+      .then(function(r) {
+        if (r.status === 401) { root.innerHTML = '<p class="err" style="padding:20px">Invalid admin key.</p>'; return null; }
+        return r.json();
+      })
+      .then(function(d) {
+        if (d) { render(d); startCountdown(); }
+      })
+      .catch(function(e) { root.innerHTML = '<p class="err" style="padding:20px">Fetch error: ' + esc(e.message) + '</p>'; })
+      .finally(function() { timer = setTimeout(load, 10000); });
+  }
+
+  load();
+})();
+</script>
+</body>
+</html>`);
+});
+
 // ── PWA web app — served after all API routes so /api/* is never shadowed ──
 const webDist = path.join(__dirname, "../public");
 if (fs.existsSync(webDist)) {

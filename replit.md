@@ -113,6 +113,17 @@ The API server proxies MetaTrader 5 operations through MetaAPI Cloud.
 - Region is returned from `/connect` and stored in AsyncStorage; passed as `?region=` query param on all subsequent calls
 - `METAAPI_TOKEN` env secret is required
 
+## Troubleshooting
+
+### Status page
+Visit `/status?key=YOUR_ADMIN_KEY` for a live health dashboard that shows:
+- MetaAPI stream health per account (live / stale / silent duration)
+- Open and risk-free zone counts
+- Recent trade failures (last 20, with broker error code + message)
+- Rate-limit hit count (broker code 10024)
+
+The same data is available as JSON at `/api/admin/status?key=YOUR_ADMIN_KEY` for scripting or monitoring integrations. Check here first when debugging stream or trade issues.
+
 ## Deployment
 
 ### Target: Reserved VM (always-warm)

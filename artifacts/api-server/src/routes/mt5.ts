@@ -4,6 +4,7 @@ import { createRequire } from "module";
 import { db, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable, cascadeZonesTable, zonePositionsTable, zoneOrdersTable, notificationPrefsTable } from "@workspace/db";
 import { and, eq, inArray, isNotNull } from "drizzle-orm";
 import { JWT_SECRET } from "./auth";
+import { logEvent } from "../logger";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
 // In dev (tsx/ESM) import.meta.url is the real file URL.
 // In production (esbuild CJS) build.ts injects a __importMetaUrl banner and
@@ -450,6 +451,15 @@ export function getStreamHealth(): { healthy: boolean; accounts: StreamHealthAcc
   return { healthy, accounts };
 }
 
+export function getZoneCounts(): { open: number; riskFree: number } {
+  let open = 0; let riskFree = 0;
+  for (const st of zoneStates.values()) {
+    if (st.status === "OPEN") open++;
+    else if (st.status === "RISK_FREE") riskFree++;
+  }
+  return { open, riskFree };
+}
+
 // Tracks positionIds that have already been auto-cascaded (per account).
 // Persisted to the cascade_history table so it survives server restarts —
 // without this, post-sync catch-up re-cascades positions whose cascade limit
@@ -591,7 +601,7 @@ function makeDealListener(accountId: string) {
       // during the full reconnect+resync window (~54 s) instead of going
       // blind and missing trades placed during that gap.
       // startStreaming() will replace activeConnections with the new conn.
-      console.log(`[stream ${accountId}] WebSocket disconnected — reconnecting in 3 s (terminalState preserved)`);
+      logEvent("stream.disconnect", { accountId });
       // Don't wait for the 10 s watchdog — reconnect immediately (3 s delay
       // to avoid a tight loop if the broker endpoint is briefly down).
       setTimeout(() => {
@@ -813,7 +823,7 @@ async function startStreaming(token: string, accountId: string, region: string =
     // Keep the in-memory registry current so the watchdog/safety-net can work
     // even when the DB is temporarily unavailable.
     knownAccounts.set(accountId, { accountId, userId, region });
-    console.log(`[stream ${accountId}] streaming connection established — SDK trade path armed`);
+    logEvent("stream.connect", { accountId, region });
     // Sync-stuck recovery: if `onDealsSynchronized` hasn't fired within 150s,
     // the account's sync session on MetaAPI is wedged (the "synchronization
     // with this id is already running" error). Force-arming locally doesn't
@@ -1616,7 +1626,7 @@ async function persistPreparedZone(
   // after zone creation can't blind evaluateZone to the market entry.
   state.trackedPositions.set(positionId, { volume, entryPrice: state.anchorPrice });
   if (userId) zoneIdToUserId.set(state.zoneId, userId);
-  console.log(`[zone ${state.zoneId}] persisted ${state.direction.toUpperCase()} anchor=${state.anchorPrice} posId=${positionId} vol=${volume}`);
+  logEvent("zone.create", { accountId: state.accountId, zoneId: state.zoneId, direction: state.direction, anchorPrice: state.anchorPrice, positionId, volume });
 }
 
 async function attachLimitOrderToZone(accountId: string, orderId: string): Promise<void> {
@@ -1721,7 +1731,7 @@ async function markZonePositionClosed(accountId: string, positionId: string): Pr
         .where(eq(cascadeZonesTable.zoneId, zoneId))
       );
       if (st) st.status = "CLOSED";
-      console.log(`[zone ${zoneId}] all positions closed — zone CLOSED`);
+      logEvent("zone.close", { accountId, zoneId, trigger: "position.closed" });
     }
   } catch (e) {
     console.error(`[zone] markZonePositionClosed error posId=${positionId}:`, (e as Error).message);
@@ -1952,7 +1962,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         ).catch(() => {/* logged inside withDbRetry */});
         st.status = "CLOSED";
         broadcastZoneUpdate(zoneId);
-        console.log(`[zone ${zoneId}] reconciliation: no live tracked positions — zone CLOSED`);
+        logEvent("zone.close", { accountId: st.accountId, zoneId, trigger: "reconciliation" });
       }
       return;
     }
@@ -2751,7 +2761,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
       .where(eq(cascadeZonesTable.zoneId, zoneId));
     if (st) st.status = "CLOSED";
     broadcastZoneUpdate(zoneId);
-    console.log(`[zone ${zoneId}] close: user-initiated, closedCount=${live.length}`);
+    logEvent("zone.close", { accountId, zoneId, closedCount: live.length, trigger: "user" });
     res.json({ ok: true, closedCount: live.length });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
@@ -3623,6 +3633,14 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
     const success = TRADE_SUCCESS_CODES.has(code);
     const errorMessage = success ? undefined : (TRADE_ERROR_MESSAGES[code] ?? data.message ?? `Trade failed (code ${code})`);
     if (!success) console.log(`[trade] FAILED action=${body.actionType} code=${code} msg="${errorMessage}"`);
+    logEvent(success ? "trade.ok" : "trade.fail", {
+      accountId,
+      action: _tradeActionType,
+      code,
+      message: errorMessage ?? null,
+      positionId: data.positionId ?? null,
+    });
+    if (code === 10024) logEvent("rate.hit", { accountId, code });
 
     // Clear the in-flight guard now that the trade response is back (the race
     // window is closed — the deal event has already been handled or won't fire).
