@@ -1173,6 +1173,12 @@ const ZONE_ASSOC_WINDOW_MS  = 30_000; // limits placed within 30s of market atta
 const zoneStates = new Map<string, ZoneState>();          // zoneId → state
 const zoneLimitOrders = new Map<string, string>();        // orderId → zoneId
 const pendingZoneAssoc = new Map<string, { zoneId: string; direction: "buy" | "sell"; expiresAt: number }>(); // accountId → recent zone for limit attach
+// Race buffer: when a cascade limit POST response arrives BEFORE the market
+// POST response has set up pendingZoneAssoc (the app fires them in parallel),
+// stash the orderId here so the next prepareZoneForCascade for this account
+// can attach it. Expires after ZONE_ASSOC_WINDOW_MS to avoid leaking across
+// unrelated cascades.
+const orphanedCascadeLimits = new Map<string, { orderId: string; expiresAt: number }[]>();
 
 function newZoneId(): string {
   return `z_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -1202,6 +1208,22 @@ function prepareZoneForCascade(
   };
   zoneStates.set(zoneId, state);
   pendingZoneAssoc.set(accountId, { zoneId, direction, expiresAt: Date.now() + ZONE_ASSOC_WINDOW_MS });
+  // Drain any cascade limit orderIds whose POST response landed before this
+  // market response. Each gets attached to this freshly-prepared zone.
+  const orphans = orphanedCascadeLimits.get(accountId);
+  if (orphans && orphans.length > 0) {
+    const now = Date.now();
+    for (const o of orphans) {
+      if (o.expiresAt < now) continue;
+      zoneLimitOrders.set(o.orderId, zoneId);
+      void db.insert(zoneOrdersTable)
+        .values({ zoneId, orderId: o.orderId, createdAt: now })
+        .onConflictDoNothing()
+        .catch((e: Error) => console.warn(`[zone ${zoneId}] orphan-attach persist orderId=${o.orderId} failed:`, e.message));
+      console.log(`[zone ${zoneId}] attached orphaned cascade limit orderId=${o.orderId} (arrived before zone was prepared)`);
+    }
+    orphanedCascadeLimits.delete(accountId);
+  }
   return state;
 }
 
@@ -1240,8 +1262,18 @@ async function persistPreparedZone(
 
 async function attachLimitOrderToZone(accountId: string, orderId: string): Promise<void> {
   const pending = pendingZoneAssoc.get(accountId);
-  if (!pending) return;
-  if (Date.now() > pending.expiresAt) { pendingZoneAssoc.delete(accountId); return; }
+  if (!pending || Date.now() > pending.expiresAt) {
+    if (pending) pendingZoneAssoc.delete(accountId);
+    // Race: this cascade limit POST resolved before the companion market POST
+    // could call prepareZoneForCascade. Buffer the orderId so the next zone
+    // prepared for this account picks it up.
+    const expiresAt = Date.now() + ZONE_ASSOC_WINDOW_MS;
+    const arr = orphanedCascadeLimits.get(accountId) ?? [];
+    arr.push({ orderId, expiresAt });
+    orphanedCascadeLimits.set(accountId, arr);
+    console.log(`[zone ?] buffered cascade limit orderId=${orderId} for account=${accountId} (no zone prepared yet)`);
+    return;
+  }
   zoneLimitOrders.set(orderId, pending.zoneId);
   try {
     await db.insert(zoneOrdersTable).values({
