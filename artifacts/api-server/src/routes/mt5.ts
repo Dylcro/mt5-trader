@@ -1188,6 +1188,13 @@ interface ZoneState {
   tp4Hit: boolean;
   status: "OPEN" | "RISK_FREE" | "CLOSED";
   busy: boolean; // debounce: prevent overlapping monitor ticks for this zone
+  // In-memory mirror of zone_positions(status=OPEN) for this zone, used as a
+  // fallback when the DB query inside evaluateZone fails — prevents transient
+  // DB blips from silently blinding the TP engine for an entire zone. We carry
+  // {volume, entryPrice} because TP partial-close logic needs the original
+  // per-entry volume to compute the 25% slice (a fallback row without volume
+  // would silently advance TP flags without actually closing anything).
+  trackedPositions: Map<string, { volume: number; entryPrice: number }>;
 }
 
 export const ZONE_RISK_FREE_PIPS   = 8;
@@ -1258,6 +1265,7 @@ function prepareZoneForCascade(
     cashoutDone: false,
     tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
     status: "OPEN", busy: false,
+    trackedPositions: new Map(),
   };
   zoneStates.set(zoneId, state);
   pendingZoneAssoc.set(accountId, { zoneId, direction, expiresAt: Date.now() + ZONE_ASSOC_WINDOW_MS });
@@ -1313,6 +1321,9 @@ async function persistPreparedZone(
       zoneId: state.zoneId, positionId, entryPrice: state.anchorPrice, volume,
       status: "OPEN", createdAt: now,
     }).onConflictDoNothing();
+    // Seed the in-memory cache for the anchor leg so a DB blip immediately
+    // after zone creation can't blind evaluateZone to the market entry.
+    state.trackedPositions.set(positionId, { volume, entryPrice: state.anchorPrice });
     if (userId) zoneIdToUserId.set(state.zoneId, userId);
     console.log(`[zone ${state.zoneId}] persisted ${state.direction.toUpperCase()} anchor=${state.anchorPrice} posId=${positionId} vol=${volume}`);
   } catch (e) {
@@ -1359,6 +1370,10 @@ async function recordZonePositionFill(
       await db.insert(zonePositionsTable).values({
         zoneId, positionId, entryPrice, volume, status: "OPEN", createdAt: Date.now(),
       }).onConflictDoNothing();
+      // Mirror into the in-memory cache so evaluateZone keeps working through
+      // DB blips even if the next select() throws.
+      const st = zoneStates.get(zoneId);
+      if (st) st.trackedPositions.set(positionId, { volume, entryPrice });
       console.log(`[zone ${zoneId}] linked filled positionId=${positionId} @${entryPrice} vol=${volume}${i > 0 ? ` (after ${i} retries)` : ""}`);
       return;
     } catch (e) {
@@ -1564,12 +1579,44 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
   try {
     const region = activeRegions.get(st.accountId) ?? knownAccounts.get(st.accountId)?.region ?? DEFAULT_REGION;
     // Fetch this zone's tracked positions from DB (OPEN status only).
-    const zps = await db.select().from(zonePositionsTable)
-      .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
+    // Resilient tracked-positions lookup: prefer DB (source of truth) but
+    // fall back to the in-memory mirror on transient query failures so a DB
+    // blip can't silently blind the TP engine for the whole zone (the bug
+    // that left TP1 unfired on z_mppceam5_ulh4du). We carry volume + entry
+    // price so the TP partial-close logic still has the data it needs.
+    let zps: { positionId: string; volume: number; entryPrice: number }[] = [];
+    let trackedIds: Set<string>;
+    let dbOk = true;
+    try {
+      const rows = await db.select().from(zonePositionsTable)
+        .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
+      zps = rows.map(r => ({
+        positionId: r.positionId, volume: Number(r.volume), entryPrice: Number(r.entryPrice),
+      }));
+      trackedIds = new Set(zps.map(z => z.positionId));
+      // Merge DB snapshot into existing cache (do NOT replace the Map wholesale)
+      // — replacing would clobber a concurrent recordZonePositionFill().add()
+      // landing between our SELECT and this assignment.
+      for (const z of zps) st.trackedPositions.set(z.positionId, { volume: z.volume, entryPrice: z.entryPrice });
+      // Drop entries the authoritative DB view says are no longer OPEN.
+      for (const id of Array.from(st.trackedPositions.keys())) {
+        if (!trackedIds.has(id)) st.trackedPositions.delete(id);
+      }
+    } catch (e) {
+      dbOk = false;
+      zps = Array.from(st.trackedPositions.entries()).map(([positionId, v]) => ({
+        positionId, volume: v.volume, entryPrice: v.entryPrice,
+      }));
+      trackedIds = new Set(zps.map(z => z.positionId));
+      console.warn(`[zone ${zoneId}] tracked-positions DB query failed, using in-memory cache (${trackedIds.size} ids): ${(e as Error).message}`);
+    }
     if (zps.length === 0) return;
-    const trackedIds = new Set(zps.map(z => z.positionId));
     const allLive = await fetchOpenPositions(token, region, st.accountId);
     const live = allLive.filter(p => trackedIds.has(p.id));
+    // Skip the destructive reconciliation path (which permanently marks
+    // positions CLOSED in the DB) when we're operating off the cache —
+    // we can't trust "missing from live" without a confirmed DB view.
+    if (live.length === 0 && !dbOk) return;
     if (live.length === 0) {
       // Reconciliation: all tracked positions are gone (possibly closed during
       // a server restart — DEAL_ENTRY_OUT events from that window are lost
@@ -1791,7 +1838,24 @@ export async function loadZoneState(): Promise<void> {
         cashoutDone: z.cashoutDone ?? false,
         tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit, tp4Hit: z.tp4Hit ?? false,
         status: "OPEN", busy: false,
+        trackedPositions: new Map(),
       });
+    }
+    // Hydrate the in-memory tracked-positions cache from the open
+    // zone_positions rows so we have a working fallback the moment the
+    // process is up — without this, a DB blip immediately after startup
+    // would blind the engine until the next successful query.
+    try {
+      const zpRows = await db.select().from(zonePositionsTable)
+        .where(eq(zonePositionsTable.status, "OPEN"));
+      for (const zp of zpRows) {
+        const st = zoneStates.get(zp.zoneId);
+        if (st) st.trackedPositions.set(zp.positionId, {
+          volume: Number(zp.volume), entryPrice: Number(zp.entryPrice),
+        });
+      }
+    } catch (e) {
+      console.warn(`[zone] hydrate trackedPositions cache failed:`, (e as Error).message);
     }
     if (zones.length > 0) console.log(`[zone] hydrated ${zones.length} OPEN zone(s) from db`);
     // Rehydrate zone↔limit-order mappings so pre-restart limits still resolve.
@@ -2097,6 +2161,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
         cashoutDone: zr.cashoutDone ?? false,
         tp1Hit: zr.tp1Hit, tp2Hit: zr.tp2Hit, tp3Hit: zr.tp3Hit, tp4Hit: zr.tp4Hit ?? false,
         status: zr.status === "RISK_FREE" ? "RISK_FREE" : "OPEN", busy: false,
+        trackedPositions: new Map(),
       };
       zoneStates.set(zoneId, st);
     }
