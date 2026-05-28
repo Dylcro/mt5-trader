@@ -514,6 +514,7 @@ export default function TradeScreen() {
 
   const handleSingleTrade = useCallback(async (dir?: Direction) => {
     const resolvedDir = dir ?? direction;
+    console.log("[single] btn pressed dir=" + resolvedDir + " isPlacing=" + String(isPlacingRef.current) + " status=" + statusRef.current + " lot=" + String(lotSize));
     if (isPlacingRef.current) return;
     if (statusRef.current !== "connected") {
       Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
@@ -524,15 +525,23 @@ export default function TradeScreen() {
     setIsPlacing(true);
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     if (dir) setDirection(dir);
-    const result = await placeTrade({ direction: resolvedDir, volume: lotSize, stopLoss: slRef.current });
-    isPlacingRef.current = false;
-    setIsPlacing(false);
-    if (result.success) {
-      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      showToast(`${resolvedDir.toUpperCase()} order placed ✓  ${lotSize} lot XAUUSD`, "success", true);
-    } else {
-      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-      showToast(result.message, "error");
+    try {
+      const result = await placeTrade({ direction: resolvedDir, volume: lotSize, stopLoss: slRef.current });
+      if (result.success) {
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        showToast(`${resolvedDir.toUpperCase()} order placed ✓  ${lotSize} lot XAUUSD`, "success", true);
+      } else {
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+        showToast(result.message, "error");
+      }
+    } catch (err) {
+      // Guarantees button unlocks even if placeTrade throws unexpectedly —
+      // otherwise the button silently appears dead until the app restarts.
+      console.log("[single] exception: " + String(err));
+      showToast(err instanceof Error ? err.message : "Trade failed", "error");
+    } finally {
+      isPlacingRef.current = false;
+      setIsPlacing(false);
     }
   }, [direction, lotSize, placeTrade, showToast]);
 
