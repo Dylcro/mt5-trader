@@ -1529,55 +1529,55 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     const cmpPrice = st.direction === "buy" ? price.bid : price.ask;
     const hit = (tp: number) => st.direction === "buy" ? cmpPrice >= tp : cmpPrice <= tp;
 
-    // ── Step 1: cashout worst entries when price returns to anchor ± 5p ──
-    // After a cascade fans out (multiple entries filled lower for BUY / higher
-    // for SELL), the moment price rallies BACK to anchor ± 5p every worst
-    // entry is at least 5p in profit and the BEST entry sits ~spread+ in the
-    // green. Close all worst at market, keep the best for TP1-4 to run on.
+    // ── Step 1: rolling per-entry cashout ─────────────────────────────────
+    // Each non-best entry closes the instant price clears ITS OWN open price
+    // by cashoutPips (default 5p). Closes one-by-one as price climbs (BUY) or
+    // drops (SELL), instead of waiting for a full retrace to the original
+    // anchor. The "best" entry (lowest openPrice for BUY / highest for SELL)
+    // is always preserved so TP1-4 can run on it.
     //
-    // CONTINUOUS: re-arms every tick. If a later limit fills (after the first
-    // cashout + some TPs have already hit on the original best), the next time
-    // price returns to anchor ± 5p the older partially-closed survivor becomes
-    // the new "worst" and gets cashed out, leaving the fresh deeper entry as
-    // the new best. If that new best is a full-volume fresh fill, we also
-    // reset the TP flags so it runs TP1-4 from scratch.
+    // CONTINUOUS: re-evaluated every tick. If a later limit fills below the
+    // current best (BUY), it becomes the new best and the previous best
+    // becomes "an upper entry" — once price clears it by 5p it cashes out
+    // too. When the running TP position itself gets cashed out and a fresh
+    // full-volume survivor remains, the TP flags reset so the new best runs
+    // the full TP1-4 ladder.
     if (live.length > 1) {
-      const cashoutTrigger = st.direction === "buy"
-        ? st.anchorPrice + st.cashoutPips * PIP
-        : st.anchorPrice - st.cashoutPips * PIP;
-      if (hit(cashoutTrigger)) {
-        console.log(`[zone ${zoneId}] CASHOUT trigger @${cmpPrice} (anchor=${st.anchorPrice} ±${st.cashoutPips}p → ${cashoutTrigger.toFixed(2)})`);
-        const sorted = sortZonePositions(live, st.direction); // worst → best
-        const best = sorted[sorted.length - 1]!;
-        const worst = sorted.slice(0, -1);
-        let allOk = true;
-        for (const p of worst) {
-          const ok = await closeZonePosition(token, region, st.accountId, p.id);
-          if (!ok) allOk = false;
+      const sorted = sortZonePositions(live, st.direction); // worst → best
+      const best = sorted[sorted.length - 1]!;
+      const upper = sorted.slice(0, -1);
+      const closed: string[] = [];
+      let anyFailed = false;
+      for (const p of upper) {
+        const trigger = st.direction === "buy"
+          ? p.openPrice + st.cashoutPips * PIP
+          : p.openPrice - st.cashoutPips * PIP;
+        if (!hit(trigger)) continue;
+        console.log(`[zone ${zoneId}] CASHOUT roll posId=${p.id} entry=${p.openPrice} → trigger=${trigger.toFixed(2)} (cmp=${cmpPrice})`);
+        const ok = await closeZonePosition(token, region, st.accountId, p.id);
+        if (ok) closed.push(p.id); else anyFailed = true;
+      }
+      if (closed.length > 0) {
+        if (!st.cashoutDone) {
+          st.cashoutDone = true;
+          await db.update(cascadeZonesTable).set({ cashoutDone: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
         }
-        if (allOk) {
-          // If the survivor is a fresh full-volume entry (i.e. a later limit
-          // fill that hasn't been partial-closed yet), reset the zone-wide TP
-          // flags so it runs the full TP1-4 ladder on its own lot.
-          const isFreshSurvivor = st.originalVolume > 0
-            && best.volume >= st.originalVolume * 0.99
-            && (st.tp1Hit || st.tp2Hit || st.tp3Hit || st.tp4Hit);
-          if (isFreshSurvivor) {
-            st.tp1Hit = false; st.tp2Hit = false; st.tp3Hit = false; st.tp4Hit = false;
-            zoneNearNotifiedTp.set(zoneId, 0);
-            await db.update(cascadeZonesTable)
-              .set({ tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false })
-              .where(eq(cascadeZonesTable.zoneId, zoneId));
-            console.log(`[zone ${zoneId}] CASHOUT kept fresh survivor posId=${best.id} vol=${best.volume} — TP flags reset for new ladder`);
-          }
-          if (!st.cashoutDone) {
-            st.cashoutDone = true;
-            await db.update(cascadeZonesTable).set({ cashoutDone: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-          }
-          console.log(`[zone ${zoneId}] CASHOUT complete — kept best posId=${best.id} @${best.openPrice} vol=${best.volume}`);
-        } else {
-          console.warn(`[zone ${zoneId}] CASHOUT partial failure — will retry next tick`);
+        // If the surviving best is a fresh full-volume entry that wasn't the
+        // one TP1-4 had been running against, reset the zone-wide TP flags
+        // so the new best runs its own complete ladder.
+        const isFreshSurvivor = st.originalVolume > 0
+          && best.volume >= st.originalVolume * 0.99
+          && (st.tp1Hit || st.tp2Hit || st.tp3Hit || st.tp4Hit);
+        if (isFreshSurvivor) {
+          st.tp1Hit = false; st.tp2Hit = false; st.tp3Hit = false; st.tp4Hit = false;
+          zoneNearNotifiedTp.set(zoneId, 0);
+          await db.update(cascadeZonesTable)
+            .set({ tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false })
+            .where(eq(cascadeZonesTable.zoneId, zoneId));
+          console.log(`[zone ${zoneId}] CASHOUT survivor posId=${best.id} vol=${best.volume} is fresh — TP flags reset for new ladder`);
         }
+        console.log(`[zone ${zoneId}] CASHOUT closed ${closed.length} upper entries [${closed.join(",")}] — kept best posId=${best.id} @${best.openPrice} vol=${best.volume}`);
+        if (anyFailed) console.warn(`[zone ${zoneId}] CASHOUT partial failure — will retry next tick`);
         return; // next tick re-snapshots live positions
       }
     }

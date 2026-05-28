@@ -10,3 +10,8 @@ If a limit response arrives **before** the market response, `pendingZoneAssoc` i
 **Rule:** any time the api adds a step that depends on a per-account "pending association" set up by a sibling request, also add an orphan buffer that the late-arriving step drains. Pure pending-map lookups are racy when the trigger request can be beaten by its siblings.
 
 **How to apply:** when adding similar parallel-trade flows, buffer orphans keyed by accountId with the same TTL as the pending association, and drain in whichever function sets the pending association.
+
+---
+
+**Cashout strategy (not race-related, but lives in the same evaluateZone):** The cashout rule is **rolling per-entry**, not single-anchor. Each upper position closes the instant price clears *its own* openPrice by `cashoutPips` (5p default). The deepest entry (lowest BUY / highest SELL) is always preserved as "best" so TP1-4 keep running. Do not "fix" this back to a single anchor trigger — the user rejected that variant as too slow to react.
+
