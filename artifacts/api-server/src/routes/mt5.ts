@@ -2451,11 +2451,23 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     const sorted = sortZonePositions(live, st.direction); // worst → best
     const best = sorted[sorted.length - 1]!;
     const others = sorted.slice(0, -1);
-    const failed: string[] = [];
-    for (const p of others) {
-      const ok = await closeZonePosition(token, region, accountId, p.id);
-      if (!ok) failed.push(p.id);
-    }
+    // Close every "other" position in parallel — serial closes were the main
+    // cause of Risk Free taking ~1s × N positions. MetaAPI's REST trade
+    // endpoint accepts concurrent POSITION_CLOSE_ID for distinct positions.
+    // Each item is wrapped in try/catch so a single network throw cannot
+    // short-circuit Promise.all and turn a partial-success into a 500 — the
+    // caller relies on `failedPositionIds` to know what to retry.
+    const closeResults = await Promise.all(
+      others.map(async (p) => {
+        try {
+          return { id: p.id, ok: await closeZonePosition(token, region, accountId, p.id) };
+        } catch (e) {
+          console.warn(`[zone ${zoneId}] risk-free close threw for posId=${p.id}:`, (e as Error).message);
+          return { id: p.id, ok: false };
+        }
+      }),
+    );
+    const failed: string[] = closeResults.filter((r) => !r.ok).map((r) => r.id);
     // "Risk free" (misnomer — kept because the user calls it that): move SL
     // by a SIGNED pip offset from the best entry. Client passes `riskFreePips`
     // in the body (-30..+30, step 5). Negative = drawdown protection (small
@@ -2536,11 +2548,24 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
     const trackedIds = new Set(zps.map(z => z.positionId));
     const live = (await fetchOpenPositions(token, region, accountId)).filter(p => trackedIds.has(p.id));
 
-    const failed: string[] = [];
-    for (const p of live) {
-      const ok = await closeZonePosition(token, region, accountId, p.id);
-      if (!ok) failed.push(p.id);
-    }
+    // Close every tracked position in parallel — serial closes were a major
+    // source of "Close Zone takes seconds" lag. Each closeZonePosition is an
+    // independent POSITION_CLOSE_ID REST call and the broker handles them
+    // concurrently for distinct positionIds. Per-item try/catch keeps a
+    // single network throw from short-circuiting Promise.all and converting
+    // a partial-success into a generic 500 — callers depend on the 207
+    // `failedPositionIds` shape to know what to retry.
+    const closeResults = await Promise.all(
+      live.map(async (p) => {
+        try {
+          return { id: p.id, ok: await closeZonePosition(token, region, accountId, p.id) };
+        } catch (e) {
+          console.warn(`[zone ${zoneId}] close threw for posId=${p.id}:`, (e as Error).message);
+          return { id: p.id, ok: false };
+        }
+      }),
+    );
+    const failed: string[] = closeResults.filter((r) => !r.ok).map((r) => r.id);
 
     if (failed.length > 0) {
       console.warn(`[zone ${zoneId}] close: failedCloses=${failed.length}/${live.length}`);

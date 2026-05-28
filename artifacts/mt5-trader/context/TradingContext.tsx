@@ -933,7 +933,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         });
         const data = await safeJson<{ success?: boolean; code?: number; message?: string }>(res);
         if (!res.ok || data.success === false) return { success: false, message: data.message ?? `Close failed (code ${data.code ?? res.status})` };
-        await Promise.all([refreshPositions(), refreshAccountInfo()]);
+        // Refresh in background — don't make the user wait for the round-trip
+        // before the success toast appears.
+        void Promise.all([refreshPositions(), refreshAccountInfo()]);
         return { success: true, message: "Position closed" };
       } catch (err) {
         return { success: false, message: err instanceof Error ? err.message : "Close failed" };
@@ -951,7 +953,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         });
         const data = await safeJson<{ success?: boolean; message?: string }>(res);
         if (!res.ok || data.success === false) return { success: false, message: data.message ?? `Cancel failed` };
-        await Promise.all([refreshPendingOrders(), refreshAccountInfo()]);
+        // Refresh in background — don't block the success toast on the
+        // pending-orders / account-info round-trips.
+        void Promise.all([refreshPendingOrders(), refreshAccountInfo()]);
         return { success: true, message: "Order cancelled" };
       } catch (err) {
         return { success: false, message: err instanceof Error ? err.message : "Cancel failed" };
