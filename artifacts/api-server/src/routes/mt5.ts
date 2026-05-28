@@ -1,8 +1,8 @@
 import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { createRequire } from "module";
-import { db, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable, cascadeZonesTable, zonePositionsTable, zoneOrdersTable, notificationPrefsTable, userTradeDefaultsTable } from "@workspace/db";
-import { and, desc, eq, isNotNull } from "drizzle-orm";
+import { db, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable, cascadeZonesTable, zonePositionsTable, zoneOrdersTable, notificationPrefsTable } from "@workspace/db";
+import { and, eq, isNotNull } from "drizzle-orm";
 import { JWT_SECRET } from "./auth";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
 // In dev (tsx/ESM) import.meta.url is the real file URL.
@@ -2136,98 +2136,6 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     await db.update(cascadeZonesTable).set({ status: "RISK_FREE" }).where(eq(cascadeZonesTable.zoneId, zoneId));
     console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl}`);
     res.json({ ok: true, bestPositionId: best.id, sl, closedCount: others.length });
-  } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
-  }
-});
-
-// GET /api/mt5/account/:accountId/zones/latest-open
-// Returns the single most-recently-created OPEN (non-risk-free, non-closed) zone
-// for this account, or 404 if there isn't one. Powers the Apple Watch "Risk Free"
-// button — no zone picker on the tiny screen, just act on the freshest zone.
-router.get("/mt5/account/:accountId/zones/latest-open", checkOwner, async (req: Request, res: Response) => {
-  try {
-    const { accountId } = req.params as { accountId: string };
-    const [row] = await db.select().from(cascadeZonesTable)
-      .where(and(eq(cascadeZonesTable.accountId, accountId), eq(cascadeZonesTable.status, "OPEN")))
-      .orderBy(desc(cascadeZonesTable.createdAt))
-      .limit(1);
-    if (!row) { res.status(404).json({ error: "No open zone" }); return; }
-    const openPositions = await db.select().from(zonePositionsTable)
-      .where(and(eq(zonePositionsTable.zoneId, row.zoneId), eq(zonePositionsTable.status, "OPEN")));
-    res.json({
-      zoneId: row.zoneId,
-      direction: row.direction,
-      anchorPrice: Number(row.anchorPrice),
-      createdAt: Number(row.createdAt),
-      positionCount: openPositions.length,
-    });
-  } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
-  }
-});
-
-// GET /api/mt5/user/trade-defaults — per-user "last used" cascade defaults.
-// Used by the Apple Watch so it can fire BUY/SELL with the same lot + TPs the
-// user last placed on the phone, without needing any UI on the watch.
-router.get("/mt5/user/trade-defaults", async (req: Request, res: Response) => {
-  const userId = (req as Record<string, unknown>)["userId"] as string;
-  try {
-    const [row] = await db.select().from(userTradeDefaultsTable)
-      .where(eq(userTradeDefaultsTable.userId, userId)).limit(1);
-    if (!row) {
-      // Sensible defaults so the watch is still usable on day one.
-      res.json({ lotSize: 0.04, tp1Pips: 20, tp2Pips: 50, tp3Pips: 90, tp4Pips: 0, slPips: 100, updatedAt: 0 });
-      return;
-    }
-    res.json({
-      lotSize: Number(row.lotSize),
-      tp1Pips: Number(row.tp1Pips),
-      tp2Pips: Number(row.tp2Pips),
-      tp3Pips: Number(row.tp3Pips),
-      tp4Pips: Number(row.tp4Pips),
-      slPips:  Number(row.slPips),
-      updatedAt: Number(row.updatedAt),
-    });
-  } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
-  }
-});
-
-// PUT /api/mt5/user/trade-defaults — phone writes this after every successful
-// cascade placement so the watch stays in sync.
-router.put("/mt5/user/trade-defaults", async (req: Request, res: Response) => {
-  const userId = (req as Record<string, unknown>)["userId"] as string;
-  const b = (req.body ?? {}) as Record<string, unknown>;
-  const num = (v: unknown, min: number, max: number, fallback: number): number => {
-    const n = typeof v === "number" ? v : parseFloat(String(v));
-    if (!Number.isFinite(n) || n < min || n > max) return fallback;
-    return n;
-  };
-  const lotSize = num(b.lotSize, 0.01, 100, 0.04);
-  const tp1Pips = num(b.tp1Pips, 1, 10_000, 20);
-  const tp2Pips = num(b.tp2Pips, 1, 10_000, 50);
-  const tp3Pips = num(b.tp3Pips, 1, 10_000, 90);
-  // tp4 = 0 is valid (means manual close of remainder)
-  const tp4Pips = num(b.tp4Pips, 0, 10_000, 0);
-  const slPips  = num(b.slPips,  1, 10_000, 100);
-  if (!(tp1Pips < tp2Pips && tp2Pips < tp3Pips)) {
-    res.status(400).json({ error: "TPs must be strictly increasing (TP1 < TP2 < TP3)" });
-    return;
-  }
-  if (tp4Pips !== 0 && tp4Pips <= tp3Pips) {
-    res.status(400).json({ error: "TP4 must be greater than TP3 (or 0 to leave manual)" });
-    return;
-  }
-  try {
-    const now = Date.now();
-    await db.insert(userTradeDefaultsTable)
-      .values({ userId, lotSize, tp1Pips, tp2Pips, tp3Pips, tp4Pips, slPips, updatedAt: now })
-      .onConflictDoUpdate({
-        target: userTradeDefaultsTable.userId,
-        set: { lotSize, tp1Pips, tp2Pips, tp3Pips, tp4Pips, slPips, updatedAt: now },
-      });
-    res.json({ ok: true, lotSize, tp1Pips, tp2Pips, tp3Pips, tp4Pips, slPips, updatedAt: now });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }

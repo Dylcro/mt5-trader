@@ -25,4 +25,3 @@ export * from "./notificationPrefs";
 export * from "./storedAccounts";
 export * from "./supportTickets";
 export * from "./users";
-export * from "./userTradeDefaults";
