@@ -7,6 +7,7 @@ import { fileURLToPath } from "url";
 import router from "./routes";
 import adminRouter from "./routes/admin";
 import authRouter from "./routes/auth";
+import healthRouter from "./routes/health";
 import { authLimiter, apiLimiter } from "./lib/rateLimiters";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -31,6 +32,10 @@ app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
+
+// ── Health check — mounted at root, outside rate limiting, so the deployment
+//    platform can probe /healthz without being throttled or blocked by /api middleware.
+app.use(healthRouter);
 
 app.use("/api/admin", adminRouter);
 app.use("/api/auth", authLimiter, authRouter);

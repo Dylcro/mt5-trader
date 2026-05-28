@@ -23,4 +23,4 @@ args = ["node", "artifacts/api-server/dist/index.cjs"]
 PORT = "8080"
 
 [services.production.health.startup]
-path = "/api/healthz"
+path = "/healthz"
