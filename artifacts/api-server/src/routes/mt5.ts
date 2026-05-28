@@ -1168,6 +1168,11 @@ export function computeRiskFreeSl(
   return parseFloat(raw.toFixed(2));
 }
 const ZONE_ASSOC_WINDOW_MS  = 30_000; // limits placed within 30s of market attach to the same zone
+// Orphan-attach window: a cascade limit POST response that arrived BEFORE its
+// sibling market POST should land within milliseconds — keep this tight so
+// leftover orphans from an earlier failed cascade do not attach to a fresh
+// zone created later in the same 30s window.
+const ZONE_ORPHAN_DRAIN_WINDOW_MS = 5_000;
 
 // In-memory state, hydrated from DB on startup.
 const zoneStates = new Map<string, ZoneState>();          // zoneId → state
@@ -1178,7 +1183,7 @@ const pendingZoneAssoc = new Map<string, { zoneId: string; direction: "buy" | "s
 // stash the orderId here so the next prepareZoneForCascade for this account
 // can attach it. Expires after ZONE_ASSOC_WINDOW_MS to avoid leaking across
 // unrelated cascades.
-const orphanedCascadeLimits = new Map<string, { orderId: string; expiresAt: number }[]>();
+const orphanedCascadeLimits = new Map<string, { orderId: string; expiresAt: number; bufferedAt: number }[]>();
 
 function newZoneId(): string {
   return `z_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -1209,12 +1214,19 @@ function prepareZoneForCascade(
   zoneStates.set(zoneId, state);
   pendingZoneAssoc.set(accountId, { zoneId, direction, expiresAt: Date.now() + ZONE_ASSOC_WINDOW_MS });
   // Drain any cascade limit orderIds whose POST response landed before this
-  // market response. Each gets attached to this freshly-prepared zone.
+  // market response. Only consider orphans buffered very recently (sibling
+  // race resolves in ms) so stale orphans from a previous cascade attempt
+  // can't attach themselves to this brand new zone.
   const orphans = orphanedCascadeLimits.get(accountId);
   if (orphans && orphans.length > 0) {
     const now = Date.now();
+    const recentCutoff = now - ZONE_ORPHAN_DRAIN_WINDOW_MS;
     for (const o of orphans) {
       if (o.expiresAt < now) continue;
+      if (o.bufferedAt < recentCutoff) {
+        console.warn(`[zone ${zoneId}] skipping stale orphan orderId=${o.orderId} (buffered ${now - o.bufferedAt}ms ago, > ${ZONE_ORPHAN_DRAIN_WINDOW_MS}ms)`);
+        continue;
+      }
       zoneLimitOrders.set(o.orderId, zoneId);
       void db.insert(zoneOrdersTable)
         .values({ zoneId, orderId: o.orderId, createdAt: now })
@@ -1267,9 +1279,9 @@ async function attachLimitOrderToZone(accountId: string, orderId: string): Promi
     // Race: this cascade limit POST resolved before the companion market POST
     // could call prepareZoneForCascade. Buffer the orderId so the next zone
     // prepared for this account picks it up.
-    const expiresAt = Date.now() + ZONE_ASSOC_WINDOW_MS;
+    const now = Date.now();
     const arr = orphanedCascadeLimits.get(accountId) ?? [];
-    arr.push({ orderId, expiresAt });
+    arr.push({ orderId, expiresAt: now + ZONE_ASSOC_WINDOW_MS, bufferedAt: now });
     orphanedCascadeLimits.set(accountId, arr);
     console.log(`[zone ?] buffered cascade limit orderId=${orderId} for account=${accountId} (no zone prepared yet)`);
     return;
@@ -1288,14 +1300,28 @@ async function attachLimitOrderToZone(accountId: string, orderId: string): Promi
 async function recordZonePositionFill(
   zoneId: string, positionId: string, entryPrice: number, volume: number,
 ): Promise<void> {
-  try {
-    await db.insert(zonePositionsTable).values({
-      zoneId, positionId, entryPrice, volume, status: "OPEN", createdAt: Date.now(),
-    }).onConflictDoNothing();
-    console.log(`[zone ${zoneId}] linked filled positionId=${positionId} @${entryPrice} vol=${volume}`);
-  } catch (e) {
-    console.error(`[zone ${zoneId}] fill persist error:`, (e as Error).message);
+  // Retry on transient DB errors. Losing this insert means the position is
+  // forever invisible to evaluateZone (no row → never in `live` → cashout and
+  // TPs skip it). Six attempts over ~30s covers typical pool/connection blips
+  // without blocking the trade flow indefinitely.
+  const delays = [200, 500, 1000, 2500, 5000, 15000];
+  let lastErr: unknown = null;
+  for (let i = 0; i <= delays.length; i++) {
+    try {
+      await db.insert(zonePositionsTable).values({
+        zoneId, positionId, entryPrice, volume, status: "OPEN", createdAt: Date.now(),
+      }).onConflictDoNothing();
+      console.log(`[zone ${zoneId}] linked filled positionId=${positionId} @${entryPrice} vol=${volume}${i > 0 ? ` (after ${i} retries)` : ""}`);
+      return;
+    } catch (e) {
+      lastErr = e;
+      if (i < delays.length) {
+        console.warn(`[zone ${zoneId}] fill persist attempt ${i + 1} failed for posId=${positionId}: ${(e as Error).message} — retrying in ${delays[i]}ms`);
+        await sleep(delays[i]!);
+      }
+    }
   }
+  console.error(`[zone ${zoneId}] fill persist FAILED after retries for posId=${positionId} @${entryPrice}:`, (lastErr as Error)?.message);
 }
 
 // Called on every DEAL_ENTRY_OUT. A partial close ALSO fires this event with
