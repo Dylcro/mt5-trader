@@ -44,40 +44,25 @@ export default function ZoneCard({ zone, onRiskFree, historical = false }: ZoneC
   const isBuy = zone.direction === "buy";
   const [busy, setBusy] = useState(false);
 
-  const handleRiskFree = () => {
-    if (!onRiskFree) return;
-    const title = "Lock in Risk Free?";
-    const msg = `Close all but the best entry in this ${isBuy ? "BUY" : "SELL"} zone and place a protective stop loss 10 pips on the losing side of the surviving entry. Pending limit orders for this zone will be cancelled.`;
-    const proceed = async () => {
-      setBusy(true);
-      await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-      const result = await onRiskFree(zone.zoneId);
-      setBusy(false);
-      if (result.ok) {
-        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      } else {
-        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-        // React Native Web's Alert.alert ignores button arrays — fall back to
-        // window.alert so the error is still surfaced.
-        if (Platform.OS === "web" && typeof window !== "undefined") {
-          window.alert(`Couldn't go risk-free\n\n${result.message ?? "Please try again."}`);
-        } else {
-          Alert.alert("Couldn't go risk-free", result.message ?? "Please try again.");
-        }
-      }
-    };
-    // On web, RN's Alert.alert renders only the title/message via window.alert
-    // and drops the action buttons entirely — so the user can never tap
-    // "Risk Free" and the action would silently do nothing. Use window.confirm
-    // there so the confirm flow actually fires.
-    if (Platform.OS === "web" && typeof window !== "undefined") {
-      if (window.confirm(`${title}\n\n${msg}`)) void proceed();
+  // One-tap: no confirm dialog. The button fires the API call immediately
+  // and only surfaces an alert if the operation FAILS.
+  const handleRiskFree = async () => {
+    if (!onRiskFree || busy) return;
+    setBusy(true);
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    const result = await onRiskFree(zone.zoneId);
+    setBusy(false);
+    if (result.ok) {
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       return;
     }
-    Alert.alert(title, msg, [
-      { text: "Cancel", style: "cancel" },
-      { text: "Risk Free", style: "default", onPress: () => { void proceed(); } },
-    ]);
+    await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    const errMsg = result.message ?? "Please try again.";
+    if (Platform.OS === "web" && typeof window !== "undefined") {
+      window.alert(`Couldn't go risk-free\n\n${errMsg}`);
+    } else {
+      Alert.alert("Couldn't go risk-free", errMsg);
+    }
   };
 
   const statusLabel = zone.status === "RISK_FREE" ? "RISK-FREE" : zone.status === "CLOSED" ? "CLOSED" : "ACTIVE";
