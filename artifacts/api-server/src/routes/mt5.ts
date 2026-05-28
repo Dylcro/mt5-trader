@@ -2,7 +2,7 @@ import { Router, type IRouter, type Request, type Response, type NextFunction } 
 import jwt from "jsonwebtoken";
 import { createRequire } from "module";
 import { db, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable, cascadeZonesTable, zonePositionsTable, zoneOrdersTable, notificationPrefsTable } from "@workspace/db";
-import { and, eq, isNotNull } from "drizzle-orm";
+import { and, eq, inArray, isNotNull } from "drizzle-orm";
 import { JWT_SECRET } from "./auth";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
 // In dev (tsx/ESM) import.meta.url is the real file URL.
@@ -2043,8 +2043,8 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       console.log(`[zone ${zoneId}] TP1 trigger @${cmpPrice} (tp1=${st.tp1Price}) — ${live.length} active entr${live.length === 1 ? "y" : "ies"}`);
       const ok = await closePartialForLevel(1, 0.76);
       if (ok) {
-        st.tp1Hit = true;
         await db.update(cascadeZonesTable).set({ tp1Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        st.tp1Hit = true;
         zoneNearNotifiedTp.set(zoneId, 0);
         notifyZoneEvent(zoneId, "hit", 1, 0, st.direction);
         broadcastZoneUpdate(zoneId);
@@ -2064,8 +2064,8 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         // separate sticky-retry block below; gating tp2Hit on it caused the
         // zone to re-enter this branch every tick when the broker rejected
         // the SL (code 10016), spamming logs and never advancing.
-        st.tp2Hit = true;
         await db.update(cascadeZonesTable).set({ tp2Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        st.tp2Hit = true;
         zoneNearNotifiedTp.set(zoneId, 0);
         notifyZoneEvent(zoneId, "hit", 2, 0, st.direction);
         broadcastZoneUpdate(zoneId);
@@ -2077,8 +2077,8 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       console.log(`[zone ${zoneId}] TP3 trigger @${cmpPrice} (tp3=${st.tp3Price}) — ${live.length} active entr${live.length === 1 ? "y" : "ies"}`);
       const ok = await closePartialForLevel(3, 0.26);
       if (ok) {
-        st.tp3Hit = true;
         await db.update(cascadeZonesTable).set({ tp3Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        st.tp3Hit = true;
         zoneNearNotifiedTp.set(zoneId, 0);
         notifyZoneEvent(zoneId, "hit", 3, 0, st.direction);
         broadcastZoneUpdate(zoneId);
@@ -2091,8 +2091,8 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       console.log(`[zone ${zoneId}] TP4 trigger @${cmpPrice} (tp4=${st.tp4Price}) — closing all remaining`);
       const ok = await closePartialForLevel(4, 0);
       if (ok) {
-        st.tp4Hit = true;
         await db.update(cascadeZonesTable).set({ tp4Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        st.tp4Hit = true;
         broadcastZoneUpdate(zoneId);
         console.log(`[zone ${zoneId}] TP4 complete — final exit`);
       } else {
@@ -2184,37 +2184,75 @@ export function startZoneTpMonitor(): void {
   console.log("[zone-monitor] started (3 s interval)");
 }
 
+// Convert a cascadeZonesTable row to a ZoneState (transient fields get safe defaults).
+// Single place for this logic — shared by loadZoneState and loadZone.
+// Exported for testing the restart-hydration path without requiring a live DB.
+export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneState {
+  const dir: "buy" | "sell" = z.direction === "sell" ? "sell" : "buy";
+  const anchor = Number(z.anchorPrice);
+  // Legacy zones (created before the rebuild) only have pip distances. Convert
+  // to absolute prices so the monitor's hit() comparisons still fire.
+  const fromPips = (pips: number) => dir === "buy" ? anchor + pips * PIP : anchor - pips * PIP;
+  return {
+    zoneId: z.zoneId, accountId: z.accountId, direction: dir, anchorPrice: anchor,
+    tp1Price: z.tp1Price != null ? Number(z.tp1Price) : (z.tp1Pips ? fromPips(Number(z.tp1Pips)) : null),
+    tp2Price: z.tp2Price != null ? Number(z.tp2Price) : (z.tp2Pips ? fromPips(Number(z.tp2Pips)) : null),
+    tp3Price: z.tp3Price != null ? Number(z.tp3Price) : (z.tp3Pips ? fromPips(Number(z.tp3Pips)) : null),
+    tp4Price: z.tp4Price != null ? Number(z.tp4Price) : null,
+    originalVolume: z.originalVolume != null ? Number(z.originalVolume) : 0,
+    cashoutPips: Number(z.cashoutPips ?? ZONE_CASHOUT_PIPS_DEFAULT),
+    cashoutDone: z.cashoutDone ?? false,
+    tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit, tp4Hit: z.tp4Hit ?? false,
+    // BE move isn't persisted — on restart, if tp2 was already hit, attempt
+    // BE again (modify-sl is idempotent). If the broker still rejects, the
+    // bounded retry budget below stops the loop quickly. The best-effort
+    // flag IS persisted so the app warning chip survives a restart.
+    tp2SlMoved: false, tp2BeAttempts: 0,
+    tp2SlIsBestEffort: (z as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
+    status: z.status === "CLOSED" ? "CLOSED" : z.status === "RISK_FREE" ? "RISK_FREE" : "OPEN",
+    busy: false,
+    trackedPositions: new Map(),
+  };
+}
+
+// Cache-first zone reader: check in-memory map first, hydrate from DB on miss,
+// set in cache, return. Returns null for missing or CLOSED zones.
+// This is the single read path for all code that needs to act on a zone state.
+export async function loadZone(zoneId: string): Promise<ZoneState | null> {
+  const cached = zoneStates.get(zoneId);
+  if (cached) return cached.status === "CLOSED" ? null : cached;
+  try {
+    const [z] = await db.select().from(cascadeZonesTable)
+      .where(eq(cascadeZonesTable.zoneId, zoneId))
+      .limit(1);
+    if (!z || z.status === "CLOSED") return null;
+    const st = rowToZoneState(z);
+    zoneStates.set(zoneId, st);
+    console.log(`[zone ${zoneId}] hydrated from DB on cache miss`);
+    try {
+      const zpRows = await db.select().from(zonePositionsTable)
+        .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
+      for (const zp of zpRows) {
+        st.trackedPositions.set(zp.positionId, { volume: Number(zp.volume), entryPrice: Number(zp.entryPrice) });
+      }
+    } catch { /* non-fatal — evaluateZone will re-read from DB */ }
+    return st;
+  } catch (e) {
+    console.warn(`[zone ${zoneId}] loadZone DB error:`, (e as Error).message);
+    return null;
+  }
+}
+
 // Hydrate in-memory zone state from DB on startup so the monitor resumes
 // watching zones placed in previous server sessions.
 export async function loadZoneState(): Promise<void> {
   try {
+    // Load both OPEN and RISK_FREE zones — the monitor evaluates both
+    // (RISK_FREE zones still need TP progression on the surviving entry).
     const zones = await db.select().from(cascadeZonesTable)
-      .where(eq(cascadeZonesTable.status, "OPEN"));
+      .where(inArray(cascadeZonesTable.status, ["OPEN", "RISK_FREE"]));
     for (const z of zones) {
-      const dir: "buy" | "sell" = z.direction === "sell" ? "sell" : "buy";
-      const anchor = Number(z.anchorPrice);
-      // Legacy zones (created before the rebuild) only have pip distances. Convert
-      // to absolute prices so the new monitor's hit() comparisons still fire.
-      const fromPips = (pips: number) => dir === "buy" ? anchor + pips * PIP : anchor - pips * PIP;
-      zoneStates.set(z.zoneId, {
-        zoneId: z.zoneId, accountId: z.accountId, direction: dir, anchorPrice: anchor,
-        tp1Price: z.tp1Price != null ? Number(z.tp1Price) : (z.tp1Pips ? fromPips(Number(z.tp1Pips)) : null),
-        tp2Price: z.tp2Price != null ? Number(z.tp2Price) : (z.tp2Pips ? fromPips(Number(z.tp2Pips)) : null),
-        tp3Price: z.tp3Price != null ? Number(z.tp3Price) : (z.tp3Pips ? fromPips(Number(z.tp3Pips)) : null),
-        tp4Price: z.tp4Price != null ? Number(z.tp4Price) : null,
-        originalVolume: z.originalVolume != null ? Number(z.originalVolume) : 0,
-        cashoutPips: Number(z.cashoutPips ?? ZONE_CASHOUT_PIPS_DEFAULT),
-        cashoutDone: z.cashoutDone ?? false,
-        tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit, tp4Hit: z.tp4Hit ?? false,
-        // BE move isn't persisted — on restart, if tp2 was already hit, attempt
-        // BE again (modify-sl is idempotent). If the broker still rejects, the
-        // bounded retry budget below stops the loop quickly. The best-effort
-        // flag IS persisted so the app warning chip survives a restart.
-        tp2SlMoved: false, tp2BeAttempts: 0,
-        tp2SlIsBestEffort: (z as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
-        status: "OPEN", busy: false,
-        trackedPositions: new Map(),
-      });
+      zoneStates.set(z.zoneId, rowToZoneState(z));
     }
     // Hydrate the in-memory tracked-positions cache from the open
     // zone_positions rows so we have a working fallback the moment the
@@ -2558,32 +2596,10 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
   try {
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
-    // Prefer in-memory state; fall back to DB so a missed hydration doesn't
-    // 404 a still-valid zone.
-    let st = zoneStates.get(zoneId);
-    if (!st || st.accountId !== accountId) {
-      const [zr] = await db.select().from(cascadeZonesTable)
-        .where(and(eq(cascadeZonesTable.zoneId, zoneId), eq(cascadeZonesTable.accountId, accountId)))
-        .limit(1);
-      if (!zr || zr.status === "CLOSED") { res.status(404).json({ error: "Zone not found" }); return; }
-      const dir: "buy" | "sell" = zr.direction === "sell" ? "sell" : "buy";
-      const anchor = Number(zr.anchorPrice);
-      const fromPips = (pips: number) => dir === "buy" ? anchor + pips * PIP : anchor - pips * PIP;
-      st = {
-        zoneId: zr.zoneId, accountId: zr.accountId, direction: dir, anchorPrice: anchor,
-        tp1Price: zr.tp1Price != null ? Number(zr.tp1Price) : (zr.tp1Pips ? fromPips(Number(zr.tp1Pips)) : null),
-        tp2Price: zr.tp2Price != null ? Number(zr.tp2Price) : (zr.tp2Pips ? fromPips(Number(zr.tp2Pips)) : null),
-        tp3Price: zr.tp3Price != null ? Number(zr.tp3Price) : (zr.tp3Pips ? fromPips(Number(zr.tp3Pips)) : null),
-        tp4Price: zr.tp4Price != null ? Number(zr.tp4Price) : null,
-        originalVolume: zr.originalVolume != null ? Number(zr.originalVolume) : 0,
-        cashoutPips: Number(zr.cashoutPips ?? ZONE_CASHOUT_PIPS_DEFAULT),
-        cashoutDone: zr.cashoutDone ?? false,
-        tp1Hit: zr.tp1Hit, tp2Hit: zr.tp2Hit, tp3Hit: zr.tp3Hit, tp4Hit: zr.tp4Hit ?? false,
-        status: zr.status === "RISK_FREE" ? "RISK_FREE" : "OPEN", busy: false,
-        trackedPositions: new Map(),
-      };
-      zoneStates.set(zoneId, st);
-    }
+    // DB-first read: loadZone checks cache first, then hydrates from DB on miss.
+    // Returns null for missing or CLOSED zones — both map to 404 here.
+    const st = await loadZone(zoneId);
+    if (!st || st.accountId !== accountId) { res.status(404).json({ error: "Zone not found" }); return; }
     const zps = await db.select().from(zonePositionsTable)
       .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
     const trackedIds = new Set(zps.map(z => z.positionId));
@@ -2637,8 +2653,8 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       });
       return;
     }
-    st.status = "RISK_FREE";
     await db.update(cascadeZonesTable).set({ status: "RISK_FREE" }).where(eq(cascadeZonesTable.zoneId, zoneId));
+    st.status = "RISK_FREE";
     broadcastZoneUpdate(zoneId);
     console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl} (pips=${pips})`);
     res.json({ ok: true, bestPositionId: best.id, sl, pips, closedCount: others.length });
@@ -3669,18 +3685,40 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
                 { tp1Price: tp1Price!, tp2Price: tp2Price!, tp3Price: tp3Price!, tp4Price },
                 volume,
               );
-              // Seed best-known anchor from caller-provided value / cached tick;
-              // the actual fill price will replace it async below.
+              // Seed best-known anchor from caller-provided value / cached tick.
               const tick = latestPrice(accountId);
               if (anchorHint > 0) zoneState.anchorPrice = anchorHint;
               else if (tick) zoneState.anchorPrice = direction === "buy" ? tick.ask : tick.bid;
+              // DB-FIRST: write the zone row immediately with the best-known
+              // anchor so it survives a pod restart. If the server crashes
+              // between here and the anchor-refinement below, loadZoneState()
+              // will still find this row and the monitor keeps tracking it.
+              // evaluateZone guards on anchorPrice > 0, so a zero anchor just
+              // pauses TP checks until the refinement below completes.
+              const earlyPersist = persistPreparedZone(zoneState, uId, positionId, volume);
               void (async () => {
+                await earlyPersist; // ensure initial row is committed first
                 try {
                   const positions = await fetchOpenPositions(getToken(), region, accountId);
                   const me = positions.find(p => p.id === positionId);
-                  if (me && me.openPrice > 0) zoneState.anchorPrice = me.openPrice;
+                  if (me && me.openPrice > 0 && me.openPrice !== zoneState.anchorPrice) {
+                    zoneState.anchorPrice = me.openPrice;
+                    zoneState.trackedPositions.set(positionId, { volume, entryPrice: me.openPrice });
+                    await Promise.all([
+                      db.update(cascadeZonesTable)
+                        .set({ anchorPrice: me.openPrice })
+                        .where(eq(cascadeZonesTable.zoneId, zoneState.zoneId))
+                        .catch((e: Error) => console.warn(`[zone ${zoneState.zoneId}] anchor update failed:`, e.message)),
+                      db.update(zonePositionsTable)
+                        .set({ entryPrice: me.openPrice })
+                        .where(and(
+                          eq(zonePositionsTable.zoneId, zoneState.zoneId),
+                          eq(zonePositionsTable.positionId, positionId),
+                        ))
+                        .catch((e: Error) => console.warn(`[zone ${zoneState.zoneId}] entry-price update failed:`, e.message)),
+                    ]);
+                  }
                 } catch { /* keep best-known anchor */ }
-                await persistPreparedZone(zoneState, uId, positionId, volume);
               })();
             }
           }

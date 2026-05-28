@@ -3,6 +3,7 @@ import {
   computeRiskFreeSl,
   buildCascadeConfigUpdate,
   ZONE_RISK_FREE_PIPS,
+  rowToZoneState,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
@@ -209,5 +210,126 @@ describe("buildCascadeConfigUpdate (PUT /cascade-config TP ordering)", () => {
     const r2 = buildCascadeConfigUpdate(undefined, BASE_CONFIG);
     expect(r1.ok).toBe(true);
     expect(r2.ok).toBe(true);
+  });
+});
+
+// ── rowToZoneState restart-hydration tests ───────────────────────────────────
+// These tests validate the pure DB-row → ZoneState conversion that is the
+// critical path for restart safety. A pod restart runs loadZoneState(), which
+// calls rowToZoneState() for every OPEN/RISK_FREE zone row it finds. If this
+// conversion is wrong the monitor wakes up with corrupt state.
+const makeRow = (overrides: Record<string, unknown> = {}) => ({
+  zoneId: "z_test_abc123",
+  accountId: "acc_1",
+  userId: null,
+  direction: "buy",
+  anchorPrice: "3120.50",
+  tp1Price: "3130.00",
+  tp2Price: "3145.00",
+  tp3Price: "3160.00",
+  tp4Price: null,
+  tp1Pips: null,
+  tp2Pips: null,
+  tp3Pips: null,
+  originalVolume: "0.08",
+  cashoutPips: 5,
+  cashoutDone: false,
+  tp1Hit: false,
+  tp2Hit: false,
+  tp3Hit: false,
+  tp4Hit: false,
+  tp2SlIsBestEffort: false,
+  status: "OPEN",
+  createdAt: Date.now(),
+  closedAt: null,
+  ...overrides,
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+}) as any;
+
+describe("rowToZoneState (restart-hydration path)", () => {
+  it("correctly maps BUY zone fields from DB row", () => {
+    const st = rowToZoneState(makeRow());
+    expect(st.zoneId).toBe("z_test_abc123");
+    expect(st.accountId).toBe("acc_1");
+    expect(st.direction).toBe("buy");
+    expect(st.anchorPrice).toBe(3120.50);
+    expect(st.tp1Price).toBe(3130.00);
+    expect(st.tp2Price).toBe(3145.00);
+    expect(st.tp3Price).toBe(3160.00);
+    expect(st.tp4Price).toBeNull();
+    expect(st.originalVolume).toBe(0.08);
+    expect(st.status).toBe("OPEN");
+  });
+
+  it("preserves RISK_FREE status so monitor keeps evaluating surviving entry", () => {
+    const st = rowToZoneState(makeRow({ status: "RISK_FREE", tp1Hit: true, tp2Hit: true }));
+    expect(st.status).toBe("RISK_FREE");
+    expect(st.tp1Hit).toBe(true);
+    expect(st.tp2Hit).toBe(true);
+    expect(st.tp3Hit).toBe(false);
+  });
+
+  it("maps CLOSED status correctly", () => {
+    const st = rowToZoneState(makeRow({ status: "CLOSED" }));
+    expect(st.status).toBe("CLOSED");
+  });
+
+  it("resets transient fields tp2SlMoved and tp2BeAttempts to safe defaults on restart", () => {
+    const st = rowToZoneState(makeRow({ tp2Hit: true }));
+    // These are never persisted; on restart we re-attempt BE from zero.
+    expect(st.tp2SlMoved).toBe(false);
+    expect(st.tp2BeAttempts).toBe(0);
+    expect(st.busy).toBe(false);
+  });
+
+  it("initialises trackedPositions as an empty map (filled in by loadZoneState)", () => {
+    const st = rowToZoneState(makeRow());
+    expect(st.trackedPositions).toBeInstanceOf(Map);
+    expect(st.trackedPositions.size).toBe(0);
+  });
+
+  it("falls back to legacy pip-distance TP prices when absolute prices are missing", () => {
+    const anchor = 3120.50;
+    const st = rowToZoneState(makeRow({
+      tp1Price: null, tp2Price: null, tp3Price: null,
+      tp1Pips: 20, tp2Pips: 50, tp3Pips: 90,
+      anchorPrice: String(anchor),
+    }));
+    expect(st.tp1Price).toBeCloseTo(anchor + 20 * PIP, 2);
+    expect(st.tp2Price).toBeCloseTo(anchor + 50 * PIP, 2);
+    expect(st.tp3Price).toBeCloseTo(anchor + 90 * PIP, 2);
+  });
+
+  it("computes SELL legacy pip TPs in the correct (downward) direction", () => {
+    const anchor = 3120.50;
+    const st = rowToZoneState(makeRow({
+      direction: "sell",
+      tp1Price: null, tp2Price: null, tp3Price: null,
+      tp1Pips: 20, tp2Pips: 50, tp3Pips: 90,
+      anchorPrice: String(anchor),
+    }));
+    expect(st.tp1Price).toBeCloseTo(anchor - 20 * PIP, 2);
+    expect(st.tp2Price).toBeCloseTo(anchor - 50 * PIP, 2);
+    expect(st.tp3Price).toBeCloseTo(anchor - 90 * PIP, 2);
+  });
+
+  it("preserves TP hit flags so engine does not re-fire completed TP levels after restart", () => {
+    const st = rowToZoneState(makeRow({ tp1Hit: true, tp2Hit: true, tp3Hit: false }));
+    expect(st.tp1Hit).toBe(true);
+    expect(st.tp2Hit).toBe(true);
+    expect(st.tp3Hit).toBe(false);
+    expect(st.tp4Hit).toBe(false);
+  });
+
+  it("preserves tp2SlIsBestEffort so app warning chip survives restart", () => {
+    const st = rowToZoneState(makeRow({ tp2Hit: true, tp2SlIsBestEffort: true }));
+    expect(st.tp2SlIsBestEffort).toBe(true);
+  });
+
+  it("handles anchorPrice=0 gracefully (zone created before fill price arrived)", () => {
+    const st = rowToZoneState(makeRow({ anchorPrice: "0" }));
+    expect(st.anchorPrice).toBe(0);
+    // evaluateZone guards on anchorPrice > 0, so a zero anchor pauses TP
+    // checks without crashing — this row is safe to load on restart.
   });
 });
