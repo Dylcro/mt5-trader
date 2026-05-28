@@ -30,8 +30,15 @@ export interface CascadeSettings {
   // Signed pip offset of the protective SL from the surviving entry when the
   // user taps Risk Free. Negative = drawdown side (small loss if reversed),
   // positive = profit lock (tighter exit), 0 = exactly at entry. Snapped to
-  // 5-pip steps within -30..+30 server-side.
+  // 5-pip steps within -30..+30 server-side. IGNORED when riskFreeUseWick=true.
   riskFreePips: number;
+  // When true, Risk Free anchors the SL on the structural extreme (lowest
+  // wick since zone open for BUY, highest wick for SELL) instead of the
+  // entry. `riskFreeWickBufferPips` is how far beyond that wick the SL sits.
+  riskFreeUseWick: boolean;
+  // Positive distance (pips) the SL is pushed BEYOND the wick when wick mode
+  // is on. Server clamps to 0..30 pips.
+  riskFreeWickBufferPips: number;
 }
 
 const DEFAULTS: CascadeSettings = {
@@ -46,9 +53,12 @@ const DEFAULTS: CascadeSettings = {
   tp3Pips: 100,
   tp4Pips: 0,
   riskFreePips: -10,
+  riskFreeUseWick: false,
+  riskFreeWickBufferPips: 5,
 };
 
 const VALID_RISK_FREE_PIPS = [-30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30];
+export const VALID_WICK_BUFFER_PIPS = [0, 1, 2, 3, 5, 10, 15, 20, 25, 30];
 
 const VALID_PIPS_BETWEEN = [5, 10, 15, 20];
 
@@ -67,6 +77,8 @@ function storageKeys(accountId: string) {
     tp3Pips:           `${prefix}zone_tp3_pips`,
     tp4Pips:           `${prefix}zone_tp4_pips`,
     riskFreePips:      `${prefix}risk_free_pips`,
+    riskFreeUseWick:   `${prefix}risk_free_use_wick`,
+    riskFreeWickBufferPips: `${prefix}risk_free_wick_buffer_pips`,
   };
 }
 
@@ -110,7 +122,7 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         const keys = storageKeys(accountId);
         const allKeys = [...Object.values(keys), GLOBAL_AUTO_CASCADE_KEY];
         const pairs = await AsyncStorage.multiGet(allKeys);
-        const [num, between, sl, tpEnabled, tpPips, tp1, tp2, tp3, tp4, riskFree, globalAutoEnabled] = pairs.map((p) => p[1]);
+        const [num, between, sl, tpEnabled, tpPips, tp1, tp2, tp3, tp4, riskFree, useWick, wickBuf, globalAutoEnabled] = pairs.map((p) => p[1]);
 
         let autoCascadeEnabled = DEFAULTS.autoCascadeEnabled;
         if (globalAutoEnabled !== null) {
@@ -141,6 +153,12 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
             const parsed = parseFloat(riskFree);
             return VALID_RISK_FREE_PIPS.includes(parsed) ? parsed : DEFAULTS.riskFreePips;
           })(),
+          riskFreeUseWick: useWick === "true",
+          riskFreeWickBufferPips: (() => {
+            if (wickBuf == null) return DEFAULTS.riskFreeWickBufferPips;
+            const parsed = parseFloat(wickBuf);
+            return VALID_WICK_BUFFER_PIPS.includes(parsed) ? parsed : DEFAULTS.riskFreeWickBufferPips;
+          })(),
         };
         setSettings(local);
         void pushToServer(local, accountId);
@@ -167,6 +185,8 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         [keys.tp3Pips, String(next.tp3Pips)],
         [keys.tp4Pips, String(next.tp4Pips)],
         [keys.riskFreePips, String(next.riskFreePips)],
+        [keys.riskFreeUseWick, String(next.riskFreeUseWick)],
+        [keys.riskFreeWickBufferPips, String(next.riskFreeWickBufferPips)],
         [GLOBAL_AUTO_CASCADE_KEY, String(next.autoCascadeEnabled)],
       ]);
       return next;

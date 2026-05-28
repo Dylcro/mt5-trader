@@ -82,16 +82,20 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
 
   const riskFree = useCallback(async (
     zoneId: string,
-    opts: { riskFreePips?: number } = {},
+    opts: { riskFreePips?: number; useWick?: boolean; wickBufferPips?: number } = {},
   ): Promise<{ ok: boolean; message?: string }> => {
     if (!API_BASE || !accountId) return { ok: false, message: "No account" };
     try {
+      const body: Record<string, unknown> = {};
+      if (opts.riskFreePips !== undefined) body.riskFreePips = opts.riskFreePips;
+      if (opts.useWick !== undefined) body.useWick = opts.useWick;
+      if (opts.wickBufferPips !== undefined) body.wickBufferPips = opts.wickBufferPips;
       const res = await authFetch(
         `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/risk-free`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(opts.riskFreePips !== undefined ? { riskFreePips: opts.riskFreePips } : {}),
+          body: JSON.stringify(body),
         },
       );
       const data = await res.json().catch(() => ({})) as { ok?: boolean; message?: string; error?: string };

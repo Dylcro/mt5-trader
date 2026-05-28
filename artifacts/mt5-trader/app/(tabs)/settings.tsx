@@ -221,10 +221,22 @@ export default function SettingsScreen() {
   // Risk-free SL setting: signed pips (-30..+30, step 5). Negative = drawdown
   // protection, positive = profit lock, 0 = exact break-even. Stored locally
   // and passed in the risk-free POST body per zone.
+  //
+  // Wick mode (separate toggle): when ON, the SL is anchored on the lowest
+  // wick (BUY) / highest wick (SELL) printed since the zone opened, pushed
+  // `wickBuffer` pips further AWAY from market. The signed offset above is
+  // ignored in wick mode.
   const [rfDraft, setRfDraft] = useState<number>(cs.riskFreePips);
+  const [rfUseWickDraft, setRfUseWickDraft] = useState<boolean>(cs.riskFreeUseWick);
+  const [rfWickBufferDraft, setRfWickBufferDraft] = useState<number>(cs.riskFreeWickBufferPips);
   const [rfSaveState, setRfSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   useEffect(() => { setRfDraft(cs.riskFreePips); }, [cs.riskFreePips]);
-  const rfDirty = rfDraft !== cs.riskFreePips;
+  useEffect(() => { setRfUseWickDraft(cs.riskFreeUseWick); }, [cs.riskFreeUseWick]);
+  useEffect(() => { setRfWickBufferDraft(cs.riskFreeWickBufferPips); }, [cs.riskFreeWickBufferPips]);
+  const rfDirty =
+    rfDraft !== cs.riskFreePips ||
+    rfUseWickDraft !== cs.riskFreeUseWick ||
+    rfWickBufferDraft !== cs.riskFreeWickBufferPips;
   useEffect(() => {
     setTpDraft({
       tp1: String(cs.tp1Pips),
@@ -732,7 +744,8 @@ export default function SettingsScreen() {
             </Pressable>
           </View>
 
-          {/* Risk Free SL placement — signed offset from surviving entry. */}
+          {/* Risk Free SL placement — signed offset from surviving entry, OR
+              anchored on the structural wick when "Use lowest wick" is on. */}
           <View style={styles.cascadeCard}>
             <View style={styles.cascadeCardHeader}>
               <Feather name="shield" size={16} color={C.gold} />
@@ -742,31 +755,73 @@ export default function SettingsScreen() {
               </View>
             </View>
             <Text style={styles.cascadeCardDesc}>
-              Where to place the protective stop when you tap Risk Free on a zone. Negative = drawdown side (small loss if price reverses). Positive = locks in profit (tighter exit). Zero = exactly at entry (true break-even).
+              Where to place the protective stop when you tap Risk Free on a zone. Two modes — pick one.
             </Text>
 
             <View style={styles.cascadeDivider} />
 
-            <PillSelector
-              label="SL offset from entry"
-              hint={
-                rfDraft < 0 ? `${Math.abs(rfDraft)} pips of drawdown protection`
-                : rfDraft > 0 ? `Locks in ${rfDraft} pips of profit`
-                : "Break-even — SL exactly at entry"
-              }
-              options={[-30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30]}
-              value={rfDraft}
-              onChange={(v) => {
-                setRfDraft(v);
-                if (rfSaveState !== "idle") setRfSaveState("idle");
-              }}
-              suffix=""
-              labels={{
-                [-30]: "-30", [-25]: "-25", [-20]: "-20", [-15]: "-15",
-                [-10]: "-10", [-5]: "-5", 0: "0",
-                5: "+5", 10: "+10", 15: "+15", 20: "+20", 25: "+25", 30: "+30",
-              }}
-            />
+            {/* Mode toggle — Use lowest wick */}
+            <View style={styles.settingRow}>
+              <Switch
+                value={rfUseWickDraft}
+                onValueChange={(v) => {
+                  void Haptics.selectionAsync();
+                  setRfUseWickDraft(v);
+                  if (rfSaveState !== "idle") setRfSaveState("idle");
+                }}
+                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
+                thumbColor={rfUseWickDraft ? C.gold : C.textMuted}
+              />
+              <View style={{ marginLeft: 10, flex: 1 }}>
+                <Text style={styles.settingLabel}>Use lowest wick</Text>
+                <Text style={styles.settingHint}>
+                  {rfUseWickDraft
+                    ? "SL anchored to the structural extreme since the zone opened (lowest wick on BUY, highest on SELL)."
+                    : "SL anchored to the surviving entry price ± the offset below."}
+                </Text>
+              </View>
+            </View>
+
+            <View style={styles.cascadeDivider} />
+
+            {rfUseWickDraft ? (
+              <PillSelector
+                label="Pips beyond the wick"
+                hint={
+                  rfWickBufferDraft === 0
+                    ? "SL placed exactly at the wick (no buffer)."
+                    : `SL placed ${rfWickBufferDraft} pip${rfWickBufferDraft === 1 ? "" : "s"} beyond the wick (further from market).`
+                }
+                options={[0, 1, 2, 3, 5, 10, 15, 20, 25, 30]}
+                value={rfWickBufferDraft}
+                onChange={(v) => {
+                  setRfWickBufferDraft(v);
+                  if (rfSaveState !== "idle") setRfSaveState("idle");
+                }}
+                suffix="p"
+              />
+            ) : (
+              <PillSelector
+                label="SL offset from entry"
+                hint={
+                  rfDraft < 0 ? `${Math.abs(rfDraft)} pips of drawdown protection`
+                  : rfDraft > 0 ? `Locks in ${rfDraft} pips of profit`
+                  : "Break-even — SL exactly at entry"
+                }
+                options={[-30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30]}
+                value={rfDraft}
+                onChange={(v) => {
+                  setRfDraft(v);
+                  if (rfSaveState !== "idle") setRfSaveState("idle");
+                }}
+                suffix=""
+                labels={{
+                  [-30]: "-30", [-25]: "-25", [-20]: "-20", [-15]: "-15",
+                  [-10]: "-10", [-5]: "-5", 0: "0",
+                  5: "+5", 10: "+10", 15: "+15", 20: "+20", 25: "+25", 30: "+30",
+                }}
+              />
+            )}
 
             <Pressable
               style={({ pressed }) => [
@@ -779,7 +834,11 @@ export default function SettingsScreen() {
                 void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
                 setRfSaveState("saving");
                 try {
-                  updateSettings({ riskFreePips: rfDraft });
+                  updateSettings({
+                    riskFreePips: rfDraft,
+                    riskFreeUseWick: rfUseWickDraft,
+                    riskFreeWickBufferPips: rfWickBufferDraft,
+                  });
                   setRfSaveState("saved");
                   void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
                   setTimeout(() => setRfSaveState("idle"), 2500);

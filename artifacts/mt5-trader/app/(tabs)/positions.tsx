@@ -350,7 +350,14 @@ export default function PositionsScreen() {
                 <Text style={styles.sectionLabel}>ACTIVE ZONES  ·  {activeZones.length}</Text>
                 <View style={{ gap: 10, marginBottom: showStandalone || pendingOrders.length > 0 ? 20 : 0 }}>
                   {activeZones.map((z) => (
-                    <ZoneCard key={z.zoneId} zone={z} onRiskFree={riskFree} riskFreePips={cs.riskFreePips} />
+                    <ZoneCard
+                      key={z.zoneId}
+                      zone={z}
+                      onRiskFree={riskFree}
+                      riskFreePips={cs.riskFreePips}
+                      riskFreeUseWick={cs.riskFreeUseWick}
+                      riskFreeWickBufferPips={cs.riskFreeWickBufferPips}
+                    />
                   ))}
                 </View>
               </>

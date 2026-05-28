@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   computeRiskFreeSl,
+  computeRiskFreeWickSl,
+  sanitizeWickBufferPips,
   buildCascadeConfigUpdate,
   ZONE_RISK_FREE_PIPS,
 } from "../src/routes/mt5";
@@ -87,6 +89,64 @@ describe("sanitizeRiskFreePips", () => {
     expect(sanitizeRiskFreePips(null)).toBe(ZONE_RISK_FREE_PIPS);
     expect(sanitizeRiskFreePips(undefined)).toBe(ZONE_RISK_FREE_PIPS);
     expect(sanitizeRiskFreePips(NaN)).toBe(ZONE_RISK_FREE_PIPS);
+  });
+});
+
+describe("computeRiskFreeWickSl (POST /risk-free wick-mode SL placement)", () => {
+  it("BUY: SL placed buffer pips BELOW the lowest wick", () => {
+    // User's stated example: BUY zone, lowest wick prints at 4444.00,
+    // buffer 5 pips → SL at 4443.50.
+    const sl = computeRiskFreeWickSl("buy", 4444.00, 4500.00, 5);
+    expect(sl).toBeCloseTo(4443.50, 2);
+  });
+
+  it("SELL: SL placed buffer pips ABOVE the highest wick", () => {
+    // Mirror case: SELL zone, highest wick at 4500.00, buffer 5 → SL at 4500.50.
+    const sl = computeRiskFreeWickSl("sell", 4444.00, 4500.00, 5);
+    expect(sl).toBeCloseTo(4500.50, 2);
+  });
+
+  it("zero buffer: SL exactly at the wick", () => {
+    expect(computeRiskFreeWickSl("buy", 4444.00, 4500.00, 0)).toBeCloseTo(4444.00, 2);
+    expect(computeRiskFreeWickSl("sell", 4444.00, 4500.00, 0)).toBeCloseTo(4500.00, 2);
+  });
+
+  it("returns null when the relevant wick has not been tracked yet", () => {
+    expect(computeRiskFreeWickSl("buy",  null,  4500.00, 5)).toBeNull();
+    expect(computeRiskFreeWickSl("sell", 4444.00, null,  5)).toBeNull();
+    expect(computeRiskFreeWickSl("buy",  0,     4500.00, 5)).toBeNull();
+  });
+
+  it("uses the buffer default of 5 pips when not provided", () => {
+    expect(computeRiskFreeWickSl("buy", 4444.00, 4500.00)).toBeCloseTo(4443.50, 2);
+  });
+
+  it("rounds to 2 decimal places", () => {
+    const sl = computeRiskFreeWickSl("buy", 4444.0555, 4500, 5);
+    expect(sl).toBe(parseFloat((sl ?? 0).toFixed(2)));
+  });
+});
+
+describe("sanitizeWickBufferPips", () => {
+  it("rounds to nearest whole pip", () => {
+    expect(sanitizeWickBufferPips(5.4)).toBe(5);
+    expect(sanitizeWickBufferPips(5.6)).toBe(6);
+  });
+
+  it("clamps to 0..30 bounds", () => {
+    expect(sanitizeWickBufferPips(99)).toBe(30);
+    expect(sanitizeWickBufferPips(-5)).toBe(0);
+  });
+
+  it("falls back to default (5) for non-numeric input", () => {
+    expect(sanitizeWickBufferPips("bad")).toBe(5);
+    expect(sanitizeWickBufferPips(null)).toBe(5);
+    expect(sanitizeWickBufferPips(undefined)).toBe(5);
+    expect(sanitizeWickBufferPips(NaN)).toBe(5);
+  });
+
+  it("accepts numeric strings", () => {
+    expect(sanitizeWickBufferPips("7")).toBe(7);
   });
 });
 

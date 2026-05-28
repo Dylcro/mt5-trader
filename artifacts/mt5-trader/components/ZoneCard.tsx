@@ -38,13 +38,18 @@ interface ZoneCardProps {
   zone: Zone;
   onRiskFree?: (
     zoneId: string,
-    opts?: { riskFreePips?: number },
+    opts?: { riskFreePips?: number; useWick?: boolean; wickBufferPips?: number },
   ) => Promise<{ ok: boolean; message?: string }>;
   riskFreePips?: number;
+  riskFreeUseWick?: boolean;
+  riskFreeWickBufferPips?: number;
   historical?: boolean;
 }
 
-export default function ZoneCard({ zone, onRiskFree, riskFreePips, historical = false }: ZoneCardProps) {
+export default function ZoneCard({
+  zone, onRiskFree, riskFreePips, riskFreeUseWick, riskFreeWickBufferPips,
+  historical = false,
+}: ZoneCardProps) {
   const isBuy = zone.direction === "buy";
   const [busy, setBusy] = useState(false);
 
@@ -54,7 +59,11 @@ export default function ZoneCard({ zone, onRiskFree, riskFreePips, historical = 
     if (!onRiskFree || busy) return;
     setBusy(true);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    const result = await onRiskFree(zone.zoneId, riskFreePips !== undefined ? { riskFreePips } : undefined);
+    const opts: { riskFreePips?: number; useWick?: boolean; wickBufferPips?: number } = {};
+    if (riskFreePips !== undefined) opts.riskFreePips = riskFreePips;
+    if (riskFreeUseWick !== undefined) opts.useWick = riskFreeUseWick;
+    if (riskFreeWickBufferPips !== undefined) opts.wickBufferPips = riskFreeWickBufferPips;
+    const result = await onRiskFree(zone.zoneId, opts);
     setBusy(false);
     if (result.ok) {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
