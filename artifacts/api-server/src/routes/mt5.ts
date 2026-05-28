@@ -1554,7 +1554,8 @@ function prepareZoneForCascade(
     status: "OPEN", busy: false,
     trackedPositions: new Map(),
   };
-  zoneStates.set(zoneId, state);
+  // Do NOT set zoneStates here — the zone is added to the in-memory map only
+  // after earlyPersist succeeds in the caller's async block (DB-first ordering).
   pendingZoneAssoc.set(accountId, { zoneId, direction, expiresAt: Date.now() + ZONE_ASSOC_WINDOW_MS });
   // Drain any cascade limit orderIds whose POST response landed before this
   // market response. Only consider orphans buffered very recently (sibling
@@ -1863,7 +1864,15 @@ function sortZonePositions(positions: LivePosition[], direction: "buy" | "sell")
 }
 
 async function evaluateZone(zoneId: string, token: string): Promise<void> {
-  const st = zoneStates.get(zoneId);
+  // loadZone is the single read path: cache-first, DB hydration on miss.
+  // DB errors are caught here so a transient failure just skips this tick.
+  let st: ZoneState | null;
+  try {
+    st = await loadZone(zoneId);
+  } catch (e) {
+    console.warn(`[zone ${zoneId}] loadZone error, skipping tick: ${(e as Error).message}`);
+    return;
+  }
   // Evaluate OPEN and RISK_FREE zones — Risk Free closes the losing entries
   // and arms a protective SL, but the TP ladder must keep running on the
   // surviving best entry. Only CLOSED zones are skipped.
@@ -2216,19 +2225,23 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
 }
 
 // Cache-first zone reader: check in-memory map first, hydrate from DB on miss,
-// set in cache, return. Returns null for missing or CLOSED zones.
+// set in cache, return. Returns null only when the zone does not exist in DB;
+// returns the zone (including CLOSED) if it does exist — callers check status.
+// DB errors propagate as thrown exceptions so callers surface 5xx, not silent 404.
 // This is the single read path for all code that needs to act on a zone state.
 export async function loadZone(zoneId: string): Promise<ZoneState | null> {
   const cached = zoneStates.get(zoneId);
-  if (cached) return cached.status === "CLOSED" ? null : cached;
-  try {
-    const [z] = await db.select().from(cascadeZonesTable)
-      .where(eq(cascadeZonesTable.zoneId, zoneId))
-      .limit(1);
-    if (!z || z.status === "CLOSED") return null;
-    const st = rowToZoneState(z);
-    zoneStates.set(zoneId, st);
-    console.log(`[zone ${zoneId}] hydrated from DB on cache miss`);
+  if (cached) return cached;
+  // Intentionally no try/catch — DB errors bubble up to the route handler
+  // which wraps everything in try/catch and returns 500.
+  const [z] = await db.select().from(cascadeZonesTable)
+    .where(eq(cascadeZonesTable.zoneId, zoneId))
+    .limit(1);
+  if (!z) return null; // zone truly doesn't exist
+  const st = rowToZoneState(z);
+  zoneStates.set(zoneId, st);
+  console.log(`[zone ${zoneId}] hydrated from DB on cache miss (status=${z.status})`);
+  if (z.status !== "CLOSED") {
     try {
       const zpRows = await db.select().from(zonePositionsTable)
         .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
@@ -2236,12 +2249,13 @@ export async function loadZone(zoneId: string): Promise<ZoneState | null> {
         st.trackedPositions.set(zp.positionId, { volume: Number(zp.volume), entryPrice: Number(zp.entryPrice) });
       }
     } catch { /* non-fatal — evaluateZone will re-read from DB */ }
-    return st;
-  } catch (e) {
-    console.warn(`[zone ${zoneId}] loadZone DB error:`, (e as Error).message);
-    return null;
   }
+  return st;
 }
+
+// Test hook — exposes internal state for restart-hydration integration tests.
+// NOT part of the production API; only used by test files.
+export const _zoneStatesForTest = zoneStates;
 
 // Hydrate in-memory zone state from DB on startup so the monitor resumes
 // watching zones placed in previous server sessions.
@@ -2597,9 +2611,9 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     // DB-first read: loadZone checks cache first, then hydrates from DB on miss.
-    // Returns null for missing or CLOSED zones — both map to 404 here.
+    // DB errors propagate as 500; CLOSED zones and missing zones are 404.
     const st = await loadZone(zoneId);
-    if (!st || st.accountId !== accountId) { res.status(404).json({ error: "Zone not found" }); return; }
+    if (!st || st.accountId !== accountId || st.status === "CLOSED") { res.status(404).json({ error: "Zone not found" }); return; }
     const zps = await db.select().from(zonePositionsTable)
       .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
     const trackedIds = new Set(zps.map(z => z.positionId));
@@ -2676,20 +2690,13 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
   try {
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
-    // In-memory first; DB fallback so a missed hydration doesn't 404 a live zone.
-    let st = zoneStates.get(zoneId);
-    if (!st || st.accountId !== accountId) {
-      const [zr] = await db.select().from(cascadeZonesTable)
-        .where(and(eq(cascadeZonesTable.zoneId, zoneId), eq(cascadeZonesTable.accountId, accountId)))
-        .limit(1);
-      if (!zr) { res.status(404).json({ error: "Zone not found" }); return; }
-      if (zr.status === "CLOSED") {
-        // Idempotent: already closed → treat as success so the UI's optimistic
-        // refresh doesn't show a spurious failure if the monitor beat us to it.
-        res.json({ ok: true, closedCount: 0, alreadyClosed: true });
-        return;
-      }
-    } else if (st.status === "CLOSED") {
+    // DB-first read via the single loadZone path (cache → DB → hydrate).
+    // DB errors bubble up to the surrounding try/catch and return 500.
+    const st = await loadZone(zoneId);
+    if (!st || st.accountId !== accountId) { res.status(404).json({ error: "Zone not found" }); return; }
+    if (st.status === "CLOSED") {
+      // Idempotent: already closed → treat as success so the UI's optimistic
+      // refresh doesn't show a spurious failure if the monitor beat us to it.
       res.json({ ok: true, closedCount: 0, alreadyClosed: true });
       return;
     }
@@ -3698,6 +3705,9 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
               const earlyPersist = persistPreparedZone(zoneState, uId, positionId, volume);
               void (async () => {
                 await earlyPersist; // ensure initial row is committed first
+                // DB write succeeded — now safe to put zone in the in-memory map.
+                // This is the DB-first ordering: DB row exists before monitor sees it.
+                zoneStates.set(zoneState.zoneId, zoneState);
                 try {
                   const positions = await fetchOpenPositions(getToken(), region, accountId);
                   const me = positions.find(p => p.id === positionId);
