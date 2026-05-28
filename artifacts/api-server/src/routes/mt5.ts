@@ -501,7 +501,7 @@ function handleStreamingTick(accountId: string, price: any): void {
   const now = Date.now();
   for (const [zoneId, st] of zoneStates.entries()) {
     if (st.accountId !== accountId) continue;
-    if (st.status !== "OPEN") continue;
+    if (st.status === "CLOSED") continue;
     const last = lastStreamingEvalAt.get(zoneId) ?? 0;
     if (now - last < STREAMING_EVAL_MIN_INTERVAL_MS) continue;
     lastStreamingEvalAt.set(zoneId, now);
@@ -1555,7 +1555,10 @@ function sortZonePositions(positions: LivePosition[], direction: "buy" | "sell")
 
 async function evaluateZone(zoneId: string, token: string): Promise<void> {
   const st = zoneStates.get(zoneId);
-  if (!st || st.status !== "OPEN") return;
+  // Evaluate OPEN and RISK_FREE zones — Risk Free closes the losing entries
+  // and arms a protective SL, but the TP ladder must keep running on the
+  // surviving best entry. Only CLOSED zones are skipped.
+  if (!st || st.status === "CLOSED") return;
   if (st.busy) return;
   st.busy = true;
   try {
@@ -1759,7 +1762,7 @@ export function startZoneTpMonitor(): void {
     const token = (() => { try { return getToken(); } catch { return null; } })();
     if (!token) return;
     for (const [zoneId, st] of zoneStates.entries()) {
-      if (st.status === "OPEN") void evaluateZone(zoneId, token);
+      if (st.status !== "CLOSED") void evaluateZone(zoneId, token);
     }
   }, 3_000);
   console.log("[zone-monitor] started (3 s interval)");
