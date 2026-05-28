@@ -551,6 +551,21 @@ const syncReadyAt = new Map<string, number>();
 // one diagnostic line per replay, not per historical deal.
 const skipLogged = new Set<string>();
 
+// Server-side filter for orders that streaming has confirmed are completed
+// (cancelled or filled). MetaAPI REST is eventually consistent and can lag
+// by minutes — this map lets the /orders endpoint serve an accurate list
+// immediately after a streaming onPendingOrderCompleted event fires.
+// Entries expire after 5 minutes (order IDs are not reused).
+const completedOrderIds = new Map<string, Set<string>>(); // accountId → Set<orderId>
+
+function markOrderCompleted(accountId: string, orderId: string): void {
+  if (!orderId) return;
+  if (!completedOrderIds.has(accountId)) completedOrderIds.set(accountId, new Set());
+  completedOrderIds.get(accountId)!.add(orderId);
+  // Expire after 5 minutes — MetaAPI REST will have caught up by then.
+  setTimeout(() => completedOrderIds.get(accountId)?.delete(orderId), 5 * 60 * 1000);
+}
+
 // Per-zone throttle for streaming-driven evaluateZone calls. Ticks can arrive
 // many times per second; we cap each zone at one evaluation per
 // STREAMING_EVAL_MIN_INTERVAL_MS so the broker isn't hammered on duplicates.
@@ -656,6 +671,9 @@ function makeDealListener(accountId: string) {
       if (isDuplicate(String(deal.id ?? ""))) return;
       // Zone-aware limit-fill association: a tracked cascade limit just filled.
       // Record the resulting positionId in zone_positions so the monitor can manage it.
+      // A limit order just filled — mark it completed so /orders filters it out
+      // of MetaAPI REST immediately (REST cache can lag significantly).
+      if (deal.orderId) markOrderCompleted(accountId, String(deal.orderId));
       if (deal.orderId && cascadePlacedOrderIds.has(String(deal.orderId))) {
         let zoneId = zoneLimitOrders.get(String(deal.orderId));
         // Backstop: if the orderId is known as a cascade limit but somehow has
@@ -744,8 +762,12 @@ function makeDealListener(accountId: string) {
       broadcastToAccount(accountId, "pending_order", {});
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    async onPendingOrderCompleted(_instanceIndex: string, _order: any): Promise<void> {
+    async onPendingOrderCompleted(_instanceIndex: string, order: any): Promise<void> {
       lastEventAt.set(accountId, Date.now());
+      // Mark the order completed so the /orders endpoint can filter it out of
+      // the MetaAPI REST response immediately (MetaAPI REST can lag minutes).
+      const oid = String(order?.id ?? order?._id ?? "");
+      markOrderCompleted(accountId, oid);
       broadcastToAccount(accountId, "pending_order", {});
     },
   };
@@ -3521,12 +3543,21 @@ router.get("/mt5/account/:accountId/orders", checkOwner, async (req: Request, re
   try {
     const token = getToken();
     const region = qstr(req.query.region) || DEFAULT_REGION;
+    const { accountId } = req.params as { accountId: string };
     const ordRes = await fetch(
-      `${clientBase(region)}/users/current/accounts/${req.params.accountId}/orders`,
+      `${clientBase(region)}/users/current/accounts/${accountId}/orders`,
       { headers: authHeaders(token) }
     );
     if (!ordRes.ok) return res.status(ordRes.status).json({ error: "Orders fetch failed" });
-    return res.json(await ordRes.json());
+    const orders = await ordRes.json() as Array<Record<string, unknown>>;
+    // Filter out orders that streaming has confirmed are completed (cancelled/filled).
+    // MetaAPI REST is eventually consistent and can serve stale data for minutes;
+    // the streaming completedOrderIds set is our real-time source of truth.
+    const done = completedOrderIds.get(accountId);
+    const filtered = done?.size
+      ? orders.filter(o => !done.has(String(o.id ?? o._id ?? "")))
+      : orders;
+    return res.json(filtered);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
   }
