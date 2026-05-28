@@ -1,6 +1,7 @@
 import * as Notifications from "expo-notifications";
 import { useRouter } from "expo-router";
 import { useEffect } from "react";
+import { Platform } from "react-native";
 
 // Route taps on a TP-alert push back to the Positions screen, where the
 // matching ZoneCard lives. The zoneId travels through `data` so we can also
@@ -20,6 +21,9 @@ export function useNotificationDeepLink(): void {
         // will refire after the next user interaction.
       }
     };
+
+    // Push notification APIs are native-only; skip entirely on web.
+    if (Platform.OS === "web") return;
 
     // Cold-start: app was opened by tapping a notification while killed.
     Notifications.getLastNotificationResponseAsync().then((resp) => {
