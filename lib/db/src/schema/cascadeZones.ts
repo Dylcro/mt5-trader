@@ -32,11 +32,6 @@ export const cascadeZonesTable = pgTable("cascade_zones", {
   status:      text("status").notNull().default("OPEN"),
   createdAt:   bigint("created_at", { mode: "number" }).notNull(),
   closedAt:    bigint("closed_at", { mode: "number" }),
-  // Lowest bid / highest ask the market has printed since this zone opened.
-  // Used by the Risk-Free "lowest wick" mode to anchor the protective SL just
-  // beyond the structural extreme rather than relative to the entry price.
-  lowestPrice:  doublePrecision("lowest_price"),
-  highestPrice: doublePrecision("highest_price"),
 });
 
 export type CascadeZoneRow = typeof cascadeZonesTable.$inferSelect;

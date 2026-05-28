@@ -1195,12 +1195,6 @@ interface ZoneState {
   // per-entry volume to compute the 25% slice (a fallback row without volume
   // would silently advance TP flags without actually closing anything).
   trackedPositions: Map<string, { volume: number; entryPrice: number }>;
-  // Wick tracking: lowest bid / highest ask printed since the zone opened.
-  // Refreshed by evaluateZone on every monitor tick and persisted whenever a
-  // new extreme is set, so a restart doesn't reset the structural wick used
-  // by the Risk-Free "lowest wick" mode.
-  lowestPrice: number | null;
-  highestPrice: number | null;
 }
 
 // Signed offset (pips) of the protective SL from the surviving entry:
@@ -1234,41 +1228,6 @@ export function computeRiskFreeSl(
 ): number {
   const offset = pips * PIP;
   const raw = direction === "buy" ? entryPrice + offset : entryPrice - offset;
-  return parseFloat(raw.toFixed(2));
-}
-
-// Wick-mode buffer: how far BEYOND the lowest-wick / highest-wick the SL
-// sits. Always treated as a positive distance — direction handled by code.
-// User-tunable per zone via the risk-free POST body (`wickBufferPips`).
-const ZONE_WICK_BUFFER_PIPS_DEFAULT = 5;
-const ZONE_WICK_BUFFER_PIPS_MIN = 0;
-const ZONE_WICK_BUFFER_PIPS_MAX = 30;
-
-export function sanitizeWickBufferPips(input: unknown): number {
-  let n: number;
-  if (typeof input === "number") n = input;
-  else if (typeof input === "string" && input.trim() !== "") n = Number(input);
-  else return ZONE_WICK_BUFFER_PIPS_DEFAULT;
-  if (!Number.isFinite(n)) return ZONE_WICK_BUFFER_PIPS_DEFAULT;
-  return Math.max(ZONE_WICK_BUFFER_PIPS_MIN, Math.min(ZONE_WICK_BUFFER_PIPS_MAX, Math.round(n)));
-}
-
-// Pure helper: compute the "risk free" SL anchored on the zone's structural
-// wick (lowest bid since open for BUY; highest ask since open for SELL),
-// offset by `bufferPips` BEYOND the wick (further away from market).
-//   BUY  → SL = lowestWick − buffer*PIP   (SL sits just below the structural low)
-//   SELL → SL = highestWick + buffer*PIP  (SL sits just above the structural high)
-// Returns null when no wick has been tracked yet (zone just opened).
-export function computeRiskFreeWickSl(
-  direction: "buy" | "sell",
-  lowestPrice: number | null,
-  highestPrice: number | null,
-  bufferPips: number = ZONE_WICK_BUFFER_PIPS_DEFAULT,
-): number | null {
-  const wick = direction === "buy" ? lowestPrice : highestPrice;
-  if (wick == null || !(wick > 0)) return null;
-  const offset = bufferPips * PIP;
-  const raw = direction === "buy" ? wick - offset : wick + offset;
   return parseFloat(raw.toFixed(2));
 }
 
@@ -1333,7 +1292,6 @@ function prepareZoneForCascade(
     tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
     status: "OPEN", busy: false,
     trackedPositions: new Map(),
-    lowestPrice: null, highestPrice: null,
   };
   zoneStates.set(zoneId, state);
   pendingZoneAssoc.set(accountId, { zoneId, direction, expiresAt: Date.now() + ZONE_ASSOC_WINDOW_MS });
@@ -1384,13 +1342,7 @@ async function persistPreparedZone(
       cashoutPips: state.cashoutPips, cashoutDone: false,
       tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
       status: "OPEN", createdAt: now,
-      // Seed the wick trackers at the anchor — guarantees the Risk-Free wick
-      // mode has something sensible to anchor on even if it's tapped before
-      // the first monitor tick has run.
-      lowestPrice: state.anchorPrice, highestPrice: state.anchorPrice,
     }).onConflictDoNothing();
-    state.lowestPrice = state.anchorPrice;
-    state.highestPrice = state.anchorPrice;
     await db.insert(zonePositionsTable).values({
       zoneId: state.zoneId, positionId, entryPrice: state.anchorPrice, volume,
       status: "OPEN", createdAt: now,
@@ -1726,29 +1678,6 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     if (!(st.anchorPrice > 0)) return;
     const cmpPrice = st.direction === "buy" ? price.bid : price.ask;
 
-    // ── Wick tracking ───────────────────────────────────────────────────────
-    // Track the structural extreme reached since the zone opened so the
-    // Risk-Free "lowest wick" mode can anchor its protective SL just beyond
-    // it. BUY positions are closed at the bid, so the bid's running low is
-    // what stings them; symmetric for SELL on the ask. Persist only when a
-    // new extreme prints — typical XAUUSD session = a handful of writes per
-    // zone, not 20/min.
-    {
-      const lowCandidate = price.bid;   // worst-case close price for a BUY
-      const highCandidate = price.ask;  // worst-case close price for a SELL
-      const newLow  = st.lowestPrice  == null || lowCandidate  < st.lowestPrice;
-      const newHigh = st.highestPrice == null || highCandidate > st.highestPrice;
-      if (newLow)  st.lowestPrice  = parseFloat(lowCandidate.toFixed(2));
-      if (newHigh) st.highestPrice = parseFloat(highCandidate.toFixed(2));
-      if (newLow || newHigh) {
-        const patch: Record<string, number> = {};
-        if (newLow)  patch.lowestPrice  = st.lowestPrice!;
-        if (newHigh) patch.highestPrice = st.highestPrice!;
-        void db.update(cascadeZonesTable).set(patch)
-          .where(eq(cascadeZonesTable.zoneId, zoneId))
-          .catch((e: Error) => console.warn(`[zone ${zoneId}] wick persist failed:`, e.message));
-      }
-    }
     // Spread/slippage tolerance: fire TP when price comes within
     // ZONE_TP_TOLERANCE_PIPS of the target on the profitable side. Without
     // this, a TP set at the exact bid/ask never triggers because the broker's
@@ -1937,8 +1866,6 @@ export async function loadZoneState(): Promise<void> {
         tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit, tp4Hit: z.tp4Hit ?? false,
         status: "OPEN", busy: false,
         trackedPositions: new Map(),
-        lowestPrice:  z.lowestPrice  != null ? Number(z.lowestPrice)  : (anchor > 0 ? anchor : null),
-        highestPrice: z.highestPrice != null ? Number(z.highestPrice) : (anchor > 0 ? anchor : null),
       });
     }
     // Hydrate the in-memory tracked-positions cache from the open
@@ -2262,8 +2189,6 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
         tp1Hit: zr.tp1Hit, tp2Hit: zr.tp2Hit, tp3Hit: zr.tp3Hit, tp4Hit: zr.tp4Hit ?? false,
         status: zr.status === "RISK_FREE" ? "RISK_FREE" : "OPEN", busy: false,
         trackedPositions: new Map(),
-        lowestPrice:  zr.lowestPrice  != null ? Number(zr.lowestPrice)  : (anchor > 0 ? anchor : null),
-        highestPrice: zr.highestPrice != null ? Number(zr.highestPrice) : (anchor > 0 ? anchor : null),
       };
       zoneStates.set(zoneId, st);
     }
@@ -2283,40 +2208,16 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       if (!ok) failed.push(p.id);
     }
     // "Risk free" (misnomer — kept because the user calls it that): move SL
-    // on the surviving entry. Two modes:
-    //   1. OFFSET mode (default) — SL = entry ± SIGNED `riskFreePips`*PIP.
-    //      Negative = drawdown protection, positive = profit lock, 0 = BE.
-    //   2. WICK mode (useWick=true) — SL anchored on the structural extreme
-    //      the market printed since the zone opened (lowest bid for BUY,
-    //      highest ask for SELL), pushed `wickBufferPips` further AWAY from
-    //      market. The `riskFreePips` value is ignored in this mode. Falls
-    //      back to offset mode automatically if no wick has been tracked yet.
-    const body = (req.body ?? {}) as {
-      riskFreePips?: unknown;
-      useWick?: unknown;
-      wickBufferPips?: unknown;
-    };
-    const useWick = body.useWick === true;
-    const wickBuffer = sanitizeWickBufferPips(body.wickBufferPips);
+    // by a SIGNED pip offset from the best entry. Client passes `riskFreePips`
+    // in the body (-30..+30, step 5). Negative = drawdown protection (small
+    // loss if reversed); positive = profit lock (tighter exit); 0 = exactly
+    // at entry. Falls back to ZONE_RISK_FREE_PIPS when omitted. See
+    // computeRiskFreeSl for direction math.
+    const body = (req.body ?? {}) as { riskFreePips?: unknown };
     const pips = body.riskFreePips !== undefined
       ? sanitizeRiskFreePips(body.riskFreePips)
       : ZONE_RISK_FREE_PIPS;
-
-    let sl: number;
-    let mode: "wick" | "offset" = "offset";
-    if (useWick) {
-      const wickSl = computeRiskFreeWickSl(st.direction, st.lowestPrice, st.highestPrice, wickBuffer);
-      if (wickSl != null) {
-        sl = wickSl;
-        mode = "wick";
-      } else {
-        // No wick tracked yet — fall back to offset mode so the user still
-        // gets a protective SL on the very first tick after zone open.
-        sl = computeRiskFreeSl(st.direction, best.openPrice, pips);
-      }
-    } else {
-      sl = computeRiskFreeSl(st.direction, best.openPrice, pips);
-    }
+    const sl = computeRiskFreeSl(st.direction, best.openPrice, pips);
     const slOk = await modifyZonePositionSl(token, region, accountId, best.id, sl);
     await cancelZoneLimits(token, region, accountId, zoneId);
     if (failed.length > 0 || !slOk) {
@@ -2325,7 +2226,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       res.status(207).json({
         ok: false,
         bestPositionId: best.id,
-        sl, slOk, mode,
+        sl, slOk,
         closedCount: others.length - failed.length,
         failedPositionIds: failed,
         message: "Some operations failed — zone NOT marked risk-free. Retry to clear remaining issues.",
@@ -2334,13 +2235,8 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     }
     st.status = "RISK_FREE";
     await db.update(cascadeZonesTable).set({ status: "RISK_FREE" }).where(eq(cascadeZonesTable.zoneId, zoneId));
-    if (mode === "wick") {
-      const anchorWick = st.direction === "buy" ? st.lowestPrice : st.highestPrice;
-      console.log(`[zone ${zoneId}] risk-free [wick]: kept posId=${best.id} @${best.openPrice} sl=${sl} (wick=${anchorWick} buffer=${wickBuffer}p)`);
-    } else {
-      console.log(`[zone ${zoneId}] risk-free [offset]: kept posId=${best.id} @${best.openPrice} sl=${sl} (pips=${pips})`);
-    }
-    res.json({ ok: true, bestPositionId: best.id, sl, mode, pips, wickBufferPips: wickBuffer, closedCount: others.length });
+    console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl} (pips=${pips})`);
+    res.json({ ok: true, bestPositionId: best.id, sl, pips, closedCount: others.length });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }

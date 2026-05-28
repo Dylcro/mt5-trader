@@ -356,8 +356,6 @@ export default function PositionsScreen() {
                       onRiskFree={riskFree}
                       onCloseZone={closeZone}
                       riskFreePips={cs.riskFreePips}
-                      riskFreeUseWick={cs.riskFreeUseWick}
-                      riskFreeWickBufferPips={cs.riskFreeWickBufferPips}
                     />
                   ))}
                 </View>
