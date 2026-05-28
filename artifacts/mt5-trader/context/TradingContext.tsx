@@ -810,6 +810,33 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       // Refresh in background — don't delay success feedback
       void Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
 
+      // Persist "last used" cascade defaults so the Apple Watch companion can
+      // fire BUY/SELL with the same lot + TP geometry the user just used on
+      // the phone. Pip offsets are derived from the absolute TP prices and the
+      // anchor (live market at user tap). Fire-and-forget — never blocks UI.
+      if (placed > 0 && !params.existingPositionId && params.anchorPrice && params.anchorPrice > 0) {
+        const PIP = 0.10;
+        const sign = params.direction === "buy" ? 1 : -1;
+        const toPips = (px: number | undefined): number => {
+          if (px == null || !Number.isFinite(px)) return 0;
+          return Math.max(0, Math.round(((px - params.anchorPrice!) * sign) / PIP));
+        };
+        const slPips = Math.max(1, Math.round(Math.abs(params.anchorPrice - params.stopLoss) / PIP));
+        const payload = {
+          lotSize: params.volume,
+          tp1Pips: toPips(params.tp1Price),
+          tp2Pips: toPips(params.tp2Price),
+          tp3Pips: toPips(params.tp3Price),
+          tp4Pips: toPips(params.tp4Price), // 0 = manual close
+          slPips,
+        };
+        void authFetch(`${API_BASE}/mt5/user/trade-defaults`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        }).catch(() => { /* best effort */ });
+      }
+
       if (placed === 0) {
         return { success: false, placed, failed, message: errors[0] ?? "All orders failed to place" };
       }
