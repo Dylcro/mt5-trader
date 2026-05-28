@@ -692,7 +692,82 @@ export default function SettingsScreen() {
             </Pressable>
           </View>
 
-          {/* TP levels are now per-trade absolute prices typed on the Trade tab. */}
+          {/* Zone Take Profit pip distances — applied to every cascade until changed. */}
+          <View style={styles.cascadeCard}>
+            <View style={styles.cascadeCardHeader}>
+              <Feather name="target" size={16} color={C.gold} />
+              <Text style={styles.cascadeCardTitle}>Zone Take Profit</Text>
+              <View style={styles.sourceBadge}>
+                <Text style={styles.sourceBadgeText}>IN-APP</Text>
+              </View>
+            </View>
+            <Text style={styles.cascadeCardDesc}>
+              Pip distances from the cascade market entry for each take-profit. Each TP closes 25% of the surviving best entry. Set TP4 to 0 to leave the final 25% open for manual close. These are saved once and used for every cascade until you change them.
+            </Text>
+
+            <View style={styles.cascadeDivider} />
+
+            <SliderSetting
+              label="TP1"
+              value={cs.tp1Pips}
+              min={1}
+              max={200}
+              step={1}
+              onChange={(v) => updateSettings({ tp1Pips: v })}
+              displayValue={`${cs.tp1Pips} pips`}
+              hint={`Close 25% at ${(cs.tp1Pips * 0.10).toFixed(2)} from entry`}
+            />
+
+            <View style={styles.cascadeDivider} />
+
+            <SliderSetting
+              label="TP2"
+              value={cs.tp2Pips}
+              min={1}
+              max={500}
+              step={1}
+              onChange={(v) => updateSettings({ tp2Pips: v })}
+              displayValue={`${cs.tp2Pips} pips`}
+              hint={`Close 25% at ${(cs.tp2Pips * 0.10).toFixed(2)}; SL moves to break-even and pending limits are cancelled`}
+            />
+
+            <View style={styles.cascadeDivider} />
+
+            <SliderSetting
+              label="TP3"
+              value={cs.tp3Pips}
+              min={1}
+              max={1000}
+              step={1}
+              onChange={(v) => updateSettings({ tp3Pips: v })}
+              displayValue={`${cs.tp3Pips} pips`}
+              hint={`Close 25% at ${(cs.tp3Pips * 0.10).toFixed(2)} from entry`}
+            />
+
+            <View style={styles.cascadeDivider} />
+
+            <SliderSetting
+              label="TP4 (0 = leave open)"
+              value={cs.tp4Pips}
+              min={0}
+              max={2000}
+              step={1}
+              onChange={(v) => updateSettings({ tp4Pips: v })}
+              displayValue={cs.tp4Pips > 0 ? `${cs.tp4Pips} pips` : "Open / manual"}
+              hint={cs.tp4Pips > 0
+                ? `Close the final 25% at ${(cs.tp4Pips * 0.10).toFixed(2)} from entry`
+                : "Final 25% stays open — you close it manually whenever you like"}
+            />
+
+            {(cs.tp2Pips <= cs.tp1Pips || cs.tp3Pips <= cs.tp2Pips || (cs.tp4Pips > 0 && cs.tp4Pips <= cs.tp3Pips)) && (
+              <View style={styles.cascadeWarningBox}>
+                <Feather name="alert-triangle" size={14} color="#f59e0b" />
+                <Text style={styles.cascadeWarningText}>
+                  TP levels must be strictly increasing (TP1 &lt; TP2 &lt; TP3, and TP4 either 0 or &gt; TP3).
+                </Text>
+              </View>
+            )}
+          </View>
 
           {/* Help & Support */}
           <Pressable

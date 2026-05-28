@@ -355,42 +355,14 @@ export default function TradeScreen() {
     void AsyncStorage.setItem(LOT_SIZE_CASCADE_KEY, String(v));
   }, []);
 
-  // Per-trade absolute TP prices. TP1-3 required, TP4 optional (0 = manual close).
-  // Auto-seeded from live price when blank — see effect below.
-  const [tp1Price, setTp1Price] = useState<number>(0);
-  const [tp2Price, setTp2Price] = useState<number>(0);
-  const [tp3Price, setTp3Price] = useState<number>(0);
-  const [tp4Price, setTp4Price] = useState<number>(0);
-  const tpPricesRef = useRef({ tp1: tp1Price, tp2: tp2Price, tp3: tp3Price, tp4: tp4Price });
-  useEffect(() => {
-    tpPricesRef.current = { tp1: tp1Price, tp2: tp2Price, tp3: tp3Price, tp4: tp4Price };
-  }, [tp1Price, tp2Price, tp3Price, tp4Price]);
-  useEffect(() => {
-    // Auto-suggest sensible TP defaults seeded from the current price.
-    // BUY → ladder above the ask; SELL → ladder below the bid. Only fill blanks
-    // (0) so user edits aren't overwritten.
-    const p = priceRef.current;
-    if (!p) return;
-    const seed = cascadeDirection === "buy" ? p.ask : p.bid;
-    if (!(seed > 0)) return;
-    const sign = cascadeDirection === "buy" ? 1 : -1;
-    const round2 = (v: number) => parseFloat(v.toFixed(2));
-    if (tp1Price <= 0) setTp1Price(round2(seed + sign * 20 * 0.10));
-    if (tp2Price <= 0) setTp2Price(round2(seed + sign * 50 * 0.10));
-    if (tp3Price <= 0) setTp3Price(round2(seed + sign * 90 * 0.10));
-    // TP4 deliberately left at 0 = manual.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cascadeDirection, price?.ask, price?.bid]);
-  // Validation: TP1<TP2<TP3 (BUY) on profitable side; TP4 optional & must extend.
-  const tpAnchor = cascadeDirection === "buy" ? (price?.ask ?? 0) : (price?.bid ?? 0);
-  const cmpTp = cascadeDirection === "buy"
-    ? (a: number, b: number) => a > b
-    : (a: number, b: number) => a < b;
-  const tpPricesValid =
-    tp1Price > 0 && tp2Price > 0 && tp3Price > 0 &&
-    (tpAnchor <= 0 || cmpTp(tp1Price, tpAnchor)) &&
-    cmpTp(tp2Price, tp1Price) && cmpTp(tp3Price, tp2Price) &&
-    (tp4Price <= 0 || cmpTp(tp4Price, tp3Price));
+  // Zone TPs are configured globally in Settings as pip distances. At submit
+  // time we convert them to absolute prices from the live market entry.
+  // tp4Pips = 0 means "leave the final 25% open / manual close".
+  const tpPipsValid =
+    cascadeSettings.tp1Pips > 0 &&
+    cascadeSettings.tp2Pips > cascadeSettings.tp1Pips &&
+    cascadeSettings.tp3Pips > cascadeSettings.tp2Pips &&
+    (cascadeSettings.tp4Pips === 0 || cascadeSettings.tp4Pips > cascadeSettings.tp3Pips);
 
   const [isPlacing, setIsPlacing] = useState(false);
 
@@ -614,17 +586,16 @@ export default function TradeScreen() {
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
     console.log("[cascade] placing dir=" + dir + " vol=" + String(cascadeLotSize) + " entries=[" + levels.limitEntries.join(",") + "] sl=" + String(levels.stopLoss));
     try {
-      const tps = tpPricesRef.current;
-      // Re-validate at submit time (state may have changed since render).
-      const cmpFn = dir === "buy" ? (a: number, b: number) => a > b : (a: number, b: number) => a < b;
-      const tpsOk =
-        tps.tp1 > 0 && tps.tp2 > 0 && tps.tp3 > 0 &&
-        cmpFn(tps.tp1, mktPrice) && cmpFn(tps.tp2, tps.tp1) && cmpFn(tps.tp3, tps.tp2) &&
-        (tps.tp4 <= 0 || cmpFn(tps.tp4, tps.tp3));
-      if (!tpsOk) {
+      // Read current pip distances from Settings and convert to absolute prices
+      // based on the live cascade entry. tp4Pips = 0 → leave the last 25% open.
+      const { tp1Pips, tp2Pips, tp3Pips, tp4Pips } = cs;
+      const pipsOk =
+        tp1Pips > 0 && tp2Pips > tp1Pips && tp3Pips > tp2Pips &&
+        (tp4Pips === 0 || tp4Pips > tp3Pips);
+      if (!pipsOk) {
         isPlacingRef.current = false;
         setIsPlacing(false);
-        Alert.alert("Invalid TP Prices", `Set TP1, TP2 and TP3 on the profitable side of the entry, in strictly ${dir === "buy" ? "ascending" : "descending"} order. TP4 is optional.`);
+        Alert.alert("Invalid TP Settings", "Open Settings → Zone Take Profit and make sure TP1 < TP2 < TP3 (and TP4 if used).");
         return;
       }
       if (cascadeLotSize < 0.04) {
@@ -633,15 +604,19 @@ export default function TradeScreen() {
         Alert.alert("Lot Too Small", "Cascade lot size must be at least 0.04 — the zone closes 25% of the best entry at each of TP1-4, which requires 4 × 0.01 broker minimum.");
         return;
       }
+      const PIP = 0.10;
+      const sign = dir === "buy" ? 1 : -1;
+      const round2 = (v: number) => parseFloat(v.toFixed(2));
+      const tp1Price = round2(mktPrice + sign * tp1Pips * PIP);
+      const tp2Price = round2(mktPrice + sign * tp2Pips * PIP);
+      const tp3Price = round2(mktPrice + sign * tp3Pips * PIP);
+      const tp4Price = tp4Pips > 0 ? round2(mktPrice + sign * tp4Pips * PIP) : undefined;
       const result = await placeCascadeOrders({
         direction: dir,
         volume: cascadeLotSize,
         limitEntries: levels.limitEntries,
         stopLoss: levels.stopLoss,
-        tp1Price: tps.tp1,
-        tp2Price: tps.tp2,
-        tp3Price: tps.tp3,
-        tp4Price: tps.tp4 > 0 ? tps.tp4 : undefined,
+        tp1Price, tp2Price, tp3Price, tp4Price,
         anchorPrice: mktPrice,
       });
       console.log("[cascade] done placed=" + String(result.placed) + " failed=" + String(result.failed) + " success=" + String(result.success) + " msg=" + result.message);
@@ -889,37 +864,35 @@ export default function TradeScreen() {
               <StepInput value={cascadeLotSize} onChange={setCascadeLotSize} step={0.01} min={0.01} max={100} decimals={2} />
             </View>
 
-            {/* Per-trade absolute TP prices. TP1-3 required, TP4 optional. */}
+            {/* Zone TP summary — sourced from Settings. Read-only here. */}
             <View style={styles.sectionCard}>
               <View style={styles.sectionHeader}>
-                <Text style={styles.sectionTitle}>Take Profit Prices</Text>
-                <Text style={styles.sectionHint}>
-                  {cascadeDirection === "buy" ? "Above entry" : "Below entry"}
-                </Text>
+                <Text style={styles.sectionTitle}>Zone Take Profits</Text>
+                <Text style={styles.sectionHint}>From Settings</Text>
               </View>
-              <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
-                <View style={{ flex: 1 }}>
-                  <Text style={[styles.cascadeSummaryLabel, { marginBottom: 6 }]}>TP1 PRICE</Text>
-                  <StepInput value={tp1Price} onChange={setTp1Price} step={0.10} min={0} max={100000} decimals={2} />
+              <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
+                <View style={{ flex: 1, minWidth: 120 }}>
+                  <Text style={[styles.cascadeSummaryLabel, { marginBottom: 4 }]}>TP1</Text>
+                  <Text style={styles.cascadeSummaryValue}>{cascadeSettings.tp1Pips} pips</Text>
                 </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={[styles.cascadeSummaryLabel, { marginBottom: 6 }]}>TP2 PRICE</Text>
-                  <StepInput value={tp2Price} onChange={setTp2Price} step={0.10} min={0} max={100000} decimals={2} />
+                <View style={{ flex: 1, minWidth: 120 }}>
+                  <Text style={[styles.cascadeSummaryLabel, { marginBottom: 4 }]}>TP2</Text>
+                  <Text style={styles.cascadeSummaryValue}>{cascadeSettings.tp2Pips} pips</Text>
                 </View>
-              </View>
-              <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
-                <View style={{ flex: 1 }}>
-                  <Text style={[styles.cascadeSummaryLabel, { marginBottom: 6 }]}>TP3 PRICE</Text>
-                  <StepInput value={tp3Price} onChange={setTp3Price} step={0.10} min={0} max={100000} decimals={2} />
+                <View style={{ flex: 1, minWidth: 120 }}>
+                  <Text style={[styles.cascadeSummaryLabel, { marginBottom: 4 }]}>TP3</Text>
+                  <Text style={styles.cascadeSummaryValue}>{cascadeSettings.tp3Pips} pips</Text>
                 </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={[styles.cascadeSummaryLabel, { marginBottom: 6 }]}>TP4 PRICE (opt)</Text>
-                  <StepInput value={tp4Price} onChange={setTp4Price} step={0.10} min={0} max={100000} decimals={2} />
+                <View style={{ flex: 1, minWidth: 120 }}>
+                  <Text style={[styles.cascadeSummaryLabel, { marginBottom: 4 }]}>TP4</Text>
+                  <Text style={styles.cascadeSummaryValue}>
+                    {cascadeSettings.tp4Pips > 0 ? `${cascadeSettings.tp4Pips} pips` : "Open"}
+                  </Text>
                 </View>
               </View>
-              {!tpPricesValid && (
+              {!tpPipsValid && (
                 <Text style={[styles.sectionHint, { color: C.sell, marginTop: 8 }]}>
-                  TP1, TP2, TP3 must be {cascadeDirection === "buy" ? "above the ask in ascending" : "below the bid in descending"} order. TP4 optional, must extend further.
+                  TP pip levels must be strictly increasing (TP1 &lt; TP2 &lt; TP3, TP4 either 0 or &gt; TP3). Fix in Settings.
                 </Text>
               )}
               {cascadeLotSize < 0.04 && (
