@@ -1831,21 +1831,27 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       const allLiveIds = new Set(allLive.map(p => p.id));
       for (const zp of zps) {
         if (!allLiveIds.has(zp.positionId)) {
-          await db.update(zonePositionsTable)
-            .set({ status: "CLOSED" })
-            .where(and(
-              eq(zonePositionsTable.zoneId, zoneId),
-              eq(zonePositionsTable.positionId, zp.positionId),
-              eq(zonePositionsTable.status, "OPEN"),
-            ));
+          await withDbRetry(`evalZone.reconcileClose zone=${zoneId} posId=${zp.positionId}`,
+            () => db.update(zonePositionsTable)
+              .set({ status: "CLOSED" })
+              .where(and(
+                eq(zonePositionsTable.zoneId, zoneId),
+                eq(zonePositionsTable.positionId, zp.positionId),
+                eq(zonePositionsTable.status, "OPEN"),
+              ))
+          ).catch(() => {/* logged inside withDbRetry */});
         }
       }
-      const stillOpen = await db.select().from(zonePositionsTable)
-        .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
-      if (stillOpen.length === 0) {
-        await db.update(cascadeZonesTable)
-          .set({ status: "CLOSED", closedAt: Date.now() })
-          .where(eq(cascadeZonesTable.zoneId, zoneId));
+      const stillOpen = await withDbRetry(`evalZone.reconcileOpenCheck zone=${zoneId}`,
+        () => db.select().from(zonePositionsTable)
+          .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
+      ).catch(() => null);
+      if (stillOpen && stillOpen.length === 0) {
+        await withDbRetry(`evalZone.reconcileZoneClose zone=${zoneId}`,
+          () => db.update(cascadeZonesTable)
+            .set({ status: "CLOSED", closedAt: Date.now() })
+            .where(eq(cascadeZonesTable.zoneId, zoneId))
+        ).catch(() => {/* logged inside withDbRetry */});
         st.status = "CLOSED";
         console.log(`[zone ${zoneId}] reconciliation: no live tracked positions — zone CLOSED`);
       }
