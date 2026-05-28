@@ -1193,6 +1193,10 @@ interface ZoneState {
 export const ZONE_RISK_FREE_PIPS   = 10;
 const ZONE_CASHOUT_PIPS_DEFAULT = 5;   // anchor + 5p covers spread
 const ZONE_MIN_LOT_PER_ENTRY    = 0.04; // 4 × 0.01 broker minimum for 25% slices
+// How close (in pips) price must come to a TP target before the engine fires
+// the partial close. Lets TPs trigger through the broker spread instead of
+// requiring the comparison side to print the exact level.
+const ZONE_TP_TOLERANCE_PIPS    = 3;
 
 // Pure helper: compute the "risk free" stop-loss price for a zone's surviving
 // entry. The PROTECTIVE stop sits on the LOSING side of the entry by `pips`
@@ -1597,7 +1601,14 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     // For BUY closes use bid; for SELL closes use ask. Skip if anchor is invalid.
     if (!(st.anchorPrice > 0)) return;
     const cmpPrice = st.direction === "buy" ? price.bid : price.ask;
-    const hit = (tp: number) => st.direction === "buy" ? cmpPrice >= tp : cmpPrice <= tp;
+    // Spread/slippage tolerance: fire TP when price comes within
+    // ZONE_TP_TOLERANCE_PIPS of the target on the profitable side. Without
+    // this, a TP set at the exact bid/ask never triggers because the broker's
+    // spread keeps the comparison side just shy of the level (e.g. user sets
+    // TP1 at 2400.00, bid peaks at 2399.94 due to 6-pip spread, and the close
+    // never fires). 3 pips is a typical XAUUSD spread + a small slippage buffer.
+    const tol = ZONE_TP_TOLERANCE_PIPS * PIP;
+    const hit = (tp: number) => st.direction === "buy" ? cmpPrice >= (tp - tol) : cmpPrice <= (tp + tol);
 
     // No auto cashout — the user closes upper entries manually if they want.
     // All four cascade orders share the same SL and TP1-4 (set broker-side at
