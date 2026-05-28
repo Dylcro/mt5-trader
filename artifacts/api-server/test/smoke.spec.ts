@@ -48,8 +48,10 @@ const DEMO_PLATFORM = process.env.DEMO_MT5_PLATFORM ?? "mt5";
 // Scenario 1 — Public endpoints
 // ──────────────────────────────────────────────────────────────────────────────
 
-test("Public: GET /healthz → 200 {status:'ok'}", async ({ request }) => {
-  const r = await request.get("/healthz");
+test("Public: GET /api/healthz → 200 {status:'ok'}", async ({ request }) => {
+  // Note: bare /healthz is intercepted by Replit's CDN layer (reserved probe
+  // path). The same handler is reachable at /api/healthz via the routed prefix.
+  const r = await request.get("/api/healthz");
   expect(r.ok()).toBe(true);
   const body = await r.json() as { status: string };
   expect(body.status).toBe("ok");
