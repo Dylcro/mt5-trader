@@ -417,6 +417,38 @@ function broadcastZoneUpdate(zoneId: string): void {
   });
 }
 
+// ── Stream-health tracking ──────────────────────────────────────────────────
+// Records the ms timestamp of the most-recent streaming event received per
+// account (price tick, deal, order lifecycle). Cleared on clean disconnect /
+// stop so wedged-but-connected streams are the only ones that go stale.
+// The /healthz endpoint reads this map to decide 200 vs 503.
+const lastEventAt = new Map<string, number>();
+
+/** Freshness window — default 60 s; override with STREAM_FRESHNESS_MS env var. */
+const STREAM_FRESHNESS_MS = Number(process.env["STREAM_FRESHNESS_MS"] ?? 60_000);
+
+export interface StreamHealthAccount {
+  accountId: string;
+  silentForSec: number;
+  stale: boolean;
+}
+
+/** Returns the health of every currently-tracked streaming account.
+ *  Empty map (no accounts) → healthy.
+ *  Any account silent for > STREAM_FRESHNESS_MS → unhealthy. */
+export function getStreamHealth(): { healthy: boolean; accounts: StreamHealthAccount[] } {
+  if (lastEventAt.size === 0) return { healthy: true, accounts: [] };
+  const now = Date.now();
+  let healthy = true;
+  const accounts: StreamHealthAccount[] = [];
+  for (const [accountId, ts] of lastEventAt.entries()) {
+    const silentForSec = Math.round((now - ts) / 1000);
+    const stale = now - ts > STREAM_FRESHNESS_MS;
+    if (stale) healthy = false;
+    accounts.push({ accountId, silentForSec, stale });
+  }
+  return { healthy, accounts };
+}
 
 // Tracks positionIds that have already been auto-cascaded (per account).
 // Persisted to the cascade_history table so it survives server restarts —
@@ -524,6 +556,7 @@ function handleStreamingTick(accountId: string, price: any): void {
   // Cache the tick so latestPrice() / candle builders stay current even when
   // the mobile app isn't polling /price (e.g. backgrounded).
   storeTick(accountId, bid, ask);
+  lastEventAt.set(accountId, Date.now());
   broadcastToAccount(accountId, "price", { bid, ask });
   // Trigger evaluateZone for any OPEN zone on this account, throttled.
   let token: string;
@@ -550,6 +583,7 @@ function makeDealListener(accountId: string) {
       syncReadyAt.delete(accountId);
       skipLogged.delete(accountId);
       activeStreams.delete(accountId);
+      lastEventAt.delete(accountId); // clean disconnect — don't leave a stale entry
       // NOTE: intentionally NOT clearing activeConnections here.
       // The old connection's terminalState (in-memory cache) stays intact
       // across brief disconnects — positions synced before the drop are
@@ -573,6 +607,7 @@ function makeDealListener(accountId: string) {
     },
     // onDealsSynchronized fires after all historical deals have been replayed.
     async onDealsSynchronized(_instanceIndex: string, _synchronizationId: string): Promise<void> {
+      lastEventAt.set(accountId, Date.now());
       if (!syncReady.has(accountId)) {
         syncReady.add(accountId);
         syncReadyAt.set(accountId, Date.now());
@@ -587,6 +622,7 @@ function makeDealListener(accountId: string) {
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async onDealAdded(_instanceIndex: string, deal: any): Promise<void> {
+      lastEventAt.set(accountId, Date.now());
       // Zone cleanup: an exit deal may be a partial or full close — the helper
       // re-checks live positions via REST before marking the row CLOSED.
       if (deal?.entryType === "DEAL_ENTRY_OUT") {
@@ -679,14 +715,17 @@ function makeDealListener(accountId: string) {
     // without waiting for a deal event or the next poll cycle.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async onPendingOrderAdded(_instanceIndex: string, _order: any): Promise<void> {
+      lastEventAt.set(accountId, Date.now());
       broadcastToAccount(accountId, "pending_order", {});
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async onPendingOrderUpdated(_instanceIndex: string, _order: any): Promise<void> {
+      lastEventAt.set(accountId, Date.now());
       broadcastToAccount(accountId, "pending_order", {});
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async onPendingOrderCompleted(_instanceIndex: string, _order: any): Promise<void> {
+      lastEventAt.set(accountId, Date.now());
       broadcastToAccount(accountId, "pending_order", {});
     },
   };
@@ -713,6 +752,7 @@ async function stopStreaming(accountId: string): Promise<void> {
   activeRegions.delete(accountId);
   syncReady.delete(accountId);
   syncReadyAt.delete(accountId);
+  lastEventAt.delete(accountId);
   // Do NOT delete cascadeConfigs here — config is persistent settings, not stream state.
   const pending = recoveryTimers.get(accountId);
   if (pending) {
