@@ -40,6 +40,7 @@ interface ZoneCardProps {
     zoneId: string,
     opts?: { riskFreePips?: number; useWick?: boolean; wickBufferPips?: number },
   ) => Promise<{ ok: boolean; message?: string }>;
+  onCloseZone?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
   riskFreePips?: number;
   riskFreeUseWick?: boolean;
   riskFreeWickBufferPips?: number;
@@ -47,11 +48,12 @@ interface ZoneCardProps {
 }
 
 export default function ZoneCard({
-  zone, onRiskFree, riskFreePips, riskFreeUseWick, riskFreeWickBufferPips,
+  zone, onRiskFree, onCloseZone, riskFreePips, riskFreeUseWick, riskFreeWickBufferPips,
   historical = false,
 }: ZoneCardProps) {
   const isBuy = zone.direction === "buy";
   const [busy, setBusy] = useState(false);
+  const [closeBusy, setCloseBusy] = useState(false);
 
   // One-tap: no confirm dialog. The button fires the API call immediately
   // and only surfaces an alert if the operation FAILS.
@@ -83,6 +85,46 @@ export default function ZoneCard({
 
   const canRiskFree =
     !historical && zone.status === "OPEN" && zone.positionCount >= 1 && !!onRiskFree;
+  // Close Zone is allowed for any non-historical, non-closed zone that still
+  // has at least one tracked position. We allow it on RISK_FREE zones too —
+  // the user might want to bail out completely even after going risk-free.
+  const canCloseZone =
+    !historical && zone.status !== "CLOSED" && zone.positionCount >= 1 && !!onCloseZone;
+
+  const handleCloseZone = async () => {
+    if (!onCloseZone || closeBusy) return;
+    // Destructive — always confirm. One-tap is fine for Risk Free (defensive)
+    // but full close needs an explicit "yes" so a mis-tap doesn't blow away
+    // a partially-profitable zone.
+    const confirmMsg = `Close ${zone.positionCount} ${zone.positionCount === 1 ? "position" : "positions"} in this ${isBuy ? "BUY" : "SELL"} zone? Pending limit orders will also be cancelled. This cannot be undone.`;
+    const confirmed = await new Promise<boolean>((resolve) => {
+      if (Platform.OS === "web" && typeof window !== "undefined") {
+        resolve(window.confirm(confirmMsg));
+        return;
+      }
+      Alert.alert("Close zone?", confirmMsg, [
+        { text: "Cancel", style: "cancel", onPress: () => resolve(false) },
+        { text: "Close zone", style: "destructive", onPress: () => resolve(true) },
+      ]);
+    });
+    if (!confirmed) return;
+
+    setCloseBusy(true);
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    const result = await onCloseZone(zone.zoneId);
+    setCloseBusy(false);
+    if (result.ok) {
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      return;
+    }
+    await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    const errMsg = result.message ?? "Please try again.";
+    if (Platform.OS === "web" && typeof window !== "undefined") {
+      window.alert(`Couldn't close zone\n\n${errMsg}`);
+    } else {
+      Alert.alert("Couldn't close zone", errMsg);
+    }
+  };
 
   return (
     <View style={[styles.card, historical && { opacity: 0.85 }]}>
@@ -190,25 +232,51 @@ export default function ZoneCard({
         </View>
       )}
 
-      {canRiskFree && (
-        <Pressable
-          style={({ pressed }) => [
-            styles.rfBtn,
-            pressed && { opacity: 0.75 },
-            busy && { opacity: 0.5 },
-          ]}
-          onPress={handleRiskFree}
-          disabled={busy}
-        >
-          {busy ? (
-            <ActivityIndicator size="small" color={C.gold} />
-          ) : (
-            <>
-              <Feather name="shield" size={13} color={C.gold} />
-              <Text style={styles.rfBtnText}>Risk Free</Text>
-            </>
+      {(canRiskFree || canCloseZone) && (
+        <View style={styles.actionRow}>
+          {canRiskFree && (
+            <Pressable
+              style={({ pressed }) => [
+                styles.rfBtn,
+                { flex: 1 },
+                pressed && { opacity: 0.75 },
+                busy && { opacity: 0.5 },
+              ]}
+              onPress={handleRiskFree}
+              disabled={busy || closeBusy}
+            >
+              {busy ? (
+                <ActivityIndicator size="small" color={C.gold} />
+              ) : (
+                <>
+                  <Feather name="shield" size={13} color={C.gold} />
+                  <Text style={styles.rfBtnText}>Risk Free</Text>
+                </>
+              )}
+            </Pressable>
           )}
-        </Pressable>
+          {canCloseZone && (
+            <Pressable
+              style={({ pressed }) => [
+                styles.closeBtn,
+                { flex: 1 },
+                pressed && { opacity: 0.75 },
+                closeBusy && { opacity: 0.5 },
+              ]}
+              onPress={handleCloseZone}
+              disabled={closeBusy || busy}
+            >
+              {closeBusy ? (
+                <ActivityIndicator size="small" color={C.sell} />
+              ) : (
+                <>
+                  <Feather name="x-octagon" size={13} color={C.sell} />
+                  <Text style={styles.closeBtnText}>Close Zone</Text>
+                </>
+              )}
+            </Pressable>
+          )}
+        </View>
       )}
     </View>
   );
@@ -369,6 +437,10 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_500Medium",
     color: C.textMuted,
   },
+  actionRow: {
+    flexDirection: "row",
+    gap: 8,
+  },
   rfBtn: {
     flexDirection: "row",
     alignItems: "center",
@@ -384,6 +456,23 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontFamily: "Inter_700Bold",
     color: C.gold,
+    letterSpacing: 0.3,
+  },
+  closeBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    paddingVertical: 9,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: C.sell,
+    backgroundColor: "rgba(229,57,53,0.08)",
+  },
+  closeBtnText: {
+    fontSize: 13,
+    fontFamily: "Inter_700Bold",
+    color: C.sell,
     letterSpacing: 0.3,
   },
 });

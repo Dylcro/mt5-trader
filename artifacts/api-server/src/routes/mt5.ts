@@ -2346,6 +2346,80 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
   }
 });
 
+// POST /api/mt5/account/:accountId/zones/:zoneId/close
+// User-initiated full close: cancels any outstanding cascade limit orders,
+// market-closes every tracked open position in the zone, then marks the
+// zone CLOSED. Intended as an "I'm done with this zone" escape hatch when
+// the user wants out regardless of TP progress or PnL. The 3-second
+// zone-monitor tick will also notice the empty position set and tidy up,
+// but doing it inline keeps the UI snappy and the limit-order cleanup
+// deterministic from the user's point of view.
+router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (req: Request, res: Response) => {
+  const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
+  try {
+    const token = getToken();
+    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
+    // In-memory first; DB fallback so a missed hydration doesn't 404 a live zone.
+    let st = zoneStates.get(zoneId);
+    if (!st || st.accountId !== accountId) {
+      const [zr] = await db.select().from(cascadeZonesTable)
+        .where(and(eq(cascadeZonesTable.zoneId, zoneId), eq(cascadeZonesTable.accountId, accountId)))
+        .limit(1);
+      if (!zr) { res.status(404).json({ error: "Zone not found" }); return; }
+      if (zr.status === "CLOSED") {
+        // Idempotent: already closed → treat as success so the UI's optimistic
+        // refresh doesn't show a spurious failure if the monitor beat us to it.
+        res.json({ ok: true, closedCount: 0, alreadyClosed: true });
+        return;
+      }
+    } else if (st.status === "CLOSED") {
+      res.json({ ok: true, closedCount: 0, alreadyClosed: true });
+      return;
+    }
+
+    // Cancel pending cascade limits FIRST. If we closed positions first and
+    // then a cancel failed, the user would be left with un-anchored limits
+    // that could open new entries into a "closed" zone. Cancel-first ordering
+    // means the worst case is "limits gone, some positions still open" — much
+    // easier to retry from than the inverse.
+    await cancelZoneLimits(token, region, accountId, zoneId);
+
+    // Collect tracked open positions from DB (source of truth for zone
+    // membership) and intersect with what the broker actually has open.
+    const zps = await db.select().from(zonePositionsTable)
+      .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
+    const trackedIds = new Set(zps.map(z => z.positionId));
+    const live = (await fetchOpenPositions(token, region, accountId)).filter(p => trackedIds.has(p.id));
+
+    const failed: string[] = [];
+    for (const p of live) {
+      const ok = await closeZonePosition(token, region, accountId, p.id);
+      if (!ok) failed.push(p.id);
+    }
+
+    if (failed.length > 0) {
+      console.warn(`[zone ${zoneId}] close: failedCloses=${failed.length}/${live.length}`);
+      res.status(207).json({
+        ok: false,
+        closedCount: live.length - failed.length,
+        failedPositionIds: failed,
+        message: "Some positions failed to close — zone NOT marked closed. Retry to clear remaining.",
+      });
+      return;
+    }
+
+    // All closes succeeded → flip the zone to CLOSED and clear in-memory state.
+    await db.update(cascadeZonesTable)
+      .set({ status: "CLOSED", closedAt: Date.now() })
+      .where(eq(cascadeZonesTable.zoneId, zoneId));
+    if (st) st.status = "CLOSED";
+    console.log(`[zone ${zoneId}] close: user-initiated, closedCount=${live.length}`);
+    res.json({ ok: true, closedCount: live.length });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 // GET /api/mt5/my-account — returns the accountId bound to the authenticated user
 router.get("/mt5/my-account", async (req: Request, res: Response) => {
   const userId = (req as Record<string, unknown>)["userId"] as string;
