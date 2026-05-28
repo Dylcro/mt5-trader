@@ -12,8 +12,6 @@ Each needs its own focused migration task.
 
 | Package | Pinned | Latest | Reason |
 |---------|--------|--------|--------|
-| `vite` | 7.x | 8.x | Vite 8 drops several plugin APIs and changes the dev-server startup contract. Upgrade together with `@vitejs/plugin-react`. |
-| `@vitejs/plugin-react` | 5.x | 6.x | v6 requires Vite 8. Upgrade together with `vite`. |
 | `zod` | 3.x | 4.x | Zod 4 is a complete API redesign (`z.string().email()` → `z.email()`, etc.). All schemas in `lib/api-zod`, `lib/db`, and everywhere `zod` is imported need migration. |
 | `zod-validation-error` | 3.x | 5.x | API changes alongside Zod 4. Migrate together with `zod`. |
 | `typescript` | 5.x | 6.x | TypeScript 6 introduces stricter rules that surface new errors in the existing codebase. Needs a dedicated audit. |
