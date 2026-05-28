@@ -98,13 +98,17 @@ test("Auth: register → login → auth-guarded cascade-config round-trip", asyn
   expect(bad.status()).toBe(401);
 
   // Auth-guarded route: cascade config must include expected trading fields
+  // Exact shape from CASCADE_DEFAULTS in src/routes/mt5.ts
   const cfg = await request.get("/api/cascade-config", {
     headers: { Authorization: `Bearer ${token}` },
   });
   expect(cfg.status()).toBe(200);
   const cfgBody = await cfg.json() as Record<string, unknown>;
-  expect(cfgBody).toHaveProperty("lots");
-  expect(cfgBody).toHaveProperty("tpLevels");
+  expect(cfgBody).toHaveProperty("enabled");
+  expect(cfgBody).toHaveProperty("numPositions");
+  expect(cfgBody).toHaveProperty("slPips");
+  expect(cfgBody).toHaveProperty("tp1Pips");
+  expect(cfgBody).toHaveProperty("pipsBetween");
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -120,8 +124,12 @@ test("Admin: /api/admin/status guards with key and returns telemetry shape", asy
   const r = await request.get(`/api/admin/status?key=${ADMIN_KEY}`);
   expect(r.status()).toBe(200);
   const body = await r.json() as Record<string, unknown>;
-  expect(body).toHaveProperty("accounts");
-  expect(body).toHaveProperty("recentEvents");
+  // Exact fields from src/routes/admin.ts: { ts, streams, zones, recentTradeFailures, recentRateLimits }
+  expect(body).toHaveProperty("ts");
+  expect(body).toHaveProperty("streams");
+  expect(body).toHaveProperty("zones");
+  expect(body).toHaveProperty("recentTradeFailures");
+  expect(body).toHaveProperty("recentRateLimits");
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -217,21 +225,21 @@ test.describe("Cascade: end-to-end demo account flow", () => {
       { headers: { Authorization: `Bearer ${token}` } },
     );
 
-    // 200 = SL moved; 207 = partial (some positions failed but SL attempted);
-    // 400/409 = price not far enough / no open positions (acceptable in smoke)
-    expect([200, 207, 400, 409]).toContain(rf.status());
+    // 200 = SL moved successfully; 207 = partial (some closes failed but SL attempted);
+    // 409 = positions not yet filled (transient race on demo — tolerated in smoke).
+    // 400 is NOT accepted: that would indicate a request/logic error, not a timing issue.
+    expect([200, 207, 409]).toContain(rf.status());
 
-    if (rf.status() === 200) {
-      // Explicit SL verification: the response carries the new SL price
-      // and the position ID it was applied to.
+    if (rf.status() === 200 || rf.status() === 207) {
+      // Both 200 and 207 include sl + bestPositionId — use them for SL verification.
+      // 200 → ok: true, zone set to RISK_FREE.
+      // 207 → ok: false (partial failure), zone NOT set to RISK_FREE yet.
       const rfBody = await rf.json() as {
         ok: boolean;
         sl: number;
         bestPositionId: string;
-        pips: number;
-        closedCount: number;
+        slOk?: boolean;
       };
-      expect(rfBody.ok).toBe(true);
       expect(typeof rfBody.sl).toBe("number");
       expect(rfBody.sl).toBeGreaterThan(0);
       expect(typeof rfBody.bestPositionId).toBe("string");
@@ -247,8 +255,6 @@ test.describe("Cascade: end-to-end demo account flow", () => {
       const positions = await posR.json() as Array<{
         id: string;
         stopLoss?: number;
-        currentPrice?: number;
-        openPrice?: number;
       }>;
       const bestPos = positions.find((p) => p.id === riskFreeBestPosId);
       if (bestPos !== undefined) {
@@ -257,13 +263,16 @@ test.describe("Cascade: end-to-end demo account flow", () => {
         expect(Math.abs((bestPos.stopLoss ?? 0) - riskFreeSlPrice)).toBeLessThan(0.02);
       }
 
-      // Zone status must have transitioned to RISK_FREE in the database
-      const zonesR = await request.get(`/api/mt5/account/${accountId}/zones`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const zones = await zonesR.json() as Array<{ zoneId: string; status: string }>;
-      const zone = zones.find((z) => z.zoneId === zoneId);
-      expect(zone?.status).toBe("RISK_FREE");
+      if (rf.status() === 200) {
+        // Full success: zone must have transitioned to RISK_FREE in the database.
+        // (207 = partial failure; zone stays in its previous status until retry.)
+        const zonesR = await request.get(`/api/mt5/account/${accountId}/zones`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const zones = await zonesR.json() as Array<{ zoneId: string; status: string }>;
+        const zone = zones.find((z) => z.zoneId === zoneId);
+        expect(zone?.status).toBe("RISK_FREE");
+      }
     }
   });
 
