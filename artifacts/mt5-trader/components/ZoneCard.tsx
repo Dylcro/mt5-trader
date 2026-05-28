@@ -36,11 +36,15 @@ function TpChip({ label, hit }: { label: string; hit: boolean }) {
 
 interface ZoneCardProps {
   zone: Zone;
-  onRiskFree?: (zoneId: string) => Promise<{ ok: boolean; message?: string }>;
+  onRiskFree?: (
+    zoneId: string,
+    opts?: { riskFreePips?: number },
+  ) => Promise<{ ok: boolean; message?: string }>;
+  riskFreePips?: number;
   historical?: boolean;
 }
 
-export default function ZoneCard({ zone, onRiskFree, historical = false }: ZoneCardProps) {
+export default function ZoneCard({ zone, onRiskFree, riskFreePips, historical = false }: ZoneCardProps) {
   const isBuy = zone.direction === "buy";
   const [busy, setBusy] = useState(false);
 
@@ -50,7 +54,7 @@ export default function ZoneCard({ zone, onRiskFree, historical = false }: ZoneC
     if (!onRiskFree || busy) return;
     setBusy(true);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    const result = await onRiskFree(zone.zoneId);
+    const result = await onRiskFree(zone.zoneId, riskFreePips !== undefined ? { riskFreePips } : undefined);
     setBusy(false);
     if (result.ok) {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);

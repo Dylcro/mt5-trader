@@ -6,43 +6,87 @@ import {
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
-const EXPECTED_OFFSET = ZONE_RISK_FREE_PIPS * PIP;
+// `pips` is SIGNED: negative = drawdown side (protective), positive = profit side.
+// Default ZONE_RISK_FREE_PIPS is negative — protective is the conventional behaviour.
+const DEFAULT_ABS_OFFSET = Math.abs(ZONE_RISK_FREE_PIPS) * PIP;
+const DEFAULT_IS_PROTECTIVE = ZONE_RISK_FREE_PIPS < 0;
 
 describe("computeRiskFreeSl (POST /risk-free SL placement)", () => {
-  // Per spec: risk-free SL is PROTECTIVE — sits on the LOSING side of the
-  // entry so a reversal closes for ~10p loss instead of running through SL.
-  it("BUY: moves SL BELOW entry by exactly ZONE_RISK_FREE_PIPS * PIP", () => {
+  it("BUY default (negative pips → protective): SL sits BELOW entry", () => {
     const entry = 3120.55;
     const sl = computeRiskFreeSl("buy", entry);
+    expect(DEFAULT_IS_PROTECTIVE).toBe(true);
     expect(sl).toBeLessThan(entry);
-    expect(sl).toBeCloseTo(entry - EXPECTED_OFFSET, 2);
-    expect(entry - sl).toBeCloseTo(EXPECTED_OFFSET, 6);
+    expect(entry - sl).toBeCloseTo(DEFAULT_ABS_OFFSET, 6);
   });
 
-  it("SELL: moves SL ABOVE entry by exactly ZONE_RISK_FREE_PIPS * PIP", () => {
+  it("SELL default (negative pips → protective): SL sits ABOVE entry", () => {
     const entry = 3120.55;
     const sl = computeRiskFreeSl("sell", entry);
     expect(sl).toBeGreaterThan(entry);
-    expect(sl).toBeCloseTo(entry + EXPECTED_OFFSET, 2);
-    expect(sl - entry).toBeCloseTo(EXPECTED_OFFSET, 6);
+    expect(sl - entry).toBeCloseTo(DEFAULT_ABS_OFFSET, 6);
+  });
+
+  it("BUY with POSITIVE pips: SL sits ABOVE entry (profit lock)", () => {
+    const entry = 3000.00;
+    const sl = computeRiskFreeSl("buy", entry, 15);
+    expect(sl).toBeGreaterThan(entry);
+    expect(sl - entry).toBeCloseTo(15 * PIP, 6);
+  });
+
+  it("SELL with POSITIVE pips: SL sits BELOW entry (profit lock)", () => {
+    const entry = 3000.00;
+    const sl = computeRiskFreeSl("sell", entry, 15);
+    expect(sl).toBeLessThan(entry);
+    expect(entry - sl).toBeCloseTo(15 * PIP, 6);
+  });
+
+  it("zero pips: SL placed exactly at entry (true break-even)", () => {
+    const entry = 2987.42;
+    expect(computeRiskFreeSl("buy", entry, 0)).toBeCloseTo(entry, 2);
+    expect(computeRiskFreeSl("sell", entry, 0)).toBeCloseTo(entry, 2);
   });
 
   it("rounds to 2 decimal places (XAUUSD price precision)", () => {
-    const sl = computeRiskFreeSl("buy", 3120.5555);
+    const sl = computeRiskFreeSl("buy", 3120.5555, -10);
     expect(sl).toBe(parseFloat(sl.toFixed(2)));
   });
 
-  it("BUY and SELL are exact mirror images around the entry price", () => {
+  it("BUY and SELL with the same signed pips mirror around the entry price", () => {
     const entry = 2987.42;
-    const buySl = computeRiskFreeSl("buy", entry);
-    const sellSl = computeRiskFreeSl("sell", entry);
+    const buySl = computeRiskFreeSl("buy", entry, -10);
+    const sellSl = computeRiskFreeSl("sell", entry, -10);
     expect(entry - buySl).toBeCloseTo(sellSl - entry, 6);
   });
 
   it("honours a custom pip count when provided", () => {
     const entry = 3000.00;
-    const sl = computeRiskFreeSl("buy", entry, 25);
+    const sl = computeRiskFreeSl("buy", entry, -25);
     expect(sl).toBeCloseTo(entry - 25 * PIP, 2);
+  });
+});
+
+describe("sanitizeRiskFreePips", () => {
+  it("snaps to nearest 5-pip step inside -30..+30 range", async () => {
+    const { sanitizeRiskFreePips } = await import("../src/routes/mt5");
+    expect(sanitizeRiskFreePips(7)).toBe(5);
+    expect(sanitizeRiskFreePips(8)).toBe(10);
+    expect(sanitizeRiskFreePips(-12)).toBe(-10);
+    expect(sanitizeRiskFreePips(-13)).toBe(-15);
+  });
+
+  it("clamps to -30..+30 bounds", async () => {
+    const { sanitizeRiskFreePips } = await import("../src/routes/mt5");
+    expect(sanitizeRiskFreePips(99)).toBe(30);
+    expect(sanitizeRiskFreePips(-99)).toBe(-30);
+  });
+
+  it("falls back to default for non-numeric input", async () => {
+    const { sanitizeRiskFreePips } = await import("../src/routes/mt5");
+    expect(sanitizeRiskFreePips("bad")).toBe(ZONE_RISK_FREE_PIPS);
+    expect(sanitizeRiskFreePips(null)).toBe(ZONE_RISK_FREE_PIPS);
+    expect(sanitizeRiskFreePips(undefined)).toBe(ZONE_RISK_FREE_PIPS);
+    expect(sanitizeRiskFreePips(NaN)).toBe(ZONE_RISK_FREE_PIPS);
   });
 });
 

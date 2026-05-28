@@ -1197,7 +1197,15 @@ interface ZoneState {
   trackedPositions: Map<string, { volume: number; entryPrice: number }>;
 }
 
-export const ZONE_RISK_FREE_PIPS   = 8;
+// Signed offset (pips) of the protective SL from the surviving entry:
+//   negative → SL sits on the DRAWDOWN side  (small loss if reversed)
+//   positive → SL sits on the PROFIT side    (locks in gain, tighter exit)
+//   zero     → SL exactly at entry           (true break-even)
+// User-tunable per-account via the risk-free POST body; this is the fallback.
+export const ZONE_RISK_FREE_PIPS   = -10;
+const ZONE_RISK_FREE_PIPS_MIN = -30;
+const ZONE_RISK_FREE_PIPS_MAX =  30;
+const ZONE_RISK_FREE_PIPS_STEP = 5;
 const ZONE_CASHOUT_PIPS_DEFAULT = 5;   // anchor + 5p covers spread
 const ZONE_MIN_LOT_PER_ENTRY    = 0.04; // 4 × 0.01 broker minimum for 25% slices
 // How close (in pips) price must come to a TP target before the engine fires
@@ -1206,12 +1214,12 @@ const ZONE_MIN_LOT_PER_ENTRY    = 0.04; // 4 × 0.01 broker minimum for 25% slic
 const ZONE_TP_TOLERANCE_PIPS    = 4;
 
 // Pure helper: compute the "risk free" stop-loss price for a zone's surviving
-// entry. The PROTECTIVE stop sits on the LOSING side of the entry by `pips`
-// — small loss if reversed, but locks in most of the unrealised gain on the
-// remaining best entry (which is already deep in profit by the time the user
-// taps Risk Free).
-//   BUY  → SL goes BELOW entry (limits downside).
-//   SELL → SL goes ABOVE entry (limits upside).
+// entry. `pips` is SIGNED relative to entry from the trader's perspective:
+//   negative → SL on the DRAWDOWN side (small loss if reversed; protective)
+//   positive → SL on the PROFIT side   (locks in gain; tighter exit)
+//   zero     → SL exactly at entry (true break-even)
+// For BUY: profit is above entry, drawdown is below → SL = entry + pips*PIP.
+// For SELL: profit is below entry, drawdown is above → SL = entry − pips*PIP.
 // Exported so regression tests can lock the direction in (it was once inverted).
 export function computeRiskFreeSl(
   direction: "buy" | "sell",
@@ -1219,8 +1227,26 @@ export function computeRiskFreeSl(
   pips: number = ZONE_RISK_FREE_PIPS,
 ): number {
   const offset = pips * PIP;
-  const raw = direction === "buy" ? entryPrice - offset : entryPrice + offset;
+  const raw = direction === "buy" ? entryPrice + offset : entryPrice - offset;
   return parseFloat(raw.toFixed(2));
+}
+
+// Clamp + snap user-supplied risk-free pips to the supported -30..+30 / step 5
+// grid. Returns the configured default for non-numeric / out-of-range input.
+export function sanitizeRiskFreePips(input: unknown): number {
+  // `Number(null)` is 0 and `Number("")` is 0, so reject those explicitly
+  // — only accept numbers and numeric strings as valid input.
+  let n: number;
+  if (typeof input === "number") {
+    n = input;
+  } else if (typeof input === "string" && input.trim() !== "") {
+    n = Number(input);
+  } else {
+    return ZONE_RISK_FREE_PIPS;
+  }
+  if (!Number.isFinite(n)) return ZONE_RISK_FREE_PIPS;
+  const clamped = Math.max(ZONE_RISK_FREE_PIPS_MIN, Math.min(ZONE_RISK_FREE_PIPS_MAX, n));
+  return Math.round(clamped / ZONE_RISK_FREE_PIPS_STEP) * ZONE_RISK_FREE_PIPS_STEP;
 }
 const ZONE_ASSOC_WINDOW_MS  = 30_000; // limits placed within 30s of market attach to the same zone
 // Orphan-attach window: a cascade limit POST response that arrived BEFORE its
@@ -2181,10 +2207,15 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       if (!ok) failed.push(p.id);
     }
     // "Risk free" (misnomer — kept because the user calls it that): move SL
-    // ZONE_RISK_FREE_PIPS of DRAWDOWN under the best entry (BUY: below; SELL:
-    // above). Caps the loss on the remaining best entry to ~10p, much smaller
-    // than the original SL. See computeRiskFreeSl for direction math.
-    const sl = computeRiskFreeSl(st.direction, best.openPrice);
+    // by a SIGNED pip offset from the best entry. Client passes `riskFreePips`
+    // in the body (-30..+30, step 5). Negative = drawdown protection (small
+    // loss if reversed); positive = profit lock (tighter exit). Falls back to
+    // ZONE_RISK_FREE_PIPS when omitted. See computeRiskFreeSl for direction math.
+    const body = (req.body ?? {}) as { riskFreePips?: unknown };
+    const pips = body.riskFreePips !== undefined
+      ? sanitizeRiskFreePips(body.riskFreePips)
+      : ZONE_RISK_FREE_PIPS;
+    const sl = computeRiskFreeSl(st.direction, best.openPrice, pips);
     const slOk = await modifyZonePositionSl(token, region, accountId, best.id, sl);
     await cancelZoneLimits(token, region, accountId, zoneId);
     if (failed.length > 0 || !slOk) {
@@ -2202,8 +2233,8 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     }
     st.status = "RISK_FREE";
     await db.update(cascadeZonesTable).set({ status: "RISK_FREE" }).where(eq(cascadeZonesTable.zoneId, zoneId));
-    console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl}`);
-    res.json({ ok: true, bestPositionId: best.id, sl, closedCount: others.length });
+    console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl} (pips=${pips})`);
+    res.json({ ok: true, bestPositionId: best.id, sl, pips, closedCount: others.length });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }

@@ -16,6 +16,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import Colors from "@/constants/colors";
 import { useTrading, type PendingOrder, type Position } from "@/context/TradingContext";
+import { useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useZones } from "@/hooks/useZones";
 import ZoneCard from "@/components/ZoneCard";
 
@@ -197,6 +198,7 @@ export default function PositionsScreen() {
   const insets = useSafeAreaInsets();
   const { positions, pendingOrders, status, refreshPositions, closePosition, cancelOrder, accountInfo, accountId } = useTrading();
   const { zones, riskFree } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000 });
+  const { settings: cs } = useCascadeSettings();
   const activeZones = zones.filter((z) => z.status !== "CLOSED");
   const pastZones = zones
     .filter((z) => z.status === "CLOSED")
@@ -348,7 +350,7 @@ export default function PositionsScreen() {
                 <Text style={styles.sectionLabel}>ACTIVE ZONES  ·  {activeZones.length}</Text>
                 <View style={{ gap: 10, marginBottom: showStandalone || pendingOrders.length > 0 ? 20 : 0 }}>
                   {activeZones.map((z) => (
-                    <ZoneCard key={z.zoneId} zone={z} onRiskFree={riskFree} />
+                    <ZoneCard key={z.zoneId} zone={z} onRiskFree={riskFree} riskFreePips={cs.riskFreePips} />
                   ))}
                 </View>
               </>

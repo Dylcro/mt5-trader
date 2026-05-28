@@ -27,6 +27,11 @@ export interface CascadeSettings {
   tp2Pips: number;
   tp3Pips: number;
   tp4Pips: number;
+  // Signed pip offset of the protective SL from the surviving entry when the
+  // user taps Risk Free. Negative = drawdown side (small loss if reversed),
+  // positive = profit lock (tighter exit), 0 = exactly at entry. Snapped to
+  // 5-pip steps within -30..+30 server-side.
+  riskFreePips: number;
 }
 
 const DEFAULTS: CascadeSettings = {
@@ -40,7 +45,10 @@ const DEFAULTS: CascadeSettings = {
   tp2Pips: 60,
   tp3Pips: 100,
   tp4Pips: 0,
+  riskFreePips: -10,
 };
+
+const VALID_RISK_FREE_PIPS = [-30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30];
 
 const VALID_PIPS_BETWEEN = [5, 10, 15, 20];
 
@@ -58,6 +66,7 @@ function storageKeys(accountId: string) {
     tp2Pips:           `${prefix}zone_tp2_pips`,
     tp3Pips:           `${prefix}zone_tp3_pips`,
     tp4Pips:           `${prefix}zone_tp4_pips`,
+    riskFreePips:      `${prefix}risk_free_pips`,
   };
 }
 
@@ -101,7 +110,7 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         const keys = storageKeys(accountId);
         const allKeys = [...Object.values(keys), GLOBAL_AUTO_CASCADE_KEY];
         const pairs = await AsyncStorage.multiGet(allKeys);
-        const [num, between, sl, tpEnabled, tpPips, tp1, tp2, tp3, tp4, globalAutoEnabled] = pairs.map((p) => p[1]);
+        const [num, between, sl, tpEnabled, tpPips, tp1, tp2, tp3, tp4, riskFree, globalAutoEnabled] = pairs.map((p) => p[1]);
 
         let autoCascadeEnabled = DEFAULTS.autoCascadeEnabled;
         if (globalAutoEnabled !== null) {
@@ -127,6 +136,11 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
           tp2Pips: tp2 ? parseFloat(tp2) : DEFAULTS.tp2Pips,
           tp3Pips: tp3 ? parseFloat(tp3) : DEFAULTS.tp3Pips,
           tp4Pips: tp4 != null ? parseFloat(tp4) : DEFAULTS.tp4Pips,
+          riskFreePips: (() => {
+            if (riskFree == null) return DEFAULTS.riskFreePips;
+            const parsed = parseFloat(riskFree);
+            return VALID_RISK_FREE_PIPS.includes(parsed) ? parsed : DEFAULTS.riskFreePips;
+          })(),
         };
         setSettings(local);
         void pushToServer(local, accountId);
@@ -152,6 +166,7 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         [keys.tp2Pips, String(next.tp2Pips)],
         [keys.tp3Pips, String(next.tp3Pips)],
         [keys.tp4Pips, String(next.tp4Pips)],
+        [keys.riskFreePips, String(next.riskFreePips)],
         [GLOBAL_AUTO_CASCADE_KEY, String(next.autoCascadeEnabled)],
       ]);
       return next;
