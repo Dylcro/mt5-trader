@@ -77,12 +77,19 @@ Copy these files into the new watchOS target group in Xcode:
 ### 5. Add the iOS-side bridge to the phone app
 
 Copy `ios-bridge/MT5WatchBridge.swift` into the iOS target in Xcode. This is a
-small native module that ships the Clerk JWT + API base URL to the watch over
-WatchConnectivity whenever the user signs in on the phone.
+small native module that ships the JWT + API base URL + account id + region to
+the watch over WatchConnectivity whenever any of them changes on the phone.
 
 You'll also need to register it as an Expo native module — the bridge file
 includes the `@objc` annotations and bridging header notes. See the comments at
 the top of `MT5WatchBridge.swift`.
+
+**The phone side is already wired** — `artifacts/mt5-trader/lib/watchBridge.ts`
+calls `NativeModules.MT5WatchBridge.publishSession(...)` and is invoked from
+`app/(tabs)/_layout.tsx` whenever the user signs in / out or switches accounts.
+The wrapper safely no-ops when the native module isn't linked (i.e. when
+running in Expo Go), so no further JS changes are needed once the native
+module exists in the build.
 
 ### 6. Build & run
 
