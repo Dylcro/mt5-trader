@@ -17,6 +17,11 @@ export interface Zone {
   tp2Hit: boolean;
   tp3Hit: boolean;
   tp4Hit: boolean;
+  // True when TP2 fired but the broker rejected true break-even (SL at entry)
+  // because price had retraced through entry. The engine applied the safest
+  // protective SL it could and will keep trying to upgrade to true BE on
+  // every tick. Surfaced as a warning chip on the active-zone card.
+  tp2SlIsBestEffort?: boolean;
   cashoutDone: boolean;
   status: "OPEN" | "RISK_FREE" | "CLOSED";
   createdAt: number;

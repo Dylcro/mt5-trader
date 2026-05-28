@@ -29,6 +29,14 @@ export const cascadeZonesTable = pgTable("cascade_zones", {
   tp2Hit:      boolean("tp2_hit").notNull().default(false),
   tp3Hit:      boolean("tp3_hit").notNull().default(false),
   tp4Hit:      boolean("tp4_hit").notNull().default(false),
+  // When TP2 fires but price has retraced through the entry, true BE
+  // (SL = openPrice) would be rejected by the broker (SL below current ask
+  // for a SELL would close the position instantly). We instead apply a
+  // "best effort" SL at the broker's minimum-allowed distance and flag the
+  // zone so the app can show a "SL not at BE" warning chip. Once price
+  // moves favorably enough that true BE becomes valid, the engine upgrades
+  // the SL and clears the flag.
+  tp2SlIsBestEffort: boolean("tp2_sl_is_best_effort").notNull().default(false),
   status:      text("status").notNull().default("OPEN"),
   createdAt:   bigint("created_at", { mode: "number" }).notNull(),
   closedAt:    bigint("closed_at", { mode: "number" }),

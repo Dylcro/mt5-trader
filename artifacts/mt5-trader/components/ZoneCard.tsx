@@ -190,6 +190,15 @@ export default function ZoneCard({
         </View>
       </View>
 
+      {!historical && zone.tp2Hit && zone.tp2SlIsBestEffort && zone.status !== "CLOSED" && (
+        <View style={styles.warnRow}>
+          <Feather name="alert-triangle" size={11} color="#E6A23C" />
+          <Text style={styles.warnText}>
+            SL set to safest protective level — true BE pending (price retraced through entry)
+          </Text>
+        </View>
+      )}
+
       {!historical && zone.status !== "CLOSED" && zone.nextTp && zone.nextTp > 0 && (
         <View style={styles.progressBlock}>
           <View style={styles.progressHeader}>
@@ -413,6 +422,24 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_600SemiBold",
     color: C.textSecondary,
     letterSpacing: 0.3,
+  },
+  warnRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "rgba(230,162,60,0.45)",
+    backgroundColor: "rgba(230,162,60,0.10)",
+  },
+  warnText: {
+    flex: 1,
+    fontSize: 11,
+    fontFamily: "Inter_500Medium",
+    color: "#E6A23C",
+    letterSpacing: 0.2,
   },
   progressBlock: {
     gap: 6,

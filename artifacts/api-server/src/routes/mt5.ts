@@ -1237,6 +1237,13 @@ interface ZoneState {
   // BE up to the cap, which is safe (modify-sl is idempotent).
   tp2SlMoved: boolean;
   tp2BeAttempts: number;
+  // True iff the SL we got onto the position(s) at TP2 is a "best effort"
+  // protective SL (broker rejected true BE because price had retraced
+  // through entry), NOT the actual break-even price. Persisted to DB so the
+  // app warning chip survives a restart. Engine keeps trying to upgrade to
+  // true BE on every tick while this is true; clears it once SL = openPrice
+  // is accepted.
+  tp2SlIsBestEffort: boolean;
   status: "OPEN" | "RISK_FREE" | "CLOSED";
   busy: boolean; // debounce: prevent overlapping monitor ticks for this zone
   // In-memory mirror of zone_positions(status=OPEN) for this zone, used as a
@@ -1268,6 +1275,104 @@ const ZONE_TP_TOLERANCE_PIPS    = 4;
 // roughly 15 s of trying; enough to ride out a transient broker burp
 // but bounded so a hard rejection (code 10016) doesn't loop forever.
 const MAX_TP2_BE_ATTEMPTS       = 5;
+// Safety buffer (pips) ABOVE the broker's minimum stops-level when setting a
+// "best effort" protective SL after a TP2 break-even rejection. 2 pips on
+// XAUUSD ≈ 0.20 — enough cushion that the broker accepts the SL even when
+// the spread widens momentarily, without giving up too much room.
+const ZONE_BE_SAFETY_PIPS       = 2;
+
+// ── Small DB-resilience + request-rate helpers ───────────────────────────────
+// withDbRetry wraps a single DB call in up to N attempts with a small fixed
+// backoff. Use it on reads/writes that fire from hot paths (per-tick zone
+// evaluation, deal handlers) where Neon's occasional "Failed query" blips
+// were causing ERROR-level log spam even though a 1-2 attempt retry fixes
+// them. Only logs once, after all retries fail.
+async function withDbRetry<T>(
+  label: string, fn: () => Promise<T>, tries = 3, delayMs = 200,
+): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < tries; i++) {
+    try { return await fn(); }
+    catch (e) { lastErr = e; if (i < tries - 1) await sleep(delayMs); }
+  }
+  console.warn(`[db-retry] ${label} failed after ${tries} attempts: ${(lastErr as Error)?.message}`);
+  throw lastErr;
+}
+
+// Per-account rolling 60s request counter for MetaAPI calls. Logs a WARN if
+// any single account exceeds REQ_RATE_WARN_PER_MIN — a signal that we may be
+// piling concurrent calls onto MetaAPI (which can indirectly slow down the
+// user's trading experience if MetaAPI throttles us). The window is rolling:
+// we keep timestamps and drop entries older than 60s on each record.
+const REQ_RATE_WINDOW_MS = 60_000;
+const REQ_RATE_WARN_PER_MIN = 60;
+const accountReqLog = new Map<string, number[]>(); // accountId → timestamps
+const accountReqWarnAt = new Map<string, number>(); // accountId → last warn ts (dedupe)
+function recordApiCall(accountId: string): void {
+  const now = Date.now();
+  const log = accountReqLog.get(accountId) ?? [];
+  // Drop entries older than the rolling window.
+  let cut = 0;
+  while (cut < log.length && log[cut]! < now - REQ_RATE_WINDOW_MS) cut++;
+  if (cut > 0) log.splice(0, cut);
+  log.push(now);
+  accountReqLog.set(accountId, log);
+  if (log.length > REQ_RATE_WARN_PER_MIN) {
+    const lastWarn = accountReqWarnAt.get(accountId) ?? 0;
+    if (now - lastWarn > 30_000) {
+      console.warn(`[req-rate] ${accountId} sustained ${log.length} MetaAPI calls in last 60s (warn>${REQ_RATE_WARN_PER_MIN}) — review for accidental fan-out`);
+      accountReqWarnAt.set(accountId, now);
+    }
+  }
+}
+
+// Periodically evict accounts whose last MetaAPI call (or warn) is well
+// outside the rate window — otherwise transient/deleted/never-reconnected
+// accountIds would accumulate forever in the rate-log maps. Runs every
+// 5 minutes; cutoff is 2× the rate window so we only drop truly idle keys.
+setInterval(() => {
+  const cutoff = Date.now() - REQ_RATE_WINDOW_MS * 2;
+  for (const [acct, log] of accountReqLog) {
+    if (log.length === 0 || log[log.length - 1]! < cutoff) {
+      accountReqLog.delete(acct);
+      accountReqWarnAt.delete(acct);
+    }
+  }
+  // Independently sweep warn-at entries whose log is already gone.
+  for (const acct of accountReqWarnAt.keys()) {
+    if (!accountReqLog.has(acct)) accountReqWarnAt.delete(acct);
+  }
+}, 5 * 60_000).unref?.();
+
+// Compute a broker-safe protective SL for TP2 break-even.
+//   - True BE = position openPrice.
+//   - Broker rejects SL too close to current price (stops_level). For a SELL,
+//     SL must sit at least N pips ABOVE the current ask; for a BUY, at least
+//     N pips BELOW the current bid. We don't know stops_level precisely — we
+//     use ZONE_BE_SAFETY_PIPS as the cushion which is comfortably above the
+//     typical XAUUSD level.
+//   - When current price has NOT crossed entry (still in profit relative to
+//     direction), true BE is valid → returns { sl: openPrice, isBestEffort: false }.
+//   - When price has crossed back through entry, true BE would be rejected →
+//     returns the broker-safe SL with isBestEffort: true. This is still
+//     protective (no worse than the current price + buffer) and lets the engine
+//     keep upgrading toward true BE on later ticks.
+function computeBrokerSafeBeSl(
+  direction: "buy" | "sell", openPrice: number,
+  price: { bid: number; ask: number },
+): { sl: number; isBestEffort: boolean } {
+  const safety = ZONE_BE_SAFETY_PIPS * PIP;
+  if (direction === "sell") {
+    // For SELL, valid SL > ask + safety. True BE valid iff openPrice >= ask + safety.
+    const minSl = price.ask + safety;
+    if (openPrice >= minSl) return { sl: parseFloat(openPrice.toFixed(2)), isBestEffort: false };
+    return { sl: parseFloat(minSl.toFixed(2)), isBestEffort: true };
+  }
+  // BUY: valid SL < bid - safety. True BE valid iff openPrice <= bid - safety.
+  const maxSl = price.bid - safety;
+  if (openPrice <= maxSl) return { sl: parseFloat(openPrice.toFixed(2)), isBestEffort: false };
+  return { sl: parseFloat(maxSl.toFixed(2)), isBestEffort: true };
+}
 
 // Pure helper: compute the "risk free" stop-loss price for a zone's surviving
 // entry. `pips` is SIGNED relative to entry from the trader's perspective:
@@ -1356,7 +1461,7 @@ function prepareZoneForCascade(
     cashoutPips: ZONE_CASHOUT_PIPS_DEFAULT,
     cashoutDone: false,
     tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
-    tp2SlMoved: false, tp2BeAttempts: 0,
+    tp2SlMoved: false, tp2BeAttempts: 0, tp2SlIsBestEffort: false,
     status: "OPEN", busy: false,
     trackedPositions: new Map(),
   };
@@ -1488,12 +1593,13 @@ async function markZonePositionClosed(accountId: string, positionId: string): Pr
   try {
     // Join through cascade_zones so we only act on rows belonging to *this*
     // account — MT5 position IDs can be reused across accounts/brokers.
-    const rows = await db
+    const rows = await withDbRetry(`markClosed.lookup posId=${positionId}`, () => db
       .select({ zoneId: zonePositionsTable.zoneId, zoneAccountId: cascadeZonesTable.accountId })
       .from(zonePositionsTable)
       .innerJoin(cascadeZonesTable, eq(zonePositionsTable.zoneId, cascadeZonesTable.zoneId))
       .where(and(eq(zonePositionsTable.positionId, positionId), eq(cascadeZonesTable.accountId, accountId)))
-      .limit(1);
+      .limit(1)
+    );
     const zoneId = rows[0]?.zoneId;
     if (!zoneId) return;
     const st = zoneStates.get(zoneId);
@@ -1507,20 +1613,23 @@ async function markZonePositionClosed(accountId: string, positionId: string): Pr
     const stillOpen = live.some(p => p.id === positionId);
     if (stillOpen) return; // partial close — leave row as OPEN
 
-    await db.update(zonePositionsTable)
+    await withDbRetry(`markClosed.update posId=${positionId}`, () => db.update(zonePositionsTable)
       .set({ status: "CLOSED" })
       .where(and(
         eq(zonePositionsTable.zoneId, zoneId),
         eq(zonePositionsTable.positionId, positionId),
         eq(zonePositionsTable.status, "OPEN"),
-      ));
+      ))
+    );
 
-    const openInZone = await db.select().from(zonePositionsTable)
-      .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
+    const openInZone = await withDbRetry(`markClosed.openCheck zone=${zoneId}`, () => db.select().from(zonePositionsTable)
+      .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
+    );
     if (openInZone.length === 0) {
-      await db.update(cascadeZonesTable)
+      await withDbRetry(`markClosed.zoneClose zone=${zoneId}`, () => db.update(cascadeZonesTable)
         .set({ status: "CLOSED", closedAt: Date.now() })
-        .where(eq(cascadeZonesTable.zoneId, zoneId));
+        .where(eq(cascadeZonesTable.zoneId, zoneId))
+      );
       if (st) st.status = "CLOSED";
       console.log(`[zone ${zoneId}] all positions closed — zone CLOSED`);
     }
@@ -1534,6 +1643,7 @@ async function markZonePositionClosed(accountId: string, positionId: string): Pr
 async function tradeAction(
   token: string, region: string, accountId: string, body: Record<string, unknown>,
 ): Promise<{ ok: boolean; code: number; message?: string }> {
+  recordApiCall(accountId);
   const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
     method: "POST", headers: authHeaders(token), body: JSON.stringify(body),
   });
@@ -1608,6 +1718,7 @@ interface LivePosition {
 }
 
 async function fetchOpenPositions(token: string, region: string, accountId: string): Promise<LivePosition[]> {
+  recordApiCall(accountId);
   const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/positions`, {
     headers: authHeaders(token),
   });
@@ -1628,6 +1739,7 @@ async function fetchOpenPositions(token: string, region: string, accountId: stri
 async function fetchSymbolPrice(
   token: string, region: string, accountId: string, symbol: string,
 ): Promise<{ bid: number; ask: number } | null> {
+  recordApiCall(accountId);
   try {
     const r = await fetch(
       `${clientBase(region)}/users/current/accounts/${accountId}/symbols/${encodeURIComponent(symbol)}/current-price`,
@@ -1681,8 +1793,9 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     let trackedIds: Set<string>;
     let dbOk = true;
     try {
-      const rows = await db.select().from(zonePositionsTable)
-        .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
+      const rows = await withDbRetry(`evalZone.trackedPositions zone=${zoneId}`, () => db.select().from(zonePositionsTable)
+        .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
+      );
       zps = rows.map(r => ({
         positionId: r.positionId, volume: Number(r.volume), entryPrice: Number(r.entryPrice),
       }));
@@ -1887,25 +2000,69 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       }
     }
 
-    // Sticky SL→BE retry, independent of the TP if/else chain above. Runs
-    // every tick once TP2 partials have closed, up to MAX_TP2_BE_ATTEMPTS.
-    // Bounded so a persistent broker rejection (e.g. code 10016 "Invalid
-    // stops" when SL would equal the position open price exactly) can't
-    // spam the broker or the logs forever. After the budget is exhausted
-    // we mark the BE as "done" so the zone advances cleanly — partial
-    // profit is already locked in and TP3/TP4 detection keeps running.
-    if (st.tp2Hit && !st.tp2SlMoved && live.length > 0 && st.tp2BeAttempts < MAX_TP2_BE_ATTEMPTS) {
-      st.tp2BeAttempts += 1;
-      const slResults = await Promise.all(live.map(p =>
-        modifyZonePositionSl(token, region, st.accountId, p.id, p.openPrice)
-      ));
-      if (slResults.every(Boolean)) {
-        st.tp2SlMoved = true;
-        console.log(`[zone ${zoneId}] TP2 SL→BE complete on ${live.length} entr${live.length === 1 ? "y" : "ies"} (attempt ${st.tp2BeAttempts})`);
-      } else if (st.tp2BeAttempts >= MAX_TP2_BE_ATTEMPTS) {
-        st.tp2SlMoved = true; // give up; stop retrying
-        console.error(`[zone ${zoneId}] TP2 SL→BE giving up after ${MAX_TP2_BE_ATTEMPTS} attempts — broker rejected the move; positions remain at their original SL`);
+    // Sticky SL→BE block, independent of the TP if/else chain above. Runs
+    // every tick once TP2 partials have closed, until either true BE is
+    // achieved (tp2SlMoved=true) or we've truly exhausted the attempt budget.
+    //
+    // Why this is more than a naive retry: the original symptom was the
+    // broker rejecting SL=openPrice with code 10016 ("Invalid stops") on a
+    // SELL whose entry price was now BELOW current ask — a true BE would
+    // close the position instantly, so the broker refuses it. The old code
+    // burned all 5 attempts on that condition and gave up, leaving the
+    // position at its original wide SL. The fix: pre-compute a broker-safe
+    // SL based on current bid/ask. If true BE is valid, use it; otherwise
+    // apply the safest possible protective SL and flag the zone as
+    // "best effort" so the app can warn the user — and keep trying to
+    // upgrade to true BE on later ticks without consuming the retry budget.
+    if (st.tp2Hit && live.length > 0 && (!st.tp2SlMoved || st.tp2SlIsBestEffort)) {
+      const price = await fetchSymbolPrice(token, region, st.accountId, live[0]!.symbol || "XAUUSD");
+      if (price) {
+        // Compute per-position safe SL (openPrice differs across cascade
+        // entries). If ALL positions can reach true BE this tick, we'll
+        // clear the flag below; otherwise the zone stays "best effort".
+        let allTrueBe = true;
+        const results = await Promise.all(live.map(async (p) => {
+          const { sl, isBestEffort } = computeBrokerSafeBeSl(st.direction, p.openPrice, price);
+          if (isBestEffort) allTrueBe = false;
+          const ok = await modifyZonePositionSl(token, region, st.accountId, p.id, sl);
+          return { ok, isBestEffort };
+        }));
+        const allOk = results.every(r => r.ok);
+        if (allOk && allTrueBe) {
+          // True BE achieved on every entry.
+          const wasBestEffort = st.tp2SlIsBestEffort;
+          st.tp2SlMoved = true;
+          st.tp2SlIsBestEffort = false;
+          if (wasBestEffort) {
+            await withDbRetry(`zones[${zoneId}].tp2SlIsBestEffort=false`,
+              () => db.update(cascadeZonesTable).set({ tp2SlIsBestEffort: false }).where(eq(cascadeZonesTable.zoneId, zoneId))
+            ).catch(() => {/* logged inside withDbRetry */});
+          }
+          console.log(`[zone ${zoneId}] TP2 SL→BE complete on ${live.length} entr${live.length === 1 ? "y" : "ies"}${wasBestEffort ? " (upgraded from best-effort)" : ""}`);
+        } else if (allOk) {
+          // Best-effort SL accepted on every entry but at least one isn't
+          // at true BE yet (price hasn't moved far enough). Mark the zone
+          // so the app warns the user, and keep trying on future ticks
+          // WITHOUT consuming retry budget — the budget is only for genuine
+          // broker errors, not for waiting on price.
+          if (!st.tp2SlIsBestEffort) {
+            st.tp2SlIsBestEffort = true;
+            await withDbRetry(`zones[${zoneId}].tp2SlIsBestEffort=true`,
+              () => db.update(cascadeZonesTable).set({ tp2SlIsBestEffort: true }).where(eq(cascadeZonesTable.zoneId, zoneId))
+            ).catch(() => {/* logged inside withDbRetry */});
+            console.warn(`[zone ${zoneId}] TP2 SL set to best-effort protective level (price has retraced through entry — will keep trying to upgrade to true BE)`);
+          }
+        } else if (st.tp2BeAttempts < MAX_TP2_BE_ATTEMPTS) {
+          // Real broker error (not a price-side rejection that we pre-filtered).
+          // Burn budget; retry next tick.
+          st.tp2BeAttempts += 1;
+        } else {
+          // Budget exhausted on real broker errors. Stop retrying.
+          st.tp2SlMoved = true;
+          console.error(`[zone ${zoneId}] TP2 SL→BE giving up after ${MAX_TP2_BE_ATTEMPTS} attempts — broker keeps rejecting the move; positions remain at their original SL`);
+        }
       }
+      // If price is null we just skip this tick — no budget burn, retry later.
     }
   } catch (e) {
     console.error(`[zone ${zoneId}] evaluate error:`, (e as Error).message);
@@ -1951,8 +2108,10 @@ export async function loadZoneState(): Promise<void> {
         tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit, tp4Hit: z.tp4Hit ?? false,
         // BE move isn't persisted — on restart, if tp2 was already hit, attempt
         // BE again (modify-sl is idempotent). If the broker still rejects, the
-        // bounded retry budget below stops the loop quickly.
+        // bounded retry budget below stops the loop quickly. The best-effort
+        // flag IS persisted so the app warning chip survives a restart.
         tp2SlMoved: false, tp2BeAttempts: 0,
+        tp2SlIsBestEffort: (z as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
         status: "OPEN", busy: false,
         trackedPositions: new Map(),
       });
@@ -2229,6 +2388,7 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         anchorPrice: anchor,
         tp1Price, tp2Price, tp3Price, tp4Price,
         tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit, tp4Hit: z.tp4Hit ?? false,
+        tp2SlIsBestEffort: (z as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
         cashoutDone: z.cashoutDone ?? false,
         status: z.status,
         createdAt: Number(z.createdAt),
