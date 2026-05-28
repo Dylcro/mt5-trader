@@ -479,6 +479,36 @@ const syncReadyAt = new Map<string, number>();
 // one diagnostic line per replay, not per historical deal.
 const skipLogged = new Set<string>();
 
+// Per-zone throttle for streaming-driven evaluateZone calls. Ticks can arrive
+// many times per second; we cap each zone at one evaluation per
+// STREAMING_EVAL_MIN_INTERVAL_MS so the broker isn't hammered on duplicates.
+// The 3 s timer remains as a safety net for ticks lost to a streaming dropout.
+const STREAMING_EVAL_MIN_INTERVAL_MS = 300;
+const lastStreamingEvalAt = new Map<string, number>(); // zoneId → epoch ms
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function handleStreamingTick(accountId: string, price: any): void {
+  if (!price || typeof price !== "object") return;
+  const bid = Number(price.bid);
+  const ask = Number(price.ask);
+  if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0) return;
+  // Cache the tick so latestPrice() / candle builders stay current even when
+  // the mobile app isn't polling /price (e.g. backgrounded).
+  storeTick(accountId, bid, ask);
+  // Trigger evaluateZone for any OPEN zone on this account, throttled.
+  let token: string;
+  try { token = getToken(); } catch { return; }
+  const now = Date.now();
+  for (const [zoneId, st] of zoneStates.entries()) {
+    if (st.accountId !== accountId) continue;
+    if (st.status !== "OPEN") continue;
+    const last = lastStreamingEvalAt.get(zoneId) ?? 0;
+    if (now - last < STREAMING_EVAL_MIN_INTERVAL_MS) continue;
+    lastStreamingEvalAt.set(zoneId, now);
+    void evaluateZone(zoneId, token);
+  }
+}
+
 function makeDealListener(accountId: string) {
   // The MetaAPI SDK calls many methods on every registered listener and throws
   // if any of them is missing — aborting the entire synchronization packet.
@@ -564,6 +594,20 @@ function makeDealListener(accountId: string) {
       };
       console.log(`[stream ${accountId}] deal dealId=${evt.dealId} posId=${evt.positionId} type=${evt.type} sym=${evt.symbol} price=${evt.openPrice} comment="${evt.comment ?? ""}"`);
       storeDealEvent(accountId, evt);
+    },
+    // Streaming tick handlers — drive evaluateZone off real broker ticks so
+    // TPs fire within ~100ms of the level being touched (vs the 3 s timer's
+    // worst-case 3 s lag). MetaAPI calls one or the other depending on SDK
+    // version: `onSymbolPriceUpdated` (singular) on older builds,
+    // `onSymbolPricesUpdated` (plural, batched) on newer.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    async onSymbolPriceUpdated(_instanceIndex: string, price: any): Promise<void> {
+      handleStreamingTick(accountId, price);
+    },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    async onSymbolPricesUpdated(_instanceIndex: string, prices: any[]): Promise<void> {
+      if (!Array.isArray(prices)) return;
+      for (const p of prices) handleStreamingTick(accountId, p);
     },
   };
 
