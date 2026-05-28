@@ -119,6 +119,7 @@ interface TradingContextValue {
   refreshPendingOrders: () => Promise<void>;
   refreshPrice: () => Promise<void>;
   refreshAccountInfo: () => Promise<void>;
+  sseConnected: boolean;
 }
 
 export interface PlaceTradeParams {
@@ -219,6 +220,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const [pendingOrders, setPendingOrders] = useState<PendingOrder[]>([]);
   const [price, setPrice] = useState<Price | null>(null);
   const [priceError, setPriceError] = useState(false);
+  const [sseConnected, setSseConnected] = useState(false);
 
   const [cascadeNotification, setCascadeNotification] = useState<CascadeNotification | null>(null);
 
@@ -240,8 +242,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   // closures. Populated below — after those callbacks are declared.
   const sseHandlersRef = useRef<{
     onDeal: () => void;
+    onPendingOrder: () => void;
     onZoneUpdate: (data: unknown) => void;
-  }>({ onDeal: () => {}, onZoneUpdate: () => {} });
+  }>({ onDeal: () => {}, onPendingOrder: () => {}, onZoneUpdate: () => {} });
 
   const clearCascadeNotification = useCallback(() => setCascadeNotification(null), []);
 
@@ -460,6 +463,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         fetchPendingOrdersData(a, r).then(setPendingOrders).catch(() => {}),
       ]);
     },
+    onPendingOrder: () => {
+      const r = regionRef.current;
+      const a = accountId;
+      void fetchPendingOrdersData(a, r).then(setPendingOrders).catch(() => {});
+    },
     onZoneUpdate: (data: unknown) => {
       emitAccountEvent(accountId, "zone_update", data);
     },
@@ -583,6 +591,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
           // SSE connected — it is now primary; stop any fallback intervals.
           clearFallbackIntervals();
+          setSseConnected(true);
           sseDroppedAt = null;
           retryDelay = 2_000;
 
@@ -615,6 +624,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
                       }
                     } else if (curEvent === "deal") {
                       sseHandlersRef.current.onDeal();
+                    } else if (curEvent === "pending_order") {
+                      sseHandlersRef.current.onPendingOrder();
                     } else if (curEvent === "zone_update") {
                       sseHandlersRef.current.onZoneUpdate(data);
                     }
@@ -635,7 +646,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
         if (!mounted || controller.signal.aborted) break;
 
-        // SSE dropped — arm the 30 s grace timer, then start fallback polling.
+        // SSE dropped — update connection state and arm the 30 s grace timer.
+        setSseConnected(false);
         if (sseDroppedAt === null) sseDroppedAt = Date.now();
         if (Date.now() - sseDroppedAt >= 30_000) startFallbackPolling();
 
@@ -649,6 +661,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       mounted = false;
       controller.abort();
       clearFallbackIntervals();
+      setSseConnected(false);
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status, accountId]);
@@ -1153,6 +1166,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         refreshPendingOrders,
         refreshPrice,
         refreshAccountInfo,
+        sseConnected,
       }}
     >
       {children}

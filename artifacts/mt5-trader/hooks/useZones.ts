@@ -46,10 +46,17 @@ async function authFetch(url: string, options: RequestInit = {}): Promise<Respon
 interface UseZonesOptions {
   includeClosed?: boolean;
   pollIntervalMs?: number;
+  /** When true, SSE is live and zone_update events patch state directly.
+   *  The poll interval is stretched to 60 s (safety net only). */
+  sseConnected?: boolean;
 }
 
 export function useZones(accountId: string, options: UseZonesOptions = {}) {
-  const { includeClosed = false, pollIntervalMs = 5_000 } = options;
+  const { includeClosed = false, pollIntervalMs = 5_000, sseConnected = false } = options;
+  // SSE is primary when connected — use a long safety-net interval so the
+  // endpoint is not hit on every tick. Fall back to the caller's interval
+  // when SSE is disconnected.
+  const effectivePollMs = sseConnected ? 60_000 : pollIntervalMs;
   const [zones, setZones] = useState<Zone[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -82,9 +89,9 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     }
     setLoading(true);
     void refresh().finally(() => setLoading(false));
-    const id = setInterval(() => void refresh(), pollIntervalMs);
+    const id = setInterval(() => void refresh(), effectivePollMs);
     return () => clearInterval(id);
-  }, [accountId, pollIntervalMs, refresh]);
+  }, [accountId, effectivePollMs, refresh]);
 
   // Subscribe to SSE-driven zone events via the module-level accountEventBus.
   // zone_update → patch the matching zone in-place for instant TP/status changes.

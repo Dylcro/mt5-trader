@@ -672,6 +672,20 @@ function makeDealListener(accountId: string) {
       if (!Array.isArray(prices)) return;
       for (const p of prices) handleStreamingTick(accountId, p);
     },
+    // Pending-order lifecycle — broadcast so the client can update its list
+    // without waiting for a deal event or the next poll cycle.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    async onPendingOrderAdded(_instanceIndex: string, _order: any): Promise<void> {
+      broadcastToAccount(accountId, "pending_order", {});
+    },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    async onPendingOrderUpdated(_instanceIndex: string, _order: any): Promise<void> {
+      broadcastToAccount(accountId, "pending_order", {});
+    },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    async onPendingOrderCompleted(_instanceIndex: string, _order: any): Promise<void> {
+      broadcastToAccount(accountId, "pending_order", {});
+    },
   };
 
   // Proxy: any property access that isn't `onDealAdded` returns a silent no-op.

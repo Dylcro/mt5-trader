@@ -231,8 +231,8 @@ function PendingOrderCard({ order, onCancel }: { order: PendingOrder; onCancel: 
 
 export default function PositionsScreen() {
   const insets = useSafeAreaInsets();
-  const { positions, pendingOrders, status, refreshPositions, closePosition, cancelOrder, accountInfo, accountId } = useTrading();
-  const { zones, riskFree, closeZone, cancelZoneOrders } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000 });
+  const { positions, pendingOrders, status, refreshPositions, closePosition, cancelOrder, accountInfo, accountId, sseConnected } = useTrading();
+  const { zones, riskFree, closeZone, cancelZoneOrders } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000, sseConnected });
   const { settings: cs } = useCascadeSettings();
   const activeZones = zones.filter((z) => z.status !== "CLOSED");
   const pastZones = zones
