@@ -453,6 +453,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     onDeal: () => {
       const r = regionRef.current;
       const a = accountId;
+      // Emit to the bus so useZones can react (e.g. refresh zone list on deal).
+      emitAccountEvent(a, "deal", {});
       void Promise.all([
         fetchPositionsData(a, r).then(setPositions).catch(() => {}),
         fetchPendingOrdersData(a, r).then(setPendingOrders).catch(() => {}),
@@ -503,13 +505,14 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         }
       };
 
+      // One-time fetch on connect. SSE is the primary source for ongoing price +
+      // position updates — intervals for those are managed by the SSE effect below
+      // (fallback-only, started only after 30 s of SSE disconnection).
       pollPrice();
       pollPositions();
       void pollEvents();
-      // SSE delivers real-time price ticks; this interval is the fallback when SSE
-      // is disconnected or unavailable. 5 s is still fast enough for manual decisions.
-      priceIntervalRef.current = setInterval(pollPrice, 5_000);
-      positionsIntervalRef.current = setInterval(pollPositions, 10000);
+      priceIntervalRef.current = null;
+      positionsIntervalRef.current = null;
       eventsIntervalRef.current = setInterval(pollEvents, 5000);
     },
     [fetchPriceData, fetchPositionsData, fetchPendingOrdersData]
@@ -525,16 +528,42 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // ── SSE live stream ────────────────────────────────────────────────────────────
-  // Opens a Server-Sent Events connection when the account is connected.
-  // price events → update price state in real time (SSE supplements the 5 s poll).
-  // deal events  → immediately refresh positions + pending orders.
-  // zone_update  → emit to the module-level accountEventBus so useZones patches state.
+  // SSE is the PRIMARY source for price and position data.
+  // When connected: price/positions intervals are cleared (SSE replaces them).
+  // When disconnected: after a 30 s grace period, 15 s fallback intervals start.
+  // When reconnected: fallback intervals are cleared again.
+  // Cascade-event polling (eventsIntervalRef) is always-on; SSE doesn't carry it.
   // Reconnects with exponential back-off (2 s → 30 s) after a disconnect.
   useEffect(() => {
     if (status !== "connected" || !accountId || !API_BASE) return;
     let mounted = true;
     const controller = new AbortController();
     let retryDelay = 2_000;
+    let sseDroppedAt: number | null = null;
+
+    // Stop the 15 s fallback intervals (called when SSE (re)connects).
+    const clearFallbackIntervals = () => {
+      if (priceIntervalRef.current) { clearInterval(priceIntervalRef.current); priceIntervalRef.current = null; }
+      if (positionsIntervalRef.current) { clearInterval(positionsIntervalRef.current); positionsIntervalRef.current = null; }
+    };
+
+    // Start 15 s fallback intervals (called only after 30 s of SSE disconnection).
+    const startFallbackPolling = () => {
+      if (priceIntervalRef.current) return; // already running
+      const r = regionRef.current;
+      const a = accountId;
+      priceIntervalRef.current = setInterval(() => {
+        fetchPriceData(a, r)
+          .then(p => { priceFailCountRef.current = 0; setPriceError(false); setPrice(p); })
+          .catch(() => { priceFailCountRef.current += 1; if (priceFailCountRef.current >= 3) setPriceError(true); });
+      }, 15_000);
+      positionsIntervalRef.current = setInterval(() => {
+        void Promise.all([
+          fetchPositionsData(a, r).then(setPositions).catch(() => {}),
+          fetchPendingOrdersData(a, r).then(setPendingOrders).catch(() => {}),
+        ]);
+      }, 15_000);
+    };
 
     const run = async () => {
       while (mounted && !controller.signal.aborted) {
@@ -552,11 +581,15 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           const body = res.body;
           if (!body) throw new Error("SSE streaming not supported on this platform");
 
+          // SSE connected — it is now primary; stop any fallback intervals.
+          clearFallbackIntervals();
+          sseDroppedAt = null;
+          retryDelay = 2_000;
+
           const reader = body.getReader();
           const decoder = new TextDecoder();
           let buffer = "";
           let curEvent = "";
-          retryDelay = 2_000; // reset on successful connect
 
           try {
             while (mounted && !controller.signal.aborted) {
@@ -601,6 +634,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         }
 
         if (!mounted || controller.signal.aborted) break;
+
+        // SSE dropped — arm the 30 s grace timer, then start fallback polling.
+        if (sseDroppedAt === null) sseDroppedAt = Date.now();
+        if (Date.now() - sseDroppedAt >= 30_000) startFallbackPolling();
+
         await new Promise<void>(r => setTimeout(r, retryDelay));
         retryDelay = Math.min(retryDelay * 2, 30_000);
       }
@@ -610,6 +648,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     return () => {
       mounted = false;
       controller.abort();
+      clearFallbackIntervals();
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status, accountId]);
