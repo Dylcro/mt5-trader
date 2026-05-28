@@ -12,8 +12,6 @@ Each needs its own focused migration task.
 
 | Package | Pinned | Latest | Reason |
 |---------|--------|--------|--------|
-| `zod` | 3.x | 4.x | Zod 4 is a complete API redesign (`z.string().email()` → `z.email()`, etc.). All schemas in `lib/api-zod`, `lib/db`, and everywhere `zod` is imported need migration. |
-| `zod-validation-error` | 3.x | 5.x | API changes alongside Zod 4. Migrate together with `zod`. |
 | `typescript` | 5.x | 6.x | TypeScript 6 introduces stricter rules that surface new errors in the existing codebase. Needs a dedicated audit. |
 | `lucide-react` | 0.x | 1.x | v1.0 renamed and removed many icons. Requires a full grep of all icon imports across the codebase before upgrading. |
 | `recharts` | 2.x | 3.x | Recharts 3 changed the chart component API. Requires updating every chart in the mockup-sandbox. |

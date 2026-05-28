@@ -142,8 +142,8 @@ catalog:
   tailwindcss: 4.3.0
   tsx: 4.22.3
   vite: 8.0.14
-  # Held at 3.x — zod 4 is a complete API redesign requiring broad code changes
-  zod: 3.25.76
+  zod: 4.4.3
+  zod-validation-error: 5.0.0
 
 autoInstallPeers: false
 
