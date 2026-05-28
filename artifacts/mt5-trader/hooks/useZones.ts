@@ -125,5 +125,27 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     }
   }, [accountId, refresh]);
 
-  return { zones, loading, error, refresh, riskFree, closeZone };
+  // Cancel pending cascade limit orders for the zone without touching open
+  // positions. Powers the "Delete Orders" button on each zone card.
+  const cancelZoneOrders = useCallback(async (
+    zoneId: string,
+  ): Promise<{ ok: boolean; message?: string; cancelledCount?: number }> => {
+    if (!API_BASE || !accountId) return { ok: false, message: "No account" };
+    try {
+      const res = await authFetch(
+        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/cancel-pending`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+      );
+      const data = await res.json().catch(() => ({})) as {
+        ok?: boolean; message?: string; error?: string; cancelledCount?: number;
+      };
+      void refresh();
+      if (res.ok && data.ok) return { ok: true, cancelledCount: data.cancelledCount };
+      return { ok: false, message: data.message ?? data.error ?? `HTTP ${res.status}` };
+    } catch (e) {
+      return { ok: false, message: (e as Error).message };
+    }
+  }, [accountId, refresh]);
+
+  return { zones, loading, error, refresh, riskFree, closeZone, cancelZoneOrders };
 }

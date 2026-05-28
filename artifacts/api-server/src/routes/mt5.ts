@@ -2316,6 +2316,36 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
   }
 });
 
+// POST /api/mt5/account/:accountId/zones/:zoneId/cancel-pending
+// User-initiated "delete orders" for a zone: cancels every outstanding
+// cascade limit order tied to the zone WITHOUT touching any open positions.
+// Use case: user wants to stop additional cascade entries from filling but
+// keep the positions they already have. Zone status is intentionally NOT
+// changed — the zone is still ACTIVE / RISK_FREE, just with no pending
+// fills behind it. Idempotent: if there's nothing pending, returns ok:true
+// with cancelledCount:0 so the UI doesn't show a spurious failure.
+router.post("/mt5/account/:accountId/zones/:zoneId/cancel-pending", checkOwner, async (req: Request, res: Response) => {
+  const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
+  try {
+    const token = getToken();
+    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
+    let pendingBefore = 0;
+    for (const [, zid] of zoneLimitOrders.entries()) {
+      if (zid === zoneId) pendingBefore++;
+    }
+    await cancelZoneLimits(token, region, accountId, zoneId);
+    let pendingAfter = 0;
+    for (const [, zid] of zoneLimitOrders.entries()) {
+      if (zid === zoneId) pendingAfter++;
+    }
+    const cancelledCount = Math.max(0, pendingBefore - pendingAfter);
+    console.log(`[zone ${zoneId}] cancel-pending: user-initiated, cancelled=${cancelledCount}/${pendingBefore}`);
+    res.json({ ok: true, cancelledCount });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 // GET /api/mt5/my-account — returns the accountId bound to the authenticated user
 router.get("/mt5/my-account", async (req: Request, res: Response) => {
   const userId = (req as Record<string, unknown>)["userId"] as string;

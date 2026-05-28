@@ -41,17 +41,19 @@ interface ZoneCardProps {
     opts?: { riskFreePips?: number },
   ) => Promise<{ ok: boolean; message?: string }>;
   onCloseZone?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
+  onCancelOrders?: (zoneId: string) => Promise<{ ok: boolean; message?: string; cancelledCount?: number }>;
   riskFreePips?: number;
   historical?: boolean;
 }
 
 export default function ZoneCard({
-  zone, onRiskFree, onCloseZone, riskFreePips,
+  zone, onRiskFree, onCloseZone, onCancelOrders, riskFreePips,
   historical = false,
 }: ZoneCardProps) {
   const isBuy = zone.direction === "buy";
   const [busy, setBusy] = useState(false);
   const [closeBusy, setCloseBusy] = useState(false);
+  const [delBusy, setDelBusy] = useState(false);
 
   // One-tap: no confirm dialog. The button fires the API call immediately
   // and only surfaces an alert if the operation FAILS.
@@ -86,25 +88,18 @@ export default function ZoneCard({
   // the user might want to bail out completely even after going risk-free.
   const canCloseZone =
     !historical && zone.status !== "CLOSED" && zone.positionCount >= 1 && !!onCloseZone;
+  // Delete Orders cancels pending cascade limit fills without touching open
+  // positions. Only meaningful on non-historical, non-closed zones — we
+  // always show the button when those conditions hold and let the server
+  // no-op (cancelledCount:0) if there's nothing pending.
+  const canCancelOrders =
+    !historical && zone.status !== "CLOSED" && !!onCancelOrders;
 
+  // One-tap: no confirm dialog. The user asked for instant action —
+  // misfires are recoverable (re-place from the trade tab) and the extra
+  // OK button was just adding friction.
   const handleCloseZone = async () => {
     if (!onCloseZone || closeBusy) return;
-    // Destructive — always confirm. One-tap is fine for Risk Free (defensive)
-    // but full close needs an explicit "yes" so a mis-tap doesn't blow away
-    // a partially-profitable zone.
-    const confirmMsg = `Close ${zone.positionCount} ${zone.positionCount === 1 ? "position" : "positions"} in this ${isBuy ? "BUY" : "SELL"} zone? Pending limit orders will also be cancelled. This cannot be undone.`;
-    const confirmed = await new Promise<boolean>((resolve) => {
-      if (Platform.OS === "web" && typeof window !== "undefined") {
-        resolve(window.confirm(confirmMsg));
-        return;
-      }
-      Alert.alert("Close zone?", confirmMsg, [
-        { text: "Cancel", style: "cancel", onPress: () => resolve(false) },
-        { text: "Close zone", style: "destructive", onPress: () => resolve(true) },
-      ]);
-    });
-    if (!confirmed) return;
-
     setCloseBusy(true);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
     const result = await onCloseZone(zone.zoneId);
@@ -119,6 +114,26 @@ export default function ZoneCard({
       window.alert(`Couldn't close zone\n\n${errMsg}`);
     } else {
       Alert.alert("Couldn't close zone", errMsg);
+    }
+  };
+
+  // One-tap cancel of all pending cascade limit orders for this zone.
+  const handleCancelOrders = async () => {
+    if (!onCancelOrders || delBusy) return;
+    setDelBusy(true);
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    const result = await onCancelOrders(zone.zoneId);
+    setDelBusy(false);
+    if (result.ok) {
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      return;
+    }
+    await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    const errMsg = result.message ?? "Please try again.";
+    if (Platform.OS === "web" && typeof window !== "undefined") {
+      window.alert(`Couldn't delete orders\n\n${errMsg}`);
+    } else {
+      Alert.alert("Couldn't delete orders", errMsg);
     }
   };
 
@@ -228,7 +243,7 @@ export default function ZoneCard({
         </View>
       )}
 
-      {(canRiskFree || canCloseZone) && (
+      {(canRiskFree || canCloseZone || canCancelOrders) && (
         <View style={styles.actionRow}>
           {canRiskFree && (
             <Pressable
@@ -239,7 +254,7 @@ export default function ZoneCard({
                 busy && { opacity: 0.5 },
               ]}
               onPress={handleRiskFree}
-              disabled={busy || closeBusy}
+              disabled={busy || closeBusy || delBusy}
             >
               {busy ? (
                 <ActivityIndicator size="small" color={C.gold} />
@@ -260,7 +275,7 @@ export default function ZoneCard({
                 closeBusy && { opacity: 0.5 },
               ]}
               onPress={handleCloseZone}
-              disabled={closeBusy || busy}
+              disabled={closeBusy || busy || delBusy}
             >
               {closeBusy ? (
                 <ActivityIndicator size="small" color={C.sell} />
@@ -268,6 +283,27 @@ export default function ZoneCard({
                 <>
                   <Feather name="x-octagon" size={13} color={C.sell} />
                   <Text style={styles.closeBtnText}>Close Zone</Text>
+                </>
+              )}
+            </Pressable>
+          )}
+          {canCancelOrders && (
+            <Pressable
+              style={({ pressed }) => [
+                styles.delBtn,
+                { flex: 1 },
+                pressed && { opacity: 0.75 },
+                delBusy && { opacity: 0.5 },
+              ]}
+              onPress={handleCancelOrders}
+              disabled={delBusy || busy || closeBusy}
+            >
+              {delBusy ? (
+                <ActivityIndicator size="small" color={C.textSecondary} />
+              ) : (
+                <>
+                  <Feather name="trash-2" size={13} color={C.textSecondary} />
+                  <Text style={styles.delBtnText}>Delete Orders</Text>
                 </>
               )}
             </Pressable>
@@ -469,6 +505,23 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontFamily: "Inter_700Bold",
     color: C.sell,
+    letterSpacing: 0.3,
+  },
+  delBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    paddingVertical: 9,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: C.border,
+    backgroundColor: "rgba(255,255,255,0.04)",
+  },
+  delBtnText: {
+    fontSize: 13,
+    fontFamily: "Inter_700Bold",
+    color: C.textSecondary,
     letterSpacing: 0.3,
   },
 });
