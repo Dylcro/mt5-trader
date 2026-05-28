@@ -15,6 +15,9 @@ async function ensureTables(): Promise<void> {
     ALTER TABLE cascade_config ADD COLUMN IF NOT EXISTS tp1_pips INTEGER NOT NULL DEFAULT 20;
     ALTER TABLE cascade_config ADD COLUMN IF NOT EXISTS tp2_pips INTEGER NOT NULL DEFAULT 50;
     ALTER TABLE cascade_config ADD COLUMN IF NOT EXISTS tp3_pips INTEGER NOT NULL DEFAULT 90;
+    ALTER TABLE cascade_config ADD COLUMN IF NOT EXISTS tp4_pips INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE cascade_config ADD COLUMN IF NOT EXISTS auto_cascade_on_mt5 BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE cascade_config ADD COLUMN IF NOT EXISTS mt5_cascade_lot TEXT NOT NULL DEFAULT '0.04';
   `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS support_tickets (

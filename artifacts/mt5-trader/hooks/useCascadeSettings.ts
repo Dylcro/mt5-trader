@@ -27,6 +27,11 @@ export interface CascadeSettings {
   tp2Pips: number;
   tp3Pips: number;
   tp4Pips: number;
+  // Auto-cascade when a market trade is opened directly in MT5 (not via app).
+  // Uses the same numPositions/pipsBetween/slPips/tp1-4Pips above, plus this
+  // dedicated lot size.
+  autoCascadeOnMt5: boolean;
+  mt5CascadeLot: number;
 }
 
 const DEFAULTS: CascadeSettings = {
@@ -40,6 +45,8 @@ const DEFAULTS: CascadeSettings = {
   tp2Pips: 60,
   tp3Pips: 100,
   tp4Pips: 0,
+  autoCascadeOnMt5: false,
+  mt5CascadeLot: 0.04,
 };
 
 const VALID_PIPS_BETWEEN = [5, 10, 15, 20];
@@ -58,6 +65,8 @@ function storageKeys(accountId: string) {
     tp2Pips:           `${prefix}zone_tp2_pips`,
     tp3Pips:           `${prefix}zone_tp3_pips`,
     tp4Pips:           `${prefix}zone_tp4_pips`,
+    autoCascadeOnMt5:  `${prefix}auto_cascade_mt5`,
+    mt5CascadeLot:     `${prefix}mt5_cascade_lot`,
   };
 }
 
@@ -69,6 +78,21 @@ interface CascadeSettingsContextValue {
 
 const CascadeSettingsContext = createContext<CascadeSettingsContextValue | null>(null);
 
+function buildServerBody(s: CascadeSettings): Record<string, unknown> {
+  return {
+    enabled: s.autoCascadeEnabled,
+    numPositions: s.numPositions,
+    pipsBetween: s.pipsBetween,
+    slPips: s.slPips,
+    tp1Pips: s.tp1Pips,
+    tp2Pips: s.tp2Pips,
+    tp3Pips: s.tp3Pips,
+    tp4Pips: s.tp4Pips,
+    autoCascadeOnMt5: s.autoCascadeOnMt5,
+    mt5CascadeLot: s.mt5CascadeLot,
+  };
+}
+
 async function pushToServer(s: CascadeSettings, accountId: string): Promise<void> {
   if (!API_BASE) return;
   const url = accountId
@@ -78,12 +102,7 @@ async function pushToServer(s: CascadeSettings, accountId: string): Promise<void
     await authFetch(url, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        enabled: s.autoCascadeEnabled,
-        numPositions: s.numPositions,
-        pipsBetween: s.pipsBetween,
-        slPips: s.slPips,
-      }),
+      body: JSON.stringify(buildServerBody(s)),
     });
   } catch {
     // Non-fatal — server may be unreachable on first load
@@ -101,7 +120,7 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         const keys = storageKeys(accountId);
         const allKeys = [...Object.values(keys), GLOBAL_AUTO_CASCADE_KEY];
         const pairs = await AsyncStorage.multiGet(allKeys);
-        const [num, between, sl, tpEnabled, tpPips, tp1, tp2, tp3, tp4, globalAutoEnabled] = pairs.map((p) => p[1]);
+        const [num, between, sl, tpEnabled, tpPips, tp1, tp2, tp3, tp4, autoMt5, mt5Lot, globalAutoEnabled] = pairs.map((p) => p[1]);
 
         let autoCascadeEnabled = DEFAULTS.autoCascadeEnabled;
         if (globalAutoEnabled !== null) {
@@ -127,6 +146,8 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
           tp2Pips: tp2 ? parseFloat(tp2) : DEFAULTS.tp2Pips,
           tp3Pips: tp3 ? parseFloat(tp3) : DEFAULTS.tp3Pips,
           tp4Pips: tp4 != null ? parseFloat(tp4) : DEFAULTS.tp4Pips,
+          autoCascadeOnMt5: autoMt5 === "true",
+          mt5CascadeLot: mt5Lot ? parseFloat(mt5Lot) : DEFAULTS.mt5CascadeLot,
         };
         setSettings(local);
         void pushToServer(local, accountId);
@@ -152,6 +173,8 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         [keys.tp2Pips, String(next.tp2Pips)],
         [keys.tp3Pips, String(next.tp3Pips)],
         [keys.tp4Pips, String(next.tp4Pips)],
+        [keys.autoCascadeOnMt5, String(next.autoCascadeOnMt5)],
+        [keys.mt5CascadeLot, String(next.mt5CascadeLot)],
         [GLOBAL_AUTO_CASCADE_KEY, String(next.autoCascadeEnabled)],
       ]);
       return next;
@@ -167,12 +190,7 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
       const res = await authFetch(url, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          enabled: settings.autoCascadeEnabled,
-          numPositions: settings.numPositions,
-          pipsBetween: settings.pipsBetween,
-          slPips: settings.slPips,
-        }),
+        body: JSON.stringify(buildServerBody(settings)),
       });
       return res.ok;
     } catch {
