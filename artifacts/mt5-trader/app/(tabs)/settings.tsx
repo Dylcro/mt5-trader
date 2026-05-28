@@ -3,9 +3,10 @@ import { Feather } from "@expo/vector-icons";
 import Slider from "@react-native-community/slider";
 import * as Haptics from "expo-haptics";
 import { useRouter } from "expo-router";
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   ActivityIndicator,
+  Keyboard,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -210,6 +211,38 @@ export default function SettingsScreen() {
   const { credentials, status, errorMsg, accountInfo, connect, disconnect } = useTrading();
   const { settings: cs, updateSettings, saveToServer } = useCascadeSettings();
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [tpDraft, setTpDraft] = useState({
+    tp1: String(cs.tp1Pips),
+    tp2: String(cs.tp2Pips),
+    tp3: String(cs.tp3Pips),
+    tp4: String(cs.tp4Pips),
+  });
+  const [tpSaveState, setTpSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  useEffect(() => {
+    setTpDraft({
+      tp1: String(cs.tp1Pips),
+      tp2: String(cs.tp2Pips),
+      tp3: String(cs.tp3Pips),
+      tp4: String(cs.tp4Pips),
+    });
+  }, [cs.tp1Pips, cs.tp2Pips, cs.tp3Pips, cs.tp4Pips]);
+
+  const parsedTp = {
+    tp1: parseFloat(tpDraft.tp1),
+    tp2: parseFloat(tpDraft.tp2),
+    tp3: parseFloat(tpDraft.tp3),
+    tp4: tpDraft.tp4.trim() === "" ? 0 : parseFloat(tpDraft.tp4),
+  };
+  const tpDraftValid =
+    Number.isFinite(parsedTp.tp1) && parsedTp.tp1 > 0 &&
+    Number.isFinite(parsedTp.tp2) && parsedTp.tp2 > parsedTp.tp1 &&
+    Number.isFinite(parsedTp.tp3) && parsedTp.tp3 > parsedTp.tp2 &&
+    Number.isFinite(parsedTp.tp4) && (parsedTp.tp4 === 0 || parsedTp.tp4 > parsedTp.tp3);
+  const tpDraftDirty =
+    parsedTp.tp1 !== cs.tp1Pips ||
+    parsedTp.tp2 !== cs.tp2Pips ||
+    parsedTp.tp3 !== cs.tp3Pips ||
+    parsedTp.tp4 !== cs.tp4Pips;
   const { hapticEnabled, setHapticEnabled } = useHapticSettings();
   const { prefs: notif, loading: notifLoading, updatePrefs: updateNotif } = useNotificationSettings();
   const [notifBusy, setNotifBusy] = useState(false);
@@ -707,59 +740,33 @@ export default function SettingsScreen() {
 
             <View style={styles.cascadeDivider} />
 
-            <SliderSetting
-              label="TP1"
-              value={cs.tp1Pips}
-              min={1}
-              max={200}
-              step={1}
-              onChange={(v) => updateSettings({ tp1Pips: v })}
-              displayValue={`${cs.tp1Pips} pips`}
-              hint={`Close 25% at ${(cs.tp1Pips * 0.10).toFixed(2)} from entry`}
-            />
+            {([
+              { key: "tp1" as const, label: "TP1", placeholder: "20" },
+              { key: "tp2" as const, label: "TP2", placeholder: "60" },
+              { key: "tp3" as const, label: "TP3", placeholder: "100" },
+              { key: "tp4" as const, label: "TP4", placeholder: "0 = manual" },
+            ]).map((tp) => (
+              <View key={tp.key} style={styles.tpRow}>
+                <Text style={styles.tpRowLabel}>{tp.label}</Text>
+                <View style={styles.tpInputWrap}>
+                  <TextInput
+                    style={styles.tpInput}
+                    value={tpDraft[tp.key]}
+                    onChangeText={(v) => {
+                      setTpDraft((d) => ({ ...d, [tp.key]: v.replace(/[^0-9.]/g, "") }));
+                      if (tpSaveState !== "idle") setTpSaveState("idle");
+                    }}
+                    placeholder={tp.placeholder}
+                    placeholderTextColor={C.textMuted}
+                    keyboardType="number-pad"
+                    inputMode="numeric"
+                  />
+                  <Text style={styles.tpInputSuffix}>pips</Text>
+                </View>
+              </View>
+            ))}
 
-            <View style={styles.cascadeDivider} />
-
-            <SliderSetting
-              label="TP2"
-              value={cs.tp2Pips}
-              min={1}
-              max={500}
-              step={1}
-              onChange={(v) => updateSettings({ tp2Pips: v })}
-              displayValue={`${cs.tp2Pips} pips`}
-              hint={`Close 25% at ${(cs.tp2Pips * 0.10).toFixed(2)}; SL moves to break-even and pending limits are cancelled`}
-            />
-
-            <View style={styles.cascadeDivider} />
-
-            <SliderSetting
-              label="TP3"
-              value={cs.tp3Pips}
-              min={1}
-              max={1000}
-              step={1}
-              onChange={(v) => updateSettings({ tp3Pips: v })}
-              displayValue={`${cs.tp3Pips} pips`}
-              hint={`Close 25% at ${(cs.tp3Pips * 0.10).toFixed(2)} from entry`}
-            />
-
-            <View style={styles.cascadeDivider} />
-
-            <SliderSetting
-              label="TP4 (0 = leave open)"
-              value={cs.tp4Pips}
-              min={0}
-              max={2000}
-              step={1}
-              onChange={(v) => updateSettings({ tp4Pips: v })}
-              displayValue={cs.tp4Pips > 0 ? `${cs.tp4Pips} pips` : "Open / manual"}
-              hint={cs.tp4Pips > 0
-                ? `Close the final 25% at ${(cs.tp4Pips * 0.10).toFixed(2)} from entry`
-                : "Final 25% stays open — you close it manually whenever you like"}
-            />
-
-            {(cs.tp2Pips <= cs.tp1Pips || cs.tp3Pips <= cs.tp2Pips || (cs.tp4Pips > 0 && cs.tp4Pips <= cs.tp3Pips)) && (
+            {!tpDraftValid && (
               <View style={styles.cascadeWarningBox}>
                 <Feather name="alert-triangle" size={14} color="#f59e0b" />
                 <Text style={styles.cascadeWarningText}>
@@ -767,6 +774,54 @@ export default function SettingsScreen() {
                 </Text>
               </View>
             )}
+
+            <Pressable
+              style={({ pressed }) => [
+                styles.saveBtn,
+                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
+                (!tpDraftValid || !tpDraftDirty || tpSaveState === "saving") && { opacity: 0.5 },
+              ]}
+              disabled={!tpDraftValid || !tpDraftDirty || tpSaveState === "saving"}
+              onPress={async () => {
+                Keyboard.dismiss();
+                void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                setTpSaveState("saving");
+                try {
+                  updateSettings({
+                    tp1Pips: parsedTp.tp1,
+                    tp2Pips: parsedTp.tp2,
+                    tp3Pips: parsedTp.tp3,
+                    tp4Pips: parsedTp.tp4,
+                  });
+                  const ok = await saveToServer();
+                  setTpSaveState(ok ? "saved" : "error");
+                  void Haptics.notificationAsync(
+                    ok ? Haptics.NotificationFeedbackType.Success : Haptics.NotificationFeedbackType.Error
+                  );
+                  setTimeout(() => setTpSaveState("idle"), ok ? 2500 : 3000);
+                } catch {
+                  setTpSaveState("error");
+                  void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+                  setTimeout(() => setTpSaveState("idle"), 3000);
+                }
+              }}
+            >
+              {tpSaveState === "saving" ? (
+                <ActivityIndicator size="small" color="#000" />
+              ) : (
+                <Feather
+                  name={tpSaveState === "saved" ? "check" : tpSaveState === "error" ? "alert-circle" : "save"}
+                  size={15}
+                  color={tpSaveState === "error" ? C.sell : "#000"}
+                />
+              )}
+              <Text style={[styles.saveBtnText, tpSaveState === "error" && { color: C.sell }]}>
+                {tpSaveState === "saving" ? "Saving…"
+                  : tpSaveState === "saved" ? "TP Levels Saved"
+                  : tpSaveState === "error" ? "Save failed — check connection"
+                  : "Save TP Levels"}
+              </Text>
+            </Pressable>
           </View>
 
           {/* Help & Support */}
@@ -1245,6 +1300,42 @@ const styles = StyleSheet.create({
   cascadeCardTitle: { fontSize: 16, fontFamily: "Inter_700Bold", color: C.text },
   cascadeCardDesc: { fontSize: 13, fontFamily: "Inter_400Regular", color: C.textSecondary, lineHeight: 19 },
   cascadeDivider: { height: 1, backgroundColor: C.border },
+  tpRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: 10,
+  },
+  tpRowLabel: {
+    fontSize: 14,
+    fontFamily: "Inter_600SemiBold",
+    color: C.text,
+  },
+  tpInputWrap: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: C.card,
+    minWidth: 140,
+  },
+  tpInput: {
+    flex: 1,
+    fontSize: 15,
+    fontFamily: "Inter_600SemiBold",
+    color: C.text,
+    padding: 0,
+    textAlign: "right",
+  },
+  tpInputSuffix: {
+    fontSize: 12,
+    fontFamily: "Inter_400Regular",
+    color: C.textMuted,
+  },
   settingRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 },
   pillSelectorColumn: { flexDirection: "column", gap: 10 },
   settingRowLeft: { flex: 1, gap: 2 },
