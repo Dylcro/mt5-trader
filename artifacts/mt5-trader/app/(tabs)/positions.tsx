@@ -279,7 +279,12 @@ export default function PositionsScreen() {
 
   const totalPL = positions.reduce((sum, p) => sum + p.profit, 0);
   const webTopPad = Platform.OS === "web" ? 67 : 0;
-  const hasAnything = positions.length > 0 || pendingOrders.length > 0 || activeZones.length > 0;
+  // When zones are active, positions/limits in those zones are already shown
+  // inside each ZoneCard — hide the redundant flat OPEN/PENDING lists to cut
+  // visual noise. Only surface standalone positions when no zone is active
+  // (e.g. a manual non-cascade trade with nothing else going on).
+  const showStandalone = activeZones.length === 0 && positions.length > 0;
+  const hasAnything = activeZones.length > 0 || showStandalone || pendingOrders.length > 0;
 
   return (
     <View style={[styles.container, { paddingTop: insets.top + webTopPad }]}>
@@ -341,14 +346,14 @@ export default function PositionsScreen() {
             {activeZones.length > 0 && (
               <>
                 <Text style={styles.sectionLabel}>ACTIVE ZONES  ·  {activeZones.length}</Text>
-                <View style={{ gap: 10, marginBottom: positions.length > 0 || pendingOrders.length > 0 ? 20 : 0 }}>
+                <View style={{ gap: 10, marginBottom: showStandalone || pendingOrders.length > 0 ? 20 : 0 }}>
                   {activeZones.map((z) => (
                     <ZoneCard key={z.zoneId} zone={z} onRiskFree={riskFree} />
                   ))}
                 </View>
               </>
             )}
-            {positions.length > 0 && (
+            {showStandalone && (
               <>
                 <Text style={styles.sectionLabel}>OPEN  ·  {positions.length}</Text>
                 {positions.map((pos) => (
@@ -361,7 +366,7 @@ export default function PositionsScreen() {
                 ))}
               </>
             )}
-            {pendingOrders.length > 0 && (
+            {showStandalone && pendingOrders.length > 0 && (
               <>
                 <View style={[styles.sectionRow, { marginTop: positions.length > 0 ? 20 : 0 }]}>
                   <Text style={styles.sectionLabel}>PENDING  ·  {pendingOrders.length}</Text>
