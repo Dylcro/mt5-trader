@@ -196,7 +196,8 @@ function PendingOrderCard({ order, onCancel }: { order: PendingOrder; onCancel: 
 export default function PositionsScreen() {
   const insets = useSafeAreaInsets();
   const { positions, pendingOrders, status, refreshPositions, closePosition, cancelOrder, accountInfo, accountId } = useTrading();
-  const { zones } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000 });
+  const { zones, riskFree } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000 });
+  const activeZones = zones.filter((z) => z.status !== "CLOSED");
   const pastZones = zones
     .filter((z) => z.status === "CLOSED")
     .sort((a, b) => (b.closedAt ?? b.createdAt) - (a.closedAt ?? a.createdAt))
@@ -278,7 +279,7 @@ export default function PositionsScreen() {
 
   const totalPL = positions.reduce((sum, p) => sum + p.profit, 0);
   const webTopPad = Platform.OS === "web" ? 67 : 0;
-  const hasAnything = positions.length > 0 || pendingOrders.length > 0;
+  const hasAnything = positions.length > 0 || pendingOrders.length > 0 || activeZones.length > 0;
 
   return (
     <View style={[styles.container, { paddingTop: insets.top + webTopPad }]}>
@@ -337,6 +338,16 @@ export default function PositionsScreen() {
           </View>
         ) : (
           <>
+            {activeZones.length > 0 && (
+              <>
+                <Text style={styles.sectionLabel}>ACTIVE ZONES  ·  {activeZones.length}</Text>
+                <View style={{ gap: 10, marginBottom: positions.length > 0 || pendingOrders.length > 0 ? 20 : 0 }}>
+                  {activeZones.map((z) => (
+                    <ZoneCard key={z.zoneId} zone={z} onRiskFree={riskFree} />
+                  ))}
+                </View>
+              </>
+            )}
             {positions.length > 0 && (
               <>
                 <Text style={styles.sectionLabel}>OPEN  ·  {positions.length}</Text>

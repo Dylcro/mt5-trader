@@ -22,8 +22,6 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import { useTrading, type SLMode } from "@/context/TradingContext";
 import { buildCascadeLevels, useCascadeSettings } from "@/hooks/useCascadeSettings";
-import { useZones } from "@/hooks/useZones";
-import ZoneCard from "@/components/ZoneCard";
 
 const LOT_SIZE_SINGLE_KEY = "lot_size_single";
 const LOT_SIZE_CASCADE_KEY = "lot_size_cascade";
@@ -270,29 +268,6 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
       <Feather name={isOk ? "check-circle" : "alert-circle"} size={18} color="#fff" />
       <Text style={styles.toastText}>{toast.message}</Text>
     </Animated.View>
-  );
-}
-
-function ActiveZonesSection() {
-  const { accountId, status } = useTrading();
-  const { zones, riskFree } = useZones(accountId);
-  const active = zones.filter((z) => z.status !== "CLOSED");
-  if (status !== "connected") return null;
-  return (
-    <View style={styles.zonesSection}>
-      <Text style={styles.zonesSectionTitle}>ACTIVE ZONES  ·  {active.length}</Text>
-      {active.length === 0 ? (
-        <View style={styles.zonesEmpty}>
-          <Text style={styles.zonesEmptyText}>No active zones — open a trade to start one.</Text>
-        </View>
-      ) : (
-        <View style={{ gap: 10 }}>
-          {active.map((z) => (
-            <ZoneCard key={z.zoneId} zone={z} onRiskFree={riskFree} />
-          ))}
-        </View>
-      )}
-    </View>
   );
 }
 
@@ -802,8 +777,6 @@ export default function TradeScreen() {
             Connect your MT5 account in Settings to trade
           </Text>
         )}
-
-        <ActiveZonesSection />
 
         {/* Mode Toggle */}
         <View style={styles.modeToggle}>
@@ -1355,32 +1328,6 @@ const styles = StyleSheet.create({
   cascadeExecBtnSell: { backgroundColor: C.sell },
   cascadeExecLabel: { fontSize: 18, fontFamily: "Inter_700Bold", letterSpacing: 1.5 },
   cascadeExecPrice: { fontSize: 12, fontFamily: "Inter_400Regular", opacity: 0.75 },
-  zonesSection: {
-    marginTop: 4,
-    gap: 8,
-  },
-  zonesSectionTitle: {
-    fontSize: 11,
-    fontFamily: "Inter_700Bold",
-    color: C.textSecondary,
-    letterSpacing: 1,
-    paddingHorizontal: 2,
-  },
-  zonesEmpty: {
-    paddingVertical: 14,
-    paddingHorizontal: 14,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: C.border,
-    borderStyle: "dashed",
-    backgroundColor: "transparent",
-  },
-  zonesEmptyText: {
-    fontSize: 12,
-    fontFamily: "Inter_400Regular",
-    color: C.textMuted,
-    textAlign: "center",
-  },
   cascadeStatusHint: {
     textAlign: "center",
     fontSize: 12,
