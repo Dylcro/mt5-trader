@@ -2028,8 +2028,19 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
             .where(eq(cascadeZonesTable.zoneId, zoneId))
         ).catch(() => {/* logged inside withDbRetry */});
         st.status = "CLOSED";
-        broadcastZoneUpdate(zoneId);
         logEvent("zone.close", { accountId: st.accountId, zoneId, trigger: "reconciliation" });
+        // Cancel any outstanding cascade limit orders so they don't orphan on
+        // MT5 and flash as individual pending cards on the client. Broadcast
+        // AFTER cancellation so the client only redraws once limits are gone.
+        try {
+          const tkn = getToken();
+          cancelZoneLimits(tkn, region, st.accountId, zoneId)
+            .catch((e: Error) => console.warn(`[zone ${zoneId}] reconciliation cancelZoneLimits error:`, e.message))
+            .finally(() => broadcastZoneUpdate(zoneId));
+        } catch {
+          // Token unavailable — still broadcast so client refreshes.
+          broadcastZoneUpdate(zoneId);
+        }
       }
       return;
     }
@@ -2772,8 +2783,11 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
     const st = await loadZone(zoneId);
     if (!st || st.accountId !== accountId) { res.status(404).json({ error: "Zone not found" }); return; }
     if (st.status === "CLOSED") {
-      // Idempotent: already closed → treat as success so the UI's optimistic
-      // refresh doesn't show a spurious failure if the monitor beat us to it.
+      // Zone already closed (reconciliation or a prior close beat us). Still
+      // attempt limit cancellation — if the monitor path ran first it may not
+      // have had the token or may have lost the race with limit fills. This is
+      // a cheap idempotent call that no-ops when nothing remains.
+      await cancelZoneLimits(token, region, accountId, zoneId).catch(() => {});
       res.json({ ok: true, closedCount: 0, alreadyClosed: true });
       return;
     }
