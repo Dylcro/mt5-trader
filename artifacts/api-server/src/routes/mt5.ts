@@ -1740,10 +1740,20 @@ async function markZonePositionClosed(accountId: string, positionId: string): Pr
       // Cancel any outstanding cascade limit orders — when the user manually
       // closes all positions in MT5 the limits are NOT auto-cancelled by the
       // broker, so we must cancel them explicitly now that the zone is done.
+      // Broadcast position_changed + zone_update AFTER cancellation so the
+      // client refreshes only once limits are gone from MT5 (prevents the
+      // brief window where standalone pending orders flash on screen).
       try {
         const tkn = getToken();
         const rgn = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
-        void cancelZoneLimits(tkn, rgn, accountId, zoneId);
+        cancelZoneLimits(tkn, rgn, accountId, zoneId)
+          .then(() => {
+            broadcastToAccount(accountId, "deal", { type: "position_changed" });
+            // Use a direct zone_update broadcast (not broadcastZoneUpdate) so it
+            // fires even when zoneStates entry is absent after a server restart.
+            broadcastToAccount(accountId, "zone_update", { zoneId, status: "CLOSED" });
+          })
+          .catch((e: Error) => console.warn(`[zone ${zoneId}] cancelZoneLimits error:`, e.message));
       } catch {
         console.warn(`[zone ${zoneId}] could not cancel limits after external close — token unavailable`);
       }
@@ -1794,6 +1804,20 @@ async function cancelZoneLimits(
   const orderIds: string[] = [];
   for (const [oid, zid] of zoneLimitOrders.entries()) {
     if (zid === zoneId) orderIds.push(oid);
+  }
+  // DB fallback: the in-memory map can be empty if entries were never populated
+  // (race on zone creation), lost during a server restart gap, or already
+  // cleaned up. Always cross-check the DB so we don't skip live MT5 orders.
+  if (orderIds.length === 0) {
+    try {
+      const dbOrders = await db.select().from(zoneOrdersTable).where(eq(zoneOrdersTable.zoneId, zoneId));
+      for (const o of dbOrders) {
+        orderIds.push(o.orderId);
+        zoneLimitOrders.set(o.orderId, zoneId);
+      }
+    } catch (e) {
+      console.warn(`[zone ${zoneId}] DB fallback order lookup failed:`, (e as Error).message);
+    }
   }
   if (orderIds.length === 0) return;
   // Fetch live pending orders so we only try to cancel those that still exist.
