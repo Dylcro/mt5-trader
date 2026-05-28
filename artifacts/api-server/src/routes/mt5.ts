@@ -561,6 +561,10 @@ const lastStreamingEvalAt = new Map<string, number>(); // zoneId → epoch ms
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function handleStreamingTick(accountId: string, price: any): void {
   if (!price || typeof price !== "object") return;
+  // Reject ticks from any symbol other than XAUUSD — MT5 accounts can stream
+  // multiple symbols simultaneously and we must not mix e.g. GBPUSD (~1.34)
+  // with gold prices (~4500), which causes the alternating display bug.
+  if (price.symbol && price.symbol !== "XAUUSD") return;
   const bid = Number(price.bid);
   const ask = Number(price.ask);
   if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0) return;
