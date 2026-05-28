@@ -2193,7 +2193,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
           st.tp2SlIsBestEffort = false;
           if (wasBestEffort) {
             await withDbRetry(`zones[${zoneId}].tp2SlIsBestEffort=false`,
-              () => db.update(cascadeZonesTable).set({ tp2SlIsBestEffort: false }).where(eq(cascadeZonesTable.zoneId, zoneId))
+              () => db.update(cascadeZonesTable).set({ tp2SlIsBestEffort: false } as Record<string, unknown>).where(eq(cascadeZonesTable.zoneId, zoneId))
             ).catch(() => {/* logged inside withDbRetry */});
           }
           console.log(`[zone ${zoneId}] TP2 SL→BE complete on ${live.length} entr${live.length === 1 ? "y" : "ies"}${wasBestEffort ? " (upgraded from best-effort)" : ""}`);
@@ -2206,7 +2206,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
           if (!st.tp2SlIsBestEffort) {
             st.tp2SlIsBestEffort = true;
             await withDbRetry(`zones[${zoneId}].tp2SlIsBestEffort=true`,
-              () => db.update(cascadeZonesTable).set({ tp2SlIsBestEffort: true }).where(eq(cascadeZonesTable.zoneId, zoneId))
+              () => db.update(cascadeZonesTable).set({ tp2SlIsBestEffort: true } as Record<string, unknown>).where(eq(cascadeZonesTable.zoneId, zoneId))
             ).catch(() => {/* logged inside withDbRetry */});
             console.warn(`[zone ${zoneId}] TP2 SL set to best-effort protective level (price has retraced through entry — will keep trying to upgrade to true BE)`);
           }
