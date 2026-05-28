@@ -17,7 +17,7 @@ deploymentTarget = "vm"
 build = "pnpm --filter @workspace/api-server run smoke && pnpm --filter @workspace/api-server run build"
 
 [services.production.run]
-args = ["node", "artifacts/api-server/dist/index.cjs"]
+args = ["bash", "scripts/post-deploy-smoke.sh"]
 
 [services.production.run.env]
 PORT = "8080"
