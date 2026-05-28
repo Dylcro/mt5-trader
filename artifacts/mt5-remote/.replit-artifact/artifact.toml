@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/remote/"
+title = "MT5 Remote"
+version = "1.0.0"
+id = "artifacts/mt5-remote"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/remote/" ]
+localPort = 24457
+
+[services.development]
+run = "pnpm --filter @workspace/mt5-remote run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/mt5-remote", "run", "build" ]
+publicDir = "artifacts/mt5-remote/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "24457"
+BASE_PATH = "/remote/"

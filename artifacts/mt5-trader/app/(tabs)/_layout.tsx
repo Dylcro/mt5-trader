@@ -12,7 +12,6 @@ import Colors from "@/constants/colors";
 import { useAuth } from "@/context/AuthContext";
 import { useTrading } from "@/context/TradingContext";
 import { setAuthTokenGetter } from "@/lib/authToken";
-import { publishWatchSession } from "@/lib/watchBridge";
 
 function NativeTabLayout() {
   return (
@@ -114,7 +113,7 @@ function ClassicTabLayout() {
 
 export default function TabLayout() {
   const { isSignedIn, isLoaded, getToken } = useAuth();
-  const { reconnectFromServer, accountId, region } = useTrading();
+  const { reconnectFromServer } = useTrading();
 
   useEffect(() => {
     if (!isSignedIn) return;
@@ -122,21 +121,6 @@ export default function TabLayout() {
     void reconnectFromServer();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isSignedIn]);
-
-  // Publish session to the paired Apple Watch whenever auth or the active MT5
-  // account/region changes. No-ops in Expo Go (native module isn't linked).
-  useEffect(() => {
-    if (!isSignedIn) {
-      void publishWatchSession({ token: null, apiBase: null, accountId: null, region: null });
-      return;
-    }
-    void (async () => {
-      const token = await getToken();
-      const apiBase = process.env.EXPO_PUBLIC_API_URL || "/api";
-      await publishWatchSession({ token, apiBase, accountId: accountId || null, region: region || null });
-    })();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isSignedIn, accountId, region]);
 
   if (!isLoaded) {
     return (
