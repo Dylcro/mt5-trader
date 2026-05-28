@@ -75,7 +75,7 @@ export default function ZoneCard({ zone, onRiskFree, historical = false }: ZoneC
   const statusColor = zone.status === "RISK_FREE" ? C.gold : zone.status === "CLOSED" ? C.textMuted : C.buy;
 
   const canRiskFree =
-    !historical && zone.status === "OPEN" && zone.positionCount > 1 && !!onRiskFree;
+    !historical && zone.status === "OPEN" && zone.positionCount >= 1 && !!onRiskFree;
 
   return (
     <View style={[styles.card, historical && { opacity: 0.85 }]}>
