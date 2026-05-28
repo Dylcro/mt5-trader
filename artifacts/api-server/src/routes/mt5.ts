@@ -3118,6 +3118,36 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
       console.log(`[trade/rest] accountId=${accountId} action=${body.actionType} code=${code}`);
     }
 
+    // ── Dead-account detection ───────────────────────────────────────────────
+    // If MetaAPI says the account no longer exists (deleted/orphaned on their
+    // side), the trade can never succeed for this accountId. Evict the stale DB
+    // row + caches and tell the client to reconnect with fresh credentials so
+    // the user isn't left with a button that silently does nothing.
+    const _failMsg = String((data as { message?: string }).message ?? "").toLowerCase();
+    const _accountGone =
+      httpStatus === 404 ||
+      _failMsg.includes("trading account") && _failMsg.includes("not found") ||
+      _failMsg.includes("account is not deployed") && _failMsg.includes("not found");
+    if (_accountGone) {
+      pendingAppCascades.delete(accountId);
+      console.warn(`[trade] accountId=${accountId} — MetaAPI says account not found. Evicting stale row and asking client to reconnect.`);
+      try {
+        await stopStreaming(accountId);
+        await db.delete(storedAccountsTable).where(eq(storedAccountsTable.accountId, accountId));
+        const uId = (req as Record<string, unknown>)["userId"] as string | undefined;
+        if (uId) userAccountCache.delete(uId);
+        knownAccounts.delete(accountId);
+      } catch (evictErr) {
+        console.warn(`[trade] eviction error for ${accountId}:`, (evictErr as Error).message);
+      }
+      return res.status(410).json({
+        success: false,
+        code: 0,
+        reconnectRequired: true,
+        message: "Your MT5 connection has expired. Please reconnect with your MT5 password to continue trading.",
+      });
+    }
+
     const success = TRADE_SUCCESS_CODES.has(code);
     const errorMessage = success ? undefined : (TRADE_ERROR_MESSAGES[code] ?? data.message ?? `Trade failed (code ${code})`);
     if (!success) console.log(`[trade] FAILED action=${body.actionType} code=${code} msg="${errorMessage}"`);

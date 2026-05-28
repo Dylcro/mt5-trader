@@ -680,11 +680,23 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
-        const data = await safeJson<{ success?: boolean; code?: number; message?: string; error?: string; positionId?: string; orderId?: string }>(res);
+        const data = await safeJson<{ success?: boolean; code?: number; message?: string; error?: string; positionId?: string; orderId?: string; reconnectRequired?: boolean }>(res);
         const errMsg = data.message ?? data.error;
         console.log("[submitOrderRaw] ←", actionType, "httpStatus=" + String(res.status), "success=" + String(data.success) + " code=" + String(data.code) + " msg=" + String(errMsg));
         if (res.ok && data.success !== false) {
           return { success: true, message: data.message ?? "Trade placed successfully", positionId: data.positionId, orderId: data.orderId };
+        }
+        // Server signalled the MetaAPI account no longer exists — clear local
+        // accountId so the next app launch / connect screen forces a fresh
+        // reconnect with the user's MT5 password.
+        if (res.status === 410 || data.reconnectRequired) {
+          console.warn("[submitOrderRaw] reconnect required — clearing local accountId");
+          try {
+            await AsyncStorage.multiRemove(["mt5_account_id", "mt5_region"]);
+          } catch {}
+          setAccountIdState("");
+          setStatus("disconnected");
+          return { success: false, message: errMsg ?? "Your MT5 connection has expired. Please reconnect with your MT5 password.", reconnectRequired: true } as { success: boolean; message: string; reconnectRequired?: boolean; positionId?: string; orderId?: string };
         }
         // Retry once on transient broker-not-ready errors with a short delay
         if (attempt < MAX_ATTEMPTS && isTransient(errMsg)) {
