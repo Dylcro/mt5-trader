@@ -14,7 +14,7 @@ run = "pnpm --filter @workspace/api-server run dev"
 
 [services.production]
 deploymentTarget = "vm"
-build = "pnpm --filter @workspace/api-server run smoke && pnpm --filter @workspace/api-server run build"
+build = "pnpm --filter @workspace/api-server run build"
 
 [services.production.run]
 args = ["bash", "scripts/post-deploy-smoke.sh"]
@@ -23,4 +23,4 @@ args = ["bash", "scripts/post-deploy-smoke.sh"]
 PORT = "8080"
 
 [services.production.health.startup]
-path = "/healthz"
+path = "/api/healthz"
