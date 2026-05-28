@@ -7,6 +7,8 @@
  *
  * 2. Runs `pnpm outdated --recursive --json` and prints a human-readable
  *    summary so drift from the pinned versions is visible at a glance.
+ *    Packages documented in scripts/DEP_HOLD_BACKS.md are annotated with
+ *    "hold" so the report stays actionable.
  *
  * Exit codes:
  *   0 — no catalog range issues found (outdated packages are reported but
@@ -15,11 +17,12 @@
  */
 
 import { execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 
 const ROOT = resolve(import.meta.dirname, "../..");
 const WORKSPACE_YAML = resolve(ROOT, "pnpm-workspace.yaml");
+const HOLD_BACKS_MD = resolve(import.meta.dirname, "../DEP_HOLD_BACKS.md");
 
 // ── 1. Catalog range check ────────────────────────────────────────────────────
 
@@ -127,7 +130,39 @@ if (rangeIssues.length > 0) {
   console.log("PASS  All catalog entries are pinned to exact versions.");
 }
 
-// ── 2. Outdated packages report ───────────────────────────────────────────────
+// ── 2. Load approved hold-backs ───────────────────────────────────────────────
+
+/**
+ * Parse scripts/DEP_HOLD_BACKS.md and return a map of package-name → short reason.
+ * Reads markdown table rows of the form:
+ *   | `some-pkg` | ... | ... | reason text |
+ * or:
+ *   | `some-pkg` | ... | ... |
+ */
+function loadHoldBacks(): Map<string, string> {
+  const holds = new Map<string, string>();
+  if (!existsSync(HOLD_BACKS_MD)) return holds;
+
+  const text = readFileSync(HOLD_BACKS_MD, "utf8");
+  for (const line of text.split("\n")) {
+    // Match table rows: | `pkg-name` | ... |
+    const rowMatch = line.match(/^\|\s*`([^`]+)`\s*\|(.+)/);
+    if (!rowMatch) continue;
+    const pkgName = rowMatch[1].trim();
+    // Skip header-style rows (pkg names that are actually column headers)
+    if (pkgName === "Package") continue;
+    // Extract the last non-empty cell as a short reason hint
+    const cells = rowMatch[2].split("|").map((c) => c.trim()).filter(Boolean);
+    // The reason is the last substantive cell (may be empty for ecosystem tables)
+    const reason = cells[cells.length - 1] ?? "";
+    holds.set(pkgName, reason);
+  }
+  return holds;
+}
+
+const holdBacks = loadHoldBacks();
+
+// ── 3. Outdated packages report ───────────────────────────────────────────────
 
 console.log("\nChecking for outdated packages (informational)…\n");
 
@@ -196,6 +231,18 @@ if (!outdatedError) {
   if (entries.length === 0) {
     console.log("All packages are up to date.");
   } else {
+    // Partition into action-needed vs documented hold-backs
+    const actionNeeded: [string, OutdatedEntry][] = [];
+    const onHold: [string, OutdatedEntry][] = [];
+
+    for (const entry of entries) {
+      if (holdBacks.has(entry[0])) {
+        onHold.push(entry);
+      } else {
+        actionNeeded.push(entry);
+      }
+    }
+
     const width = { pkg: 0, cur: 7, lat: 6 };
     for (const [pkg, info] of entries) {
       width.pkg = Math.max(width.pkg, pkg.length);
@@ -204,25 +251,47 @@ if (!outdatedError) {
     }
 
     const pad = (s: string, n: number) => s.padEnd(n);
+    const header = `${pad("Package", width.pkg)}  ${pad("Current", width.cur)}  ${pad("Latest", width.lat)}  Note`;
+    const divider = `${"-".repeat(width.pkg)}  ${"-".repeat(width.cur)}  ${"-".repeat(width.lat)}  ----`;
 
-    console.log(
-      `${pad("Package", width.pkg)}  ${pad("Current", width.cur)}  ${pad("Latest", width.lat)}`
-    );
-    console.log(`${"-".repeat(width.pkg)}  ${"-".repeat(width.cur)}  ${"-".repeat(width.lat)}`);
-
-    for (const [pkg, info] of entries.sort(([a], [b]) => a.localeCompare(b))) {
-      const latest = info.latest ?? "unknown";
-      const isDeprecated = latest === "Deprecated";
-      const marker = isDeprecated ? "  ⚠  deprecated" : "";
-      console.log(
-        `${pad(pkg, width.pkg)}  ${pad(info.current ?? "?", width.cur)}  ${pad(latest, width.lat)}${marker}`
-      );
+    // ── Packages needing attention ────────────────────────────────────────────
+    if (actionNeeded.length > 0) {
+      console.log("=== ACTION NEEDED ===");
+      console.log(header);
+      console.log(divider);
+      for (const [pkg, info] of actionNeeded.sort(([a], [b]) => a.localeCompare(b))) {
+        const latest = info.latest ?? "unknown";
+        const isDeprecated = latest === "Deprecated";
+        const marker = isDeprecated ? "  ⚠  deprecated" : "";
+        console.log(
+          `${pad(pkg, width.pkg)}  ${pad(info.current ?? "?", width.cur)}  ${pad(latest, width.lat)}${marker}`
+        );
+      }
+      console.log(`\n${actionNeeded.length} package(s) need review — run \`pnpm update <package>\` to bump.`);
+    } else {
+      console.log("PASS  All outdated packages are either up to date or have documented hold-backs.");
     }
 
-    console.log(`\n${entries.length} package(s) have available updates.`);
-    console.log(
-      "Review each before upgrading — run `pnpm update <package>` to bump a specific one."
-    );
+    // ── Documented hold-backs ─────────────────────────────────────────────────
+    if (onHold.length > 0) {
+      console.log(`\n=== DOCUMENTED HOLD-BACKS (${onHold.length}) — see scripts/DEP_HOLD_BACKS.md ===`);
+      console.log(header);
+      console.log(divider);
+      for (const [pkg, info] of onHold.sort(([a], [b]) => a.localeCompare(b))) {
+        const latest = info.latest ?? "unknown";
+        const reason = holdBacks.get(pkg) ?? "";
+        const note = reason ? `hold: ${reason.slice(0, 60)}` : "hold: see DEP_HOLD_BACKS.md";
+        console.log(
+          `${pad(pkg, width.pkg)}  ${pad(info.current ?? "?", width.cur)}  ${pad(latest, width.lat)}  ${note}`
+        );
+      }
+    }
+
+    if (actionNeeded.length === 0 && onHold.length > 0) {
+      console.log(`\n${onHold.length} package(s) are intentionally held — no action required.`);
+    } else if (actionNeeded.length > 0) {
+      console.log(`\n(${onHold.length} additional package(s) are intentionally held — see scripts/DEP_HOLD_BACKS.md)`);
+    }
   }
 }
 

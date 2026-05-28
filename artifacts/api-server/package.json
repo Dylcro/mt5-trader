@@ -11,8 +11,8 @@
     "smoke": "playwright test"
   },
   "dependencies": {
-    "@clerk/express": "2.1.19",
-    "@clerk/shared": "4.12.2",
+    "@clerk/express": "2.1.21",
+    "@clerk/shared": "4.13.1",
     "@workspace/api-zod": "workspace:*",
     "@workspace/db": "workspace:*",
     "bcryptjs": "3.0.3",
@@ -21,7 +21,7 @@
     "drizzle-orm": "catalog:",
     "express": "5.2.1",
     "express-rate-limit": "8.5.2",
-    "helmet": "8.1.0",
+    "helmet": "8.2.0",
     "http-proxy-middleware": "4.0.0",
     "jsonwebtoken": "9.0.3",
     "metaapi.cloud-sdk": "29.3.3"

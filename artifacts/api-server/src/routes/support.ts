@@ -14,7 +14,7 @@ function requireAuth(req: Request, res: Response, next: NextFunction): void {
   }
   try {
     const payload = jwt.verify(authHeader.slice(7), JWT_SECRET) as { sub: string };
-    (req as Record<string, unknown>)["userId"] = payload.sub;
+    (req as unknown as Record<string, unknown>)["userId"] = payload.sub;
     next();
   } catch {
     res.status(401).json({ error: "Your session has expired. Please sign in again." });
@@ -22,7 +22,7 @@ function requireAuth(req: Request, res: Response, next: NextFunction): void {
 }
 
 router.post("/support", requireAuth, async (req: Request, res: Response) => {
-  const userId = (req as Record<string, unknown>)["userId"] as string;
+  const userId = (req as unknown as Record<string, unknown>)["userId"] as string;
   const { name, email, query } = req.body as {
     name?: string;
     email?: string;

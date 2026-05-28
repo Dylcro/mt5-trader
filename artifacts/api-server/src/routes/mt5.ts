@@ -29,7 +29,7 @@ function requireAuth(req: Request, res: Response, next: NextFunction): void {
   }
   try {
     const payload = jwt.verify(authHeader.slice(7), JWT_SECRET) as { sub: string };
-    (req as Record<string, unknown>)["userId"] = payload.sub;
+    (req as unknown as Record<string, unknown>)["userId"] = payload.sub;
     next();
   } catch {
     res.status(401).json({ error: "Invalid or expired token." });
@@ -37,8 +37,8 @@ function requireAuth(req: Request, res: Response, next: NextFunction): void {
 }
 
 async function checkOwner(req: Request, res: Response, next: NextFunction): Promise<void> {
-  const userId = (req as Record<string, unknown>)["userId"] as string;
-  const accountId = req.params["accountId"];
+  const userId = (req as unknown as Record<string, unknown>)["userId"] as string;
+  const accountId = req.params["accountId"] as string;
   if (!accountId || !userId) { next(); return; }
 
   // Fast path: in-memory cache — only trust the cache when it matches.
@@ -1059,7 +1059,7 @@ function scheduleCascadeReconcile(accountId: string, region: string, token: stri
       });
       if (!resp.ok) return;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const orders: any[] = await resp.json();
+      const orders = (await resp.json()) as any[];
       // Only treat orders older than 10s as "settled" — anything newer might
       // belong to a cascade that's currently mid-placement (whose orderIds
       // haven't yet been added to cascadePlacedOrderIds).
@@ -2407,7 +2407,7 @@ function notifyZoneEvent(
 // ── Notification prefs routes ────────────────────────────────────────────────
 // GET /api/mt5/notifications/prefs
 router.get("/mt5/notifications/prefs", async (req: Request, res: Response) => {
-  const userId = (req as Record<string, unknown>)["userId"] as string;
+  const userId = (req as unknown as Record<string, unknown>)["userId"] as string;
   const cached = notificationPrefs.get(userId);
   if (cached) {
     res.json({
@@ -2441,7 +2441,7 @@ router.get("/mt5/notifications/prefs", async (req: Request, res: Response) => {
 // PUT /api/mt5/notifications/prefs
 // Body: { nearEnabled?, hitEnabled?, thresholdPips?, expoPushToken? (null clears) }
 router.put("/mt5/notifications/prefs", async (req: Request, res: Response) => {
-  const userId = (req as Record<string, unknown>)["userId"] as string;
+  const userId = (req as unknown as Record<string, unknown>)["userId"] as string;
   const body = (req.body ?? {}) as {
     nearEnabled?: unknown; hitEnabled?: unknown;
     thresholdPips?: unknown; expoPushToken?: unknown;
@@ -2801,7 +2801,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/cancel-pending", checkOwner, 
 
 // GET /api/mt5/my-account — returns the accountId bound to the authenticated user
 router.get("/mt5/my-account", async (req: Request, res: Response) => {
-  const userId = (req as Record<string, unknown>)["userId"] as string;
+  const userId = (req as unknown as Record<string, unknown>)["userId"] as string;
   try {
     const [row] = await db.select().from(storedAccountsTable).where(eq(storedAccountsTable.userId, userId)).limit(1);
     if (!row) { res.status(404).json({ error: "No account linked" }); return; }
@@ -2817,7 +2817,7 @@ router.get("/mt5/my-account", async (req: Request, res: Response) => {
 router.post("/mt5/connect", async (req: Request, res: Response) => {
   try {
     const token = getToken();
-    const userId = (req as Record<string, unknown>)["userId"] as string | undefined;
+    const userId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
 
     // Stop streaming and remove DB rows for any previous account belonging to this user
     // that is different from the incoming accountId.  Must be awaited before binding
@@ -3632,7 +3632,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
       try {
         await stopStreaming(accountId);
         await db.delete(storedAccountsTable).where(eq(storedAccountsTable.accountId, accountId));
-        const uId = (req as Record<string, unknown>)["userId"] as string | undefined;
+        const uId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
         if (uId) userAccountCache.delete(uId);
         knownAccounts.delete(accountId);
       } catch (evictErr) {
@@ -3690,7 +3690,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
             const direction = actionType === "ORDER_TYPE_BUY" ? "buy" : "sell";
             const positionId = data.positionId;
             const volume = Number((req.body as Record<string, unknown>).volume ?? 0) || 0;
-            const uId = (req as Record<string, unknown>)["userId"] as string | undefined;
+            const uId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
             // Per-trade absolute TP prices typed by the user. TP1-3 required,
             // TP4 optional (null/0 = left for manual close). Validation already
             // happened client-side; we re-validate here so a bad request can't
@@ -3802,7 +3802,7 @@ router.get("/mt5/events/:accountId", checkOwner, async (req: Request, res: Respo
     const region = qstr(req.query.region) || DEFAULT_REGION;
 
     // Start streaming connection in the background (idempotent — safe to call repeatedly)
-    const eventsUserId = (req as Record<string, unknown>)["userId"] as string | undefined;
+    const eventsUserId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
     void startStreaming(token, accountId, region, eventsUserId);
 
     const events = getEventsSince(accountId, since);
@@ -3816,7 +3816,7 @@ router.get("/mt5/events/:accountId", checkOwner, async (req: Request, res: Respo
 // Returns cascade config for the authenticated user (userId key),
 // falling back to accountId-keyed config, then global default.
 router.get("/cascade-config", (req: Request, res: Response) => {
-  const userId = (req as Record<string, unknown>)["userId"] as string | undefined;
+  const userId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
   const accountId = typeof req.query.accountId === "string" ? req.query.accountId.trim() : "";
   return res.json(getCascadeConfig(accountId, userId));
 });
@@ -3826,7 +3826,7 @@ router.get("/cascade-config", (req: Request, res: Response) => {
 // Saves under the authenticated userId (for per-user isolation).
 // Also caches under accountId so the auto-cascade background loop can find it.
 router.put("/cascade-config", async (req: Request, res: Response) => {
-  const userId = (req as Record<string, unknown>)["userId"] as string | undefined;
+  const userId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
   const accountId = typeof req.query.accountId === "string" ? req.query.accountId.trim() : "";
   // Primary save key is userId; fall back to accountId for backwards-compat.
   const saveKey = userId ?? accountId;

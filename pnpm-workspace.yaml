@@ -34,27 +34,31 @@ packages:
   - scripts
 
 catalog:
-  '@replit/vite-plugin-cartographer': 0.5.0
+  '@replit/vite-plugin-cartographer': 0.5.5
   '@replit/vite-plugin-runtime-error-modal': 0.0.6
-  '@tailwindcss/vite': 4.2.1
-  '@tanstack/react-query': 5.90.21
-  '@types/node': 25.3.5
-  '@types/react': 19.2.14
+  '@tailwindcss/vite': 4.3.0
+  '@tanstack/react-query': 5.100.14
+  '@types/node': 25.9.1
+  '@types/react': 19.2.15
   '@types/react-dom': 19.2.3
+  # Held at 5.x — v6 requires vite 8 which is a separate major upgrade
   '@vitejs/plugin-react': 5.1.4
   class-variance-authority: 0.7.1
   clsx: 2.1.1
-  drizzle-orm: 0.45.1
-  framer-motion: 12.35.1
+  drizzle-orm: 0.45.2
+  framer-motion: 12.40.0
+  # Held at 0.x — v1.x has breaking icon-name changes requiring a full audit
   lucide-react: 0.545.0
   # Must be this exact version because expo requires it
   react: 19.1.0
   # Must be this exact version because expo requires it
   react-dom: 19.1.0
-  tailwind-merge: 3.5.0
-  tailwindcss: 4.2.1
-  tsx: 4.21.0
+  tailwind-merge: 3.6.0
+  tailwindcss: 4.3.0
+  tsx: 4.22.3
+  # Held at 7.x — vite 8 is a major release; upgrade together with @vitejs/plugin-react
   vite: 7.3.1
+  # Held at 3.x — zod 4 is a complete API redesign requiring broad code changes
   zod: 3.25.76
 
 autoInstallPeers: false
