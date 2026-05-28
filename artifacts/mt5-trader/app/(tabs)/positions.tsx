@@ -364,6 +364,19 @@ export default function PositionsScreen() {
         </View>
       )}
 
+      <Pressable
+        style={({ pressed }) => [styles.refreshRow, pressed && { opacity: 0.6 }]}
+        onPress={handleRefresh}
+        disabled={refreshing}
+      >
+        {refreshing ? (
+          <ActivityIndicator size={12} color={C.textMuted} />
+        ) : (
+          <Feather name="refresh-cw" size={12} color={C.textMuted} />
+        )}
+        <Text style={styles.refreshRowText}>{refreshing ? "Refreshing…" : "Refresh"}</Text>
+      </Pressable>
+
       <ScrollView
         contentContainerStyle={[styles.scroll, { paddingBottom: insets.bottom + 100 }]}
         showsVerticalScrollIndicator={false}
@@ -553,6 +566,22 @@ const styles = StyleSheet.create({
     width: 1,
     backgroundColor: C.border,
     marginVertical: 2,
+  },
+  refreshRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 5,
+    paddingVertical: 7,
+    backgroundColor: C.card,
+    borderBottomWidth: 1,
+    borderBottomColor: C.border,
+  },
+  refreshRowText: {
+    fontSize: 11,
+    fontFamily: "Inter_400Regular",
+    color: C.textMuted,
+    letterSpacing: 0.3,
   },
   scroll: {
     padding: 16,
