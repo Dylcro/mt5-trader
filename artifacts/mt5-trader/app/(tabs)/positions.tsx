@@ -441,7 +441,7 @@ export default function PositionsScreen() {
                 </>
               );
             })()}
-            {showStandalone && pendingOrders.length > 0 && (
+            {activeZones.length === 0 && pendingOrders.length > 0 && (
               <>
                 <View style={[styles.sectionRow, { marginTop: positions.length > 0 ? 20 : 0 }]}>
                   <Text style={styles.sectionLabel}>PENDING  ·  {pendingOrders.length}</Text>

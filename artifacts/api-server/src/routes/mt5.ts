@@ -1737,6 +1737,16 @@ async function markZonePositionClosed(accountId: string, positionId: string): Pr
       );
       if (st) st.status = "CLOSED";
       logEvent("zone.close", { accountId, zoneId, trigger: "position.closed" });
+      // Cancel any outstanding cascade limit orders — when the user manually
+      // closes all positions in MT5 the limits are NOT auto-cancelled by the
+      // broker, so we must cancel them explicitly now that the zone is done.
+      try {
+        const tkn = getToken();
+        const rgn = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
+        void cancelZoneLimits(tkn, rgn, accountId, zoneId);
+      } catch {
+        console.warn(`[zone ${zoneId}] could not cancel limits after external close — token unavailable`);
+      }
     }
   } catch (e) {
     console.error(`[zone] markZonePositionClosed error posId=${positionId}:`, (e as Error).message);
