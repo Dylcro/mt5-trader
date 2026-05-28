@@ -644,6 +644,11 @@ function makeDealListener(accountId: string) {
         const posId = String(deal.positionId ?? "");
         if (posId) void markZonePositionClosed(accountId, posId);
         broadcastToAccount(accountId, "deal", { type: "position_changed" });
+        // MetaAPI REST has eventual consistency — the first broadcast above races
+        // the cache. A second broadcast ~1500ms later ensures the client re-fetches
+        // after the REST endpoint has settled, so closed positions disappear without
+        // needing a manual pull-to-refresh.
+        setTimeout(() => broadcastToAccount(accountId, "deal", { type: "position_changed" }), 1500);
         return;
       }
       if (deal?.entryType !== "DEAL_ENTRY_IN") return;
@@ -1747,15 +1752,19 @@ async function markZonePositionClosed(accountId: string, positionId: string): Pr
         const tkn = getToken();
         const rgn = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
         cancelZoneLimits(tkn, rgn, accountId, zoneId)
-          .then(() => {
+          .catch((e: Error) => console.warn(`[zone ${zoneId}] cancelZoneLimits error:`, e.message))
+          .finally(() => {
+            // Broadcast regardless of cancellation success/failure so the client
+            // always re-fetches and sees the fresh (closed) state.
             broadcastToAccount(accountId, "deal", { type: "position_changed" });
             // Use a direct zone_update broadcast (not broadcastZoneUpdate) so it
             // fires even when zoneStates entry is absent after a server restart.
             broadcastToAccount(accountId, "zone_update", { zoneId, status: "CLOSED" });
-          })
-          .catch((e: Error) => console.warn(`[zone ${zoneId}] cancelZoneLimits error:`, e.message));
+          });
       } catch {
         console.warn(`[zone ${zoneId}] could not cancel limits after external close — token unavailable`);
+        broadcastToAccount(accountId, "deal", { type: "position_changed" });
+        broadcastToAccount(accountId, "zone_update", { zoneId, status: "CLOSED" });
       }
     }
   } catch (e) {
@@ -1819,23 +1828,42 @@ async function cancelZoneLimits(
       console.warn(`[zone ${zoneId}] DB fallback order lookup failed:`, (e as Error).message);
     }
   }
-  if (orderIds.length === 0) return;
-  // Fetch live pending orders so we only try to cancel those that still exist.
-  let pending: Set<string> = new Set();
+  // Fetch live pending orders — used both for the tracked-ID path (to skip
+  // already-gone orders) and the blind-cancel fallback below.
+  let liveOrders: Array<{ id: string; comment?: string }> = [];
   try {
     const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`, {
       headers: authHeaders(token),
     });
     if (r.ok) {
-      const orders = await r.json() as Array<{ id?: string; _id?: string }>;
-      for (const o of orders) {
-        const oid = String(o.id ?? o._id ?? "");
-        if (oid) pending.add(oid);
-      }
+      const raw = await r.json() as Array<{ id?: string; _id?: string; comment?: string }>;
+      liveOrders = raw.map(o => ({ id: String(o.id ?? o._id ?? ""), comment: o.comment })).filter(o => o.id);
     }
   } catch (e) {
     console.warn(`[zone ${zoneId}] orders fetch error during cancel:`, (e as Error).message);
   }
+
+  if (orderIds.length === 0) {
+    // Neither in-memory map nor DB had tracked order IDs — this can happen after
+    // a server restart or when the cascade-limit-attach race was lost. As a safety
+    // net, cancel every live pending order that carries a "Cascade" comment: those
+    // are definitionally stale once this zone is fully closed. Only one zone is
+    // active per account at a time, so false-cancellations are not a risk here.
+    const cascadeLive = liveOrders.filter(o => String(o.comment ?? "").startsWith("Cascade"));
+    if (cascadeLive.length === 0) return;
+    console.log(`[zone ${zoneId}] blind-cancel ${cascadeLive.length} untracked cascade limit(s) (no orderId records found)`);
+    await Promise.all(cascadeLive.map(async (o) => {
+      const r = await tradeAction(token, region, accountId, { actionType: "ORDER_CANCEL", orderId: o.id });
+      if (r.ok || r.code === 10036) {
+        console.log(`[zone ${zoneId}] blind-cancelled cascade orderId=${o.id}`);
+      } else {
+        console.warn(`[zone ${zoneId}] blind-cancel orderId=${o.id} failed code=${r.code}`);
+      }
+    }));
+    return;
+  }
+
+  const pending: Set<string> = new Set(liveOrders.map(o => o.id));
   await Promise.all(orderIds.map(async (oid) => {
     const forget = async () => {
       zoneLimitOrders.delete(oid);
