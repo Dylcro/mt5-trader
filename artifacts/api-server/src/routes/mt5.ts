@@ -1555,58 +1555,10 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     const cmpPrice = st.direction === "buy" ? price.bid : price.ask;
     const hit = (tp: number) => st.direction === "buy" ? cmpPrice >= tp : cmpPrice <= tp;
 
-    // ── Step 1: rolling per-entry cashout ─────────────────────────────────
-    // Each non-best entry closes the instant price clears ITS OWN open price
-    // by cashoutPips (default 5p). Closes one-by-one as price climbs (BUY) or
-    // drops (SELL), instead of waiting for a full retrace to the original
-    // anchor. The "best" entry (lowest openPrice for BUY / highest for SELL)
-    // is always preserved so TP1-4 can run on it.
-    //
-    // CONTINUOUS: re-evaluated every tick. If a later limit fills below the
-    // current best (BUY), it becomes the new best and the previous best
-    // becomes "an upper entry" — once price clears it by 5p it cashes out
-    // too. When the running TP position itself gets cashed out and a fresh
-    // full-volume survivor remains, the TP flags reset so the new best runs
-    // the full TP1-4 ladder.
-    if (live.length > 1) {
-      const sorted = sortZonePositions(live, st.direction); // worst → best
-      const best = sorted[sorted.length - 1]!;
-      const upper = sorted.slice(0, -1);
-      const closed: string[] = [];
-      let anyFailed = false;
-      for (const p of upper) {
-        const trigger = st.direction === "buy"
-          ? p.openPrice + st.cashoutPips * PIP
-          : p.openPrice - st.cashoutPips * PIP;
-        if (!hit(trigger)) continue;
-        console.log(`[zone ${zoneId}] CASHOUT roll posId=${p.id} entry=${p.openPrice} → trigger=${trigger.toFixed(2)} (cmp=${cmpPrice})`);
-        const ok = await closeZonePosition(token, region, st.accountId, p.id);
-        if (ok) closed.push(p.id); else anyFailed = true;
-      }
-      if (closed.length > 0) {
-        if (!st.cashoutDone) {
-          st.cashoutDone = true;
-          await db.update(cascadeZonesTable).set({ cashoutDone: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-        }
-        // If the surviving best is a fresh full-volume entry that wasn't the
-        // one TP1-4 had been running against, reset the zone-wide TP flags
-        // so the new best runs its own complete ladder.
-        const isFreshSurvivor = st.originalVolume > 0
-          && best.volume >= st.originalVolume * 0.99
-          && (st.tp1Hit || st.tp2Hit || st.tp3Hit || st.tp4Hit);
-        if (isFreshSurvivor) {
-          st.tp1Hit = false; st.tp2Hit = false; st.tp3Hit = false; st.tp4Hit = false;
-          zoneNearNotifiedTp.set(zoneId, 0);
-          await db.update(cascadeZonesTable)
-            .set({ tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false })
-            .where(eq(cascadeZonesTable.zoneId, zoneId));
-          console.log(`[zone ${zoneId}] CASHOUT survivor posId=${best.id} vol=${best.volume} is fresh — TP flags reset for new ladder`);
-        }
-        console.log(`[zone ${zoneId}] CASHOUT closed ${closed.length} upper entries [${closed.join(",")}] — kept best posId=${best.id} @${best.openPrice} vol=${best.volume}`);
-        if (anyFailed) console.warn(`[zone ${zoneId}] CASHOUT partial failure — will retry next tick`);
-        return; // next tick re-snapshots live positions
-      }
-    }
+    // No auto cashout — the user closes upper entries manually if they want.
+    // All four cascade orders share the same SL and TP1-4 (set broker-side at
+    // placement); the engine just runs 25% partial closes on EVERY live entry
+    // as each TP level is hit.
 
     // "Near next TP" detection — fire a push once per TP step when the live
     // distance crosses the user's threshold. Runs before the hit branches so a
@@ -1644,28 +1596,45 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       }
     }
 
-    // ── Step 2-5: TP1-4 on the best entry (25% partial each) ─────────────
-    // Best entry = most profitable: BUY → lowest entry; SELL → highest entry.
-    const dbSorted = zps.slice().sort((a, b) =>
-      st.direction === "buy" ? Number(b.entryPrice) - Number(a.entryPrice)
-                              : Number(a.entryPrice) - Number(b.entryPrice));
-    const dbBest = dbSorted[dbSorted.length - 1]!;
-    const liveBest = live.find(p => p.id === dbBest.positionId);
-    if (!liveBest) return; // best already gone — wait for cleanup
-    const originalBestVol = st.originalVolume > 0 ? st.originalVolume : Number(dbBest.volume);
-    const partialOf25 = Math.max(0.01, parseFloat((originalBestVol * 0.25).toFixed(2)));
+    // ── TP1-4 applied to EVERY active entry (25% per TP, of each entry's
+    //    own original volume). TP4 is optional — when set, closes whatever's
+    //    left of each entry. Each TP advances only after the previous one
+    //    has fired.
+    //
+    //   TP2 also: cancel any still-unfilled cascade limits. We deliberately
+    //   do NOT re-arm broker SLs at TP2 (each position was placed with a
+    //   broker SL already; nudging it to BE per position would be a
+    //   behaviour change the user didn't ask for in this simpler model).
+    const zpsById = new Map(zps.map(z => [z.positionId, z]));
+    const closePartialForLevel = async (
+      level: 1 | 2 | 3 | 4,
+      keepFractionGate: number, // only close if remaining > origVol * gate
+    ): Promise<boolean> => {
+      // Fire all per-entry closes IN PARALLEL — in a fast market, serially
+      // awaiting each close can let later entries slip several pips past the
+      // TP price before their close request hits the broker.
+      const results = await Promise.all(live.map(async p => {
+        const row = zpsById.get(p.id);
+        const origVol = row ? Number(row.volume) : p.volume;
+        if (!(origVol > 0)) return true;
+        if (level === 4) {
+          return closeZonePosition(token, region, st.accountId, p.id);
+        }
+        // skip if this entry already had its partial for this level applied
+        if (p.volume <= origVol * keepFractionGate) return true;
+        const partial = Math.max(0.01, parseFloat((origVol * 0.25).toFixed(2)));
+        const vol = Math.min(partial, p.volume);
+        return vol < p.volume
+          ? closeZonePosition(token, region, st.accountId, p.id, vol)
+          : closeZonePosition(token, region, st.accountId, p.id);
+      }));
+      return results.every(Boolean);
+    };
 
     if (!st.tp1Hit && st.tp1Price != null && hit(st.tp1Price)) {
-      console.log(`[zone ${zoneId}] TP1 trigger @${cmpPrice} (tp1=${st.tp1Price})`);
-      let allOk = true;
-      if (liveBest.volume > originalBestVol * 0.76) {
-        const vol = Math.min(partialOf25, liveBest.volume);
-        const ok = vol < liveBest.volume
-          ? await closeZonePosition(token, region, st.accountId, liveBest.id, vol)
-          : await closeZonePosition(token, region, st.accountId, liveBest.id);
-        if (!ok) allOk = false;
-      }
-      if (allOk) {
+      console.log(`[zone ${zoneId}] TP1 trigger @${cmpPrice} (tp1=${st.tp1Price}) — ${live.length} active entr${live.length === 1 ? "y" : "ies"}`);
+      const ok = await closePartialForLevel(1, 0.76);
+      if (ok) {
         st.tp1Hit = true;
         await db.update(cascadeZonesTable).set({ tp1Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
         zoneNearNotifiedTp.set(zoneId, 0);
@@ -1675,39 +1644,24 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         console.warn(`[zone ${zoneId}] TP1 partial failure — will retry next tick`);
       }
     } else if (!st.tp2Hit && st.tp1Hit && st.tp2Price != null && hit(st.tp2Price)) {
-      console.log(`[zone ${zoneId}] TP2 trigger @${cmpPrice} (tp2=${st.tp2Price})`);
-      let allOk = true;
-      if (liveBest.volume > originalBestVol * 0.51) {
-        const vol = Math.min(partialOf25, liveBest.volume);
-        if (vol < liveBest.volume) {
-          const ok = await closeZonePosition(token, region, st.accountId, liveBest.id, vol);
-          if (!ok) allOk = false;
-        }
-      }
-      // SL-to-BE on the remaining best entry + cancel all unfilled cascade limits.
-      const slOk = await modifyZonePositionSl(token, region, st.accountId, liveBest.id, liveBest.openPrice);
-      if (!slOk) allOk = false;
+      console.log(`[zone ${zoneId}] TP2 trigger @${cmpPrice} (tp2=${st.tp2Price}) — ${live.length} active entr${live.length === 1 ? "y" : "ies"}`);
+      const ok = await closePartialForLevel(2, 0.51);
+      // Cancel any still-unfilled cascade limits at TP2 (we're now solidly in
+      // profit; no need to add to the position).
       await cancelZoneLimits(token, region, st.accountId, zoneId);
-      if (allOk) {
+      if (ok) {
         st.tp2Hit = true;
         await db.update(cascadeZonesTable).set({ tp2Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
         zoneNearNotifiedTp.set(zoneId, 0);
         notifyZoneEvent(zoneId, "hit", 2, 0, st.direction);
-        console.log(`[zone ${zoneId}] TP2 complete — SL→BE @${liveBest.openPrice} + limits cancelled`);
+        console.log(`[zone ${zoneId}] TP2 complete — unfilled limits cancelled`);
       } else {
         console.warn(`[zone ${zoneId}] TP2 partial failure — will retry next tick`);
       }
     } else if (!st.tp3Hit && st.tp2Hit && st.tp3Price != null && hit(st.tp3Price)) {
-      console.log(`[zone ${zoneId}] TP3 trigger @${cmpPrice} (tp3=${st.tp3Price})`);
-      let allOk = true;
-      if (liveBest.volume > originalBestVol * 0.26) {
-        const vol = Math.min(partialOf25, liveBest.volume);
-        if (vol < liveBest.volume) {
-          const ok = await closeZonePosition(token, region, st.accountId, liveBest.id, vol);
-          if (!ok) allOk = false;
-        }
-      }
-      if (allOk) {
+      console.log(`[zone ${zoneId}] TP3 trigger @${cmpPrice} (tp3=${st.tp3Price}) — ${live.length} active entr${live.length === 1 ? "y" : "ies"}`);
+      const ok = await closePartialForLevel(3, 0.26);
+      if (ok) {
         st.tp3Hit = true;
         await db.update(cascadeZonesTable).set({ tp3Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
         zoneNearNotifiedTp.set(zoneId, 0);
@@ -1717,9 +1671,9 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         console.warn(`[zone ${zoneId}] TP3 partial failure — will retry next tick`);
       }
     } else if (!st.tp4Hit && st.tp3Hit && st.tp4Price != null && hit(st.tp4Price)) {
-      // TP4 is optional. When set, close whatever's left of the best entry.
-      console.log(`[zone ${zoneId}] TP4 trigger @${cmpPrice} (tp4=${st.tp4Price})`);
-      const ok = await closeZonePosition(token, region, st.accountId, liveBest.id);
+      // TP4 is optional. When set, close whatever's left of each entry.
+      console.log(`[zone ${zoneId}] TP4 trigger @${cmpPrice} (tp4=${st.tp4Price}) — closing all remaining`);
+      const ok = await closePartialForLevel(4, 0);
       if (ok) {
         st.tp4Hit = true;
         await db.update(cascadeZonesTable).set({ tp4Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
