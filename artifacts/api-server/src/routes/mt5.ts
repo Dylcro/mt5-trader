@@ -780,6 +780,18 @@ async function startStreaming(token: string, accountId: string, region: string =
       } catch (deployErr) {
         console.error(`[stream ${accountId}] re-deploy failed:`, (deployErr as Error).message);
       }
+    } else if (/account with id .* not found/i.test(msg) || msg.includes("NotFoundError")) {
+      // Permanent: account was deleted on MetaAPI's side. Without removing it
+      // from stored_accounts the watchdog reconnects every 10s forever,
+      // calling loadCascadeHistory each time — pure noise + load. Drop it
+      // so we stop trying.
+      console.warn(`[stream ${accountId}] account no longer exists on MetaAPI — removing from stored_accounts to stop retry loop`);
+      knownAccounts.delete(accountId);
+      try {
+        await db.delete(storedAccountsTable).where(eq(storedAccountsTable.accountId, accountId));
+      } catch (delErr) {
+        console.warn(`[stream ${accountId}] failed to delete stored_account:`, (delErr as Error).message);
+      }
     } else {
       console.error(`[stream ${accountId}] streaming start failed:`, msg);
     }
@@ -1217,6 +1229,14 @@ interface ZoneState {
   tp2Hit: boolean;
   tp3Hit: boolean;
   tp4Hit: boolean;
+  // SL→BE is a SEPARATE concern from the TP2 partial close. We track it on its
+  // own so a broker-rejected SL move (e.g. code 10016 "Invalid stops") cannot
+  // wedge the zone at TP2 forever — partial close succeeds, tp2Hit advances,
+  // and BE retries on a bounded budget without re-firing TP2 every tick.
+  // Both fields are runtime-only (not persisted); after a restart we re-attempt
+  // BE up to the cap, which is safe (modify-sl is idempotent).
+  tp2SlMoved: boolean;
+  tp2BeAttempts: number;
   status: "OPEN" | "RISK_FREE" | "CLOSED";
   busy: boolean; // debounce: prevent overlapping monitor ticks for this zone
   // In-memory mirror of zone_positions(status=OPEN) for this zone, used as a
@@ -1243,6 +1263,11 @@ const ZONE_MIN_LOT_PER_ENTRY    = 0.04; // 4 × 0.01 broker minimum for 25% slic
 // the partial close. Lets TPs trigger through the broker spread instead of
 // requiring the comparison side to print the exact level.
 const ZONE_TP_TOLERANCE_PIPS    = 4;
+// Max ticks we'll retry the SL→BE move after TP2 partials are closed.
+// At the 3 s monitor interval (plus streaming tick attempts) this is
+// roughly 15 s of trying; enough to ride out a transient broker burp
+// but bounded so a hard rejection (code 10016) doesn't loop forever.
+const MAX_TP2_BE_ATTEMPTS       = 5;
 
 // Pure helper: compute the "risk free" stop-loss price for a zone's surviving
 // entry. `pips` is SIGNED relative to entry from the trader's perspective:
@@ -1331,6 +1356,7 @@ function prepareZoneForCascade(
     cashoutPips: ZONE_CASHOUT_PIPS_DEFAULT,
     cashoutDone: false,
     tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
+    tp2SlMoved: false, tp2BeAttempts: 0,
     status: "OPEN", busy: false,
     trackedPositions: new Map(),
   };
@@ -1822,22 +1848,19 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       // Cancel any still-unfilled cascade limits at TP2 (we're now solidly in
       // profit; no need to add to the position).
       await cancelZoneLimits(token, region, st.accountId, zoneId);
-      // SL → break-even on every remaining live entry (each position's own
-      // openPrice). Fire in parallel so a fast market can't slip past one
-      // entry while we're still talking to the broker about another.
-      const slResults = await Promise.all(live.map(p =>
-        modifyZonePositionSl(token, region, st.accountId, p.id, p.openPrice)
-      ));
-      const slAllOk = slResults.every(Boolean);
-      if (!slAllOk) console.warn(`[zone ${zoneId}] TP2 SL→BE partial failure — will retry next tick`);
-      if (ok && slAllOk) {
+      if (ok) {
+        // Advance to TP3 detection as soon as the partial close succeeds —
+        // do NOT gate this on the SL→BE move. The BE move is attempted by a
+        // separate sticky-retry block below; gating tp2Hit on it caused the
+        // zone to re-enter this branch every tick when the broker rejected
+        // the SL (code 10016), spamming logs and never advancing.
         st.tp2Hit = true;
         await db.update(cascadeZonesTable).set({ tp2Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
         zoneNearNotifiedTp.set(zoneId, 0);
         notifyZoneEvent(zoneId, "hit", 2, 0, st.direction);
-        console.log(`[zone ${zoneId}] TP2 complete — unfilled limits cancelled + SL→BE on ${live.length} entr${live.length === 1 ? "y" : "ies"}`);
+        console.log(`[zone ${zoneId}] TP2 partial closed + limits cancelled — SL→BE will be attempted next`);
       } else {
-        console.warn(`[zone ${zoneId}] TP2 partial failure — will retry next tick`);
+        console.warn(`[zone ${zoneId}] TP2 partial close failed — will retry next tick`);
       }
     } else if (!st.tp3Hit && st.tp2Hit && st.tp3Price != null && hit(st.tp3Price)) {
       console.log(`[zone ${zoneId}] TP3 trigger @${cmpPrice} (tp3=${st.tp3Price}) — ${live.length} active entr${live.length === 1 ? "y" : "ies"}`);
@@ -1861,6 +1884,27 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         console.log(`[zone ${zoneId}] TP4 complete — final exit`);
       } else {
         console.warn(`[zone ${zoneId}] TP4 close failed — will retry next tick`);
+      }
+    }
+
+    // Sticky SL→BE retry, independent of the TP if/else chain above. Runs
+    // every tick once TP2 partials have closed, up to MAX_TP2_BE_ATTEMPTS.
+    // Bounded so a persistent broker rejection (e.g. code 10016 "Invalid
+    // stops" when SL would equal the position open price exactly) can't
+    // spam the broker or the logs forever. After the budget is exhausted
+    // we mark the BE as "done" so the zone advances cleanly — partial
+    // profit is already locked in and TP3/TP4 detection keeps running.
+    if (st.tp2Hit && !st.tp2SlMoved && live.length > 0 && st.tp2BeAttempts < MAX_TP2_BE_ATTEMPTS) {
+      st.tp2BeAttempts += 1;
+      const slResults = await Promise.all(live.map(p =>
+        modifyZonePositionSl(token, region, st.accountId, p.id, p.openPrice)
+      ));
+      if (slResults.every(Boolean)) {
+        st.tp2SlMoved = true;
+        console.log(`[zone ${zoneId}] TP2 SL→BE complete on ${live.length} entr${live.length === 1 ? "y" : "ies"} (attempt ${st.tp2BeAttempts})`);
+      } else if (st.tp2BeAttempts >= MAX_TP2_BE_ATTEMPTS) {
+        st.tp2SlMoved = true; // give up; stop retrying
+        console.error(`[zone ${zoneId}] TP2 SL→BE giving up after ${MAX_TP2_BE_ATTEMPTS} attempts — broker rejected the move; positions remain at their original SL`);
       }
     }
   } catch (e) {
@@ -1905,6 +1949,10 @@ export async function loadZoneState(): Promise<void> {
         cashoutPips: Number(z.cashoutPips ?? ZONE_CASHOUT_PIPS_DEFAULT),
         cashoutDone: z.cashoutDone ?? false,
         tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit, tp4Hit: z.tp4Hit ?? false,
+        // BE move isn't persisted — on restart, if tp2 was already hit, attempt
+        // BE again (modify-sl is idempotent). If the broker still rejects, the
+        // bounded retry budget below stops the loop quickly.
+        tp2SlMoved: false, tp2BeAttempts: 0,
         status: "OPEN", busy: false,
         trackedPositions: new Map(),
       });
