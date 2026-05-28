@@ -6,10 +6,15 @@
   "scripts": {
     "hello": "tsx ./src/hello.ts",
     "dep-drift": "tsx ./src/dep-drift.ts",
+    "notify-dep-drift-fail": "tsx ./src/notify-dep-drift-fail.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "pg": "8.21.0"
   },
   "devDependencies": {
     "@types/node": "catalog:",
+    "@types/pg": "8.20.0",
     "tsx": "catalog:"
   }
 }
