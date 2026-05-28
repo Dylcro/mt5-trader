@@ -121,9 +121,6 @@ interface CascadeConfig {
   tp1Pips: number;
   tp2Pips: number;
   tp3Pips: number;
-  tp4Pips: number;            // 0 = leave last 25% open (manual close)
-  autoCascadeOnMt5: boolean;  // auto-build cascade when user trades manually in MT5
-  mt5CascadeLot: number;      // per-leg lot size for the auto-cascade
 }
 
 const CASCADE_DEFAULTS: CascadeConfig = {
@@ -134,9 +131,6 @@ const CASCADE_DEFAULTS: CascadeConfig = {
   tp1Pips: 20,
   tp2Pips: 50,
   tp3Pips: 90,
-  tp4Pips: 0,
-  autoCascadeOnMt5: false,
-  mt5CascadeLot: 0.04,
 };
 
 // In-memory cache: accountId (or "" for global) → config.
@@ -161,7 +155,6 @@ async function attemptLoadCascadeConfig(): Promise<void> {
     }
     for (const row of rows) {
       const key = row.accountId ?? "";
-      const lotRaw = parseFloat(row.mt5CascadeLot ?? "0.04");
       const cfg: CascadeConfig = {
         enabled:           row.enabled,
         numPositions:      row.numPositions,
@@ -170,9 +163,6 @@ async function attemptLoadCascadeConfig(): Promise<void> {
         tp1Pips:           row.tp1Pips,
         tp2Pips:           row.tp2Pips,
         tp3Pips:           row.tp3Pips,
-        tp4Pips:           row.tp4Pips ?? 0,
-        autoCascadeOnMt5:  row.autoCascadeOnMt5 ?? false,
-        mt5CascadeLot:     Number.isFinite(lotRaw) && lotRaw > 0 ? lotRaw : 0.04,
       };
       cascadeConfigs.set(key, cfg);
       // Also cache under the MetaAPI accountId so the auto-cascade background
@@ -241,7 +231,7 @@ export async function loadCascadeConfig(): Promise<void> {
 // unenforced, allowing TP2 < TP1 / TP3 < TP2 to reach the staged-exit logic).
 export type CascadeConfigUpdateResult =
   | { ok: true; config: CascadeConfig }
-  | { ok: false; status: 400; body: { error: string; tp1Pips: number; tp2Pips: number; tp3Pips: number; tp4Pips?: number } };
+  | { ok: false; status: 400; body: { error: string; tp1Pips: number; tp2Pips: number; tp3Pips: number } };
 
 export function buildCascadeConfigUpdate(
   body: Partial<CascadeConfig> | null | undefined,
@@ -249,34 +239,24 @@ export function buildCascadeConfigUpdate(
 ): CascadeConfigUpdateResult {
   const b = body ?? {};
   const nextConfig: CascadeConfig = {
-    enabled:          typeof b.enabled          === "boolean" ? b.enabled          : current.enabled,
-    numPositions:     typeof b.numPositions     === "number"  ? b.numPositions     : current.numPositions,
-    pipsBetween:      typeof b.pipsBetween      === "number"  ? b.pipsBetween      : current.pipsBetween,
-    slPips:           typeof b.slPips           === "number"  ? b.slPips           : current.slPips,
-    tp1Pips:          typeof b.tp1Pips          === "number" && b.tp1Pips > 0 ? Math.round(b.tp1Pips) : current.tp1Pips,
-    tp2Pips:          typeof b.tp2Pips          === "number" && b.tp2Pips > 0 ? Math.round(b.tp2Pips) : current.tp2Pips,
-    tp3Pips:          typeof b.tp3Pips          === "number" && b.tp3Pips > 0 ? Math.round(b.tp3Pips) : current.tp3Pips,
-    // tp4Pips = 0 is valid (means "leave last 25% open / manual close").
-    tp4Pips:          typeof b.tp4Pips          === "number" && b.tp4Pips >= 0 ? Math.round(b.tp4Pips) : current.tp4Pips,
-    autoCascadeOnMt5: typeof b.autoCascadeOnMt5 === "boolean" ? b.autoCascadeOnMt5 : current.autoCascadeOnMt5,
-    mt5CascadeLot:    typeof b.mt5CascadeLot    === "number" && b.mt5CascadeLot >= 0.01
-                        ? Math.round(b.mt5CascadeLot * 100) / 100 : current.mt5CascadeLot,
+    enabled:      typeof b.enabled      === "boolean" ? b.enabled      : current.enabled,
+    numPositions: typeof b.numPositions === "number"  ? b.numPositions : current.numPositions,
+    pipsBetween:  typeof b.pipsBetween  === "number"  ? b.pipsBetween  : current.pipsBetween,
+    slPips:       typeof b.slPips       === "number"  ? b.slPips       : current.slPips,
+    tp1Pips:      typeof b.tp1Pips      === "number" && b.tp1Pips > 0 ? Math.round(b.tp1Pips) : current.tp1Pips,
+    tp2Pips:      typeof b.tp2Pips      === "number" && b.tp2Pips > 0 ? Math.round(b.tp2Pips) : current.tp2Pips,
+    tp3Pips:      typeof b.tp3Pips      === "number" && b.tp3Pips > 0 ? Math.round(b.tp3Pips) : current.tp3Pips,
   };
   // Enforce strict ordering: TP1 < TP2 < TP3 (zone TP stages must fire in sequence).
-  // TP4 is optional (0 = manual) but if set must be > TP3.
-  const tpOrderOk = nextConfig.tp1Pips < nextConfig.tp2Pips
-    && nextConfig.tp2Pips < nextConfig.tp3Pips
-    && (nextConfig.tp4Pips === 0 || nextConfig.tp4Pips > nextConfig.tp3Pips);
-  if (!tpOrderOk) {
+  if (!(nextConfig.tp1Pips < nextConfig.tp2Pips && nextConfig.tp2Pips < nextConfig.tp3Pips)) {
     return {
       ok: false,
       status: 400,
       body: {
-        error: "Take Profit levels must be strictly increasing (TP1 < TP2 < TP3, and TP4 either 0 or > TP3)",
+        error: "Take Profit levels must be strictly increasing (TP1 < TP2 < TP3)",
         tp1Pips: nextConfig.tp1Pips,
         tp2Pips: nextConfig.tp2Pips,
         tp3Pips: nextConfig.tp3Pips,
-        tp4Pips: nextConfig.tp4Pips,
       },
     };
   }
@@ -287,11 +267,8 @@ export function buildCascadeConfigUpdate(
 // accountId="" means the global (fallback) config.
 async function saveCascadeConfig(config: CascadeConfig, accountId: string): Promise<boolean> {
   try {
-    const lotStr = config.mt5CascadeLot.toFixed(2);
-    const { mt5CascadeLot: _omit, ...rest } = config;
-    void _omit;
     await db.insert(cascadeConfigTable)
-      .values({ accountId, ...rest, mt5CascadeLot: lotStr })
+      .values({ accountId, ...config })
       .onConflictDoUpdate({
         target: cascadeConfigTable.accountId,
         set: {
@@ -302,9 +279,6 @@ async function saveCascadeConfig(config: CascadeConfig, accountId: string): Prom
           tp1Pips:           config.tp1Pips,
           tp2Pips:           config.tp2Pips,
           tp3Pips:           config.tp3Pips,
-          tp4Pips:           config.tp4Pips,
-          autoCascadeOnMt5:  config.autoCascadeOnMt5,
-          mt5CascadeLot:     lotStr,
         },
       });
     return true;
@@ -334,106 +308,6 @@ function buildCascadeLevels(
     ? parseFloat((marketPrice - slDist).toFixed(2))
     : parseFloat((marketPrice + slDist).toFixed(2));
   return { limitEntries, stopLoss };
-}
-
-// ── Auto-cascade on manual MT5 entries ───────────────────────────────────────
-// When the user opens a market position directly in the MT5 terminal (not
-// via the app) and `autoCascadeOnMt5` is enabled, build a full cascade
-// around that entry using the pip distances saved in cascade config.
-// In-flight guard: prevents a duplicate deal event (or rapid sync replay)
-// from triggering two cascades for the same fresh position.
-const autoCascadeInFlight = new Set<string>(); // accountId:positionId
-
-async function triggerAutoCascadeFromMt5(
-  accountId: string,
-  region: string,
-  userId: string | undefined,
-  positionId: string,
-  direction: "buy" | "sell",
-  anchor: number,
-  symbol: string,
-  config: CascadeConfig,
-): Promise<void> {
-  const guardKey = `${accountId}:${positionId}`;
-  if (autoCascadeInFlight.has(guardKey)) return;
-  autoCascadeInFlight.add(guardKey);
-  try {
-    // Mark the position as cascaded NOW so any duplicate deal event or
-    // post-sync catch-up skips it.
-    markCascaded(accountId, positionId);
-
-    const lot = config.mt5CascadeLot;
-    if (lot < ZONE_MIN_LOT_PER_ENTRY) {
-      console.warn(`[auto-cascade-mt5] lot ${lot} < ${ZONE_MIN_LOT_PER_ENTRY} minimum — skipping posId=${positionId}`);
-      return;
-    }
-    const { limitEntries, stopLoss } = buildCascadeLevels(anchor, direction, config);
-    const sign = direction === "buy" ? 1 : -1;
-    const round2 = (n: number) => parseFloat(n.toFixed(2));
-    const tp1Price = round2(anchor + sign * config.tp1Pips * PIP);
-    const tp2Price = round2(anchor + sign * config.tp2Pips * PIP);
-    const tp3Price = round2(anchor + sign * config.tp3Pips * PIP);
-    const tp4Price = config.tp4Pips > 0 ? round2(anchor + sign * config.tp4Pips * PIP) : null;
-
-    console.log(`[auto-cascade-mt5] firing accountId=${accountId} posId=${positionId} ${direction.toUpperCase()} anchor=${anchor} lot=${lot} tps=[${tp1Price},${tp2Price},${tp3Price},${tp4Price}] sl=${stopLoss} limits=${limitEntries.join(",")}`);
-
-    // 1) Prepare zone state so any limit fills can attach immediately.
-    const zoneState = prepareZoneForCascade(
-      accountId, direction, userId,
-      { tp1Price, tp2Price, tp3Price, tp4Price },
-      lot,
-    );
-    zoneState.anchorPrice = anchor;
-
-    const token = getToken();
-
-    // 2) Modify the just-opened MT5 position to attach the cascade SL.
-    //    (Engine handles partial TP closes — no broker TP needed.)
-    const slRes = await tradeAction(token, region, accountId, {
-      actionType: "POSITION_MODIFY", positionId, stopLoss,
-    });
-    if (!slRes.ok) {
-      console.warn(`[auto-cascade-mt5] modify-sl posId=${positionId} failed code=${slRes.code} msg="${slRes.message ?? ""}"`);
-    }
-
-    // 3) Persist the zone + position.
-    await persistPreparedZone(zoneState, userId, positionId, lot);
-
-    // 4) Place the cascade limit orders in parallel.
-    const conn = activeConnections.get(accountId);
-    const limitActionType = direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT";
-    const placements = limitEntries.map(async (entry, idx) => {
-      try {
-        const body: Record<string, unknown> = {
-          actionType: limitActionType,
-          symbol,
-          volume: lot,
-          openPrice: entry,
-          stopLoss,
-          comment: "Cascade-MT5",
-        };
-        const oid = await placeCascadeLimitFast(conn, region, accountId, token, body, idx + 1, limitEntries.length);
-        if (oid) {
-          trackCascadeOrder(accountId, oid);
-          await attachLimitOrderToZone(accountId, oid);
-          console.log(`[auto-cascade-mt5] placed limit ${idx + 1}/${limitEntries.length} entry=${entry} orderId=${oid}`);
-        } else {
-          console.warn(`[auto-cascade-mt5] limit ${idx + 1}/${limitEntries.length} entry=${entry} returned no orderId`);
-        }
-      } catch (e) {
-        console.error(`[auto-cascade-mt5] limit ${idx + 1}/${limitEntries.length} entry=${entry} failed:`, (e as Error).message);
-      }
-    });
-    await Promise.all(placements);
-
-    scheduleCascadeReconcile(accountId, region, token);
-  } catch (e) {
-    console.error(`[auto-cascade-mt5] unexpected error accountId=${accountId} posId=${positionId}:`, (e as Error).message);
-  } finally {
-    // Hold the in-flight guard for a few seconds in case a duplicate deal
-    // event arrives from the other MetaAPI region node right after.
-    setTimeout(() => autoCascadeInFlight.delete(guardKey), 10_000);
-  }
 }
 
 function getSdk(token: string): InstanceType<typeof MetaApi> {
@@ -720,33 +594,6 @@ function makeDealListener(accountId: string) {
       };
       console.log(`[stream ${accountId}] deal dealId=${evt.dealId} posId=${evt.positionId} type=${evt.type} sym=${evt.symbol} price=${evt.openPrice} comment="${evt.comment ?? ""}"`);
       storeDealEvent(accountId, evt);
-
-      // ── Auto-cascade on manual MT5 market entry ──────────────────────────
-      // Only consider XAUUSD market entries that were NOT placed by the app
-      // (the app pre-marks its positions via markCascaded BEFORE the deal
-      // event can arrive, and sets pendingAppCascades while the trade is
-      // in-flight, so both guards filter app-initiated trades cleanly).
-      const symUpper = String(evt.symbol).toUpperCase();
-      const isMarketEntry = evt.type === "DEAL_TYPE_BUY" || evt.type === "DEAL_TYPE_SELL";
-      if (
-        isMarketEntry
-        && symUpper === "XAUUSD"
-        && evt.positionId
-        && evt.openPrice > 0
-        && !pendingAppCascades.has(accountId)
-        && !hasBeenCascaded(accountId, evt.positionId)
-      ) {
-        const known = knownAccounts.get(accountId);
-        const cfg = getCascadeConfig(accountId, known?.userId);
-        if (cfg.autoCascadeOnMt5) {
-          const direction: "buy" | "sell" = evt.type === "DEAL_TYPE_BUY" ? "buy" : "sell";
-          const region = activeRegions.get(accountId) ?? known?.region ?? DEFAULT_REGION;
-          void triggerAutoCascadeFromMt5(
-            accountId, region, known?.userId,
-            evt.positionId, direction, evt.openPrice, evt.symbol, cfg,
-          );
-        }
-      }
     },
     // Streaming tick handlers — drive evaluateZone off real broker ticks so
     // TPs fire within ~100ms of the level being touched (vs the 3 s timer's

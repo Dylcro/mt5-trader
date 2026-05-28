@@ -218,15 +218,6 @@ export default function SettingsScreen() {
     tp4: String(cs.tp4Pips),
   });
   const [tpSaveState, setTpSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
-  // MT5 auto-cascade draft state (lot input + save status)
-  const [mt5LotDraft, setMt5LotDraft] = useState(String(cs.mt5CascadeLot));
-  const [mt5SaveState, setMt5SaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
-  useEffect(() => {
-    setMt5LotDraft(String(cs.mt5CascadeLot));
-  }, [cs.mt5CascadeLot]);
-  const parsedMt5Lot = parseFloat(mt5LotDraft);
-  const mt5LotValid = Number.isFinite(parsedMt5Lot) && parsedMt5Lot >= 0.04;
-  const mt5LotDirty = mt5LotValid && parsedMt5Lot !== cs.mt5CascadeLot;
   useEffect(() => {
     setTpDraft({
       tp1: String(cs.tp1Pips),
@@ -829,107 +820,6 @@ export default function SettingsScreen() {
                   : tpSaveState === "saved" ? "TP Levels Saved"
                   : tpSaveState === "error" ? "Save failed — check connection"
                   : "Save TP Levels"}
-              </Text>
-            </Pressable>
-          </View>
-
-          {/* MT5 Auto-Cascade — fires a full cascade when a market trade is opened directly in MT5 */}
-          <View style={styles.cascadeCard}>
-            <View style={styles.cascadeCardHeader}>
-              <Feather name="zap" size={16} color={C.gold} />
-              <Text style={styles.cascadeCardTitle}>MT5 Auto-Cascade</Text>
-              <View style={styles.sourceBadgeMt5}>
-                <Text style={styles.sourceBadgeText}>MT5</Text>
-              </View>
-            </View>
-            <Text style={styles.cascadeCardDesc}>
-              When you place a market trade directly in MT5 (not from this app), automatically build a full cascade around it using the Stop Loss, TP1-4 and step distances above. The lot size below is used for every leg.
-            </Text>
-
-            <View style={styles.cascadeDivider} />
-
-            <View style={styles.tpRow}>
-              <Text style={styles.tpRowLabel}>Enabled</Text>
-              <Switch
-                value={cs.autoCascadeOnMt5}
-                onValueChange={(v) => {
-                  void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                  updateSettings({ autoCascadeOnMt5: v });
-                  setMt5SaveState("idle");
-                }}
-                trackColor={{ false: C.border, true: C.gold }}
-                thumbColor="#fff"
-              />
-            </View>
-
-            <View style={styles.tpRow}>
-              <Text style={styles.tpRowLabel}>Lot per leg</Text>
-              <View style={styles.tpInputWrap}>
-                <TextInput
-                  style={styles.tpInput}
-                  value={mt5LotDraft}
-                  onChangeText={(v) => {
-                    setMt5LotDraft(v.replace(/[^0-9.]/g, ""));
-                    if (mt5SaveState !== "idle") setMt5SaveState("idle");
-                  }}
-                  placeholder="0.04"
-                  placeholderTextColor={C.textMuted}
-                  keyboardType="decimal-pad"
-                  inputMode="decimal"
-                />
-                <Text style={styles.tpInputSuffix}>lots</Text>
-              </View>
-            </View>
-
-            {!mt5LotValid && (
-              <View style={styles.cascadeWarningBox}>
-                <Feather name="alert-triangle" size={14} color="#f59e0b" />
-                <Text style={styles.cascadeWarningText}>
-                  Lot size must be at least 0.04 (each TP closes 25% — broker minimum is 0.01).
-                </Text>
-              </View>
-            )}
-
-            <Pressable
-              style={({ pressed }) => [
-                styles.saveBtn,
-                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
-                (!mt5LotValid || (!mt5LotDirty && mt5SaveState === "idle") || mt5SaveState === "saving") && { opacity: 0.5 },
-              ]}
-              disabled={!mt5LotValid || mt5SaveState === "saving"}
-              onPress={async () => {
-                Keyboard.dismiss();
-                void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                setMt5SaveState("saving");
-                try {
-                  if (mt5LotDirty) updateSettings({ mt5CascadeLot: parsedMt5Lot });
-                  const ok = await saveToServer();
-                  setMt5SaveState(ok ? "saved" : "error");
-                  void Haptics.notificationAsync(
-                    ok ? Haptics.NotificationFeedbackType.Success : Haptics.NotificationFeedbackType.Error
-                  );
-                  setTimeout(() => setMt5SaveState("idle"), ok ? 2500 : 3000);
-                } catch {
-                  setMt5SaveState("error");
-                  void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-                  setTimeout(() => setMt5SaveState("idle"), 3000);
-                }
-              }}
-            >
-              {mt5SaveState === "saving" ? (
-                <ActivityIndicator size="small" color="#000" />
-              ) : (
-                <Feather
-                  name={mt5SaveState === "saved" ? "check" : mt5SaveState === "error" ? "alert-circle" : "save"}
-                  size={15}
-                  color={mt5SaveState === "error" ? C.sell : "#000"}
-                />
-              )}
-              <Text style={[styles.saveBtnText, mt5SaveState === "error" && { color: C.sell }]}>
-                {mt5SaveState === "saving" ? "Saving…"
-                  : mt5SaveState === "saved" ? "MT5 Cascade Saved"
-                  : mt5SaveState === "error" ? "Save failed — check connection"
-                  : "Save MT5 Cascade"}
               </Text>
             </Pressable>
           </View>
