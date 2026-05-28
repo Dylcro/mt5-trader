@@ -22,6 +22,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import { useTrading, type SLMode } from "@/context/TradingContext";
 import { buildCascadeLevels, useCascadeSettings } from "@/hooks/useCascadeSettings";
+import OnboardingModal from "@/components/OnboardingModal";
 
 const LOT_SIZE_SINGLE_KEY = "lot_size_single";
 const LOT_SIZE_CASCADE_KEY = "lot_size_cascade";
@@ -655,6 +656,7 @@ export default function TradeScreen() {
   return (
     <View style={[styles.container, { paddingTop: insets.top + webTopPad }]}>
       <TradeToast toast={toast} insetTop={insets.top + webTopPad} />
+      <OnboardingModal accountId={accountId} status={status} />
       {/* Header */}
       <View style={styles.header}>
         <View style={styles.headerLeft}>
