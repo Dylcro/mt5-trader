@@ -1502,7 +1502,14 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     // for SELL), the moment price rallies BACK to anchor ± 5p every worst
     // entry is at least 5p in profit and the BEST entry sits ~spread+ in the
     // green. Close all worst at market, keep the best for TP1-4 to run on.
-    if (!st.cashoutDone && live.length > 1) {
+    //
+    // CONTINUOUS: re-arms every tick. If a later limit fills (after the first
+    // cashout + some TPs have already hit on the original best), the next time
+    // price returns to anchor ± 5p the older partially-closed survivor becomes
+    // the new "worst" and gets cashed out, leaving the fresh deeper entry as
+    // the new best. If that new best is a full-volume fresh fill, we also
+    // reset the TP flags so it runs TP1-4 from scratch.
+    if (live.length > 1) {
       const cashoutTrigger = st.direction === "buy"
         ? st.anchorPrice + st.cashoutPips * PIP
         : st.anchorPrice - st.cashoutPips * PIP;
@@ -1517,9 +1524,25 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
           if (!ok) allOk = false;
         }
         if (allOk) {
-          st.cashoutDone = true;
-          await db.update(cascadeZonesTable).set({ cashoutDone: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-          console.log(`[zone ${zoneId}] CASHOUT complete — kept best posId=${best.id} @${best.openPrice}`);
+          // If the survivor is a fresh full-volume entry (i.e. a later limit
+          // fill that hasn't been partial-closed yet), reset the zone-wide TP
+          // flags so it runs the full TP1-4 ladder on its own lot.
+          const isFreshSurvivor = st.originalVolume > 0
+            && best.volume >= st.originalVolume * 0.99
+            && (st.tp1Hit || st.tp2Hit || st.tp3Hit || st.tp4Hit);
+          if (isFreshSurvivor) {
+            st.tp1Hit = false; st.tp2Hit = false; st.tp3Hit = false; st.tp4Hit = false;
+            zoneNearNotifiedTp.set(zoneId, 0);
+            await db.update(cascadeZonesTable)
+              .set({ tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false })
+              .where(eq(cascadeZonesTable.zoneId, zoneId));
+            console.log(`[zone ${zoneId}] CASHOUT kept fresh survivor posId=${best.id} vol=${best.volume} — TP flags reset for new ladder`);
+          }
+          if (!st.cashoutDone) {
+            st.cashoutDone = true;
+            await db.update(cascadeZonesTable).set({ cashoutDone: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+          }
+          console.log(`[zone ${zoneId}] CASHOUT complete — kept best posId=${best.id} @${best.openPrice} vol=${best.volume}`);
         } else {
           console.warn(`[zone ${zoneId}] CASHOUT partial failure — will retry next tick`);
         }
