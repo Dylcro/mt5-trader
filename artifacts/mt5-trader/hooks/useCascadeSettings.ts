@@ -109,15 +109,16 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
       try {
         const keys = storageKeys(accountId);
         const allKeys = [...Object.values(keys), GLOBAL_AUTO_CASCADE_KEY];
-        const pairs = await AsyncStorage.multiGet(allKeys);
-        const [num, between, sl, tpEnabled, tpPips, tp1, tp2, tp3, tp4, riskFree, globalAutoEnabled] = pairs.map((p) => p[1]);
+        const record = await AsyncStorage.getMany(allKeys);
+        const [num, between, sl, tpEnabled, tpPips, tp1, tp2, tp3, tp4, riskFree, globalAutoEnabled] = allKeys.map((k) => record[k]);
 
         let autoCascadeEnabled = DEFAULTS.autoCascadeEnabled;
         if (globalAutoEnabled !== null) {
           autoCascadeEnabled = globalAutoEnabled === "true";
         } else {
           const legacyKey = accountId ? `cascade_${accountId}_auto_enabled` : "cascade_auto_enabled";
-          const [[, legacy]] = await AsyncStorage.multiGet([legacyKey]);
+          const legacyRecord = await AsyncStorage.getMany([legacyKey]);
+          const legacy = legacyRecord[legacyKey];
           autoCascadeEnabled = legacy === "true";
           await AsyncStorage.setItem(GLOBAL_AUTO_CASCADE_KEY, String(autoCascadeEnabled));
         }
@@ -156,19 +157,19 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
     setSettings((prev) => {
       const next = { ...prev, ...partial };
       const keys = storageKeys(accountId);
-      AsyncStorage.multiSet([
-        [keys.numPositions, String(next.numPositions)],
-        [keys.pipsBetween, String(next.pipsBetween)],
-        [keys.slPips, String(next.slPips)],
-        [keys.takeProfitEnabled, String(next.takeProfitEnabled)],
-        [keys.takeProfitPips, String(next.takeProfitPips)],
-        [keys.tp1Pips, String(next.tp1Pips)],
-        [keys.tp2Pips, String(next.tp2Pips)],
-        [keys.tp3Pips, String(next.tp3Pips)],
-        [keys.tp4Pips, String(next.tp4Pips)],
-        [keys.riskFreePips, String(next.riskFreePips)],
-        [GLOBAL_AUTO_CASCADE_KEY, String(next.autoCascadeEnabled)],
-      ]);
+      AsyncStorage.setMany({
+        [keys.numPositions]: String(next.numPositions),
+        [keys.pipsBetween]: String(next.pipsBetween),
+        [keys.slPips]: String(next.slPips),
+        [keys.takeProfitEnabled]: String(next.takeProfitEnabled),
+        [keys.takeProfitPips]: String(next.takeProfitPips),
+        [keys.tp1Pips]: String(next.tp1Pips),
+        [keys.tp2Pips]: String(next.tp2Pips),
+        [keys.tp3Pips]: String(next.tp3Pips),
+        [keys.tp4Pips]: String(next.tp4Pips),
+        [keys.riskFreePips]: String(next.riskFreePips),
+        [GLOBAL_AUTO_CASCADE_KEY]: String(next.autoCascadeEnabled),
+      });
       return next;
     });
   }, [accountId]);

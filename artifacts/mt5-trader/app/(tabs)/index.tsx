@@ -358,8 +358,9 @@ export default function TradeScreen() {
 
   // Load persisted lot sizes on mount
   useEffect(() => {
-    AsyncStorage.multiGet([LOT_SIZE_SINGLE_KEY, LOT_SIZE_CASCADE_KEY]).then((pairs) => {
-      const [single, cascade] = pairs.map((p) => p[1]);
+    AsyncStorage.getMany([LOT_SIZE_SINGLE_KEY, LOT_SIZE_CASCADE_KEY]).then((record) => {
+      const single = record[LOT_SIZE_SINGLE_KEY];
+      const cascade = record[LOT_SIZE_CASCADE_KEY];
       if (single) setLotSizeRaw(parseFloat(single));
       if (cascade) {
         // Cascade needs ≥0.04 (4 × 0.01 broker min for 25% partials at TP1-4).

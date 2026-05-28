@@ -251,11 +251,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
   // Load saved credentials + accountId on startup (auth-gated reconnect happens in (tabs)/_layout)
   useEffect(() => {
-    AsyncStorage.multiGet(["mt5_login", "mt5_server", "mt5_account_id", "mt5_region"]).then((pairs) => {
-      const login = pairs[0][1] ?? "";
-      const server = pairs[1][1] ?? "";
-      const savedAccountId = pairs[2][1] ?? "";
-      const savedRegion = pairs[3][1] ?? DEFAULT_REGION;
+    AsyncStorage.getMany(["mt5_login", "mt5_server", "mt5_account_id", "mt5_region"]).then((record) => {
+      const login = record["mt5_login"] ?? "";
+      const server = record["mt5_server"] ?? "";
+      const savedAccountId = record["mt5_account_id"] ?? "";
+      const savedRegion = record["mt5_region"] ?? DEFAULT_REGION;
       if (login) setCredentialsState((prev) => ({ ...prev, login, server }));
       if (savedAccountId) {
         setAccountIdState(savedAccountId);
@@ -283,7 +283,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           const finalRegion = d.region ?? accRegion;
           setAccountIdState(accId);
           setRegionState(finalRegion);
-          await AsyncStorage.multiSet([["mt5_account_id", accId], ["mt5_region", finalRegion]]);
+          await AsyncStorage.setMany({ "mt5_account_id": accId, "mt5_region": finalRegion });
           setAccountInfo({
             balance: d.balance ?? 0,
             equity: d.equity ?? 0,
@@ -373,10 +373,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
   const setCredentials = useCallback((c: Mt5Credentials) => {
     setCredentialsState(c);
-    AsyncStorage.multiSet([
-      ["mt5_login", c.login],
-      ["mt5_server", c.server],
-    ]);
+    AsyncStorage.setMany({ "mt5_login": c.login, "mt5_server": c.server });
   }, []);
 
   const fetchPriceData = useCallback(async (accId: string, accRegion: string): Promise<Price> => {
@@ -738,7 +735,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         if (data.status === "connected") {
           setAccountIdState(accId);
           setRegionState(accRegion);
-          await AsyncStorage.multiSet([["mt5_account_id", accId], ["mt5_region", accRegion]]);
+          await AsyncStorage.setMany({ "mt5_account_id": accId, "mt5_region": accRegion });
           setAccountInfo({
             balance: data.balance ?? 0, equity: data.equity ?? 0,
             margin: data.margin ?? 0, freeMargin: data.freeMargin ?? 0,
@@ -767,7 +764,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         await authFetch(`${API_BASE}/mt5/account/${accountId}/disconnect`, { method: "POST" });
       } catch {}
     }
-    await AsyncStorage.multiRemove(["mt5_account_id", "mt5_region"]);
+    await AsyncStorage.removeMany(["mt5_account_id", "mt5_region"]);
     await clearMt5Password();
     setAccountIdState("");
     setRegionState(DEFAULT_REGION);
@@ -801,9 +798,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
       // Fall back to AsyncStorage if server has no record yet
       if (!targetAccountId) {
-        const pairs = await AsyncStorage.multiGet(["mt5_account_id", "mt5_region"]);
-        targetAccountId = pairs[0][1] ?? null;
-        targetRegion = pairs[1][1] ?? DEFAULT_REGION;
+        const record = await AsyncStorage.getMany(["mt5_account_id", "mt5_region"]);
+        targetAccountId = record["mt5_account_id"] ?? null;
+        targetRegion = record["mt5_region"] ?? DEFAULT_REGION;
       }
 
       if (targetAccountId) {
@@ -849,8 +846,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   // re-type their password.
   const silentReconnect = useCallback(async (): Promise<{ accountId: string; region: string } | null> => {
     try {
-      const pairs = await AsyncStorage.multiGet(["mt5_login", "mt5_server"]);
-      const map = Object.fromEntries(pairs) as Record<string, string | null>;
+      const map = await AsyncStorage.getMany(["mt5_login", "mt5_server"]);
       const login = map["mt5_login"]?.trim();
       const server = map["mt5_server"]?.trim();
       const password = (await loadMt5Password())?.trim();
@@ -882,7 +878,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         }
       }
       // Update local state + AsyncStorage so subsequent calls (positions/price/etc) use the new ID.
-      await AsyncStorage.multiSet([["mt5_account_id", newId], ["mt5_region", newRegion]]);
+      await AsyncStorage.setMany({ "mt5_account_id": newId, "mt5_region": newRegion });
       setAccountIdState(newId);
       setRegionState(newRegion);
       setStatus("connected");
