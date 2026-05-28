@@ -1649,12 +1649,20 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       // Cancel any still-unfilled cascade limits at TP2 (we're now solidly in
       // profit; no need to add to the position).
       await cancelZoneLimits(token, region, st.accountId, zoneId);
-      if (ok) {
+      // SL → break-even on every remaining live entry (each position's own
+      // openPrice). Fire in parallel so a fast market can't slip past one
+      // entry while we're still talking to the broker about another.
+      const slResults = await Promise.all(live.map(p =>
+        modifyZonePositionSl(token, region, st.accountId, p.id, p.openPrice)
+      ));
+      const slAllOk = slResults.every(Boolean);
+      if (!slAllOk) console.warn(`[zone ${zoneId}] TP2 SL→BE partial failure — will retry next tick`);
+      if (ok && slAllOk) {
         st.tp2Hit = true;
         await db.update(cascadeZonesTable).set({ tp2Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
         zoneNearNotifiedTp.set(zoneId, 0);
         notifyZoneEvent(zoneId, "hit", 2, 0, st.direction);
-        console.log(`[zone ${zoneId}] TP2 complete — unfilled limits cancelled`);
+        console.log(`[zone ${zoneId}] TP2 complete — unfilled limits cancelled + SL→BE on ${live.length} entr${live.length === 1 ? "y" : "ies"}`);
       } else {
         console.warn(`[zone ${zoneId}] TP2 partial failure — will retry next tick`);
       }
