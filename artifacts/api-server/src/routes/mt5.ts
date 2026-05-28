@@ -1190,13 +1190,13 @@ interface ZoneState {
   busy: boolean; // debounce: prevent overlapping monitor ticks for this zone
 }
 
-export const ZONE_RISK_FREE_PIPS   = 10;
+export const ZONE_RISK_FREE_PIPS   = 8;
 const ZONE_CASHOUT_PIPS_DEFAULT = 5;   // anchor + 5p covers spread
 const ZONE_MIN_LOT_PER_ENTRY    = 0.04; // 4 × 0.01 broker minimum for 25% slices
 // How close (in pips) price must come to a TP target before the engine fires
 // the partial close. Lets TPs trigger through the broker spread instead of
 // requiring the comparison side to print the exact level.
-const ZONE_TP_TOLERANCE_PIPS    = 5;
+const ZONE_TP_TOLERANCE_PIPS    = 4;
 
 // Pure helper: compute the "risk free" stop-loss price for a zone's surviving
 // entry. The PROTECTIVE stop sits on the LOSING side of the entry by `pips`
