@@ -7,33 +7,34 @@
     "dev": "NODE_ENV=development tsx ./src/index.ts",
     "build": "pnpm --filter @workspace/mt5-trader run export:web && tsx ./build.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "smoke": "vitest run test/smoke.test.ts"
   },
   "dependencies": {
-    "@clerk/express": "^2.1.19",
-    "@clerk/shared": "^4.12.2",
+    "@clerk/express": "2.1.19",
+    "@clerk/shared": "4.12.2",
     "@workspace/api-zod": "workspace:*",
     "@workspace/db": "workspace:*",
-    "bcryptjs": "^3.0.3",
-    "cookie-parser": "^1.4.7",
-    "cors": "^2",
+    "bcryptjs": "3.0.3",
+    "cookie-parser": "1.4.7",
+    "cors": "2.8.6",
     "drizzle-orm": "catalog:",
-    "express": "^5",
-    "express-rate-limit": "^8.5.2",
-    "helmet": "^8.1.0",
-    "http-proxy-middleware": "^4.0.0",
-    "jsonwebtoken": "^9.0.3",
-    "metaapi.cloud-sdk": "^29.3.3"
+    "express": "5.2.1",
+    "express-rate-limit": "8.5.2",
+    "helmet": "8.1.0",
+    "http-proxy-middleware": "4.0.0",
+    "jsonwebtoken": "9.0.3",
+    "metaapi.cloud-sdk": "29.3.3"
   },
   "devDependencies": {
-    "@types/bcryptjs": "^3.0.0",
-    "@types/cookie-parser": "^1.4.10",
-    "@types/cors": "^2.8.19",
-    "@types/express": "^5.0.6",
-    "@types/jsonwebtoken": "^9.0.10",
+    "@types/bcryptjs": "3.0.0",
+    "@types/cookie-parser": "1.4.10",
+    "@types/cors": "2.8.19",
+    "@types/express": "5.0.6",
+    "@types/jsonwebtoken": "9.0.10",
     "@types/node": "catalog:",
-    "esbuild": "^0.27.3",
+    "esbuild": "0.27.3",
     "tsx": "catalog:",
-    "vitest": "^4.1.7"
+    "vitest": "4.1.7"
   }
 }

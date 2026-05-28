@@ -14,7 +14,7 @@ run = "pnpm --filter @workspace/api-server run dev"
 
 [services.production]
 deploymentTarget = "vm"
-build = "pnpm --filter @workspace/api-server run build"
+build = "pnpm --filter @workspace/api-server run smoke && pnpm --filter @workspace/api-server run build"
 
 [services.production.run]
 args = ["node", "artifacts/api-server/dist/index.cjs"]
