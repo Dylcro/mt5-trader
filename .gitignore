@@ -50,3 +50,7 @@ Thumbs.db
 
 # MetaAPI SDK runtime caches — contain trading history and account identifiers
 .metaapi/
+
+# Playwright smoke test output (generated on each run)
+playwright-report/
+test-results/
