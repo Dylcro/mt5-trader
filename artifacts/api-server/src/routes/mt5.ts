@@ -570,13 +570,44 @@ function makeDealListener(accountId: string) {
       // Zone-aware limit-fill association: a tracked cascade limit just filled.
       // Record the resulting positionId in zone_positions so the monitor can manage it.
       if (deal.orderId && cascadePlacedOrderIds.has(String(deal.orderId))) {
-        const zoneId = zoneLimitOrders.get(String(deal.orderId));
+        let zoneId = zoneLimitOrders.get(String(deal.orderId));
+        // Backstop: if the orderId is known as a cascade limit but somehow has
+        // no zone mapping (orphan-drain race lost, server restart between
+        // POST and fill, etc.), recover by attaching the fill to the most
+        // recent still-active zone for this account+direction. Without this,
+        // the fill becomes an orphan position — invisible to the zone monitor
+        // and surfaced as "standalone" once the market leg closes.
+        if (!zoneId && deal.positionId) {
+          const direction: "buy" | "sell" | null =
+            deal.type === "DEAL_TYPE_BUY" ? "buy" :
+            deal.type === "DEAL_TYPE_SELL" ? "sell" : null;
+          if (direction) {
+            let best: ZoneState | null = null;
+            for (const st of zoneStates.values()) {
+              if (st.accountId !== accountId) continue;
+              if (st.direction !== direction) continue;
+              if (st.status !== "OPEN" && st.status !== "RISK_FREE") continue;
+              if (!best || st.zoneId > best.zoneId) best = st;
+            }
+            if (best) {
+              zoneId = best.zoneId;
+              zoneLimitOrders.set(String(deal.orderId), zoneId);
+              void db.insert(zoneOrdersTable)
+                .values({ zoneId, orderId: String(deal.orderId), createdAt: Date.now() })
+                .onConflictDoNothing()
+                .catch((e: Error) => console.warn(`[zone ${zoneId}] backstop persist orderId=${deal.orderId} failed:`, e.message));
+              console.warn(`[zone ${zoneId}] backstop-attached orphan cascade fill orderId=${deal.orderId} posId=${deal.positionId} (no prior zoneLimitOrders mapping)`);
+            }
+          }
+        }
         if (zoneId && deal.positionId) {
           void recordZonePositionFill(
             zoneId, String(deal.positionId),
             Number(deal.price ?? deal.openPrice ?? 0),
             Number(deal.volume ?? 0),
           );
+        } else if (deal.positionId) {
+          console.warn(`[stream ${accountId}] cascade fill orderId=${deal.orderId} posId=${deal.positionId} could not be linked to any active zone — position will be orphaned`);
         }
         return;
       }
@@ -1253,7 +1284,17 @@ const ZONE_ASSOC_WINDOW_MS  = 30_000; // limits placed within 30s of market atta
 // sibling market POST should land within milliseconds — keep this tight so
 // leftover orphans from an earlier failed cascade do not attach to a fresh
 // zone created later in the same 30s window.
-const ZONE_ORPHAN_DRAIN_WINDOW_MS = 5_000;
+// Originally 5s, but a slow market POST (>5s round-trip to MetaAPI) would
+// cause already-buffered cascade limit POSTs to be rejected as "stale" once
+// the market response finally created the zone — leaving those limits with
+// `cascadePlacedOrderIds` membership but NO `zoneLimitOrders` mapping. Their
+// later fills then fall through onDealAdded with no zone to link to, the
+// resulting positions become orphans, and when the market leg closes the
+// zone is marked CLOSED while the orphan positions remain open as
+// "standalone" entries in the Positions tab. Matching the 30s assoc window
+// closes that race; cross-cascade misattachment is already prevented by the
+// 30s expiresAt on each orphan entry.
+const ZONE_ORPHAN_DRAIN_WINDOW_MS = 30_000;
 
 // In-memory state, hydrated from DB on startup.
 const zoneStates = new Map<string, ZoneState>();          // zoneId → state
