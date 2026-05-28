@@ -2,14 +2,20 @@ import { Router, type IRouter, type Request, type Response } from "express";
 import bcrypt from "bcryptjs";
 import { db, storedAccountsTable, supportTicketsTable, usersTable } from "@workspace/db";
 import { desc, eq } from "drizzle-orm";
+import { resetAuthLockouts } from "../lib/rateLimiters";
 
 const router: IRouter = Router();
 
-const ADMIN_KEY = process.env["ADMIN_KEY"] ?? "changeme";
+const ADMIN_KEY = process.env["ADMIN_KEY"];
+if (!ADMIN_KEY || ADMIN_KEY === "changeme") {
+  // Fail fast: the admin panel can reset any user's password and clear
+  // auth lockouts, so an unset / placeholder key is a security incident.
+  throw new Error("ADMIN_KEY environment variable is required and must not be the default placeholder.");
+}
 
 function requireAdminKey(req: Request, res: Response): boolean {
   const key = (req.query["key"] as string | undefined) ?? "";
-  if (key !== ADMIN_KEY) {
+  if (!key || key !== ADMIN_KEY) {
     res.status(401).send(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px">
       <h2>Admin Access</h2>
       <p>Pass your admin key as a query parameter: <code>/admin?key=YOUR_KEY</code></p>
@@ -58,7 +64,7 @@ router.get("/", async (req: Request, res: Response) => {
     `;
 
     const registeredRows = registeredUsers.length === 0
-      ? `<tr><td colspan="4" class="empty">No users registered yet</td></tr>`
+      ? `<tr><td colspan="5" class="empty">No users registered yet</td></tr>`
       : registeredUsers.map(u => {
           const hasMt5 = connectedAccounts.some(a => a.userId === String(u.id));
           return `
@@ -67,6 +73,7 @@ router.get("/", async (req: Request, res: Response) => {
           <td class="mono muted">${escapeHtml(u.email)}</td>
           <td>${hasMt5 ? '<span class="green">✓ Connected</span>' : '<span class="muted">Not connected</span>'}</td>
           <td class="muted">${formatDate(u.createdAt?.getTime())}</td>
+          <td><button type="button" class="resetPwBtn" data-email="${escapeHtml(u.email)}" data-name="${escapeHtml(u.fullName ?? u.email)}" style="padding:6px 12px;background:rgba(201,168,76,0.15);color:#c9a84c;border:1px solid rgba(201,168,76,0.4);border-radius:6px;cursor:pointer;font-size:11px;font-weight:600">Reset password</button></td>
         </tr>`;
         }).join("");
 
@@ -106,7 +113,7 @@ router.get("/", async (req: Request, res: Response) => {
   <div class="section">
     <h2>Registered Users <span class="badge">${registeredUsers.length}</span></h2>
     <table>
-      <thead><tr><th>Full Name</th><th>Email</th><th>MT5 Status</th><th>Joined</th></tr></thead>
+      <thead><tr><th>Full Name</th><th>Email</th><th>MT5 Status</th><th>Joined</th><th>Actions</th></tr></thead>
       <tbody>${registeredRows}</tbody>
     </table>
   </div>
@@ -117,6 +124,19 @@ router.get("/", async (req: Request, res: Response) => {
       <thead><tr><th>MT5 Account ID</th><th>User ID</th><th>Region</th><th>Connected</th></tr></thead>
       <tbody>${connectedRows}</tbody>
     </table>
+  </div>
+
+  <div class="section">
+    <h2>Login Lockouts</h2>
+    <div style="background:#111118;border:1px solid #1e1e2e;border-radius:12px;padding:20px;max-width:560px">
+      <p class="muted" style="font-size:12px;margin-bottom:14px;line-height:1.5">
+        After 10 failed login attempts from one network, that IP is locked out for 15 minutes. Click below to clear all current lockouts (e.g. after resetting someone's password so they can sign in immediately).
+      </p>
+      <button id="clearLockoutsBtn" type="button" style="padding:12px 18px;background:#c9a84c;color:#0a0a0f;border:0;border-radius:6px;font-weight:700;cursor:pointer;font-size:13px">
+        CLEAR ALL LOGIN LOCKOUTS
+      </button>
+      <pre id="clearLockoutsResult" style="margin-top:14px;padding:12px;background:#0a0a0f;border:1px solid #1e1e2e;border-radius:6px;font-size:11px;color:#a0a0b8;white-space:pre-wrap;display:none"></pre>
+    </div>
   </div>
 
   <div class="section">
@@ -168,6 +188,54 @@ router.get("/", async (req: Request, res: Response) => {
           btn.disabled = false; btn.textContent = 'MIGRATE ACCOUNT';
         }
       });
+
+      // Reset password (per-user button in the Users table)
+      document.querySelectorAll('.resetPwBtn').forEach(function(btn) {
+        btn.addEventListener('click', async function() {
+          var email = btn.getAttribute('data-email');
+          var name = btn.getAttribute('data-name');
+          var pw = prompt('Reset password for ' + name + ' (' + email + ')\n\nEnter a new password (min 8 characters):');
+          if (!pw) return;
+          if (pw.length < 8) { alert('Password must be at least 8 characters.'); return; }
+          var orig = btn.textContent; btn.disabled = true; btn.textContent = 'Resetting…';
+          try {
+            var r = await fetch('/api/admin/users/reset-password?key=' + encodeURIComponent(key), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ email: email, newPassword: pw }),
+            });
+            var j = await r.json();
+            if (r.ok && j.ok) {
+              alert('Password reset for ' + email + '.\nNew password: ' + pw + '\n\nShare it with them securely.');
+            } else {
+              alert('Reset failed: ' + (j.error || ('HTTP ' + r.status)));
+            }
+          } catch (err) {
+            alert('Network error: ' + err.message);
+          } finally {
+            btn.disabled = false; btn.textContent = orig;
+          }
+        });
+      });
+
+      // Clear all login lockouts
+      var clearBtn = document.getElementById('clearLockoutsBtn');
+      var clearOut = document.getElementById('clearLockoutsResult');
+      if (clearBtn) {
+        clearBtn.addEventListener('click', async function() {
+          clearBtn.disabled = true; var orig = clearBtn.textContent; clearBtn.textContent = 'CLEARING…';
+          clearOut.style.display = 'block'; clearOut.textContent = 'Sending request...';
+          try {
+            var r = await fetch('/api/admin/reset-lockouts?key=' + encodeURIComponent(key), { method: 'POST' });
+            var j = await r.json();
+            clearOut.textContent = 'HTTP ' + r.status + '\\n\\n' + JSON.stringify(j, null, 2);
+          } catch (err) {
+            clearOut.textContent = 'Network error: ' + err.message;
+          } finally {
+            clearBtn.disabled = false; clearBtn.textContent = orig;
+          }
+        });
+      }
     })();
   </script>
 
@@ -183,6 +251,16 @@ router.get("/", async (req: Request, res: Response) => {
   } catch (err) {
     console.error("[admin] error:", (err as Error).message);
     res.status(500).send("Internal server error");
+  }
+});
+
+router.post("/reset-lockouts", async (req: Request, res: Response) => {
+  if (!requireAdminKey(req, res)) return;
+  const result = await resetAuthLockouts();
+  if (result.ok) {
+    res.json({ ok: true, message: "All login lockouts cleared. Users can log in immediately." });
+  } else {
+    res.status(500).json({ ok: false, error: result.error ?? "Rate-limit store does not support resetAll", method: result.method });
   }
 });
 
