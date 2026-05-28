@@ -8,7 +8,7 @@
     "build": "pnpm --filter @workspace/mt5-trader run export:web && tsx ./build.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "smoke": "vitest run test/smoke.test.ts"
+    "smoke": "playwright test"
   },
   "dependencies": {
     "@clerk/express": "2.1.19",
@@ -27,6 +27,7 @@
     "metaapi.cloud-sdk": "29.3.3"
   },
   "devDependencies": {
+    "@playwright/test": "1.60.0",
     "@types/bcryptjs": "3.0.0",
     "@types/cookie-parser": "1.4.10",
     "@types/cors": "2.8.19",
