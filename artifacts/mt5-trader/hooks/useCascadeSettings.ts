@@ -32,6 +32,12 @@ export interface CascadeSettings {
   // positive = profit lock (tighter exit), 0 = exactly at entry. Snapped to
   // 5-pip steps within -30..+30 server-side.
   riskFreePips: number;
+  // Per-TP close percentages. Each is the % of the original best-entry volume
+  // closed at that TP. Must sum to 100 across active TPs. Default: 25 each.
+  tp1Pct: number;
+  tp2Pct: number;
+  tp3Pct: number;
+  tp4Pct: number;
 }
 
 const DEFAULTS: CascadeSettings = {
@@ -46,6 +52,10 @@ const DEFAULTS: CascadeSettings = {
   tp3Pips: 100,
   tp4Pips: 0,
   riskFreePips: -10,
+  tp1Pct: 25,
+  tp2Pct: 25,
+  tp3Pct: 25,
+  tp4Pct: 25,
 };
 
 const VALID_RISK_FREE_PIPS = [-30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30];
@@ -67,6 +77,10 @@ function storageKeys(accountId: string) {
     tp3Pips:           `${prefix}zone_tp3_pips`,
     tp4Pips:           `${prefix}zone_tp4_pips`,
     riskFreePips:      `${prefix}risk_free_pips`,
+    tp1Pct:            `${prefix}zone_tp1_pct`,
+    tp2Pct:            `${prefix}zone_tp2_pct`,
+    tp3Pct:            `${prefix}zone_tp3_pct`,
+    tp4Pct:            `${prefix}zone_tp4_pct`,
   };
 }
 
@@ -110,7 +124,7 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         const keys = storageKeys(accountId);
         const allKeys = [...Object.values(keys), GLOBAL_AUTO_CASCADE_KEY];
         const record = await AsyncStorage.getMany(allKeys);
-        const [num, between, sl, tpEnabled, tpPips, tp1, tp2, tp3, tp4, riskFree, globalAutoEnabled] = allKeys.map((k) => record[k]);
+        const [num, between, sl, tpEnabled, tpPips, tp1, tp2, tp3, tp4, riskFree, tp1Pct, tp2Pct, tp3Pct, tp4Pct, globalAutoEnabled] = allKeys.map((k) => record[k]);
 
         let autoCascadeEnabled = DEFAULTS.autoCascadeEnabled;
         if (globalAutoEnabled !== null) {
@@ -142,6 +156,10 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
             const parsed = parseFloat(riskFree);
             return VALID_RISK_FREE_PIPS.includes(parsed) ? parsed : DEFAULTS.riskFreePips;
           })(),
+          tp1Pct: tp1Pct != null ? parseFloat(tp1Pct) : DEFAULTS.tp1Pct,
+          tp2Pct: tp2Pct != null ? parseFloat(tp2Pct) : DEFAULTS.tp2Pct,
+          tp3Pct: tp3Pct != null ? parseFloat(tp3Pct) : DEFAULTS.tp3Pct,
+          tp4Pct: tp4Pct != null ? parseFloat(tp4Pct) : DEFAULTS.tp4Pct,
         };
         setSettings(local);
         void pushToServer(local, accountId);
@@ -168,6 +186,10 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         [keys.tp3Pips]: String(next.tp3Pips),
         [keys.tp4Pips]: String(next.tp4Pips),
         [keys.riskFreePips]: String(next.riskFreePips),
+        [keys.tp1Pct]: String(next.tp1Pct),
+        [keys.tp2Pct]: String(next.tp2Pct),
+        [keys.tp3Pct]: String(next.tp3Pct),
+        [keys.tp4Pct]: String(next.tp4Pct),
         [GLOBAL_AUTO_CASCADE_KEY]: String(next.autoCascadeEnabled),
       });
       return next;

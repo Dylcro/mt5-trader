@@ -250,6 +250,29 @@ export default function SettingsScreen() {
     parsedTp.tp2 !== cs.tp2Pips ||
     parsedTp.tp3 !== cs.tp3Pips ||
     parsedTp.tp4 !== cs.tp4Pips;
+
+  // TP split % per level
+  const [splitDraft, setSplitDraft] = useState({
+    tp1: String(cs.tp1Pct),
+    tp2: String(cs.tp2Pct),
+    tp3: String(cs.tp3Pct),
+    tp4: String(cs.tp4Pct),
+  });
+  const [splitSaveState, setSplitSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  useEffect(() => {
+    setSplitDraft({ tp1: String(cs.tp1Pct), tp2: String(cs.tp2Pct), tp3: String(cs.tp3Pct), tp4: String(cs.tp4Pct) });
+  }, [cs.tp1Pct, cs.tp2Pct, cs.tp3Pct, cs.tp4Pct]);
+  const numActiveTps = cs.tp4Pips > 0 ? 4 : 3;
+  const parsedSplit = {
+    tp1: parseInt(splitDraft.tp1, 10) || 0,
+    tp2: parseInt(splitDraft.tp2, 10) || 0,
+    tp3: parseInt(splitDraft.tp3, 10) || 0,
+    tp4: parseInt(splitDraft.tp4, 10) || 0,
+  };
+  const activeSplitSum = parsedSplit.tp1 + parsedSplit.tp2 + parsedSplit.tp3 + (numActiveTps >= 4 ? parsedSplit.tp4 : 0);
+  const splitValid = activeSplitSum === 100 && parsedSplit.tp1 > 0 && parsedSplit.tp2 > 0 && parsedSplit.tp3 > 0 && (numActiveTps < 4 || parsedSplit.tp4 > 0);
+  const splitDirty = parsedSplit.tp1 !== cs.tp1Pct || parsedSplit.tp2 !== cs.tp2Pct || parsedSplit.tp3 !== cs.tp3Pct || parsedSplit.tp4 !== cs.tp4Pct;
+
   const { hapticEnabled, setHapticEnabled } = useHapticSettings();
   const { prefs: notif, loading: notifLoading, updatePrefs: updateNotif } = useNotificationSettings();
   const [notifBusy, setNotifBusy] = useState(false);
@@ -818,7 +841,7 @@ export default function SettingsScreen() {
               </View>
             </View>
             <Text style={styles.cascadeCardDesc}>
-              Pip distances from the cascade market entry for each take-profit. Each TP closes 25% of the surviving best entry. Set TP4 to 0 to leave the final 25% open for manual close. These are saved once and used for every cascade until you change them.
+              Pip distances from the cascade market entry for each take-profit. Each TP closes a configurable % of the original best entry (see TP Close % section below). Set TP4 to 0 to skip TP4 and leave the remainder for manual close. Saved once and used for every cascade until changed.
             </Text>
 
             <View style={styles.cascadeDivider} />
@@ -903,6 +926,112 @@ export default function SettingsScreen() {
                   : tpSaveState === "saved" ? "TP Levels Saved"
                   : tpSaveState === "error" ? "Save failed — check connection"
                   : "Save TP Levels"}
+              </Text>
+            </Pressable>
+          </View>
+
+          {/* TP Close % per level */}
+          <View style={styles.cascadeCard}>
+            <View style={styles.cascadeCardHeader}>
+              <Feather name="sliders" size={16} color={C.gold} />
+              <Text style={styles.cascadeCardTitle}>TP Close %</Text>
+              <View style={styles.sourceBadge}>
+                <Text style={styles.sourceBadgeText}>IN-APP</Text>
+              </View>
+            </View>
+            <Text style={styles.cascadeCardDesc}>
+              What % of the original position to close at each TP level. Must sum to 100. Saved locally and baked into each new cascade zone.{"\n"}
+              Examples: 50/50 (two TPs), 30/30/40 (three TPs), 25/25/25/25 (four TPs).
+            </Text>
+
+            <View style={styles.cascadeDivider} />
+
+            {([
+              { key: "tp1" as const, label: "TP1" },
+              { key: "tp2" as const, label: "TP2" },
+              { key: "tp3" as const, label: "TP3" },
+              ...(numActiveTps >= 4 ? [{ key: "tp4" as const, label: "TP4" }] : []),
+            ]).map((tp) => (
+              <View key={tp.key} style={styles.tpRow}>
+                <Text style={styles.tpRowLabel}>{tp.label}</Text>
+                <View style={styles.tpInputWrap}>
+                  <TextInput
+                    style={styles.tpInput}
+                    value={splitDraft[tp.key]}
+                    onChangeText={(v) => {
+                      setSplitDraft((d) => ({ ...d, [tp.key]: v.replace(/[^0-9]/g, "") }));
+                      if (splitSaveState !== "idle") setSplitSaveState("idle");
+                    }}
+                    placeholder="25"
+                    placeholderTextColor={C.textMuted}
+                    keyboardType="number-pad"
+                    inputMode="numeric"
+                  />
+                  <Text style={styles.tpInputSuffix}>%</Text>
+                </View>
+              </View>
+            ))}
+
+            <View style={[styles.infoRow, { marginTop: 4 }]}>
+              <Text style={styles.infoLabel}>Total</Text>
+              <Text style={[styles.infoValue, { color: activeSplitSum === 100 ? C.buy : C.sell }]}>
+                {activeSplitSum}%
+              </Text>
+            </View>
+
+            {!splitValid && (
+              <View style={styles.cascadeWarningBox}>
+                <Feather name="alert-triangle" size={14} color="#f59e0b" />
+                <Text style={styles.cascadeWarningText}>
+                  {activeSplitSum !== 100
+                    ? `Percentages must sum to exactly 100% (currently ${activeSplitSum}%).`
+                    : "Each active TP must have a value greater than 0%."}
+                </Text>
+              </View>
+            )}
+
+            <Pressable
+              style={({ pressed }) => [
+                styles.saveBtn,
+                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
+                (!splitValid || !splitDirty || splitSaveState === "saving") && { opacity: 0.5 },
+              ]}
+              disabled={!splitValid || !splitDirty || splitSaveState === "saving"}
+              onPress={() => {
+                Keyboard.dismiss();
+                void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                setSplitSaveState("saving");
+                try {
+                  updateSettings({
+                    tp1Pct: parsedSplit.tp1,
+                    tp2Pct: parsedSplit.tp2,
+                    tp3Pct: parsedSplit.tp3,
+                    tp4Pct: parsedSplit.tp4,
+                  });
+                  setSplitSaveState("saved");
+                  void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                  setTimeout(() => setSplitSaveState("idle"), 2500);
+                } catch {
+                  setSplitSaveState("error");
+                  void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+                  setTimeout(() => setSplitSaveState("idle"), 3000);
+                }
+              }}
+            >
+              {splitSaveState === "saving" ? (
+                <ActivityIndicator size="small" color="#000" />
+              ) : (
+                <Feather
+                  name={splitSaveState === "saved" ? "check" : splitSaveState === "error" ? "alert-circle" : "save"}
+                  size={15}
+                  color={splitSaveState === "error" ? C.sell : "#000"}
+                />
+              )}
+              <Text style={[styles.saveBtnText, splitSaveState === "error" && { color: C.sell }]}>
+                {splitSaveState === "saving" ? "Saving…"
+                  : splitSaveState === "saved" ? "TP Split Saved"
+                  : splitSaveState === "error" ? "Save failed"
+                  : "Save TP Split"}
               </Text>
             </Pressable>
           </View>

@@ -11,6 +11,13 @@ export const cascadeConfigTable = pgTable("cascade_config", {
   tp1Pips:      integer("tp1_pips").notNull().default(20),
   tp2Pips:      integer("tp2_pips").notNull().default(50),
   tp3Pips:      integer("tp3_pips").notNull().default(90),
+  // TP close percentages. Each is the % of the original best-entry volume to
+  // close at that TP level. Must sum to 100 across the active TPs. Defaults to
+  // 25/25/25/25 (equal quarters). Stored as integers (0-100).
+  tp1Pct:       integer("tp1_pct").notNull().default(25),
+  tp2Pct:       integer("tp2_pct").notNull().default(25),
+  tp3Pct:       integer("tp3_pct").notNull().default(25),
+  tp4Pct:       integer("tp4_pct").notNull().default(25),
   // MT5 auto-SL: when a trade is opened directly in MT5, automatically attach
   // a stop loss. `mt5SlEnabled` toggles the feature. `mt5SlNumPositions` is
   // the size of the auto-SL batch (1-6). `mt5SlPips` is the SL distance in

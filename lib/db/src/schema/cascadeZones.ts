@@ -21,6 +21,12 @@ export const cascadeZonesTable = pgTable("cascade_zones", {
   // Original best-entry volume captured at cascade placement so the 25%
   // partials at TP1/2/3/4 stay consistent across partial fills.
   originalVolume: doublePrecision("original_volume"),
+  // Per-zone TP close percentages baked in at zone creation time (from the user's
+  // split config). Defaults to 25 each for backward-compat with pre-split zones.
+  tp1Pct:      doublePrecision("tp1_pct").notNull().default(25),
+  tp2Pct:      doublePrecision("tp2_pct").notNull().default(25),
+  tp3Pct:      doublePrecision("tp3_pct").notNull().default(25),
+  tp4Pct:      doublePrecision("tp4_pct").notNull().default(25),
   // Cashout trigger pip offset from the anchor (default 5p covers spread).
   cashoutPips: doublePrecision("cashout_pips").notNull().default(5),
   // Step flags — once true, that step won't fire again.

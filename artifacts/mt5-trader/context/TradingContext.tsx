@@ -139,6 +139,11 @@ export interface PlaceTradeParams {
   /** Anchor hint = the live market price observed when the user tapped BUY/SELL.
    *  Server uses this to seed the zone before the real fill price arrives. */
   anchorPrice?: number;
+  /** Per-TP close percentages. Must sum to 100 across active TPs. Default 25 each. */
+  tp1Pct?: number;
+  tp2Pct?: number;
+  tp3Pct?: number;
+  tp4Pct?: number;
 }
 
 export interface CascadeOrderParams {
@@ -156,6 +161,11 @@ export interface CascadeOrderParams {
   tp4Price?: number;
   /** Live anchor hint for the new zone (market price at user tap). */
   anchorPrice?: number;
+  /** Per-TP close percentages. Must sum to 100 across active TPs. Default 25 each. */
+  tp1Pct?: number;
+  tp2Pct?: number;
+  tp3Pct?: number;
+  tp4Pct?: number;
 }
 
 // Determine the API base URL.
@@ -915,6 +925,10 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       if (params.tp3Price != null) body.tp3Price = params.tp3Price;
       if (params.tp4Price != null) body.tp4Price = params.tp4Price;
       if (params.anchorPrice != null) body.anchorPrice = params.anchorPrice;
+      if (params.tp1Pct != null) body.tp1Pct = params.tp1Pct;
+      if (params.tp2Pct != null) body.tp2Pct = params.tp2Pct;
+      if (params.tp3Pct != null) body.tp3Pct = params.tp3Pct;
+      if (params.tp4Pct != null) body.tp4Pct = params.tp4Pct;
 
       const isTransient = (msg?: string) =>
         msg?.toLowerCase().includes("failed to execute a callable") ||
@@ -1037,6 +1051,10 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
               tp3Price: params.tp3Price,
               tp4Price: params.tp4Price,
               anchorPrice: params.anchorPrice,
+              tp1Pct: params.tp1Pct,
+              tp2Pct: params.tp2Pct,
+              tp3Pct: params.tp3Pct,
+              tp4Pct: params.tp4Pct,
             }),
             ...params.limitEntries.map((limitPrice, i) =>
               submitOrderRaw({

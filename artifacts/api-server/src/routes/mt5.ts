@@ -1350,7 +1350,13 @@ interface ZoneState {
   tp2Price: number | null;
   tp3Price: number | null;
   tp4Price: number | null;
-  // Original best-entry volume — 25% slices are computed from this so
+  // Per-zone TP close percentages (0-100). Default 25 each.
+  // Gate formula: after level N fires, remaining = (100 - sum_through_N) / 100.
+  tp1Pct: number;
+  tp2Pct: number;
+  tp3Pct: number;
+  tp4Pct: number;
+  // Original best-entry volume — configured-pct slices are computed from this so
   // partials stay consistent across TP1/2/3/4.
   originalVolume: number;
   // Cashout-at-anchor offset (pips into profit; 5p covers broker spread).
@@ -1580,7 +1586,7 @@ function newZoneId(): string {
 // trade endpoint validator; TP4 is optional (null = left manual).
 function prepareZoneForCascade(
   accountId: string, direction: "buy" | "sell", userId: string | undefined,
-  tps: { tp1Price: number; tp2Price: number; tp3Price: number; tp4Price: number | null },
+  tps: { tp1Price: number; tp2Price: number; tp3Price: number; tp4Price: number | null; tp1Pct: number; tp2Pct: number; tp3Pct: number; tp4Pct: number },
   originalVolume: number,
 ): ZoneState {
   void userId;
@@ -1588,6 +1594,7 @@ function prepareZoneForCascade(
   const state: ZoneState = {
     zoneId, accountId, direction, anchorPrice: 0,
     tp1Price: tps.tp1Price, tp2Price: tps.tp2Price, tp3Price: tps.tp3Price, tp4Price: tps.tp4Price,
+    tp1Pct: tps.tp1Pct, tp2Pct: tps.tp2Pct, tp3Pct: tps.tp3Pct, tp4Pct: tps.tp4Pct,
     originalVolume,
     cashoutPips: ZONE_CASHOUT_PIPS_DEFAULT,
     cashoutDone: false,
@@ -1645,6 +1652,7 @@ async function persistPreparedZone(
     direction: state.direction, anchorPrice: state.anchorPrice,
     tp1Price: state.tp1Price, tp2Price: state.tp2Price,
     tp3Price: state.tp3Price, tp4Price: state.tp4Price,
+    tp1Pct: state.tp1Pct, tp2Pct: state.tp2Pct, tp3Pct: state.tp3Pct, tp4Pct: state.tp4Pct,
     originalVolume: state.originalVolume,
     cashoutPips: state.cashoutPips, cashoutDone: false,
     tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
@@ -2146,8 +2154,15 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     const zpsById = new Map(zps.map(z => [z.positionId, z]));
     const closePartialForLevel = async (
       level: 1 | 2 | 3 | 4,
-      keepFractionGate: number, // only close if remaining > origVol * gate
     ): Promise<boolean> => {
+      // Resolve this level's close % from the zone's baked-in split config.
+      const tpPct = level === 1 ? st.tp1Pct : level === 2 ? st.tp2Pct : level === 3 ? st.tp3Pct : st.tp4Pct;
+      // Gate: "if position is already at or below the expected remaining fraction
+      // after this level fires, the level was already applied — skip (or close
+      // remainder for small-lot cases where rounding over-took the expected %)."
+      // Formula: remaining_after_level_N = (100 - sum_through_N) / 100.
+      const priorPct = level === 1 ? 0 : level === 2 ? st.tp1Pct : level === 3 ? st.tp1Pct + st.tp2Pct : st.tp1Pct + st.tp2Pct + st.tp3Pct;
+      const keepFractionGate = Math.max(0, (100 - priorPct + 1) / 100);
       // Fire all per-entry closes IN PARALLEL — in a fast market, serially
       // awaiting each close can let later entries slip several pips past the
       // TP price before their close request hits the broker.
@@ -2159,14 +2174,14 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
           return closeZonePosition(token, region, st.accountId, p.id);
         }
         // skip if this entry already had its partial for this level applied.
-        // Exception: small lots where rounding made TP1 take >25% (e.g. 0.02 lots
-        // → TP1 closes 50%), so the remaining volume is already below the gate
-        // for TP2 — close whatever is left now rather than drifting to a later TP.
+        // Exception: small lots where rounding made a prior TP take more than
+        // its configured %, so remaining already fell below this level's gate.
+        // Close whatever is left now rather than drifting to a later TP.
         if (p.volume <= origVol * keepFractionGate) {
           if (level > 1 && p.volume > 0) return closeZonePosition(token, region, st.accountId, p.id);
           return true;
         }
-        const partial = Math.max(0.01, parseFloat((origVol * 0.25).toFixed(2)));
+        const partial = Math.max(0.01, parseFloat((origVol * (tpPct / 100)).toFixed(2)));
         const vol = Math.min(partial, p.volume);
         return vol < p.volume
           ? closeZonePosition(token, region, st.accountId, p.id, vol)
@@ -2177,7 +2192,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
 
     if (!st.tp1Hit && st.tp1Price != null && hit(st.tp1Price)) {
       console.log(`[zone ${zoneId}] TP1 trigger @${cmpPrice} (tp1=${st.tp1Price}) — ${live.length} active entr${live.length === 1 ? "y" : "ies"}`);
-      const ok = await closePartialForLevel(1, 0.76);
+      const ok = await closePartialForLevel(1);
       if (ok) {
         await db.update(cascadeZonesTable).set({ tp1Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
         st.tp1Hit = true;
@@ -2190,7 +2205,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       }
     } else if (!st.tp2Hit && st.tp1Hit && st.tp2Price != null && hit(st.tp2Price)) {
       console.log(`[zone ${zoneId}] TP2 trigger @${cmpPrice} (tp2=${st.tp2Price}) — ${live.length} active entr${live.length === 1 ? "y" : "ies"}`);
-      const ok = await closePartialForLevel(2, 0.51);
+      const ok = await closePartialForLevel(2);
       // Cancel any still-unfilled cascade limits at TP2 (we're now solidly in
       // profit; no need to add to the position).
       await cancelZoneLimits(token, region, st.accountId, zoneId);
@@ -2211,7 +2226,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       }
     } else if (!st.tp3Hit && st.tp2Hit && st.tp3Price != null && hit(st.tp3Price)) {
       console.log(`[zone ${zoneId}] TP3 trigger @${cmpPrice} (tp3=${st.tp3Price}) — ${live.length} active entr${live.length === 1 ? "y" : "ies"}`);
-      const ok = await closePartialForLevel(3, 0.26);
+      const ok = await closePartialForLevel(3);
       if (ok) {
         await db.update(cascadeZonesTable).set({ tp3Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
         st.tp3Hit = true;
@@ -2225,7 +2240,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     } else if (!st.tp4Hit && st.tp3Hit && st.tp4Price != null && hit(st.tp4Price)) {
       // TP4 is optional. When set, close whatever's left of each entry.
       console.log(`[zone ${zoneId}] TP4 trigger @${cmpPrice} (tp4=${st.tp4Price}) — closing all remaining`);
-      const ok = await closePartialForLevel(4, 0);
+      const ok = await closePartialForLevel(4);
       if (ok) {
         await db.update(cascadeZonesTable).set({ tp4Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
         st.tp4Hit = true;
@@ -2335,6 +2350,10 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
     tp2Price: z.tp2Price != null ? Number(z.tp2Price) : (z.tp2Pips ? fromPips(Number(z.tp2Pips)) : null),
     tp3Price: z.tp3Price != null ? Number(z.tp3Price) : (z.tp3Pips ? fromPips(Number(z.tp3Pips)) : null),
     tp4Price: z.tp4Price != null ? Number(z.tp4Price) : null,
+    tp1Pct: z.tp1Pct != null ? Number(z.tp1Pct) : 25,
+    tp2Pct: z.tp2Pct != null ? Number(z.tp2Pct) : 25,
+    tp3Pct: z.tp3Pct != null ? Number(z.tp3Pct) : 25,
+    tp4Pct: z.tp4Pct != null ? Number(z.tp4Pct) : 25,
     originalVolume: z.originalVolume != null ? Number(z.originalVolume) : 0,
     cashoutPips: Number(z.cashoutPips ?? ZONE_CASHOUT_PIPS_DEFAULT),
     cashoutDone: z.cashoutDone ?? false,
@@ -3832,6 +3851,14 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
             const tp2Price = pickPrice(rawBody.tp2Price);
             const tp3Price = pickPrice(rawBody.tp3Price);
             const tp4Price = pickPrice(rawBody.tp4Price);
+            const pickPct = (v: unknown, def: number): number => {
+              const n = typeof v === "number" && Number.isFinite(v) ? v : def;
+              return Math.min(100, Math.max(0, n));
+            };
+            const tp1Pct = pickPct(rawBody.tp1Pct, 25);
+            const tp2Pct = pickPct(rawBody.tp2Pct, 25);
+            const tp3Pct = pickPct(rawBody.tp3Pct, 25);
+            const tp4Pct = pickPct(rawBody.tp4Pct, 25);
             const anchorHint = Number(rawBody.anchorPrice ?? 0) || 0;
             const cmp = direction === "buy"
               ? (a: number, b: number) => a > b
@@ -3853,7 +3880,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
               // arrives immediately after will find a zoneId to attach to.
               const zoneState = prepareZoneForCascade(
                 accountId, direction, uId,
-                { tp1Price: tp1Price!, tp2Price: tp2Price!, tp3Price: tp3Price!, tp4Price },
+                { tp1Price: tp1Price!, tp2Price: tp2Price!, tp3Price: tp3Price!, tp4Price, tp1Pct, tp2Pct, tp3Pct, tp4Pct },
                 volume,
               );
               // Seed best-known anchor from caller-provided value / cached tick.

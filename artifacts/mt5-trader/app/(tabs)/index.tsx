@@ -612,6 +612,7 @@ export default function TradeScreen() {
         stopLoss: levels.stopLoss,
         tp1Price, tp2Price, tp3Price, tp4Price,
         anchorPrice: mktPrice,
+        tp1Pct: cs.tp1Pct, tp2Pct: cs.tp2Pct, tp3Pct: cs.tp3Pct, tp4Pct: cs.tp4Pct,
       });
       console.log("[cascade] done placed=" + String(result.placed) + " failed=" + String(result.failed) + " success=" + String(result.success) + " msg=" + result.message);
       if (result.success) {
