@@ -270,9 +270,7 @@ export default function SettingsScreen() {
   }, []);
   const parsedSingleLot = parseFloat(singleLotDraft);
   const parsedCascadeLot = parseFloat(cascadeLotDraft);
-  const lotDraftsValid =
-    Number.isFinite(parsedSingleLot) && parsedSingleLot >= 0.01 &&
-    Number.isFinite(parsedCascadeLot) && parsedCascadeLot >= 0.01;
+  const lotDraftsValid = Number.isFinite(parsedSingleLot) && parsedSingleLot >= 0.01;
 
   // TP split % per level
   const [splitDraft, setSplitDraft] = useState({
@@ -281,7 +279,6 @@ export default function SettingsScreen() {
     tp3: String(cs.tp3Pct),
     tp4: String(cs.tp4Pct),
   });
-  const [splitSaveState, setSplitSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   useEffect(() => {
     setSplitDraft({ tp1: String(cs.tp1Pct), tp2: String(cs.tp2Pct), tp3: String(cs.tp3Pct), tp4: String(cs.tp4Pct) });
   }, [cs.tp1Pct, cs.tp2Pct, cs.tp3Pct, cs.tp4Pct]);
@@ -301,7 +298,34 @@ export default function SettingsScreen() {
     (!cs.tp2Enabled || parsedSplit.tp2 > 0) &&
     (!cs.tp3Enabled || parsedSplit.tp3 > 0) &&
     (!cs.tp4Enabled || parsedSplit.tp4 > 0);
-  const splitDirty = parsedSplit.tp1 !== cs.tp1Pct || parsedSplit.tp2 !== cs.tp2Pct || parsedSplit.tp3 !== cs.tp3Pct || parsedSplit.tp4 !== cs.tp4Pct;
+
+  // Lot-size constraint: each partial close must be >= 0.01 lots (MT5 minimum)
+  const enabledTpCount = [cs.tp1Enabled, cs.tp2Enabled, cs.tp3Enabled, cs.tp4Enabled].filter(Boolean).length;
+  const maxActiveTPs = Number.isFinite(parsedCascadeLot) && parsedCascadeLot >= 0.01
+    ? Math.min(4, Math.round(parsedCascadeLot * 100))
+    : 0;
+  const tooManyTPs = enabledTpCount > maxActiveTPs;
+  type TpLotErr = { label: string; lots: number };
+  const tpLotErrors: TpLotErr[] = (
+    [
+      { label: "TP1", enabled: cs.tp1Enabled, pct: parsedSplit.tp1 },
+      { label: "TP2", enabled: cs.tp2Enabled, pct: parsedSplit.tp2 },
+      { label: "TP3", enabled: cs.tp3Enabled, pct: parsedSplit.tp3 },
+      { label: "TP4", enabled: cs.tp4Enabled, pct: parsedSplit.tp4 },
+    ]
+      .filter((t) => t.enabled && t.pct > 0 && Number.isFinite(parsedCascadeLot) && parsedCascadeLot >= 0.01)
+      .map((t) => {
+        const lots = Math.round(parsedCascadeLot * t.pct / 100 * 100) / 100;
+        return lots < 0.01 ? { label: t.label, lots } : null;
+      })
+      .filter((x): x is TpLotErr => x !== null)
+  );
+  const tpCardValid =
+    Number.isFinite(parsedCascadeLot) && parsedCascadeLot >= 0.01 &&
+    (enabledTpCount === 0 || splitValid) &&
+    tpDraftValid &&
+    !tooManyTPs &&
+    tpLotErrors.length === 0;
 
   const { hapticEnabled, setHapticEnabled } = useHapticSettings();
   const { prefs: notif, loading: notifLoading, updatePrefs: updateNotif } = useNotificationSettings();
@@ -800,29 +824,24 @@ export default function SettingsScreen() {
 
             <View style={styles.cascadeDivider} />
 
-            {([
-              { key: "single" as const, label: "Single Trade", draft: singleLotDraft, setDraft: setSingleLotDraft },
-              { key: "cascade" as const, label: "Cascade", draft: cascadeLotDraft, setDraft: setCascadeLotDraft },
-            ]).map((row) => (
-              <View key={row.key} style={styles.tpRow}>
-                <Text style={styles.tpRowLabel}>{row.label}</Text>
-                <View style={styles.tpInputWrap}>
-                  <TextInput
-                    style={styles.tpInput}
-                    value={row.draft}
-                    onChangeText={(v) => {
-                      row.setDraft(v.replace(/[^0-9.]/g, ""));
-                      if (lotSaveState !== "idle") setLotSaveState("idle");
-                    }}
-                    placeholder="0.01"
-                    placeholderTextColor={C.textMuted}
-                    keyboardType="decimal-pad"
-                    inputMode="decimal"
-                  />
-                  <Text style={styles.tpInputSuffix}>lot</Text>
-                </View>
+            <View style={styles.tpRow}>
+              <Text style={styles.tpRowLabel}>Single Trade</Text>
+              <View style={styles.tpInputWrap}>
+                <TextInput
+                  style={styles.tpInput}
+                  value={singleLotDraft}
+                  onChangeText={(v) => {
+                    setSingleLotDraft(v.replace(/[^0-9.]/g, ""));
+                    if (lotSaveState !== "idle") setLotSaveState("idle");
+                  }}
+                  placeholder="0.01"
+                  placeholderTextColor={C.textMuted}
+                  keyboardType="decimal-pad"
+                  inputMode="decimal"
+                />
+                <Text style={styles.tpInputSuffix}>lot</Text>
               </View>
-            ))}
+            </View>
 
             {!lotDraftsValid && (
               <View style={styles.cascadeWarningBox}>
@@ -957,7 +976,7 @@ export default function SettingsScreen() {
             </Pressable>
           </View>
 
-          {/* Zone Take Profit pip distances — applied to every cascade until changed. */}
+          {/* Merged Zone Take Profit card — lot size + per-TP pip/% + on/off */}
           <View style={styles.cascadeCard}>
             <View style={styles.cascadeCardHeader}>
               <Feather name="target" size={16} color={C.gold} />
@@ -967,77 +986,173 @@ export default function SettingsScreen() {
               </View>
             </View>
             <Text style={styles.cascadeCardDesc}>
-              Pip distances from the cascade market entry for each take-profit. Each TP closes a configurable % of the original best entry (see TP Close % section below). Set TP4 to 0 to skip TP4 and leave the remainder for manual close. Saved once and used for every cascade until changed.
+              Set your cascade lot size and configure each TP level. Toggle any TP off to skip it. Each partial close must be at least 0.01 lots — the lot size limits how many TPs you can split between.
             </Text>
 
             <View style={styles.cascadeDivider} />
 
+            {/* Cascade lot size */}
+            <View style={styles.tpRow}>
+              <Text style={styles.tpRowLabel}>Cascade Lot Size</Text>
+              <View style={styles.tpInputWrap}>
+                <TextInput
+                  style={styles.tpInput}
+                  value={cascadeLotDraft}
+                  onChangeText={(v) => {
+                    setCascadeLotDraft(v.replace(/[^0-9.]/g, ""));
+                    if (tpSaveState !== "idle") setTpSaveState("idle");
+                  }}
+                  placeholder="0.04"
+                  placeholderTextColor={C.textMuted}
+                  keyboardType="decimal-pad"
+                  inputMode="decimal"
+                />
+                <Text style={styles.tpInputSuffix}>lot</Text>
+              </View>
+            </View>
+
+            <View style={styles.cascadeDivider} />
+
+            {/* Per-TP blocks */}
             {([
-              { key: "tp1" as const, label: "TP1", placeholder: "20",      enKey: "tp1Enabled" as const },
-              { key: "tp2" as const, label: "TP2", placeholder: "60",      enKey: "tp2Enabled" as const },
-              { key: "tp3" as const, label: "TP3", placeholder: "100",     enKey: "tp3Enabled" as const },
-              { key: "tp4" as const, label: "TP4", placeholder: "0 = manual", enKey: "tp4Enabled" as const },
-            ]).map((tp) => {
+              { key: "tp1" as const, label: "TP1", placeholder: "20",         enKey: "tp1Enabled" as const },
+              { key: "tp2" as const, label: "TP2", placeholder: "60",         enKey: "tp2Enabled" as const },
+              { key: "tp3" as const, label: "TP3", placeholder: "100",        enKey: "tp3Enabled" as const },
+              { key: "tp4" as const, label: "TP4", placeholder: "0 = skip",   enKey: "tp4Enabled" as const },
+            ]).map((tp, idx) => {
               const enabled = cs[tp.enKey];
               return (
-                <View key={tp.key} style={[styles.tpRow, { gap: 8 }]}>
-                  <Switch
-                    value={enabled}
-                    onValueChange={(v) => {
-                      updateSettings({ [tp.enKey]: v });
-                      void Haptics.selectionAsync();
-                    }}
-                    trackColor={{ false: C.border, true: C.buy }}
-                    thumbColor="#fff"
-                    style={{ transform: [{ scaleX: 0.85 }, { scaleY: 0.85 }] }}
-                  />
-                  <Text style={[styles.tpRowLabel, !enabled && { color: C.textMuted }]}>{tp.label}</Text>
-                  <View style={[styles.tpInputWrap, { flex: 1, opacity: enabled ? 1 : 0.35 }]}>
-                    <TextInput
-                      style={styles.tpInput}
-                      value={tpDraft[tp.key]}
-                      onChangeText={(v) => {
-                        setTpDraft((d) => ({ ...d, [tp.key]: v.replace(/[^0-9.]/g, "") }));
-                        if (tpSaveState !== "idle") setTpSaveState("idle");
+                <View key={tp.key} style={[styles.tpBlock, idx > 0 && { borderTopWidth: 1, borderTopColor: C.border }]}>
+                  {/* Header row: label + toggle */}
+                  <View style={styles.tpBlockHeader}>
+                    <Text style={[styles.tpBlockTitle, !enabled && { color: C.textMuted }]}>{tp.label}</Text>
+                    {!enabled && (
+                      <Text style={styles.tpOffBadge}>OFF</Text>
+                    )}
+                    <View style={{ flex: 1 }} />
+                    <Switch
+                      value={enabled}
+                      onValueChange={(v) => {
+                        updateSettings({ [tp.enKey]: v });
+                        void Haptics.selectionAsync();
                       }}
-                      placeholder={tp.placeholder}
-                      placeholderTextColor={C.textMuted}
-                      keyboardType="number-pad"
-                      inputMode="numeric"
-                      editable={enabled}
+                      trackColor={{ false: C.border, true: C.buy }}
+                      thumbColor="#fff"
+                      style={{ transform: [{ scaleX: 0.85 }, { scaleY: 0.85 }] }}
                     />
-                    <Text style={styles.tpInputSuffix}>pips</Text>
+                  </View>
+
+                  {/* Pip distance row */}
+                  <View style={[styles.tpSubRow, !enabled && { opacity: 0.35 }]}>
+                    <Text style={styles.tpSubLabel}>Pip distance</Text>
+                    <View style={[styles.tpInputWrap, { minWidth: 120 }]}>
+                      <TextInput
+                        style={styles.tpInput}
+                        value={tpDraft[tp.key]}
+                        onChangeText={(v) => {
+                          setTpDraft((d) => ({ ...d, [tp.key]: v.replace(/[^0-9.]/g, "") }));
+                          if (tpSaveState !== "idle") setTpSaveState("idle");
+                        }}
+                        placeholder={tp.placeholder}
+                        placeholderTextColor={C.textMuted}
+                        keyboardType="number-pad"
+                        inputMode="numeric"
+                        editable={enabled}
+                      />
+                      <Text style={styles.tpInputSuffix}>pips</Text>
+                    </View>
+                  </View>
+
+                  {/* Close % row */}
+                  <View style={[styles.tpSubRow, !enabled && { opacity: 0.35 }]}>
+                    <Text style={styles.tpSubLabel}>Close %</Text>
+                    <View style={[styles.tpInputWrap, { minWidth: 120 }]}>
+                      <TextInput
+                        style={styles.tpInput}
+                        value={enabled ? splitDraft[tp.key] : "0"}
+                        onChangeText={(v) => {
+                          setSplitDraft((d) => ({ ...d, [tp.key]: v.replace(/[^0-9]/g, "") }));
+                          if (tpSaveState !== "idle") setTpSaveState("idle");
+                        }}
+                        placeholder="25"
+                        placeholderTextColor={C.textMuted}
+                        keyboardType="number-pad"
+                        inputMode="numeric"
+                        editable={enabled}
+                      />
+                      <Text style={styles.tpInputSuffix}>{enabled ? "%" : "off"}</Text>
+                    </View>
                   </View>
                 </View>
               );
             })}
 
+            <View style={styles.cascadeDivider} />
+
+            {/* Running total */}
+            <View style={[styles.infoRow, { marginTop: 4 }]}>
+              <Text style={styles.infoLabel}>Total close %</Text>
+              <Text style={[styles.infoValue, { color: enabledTpCount === 0 || activeSplitSum === 100 ? C.buy : C.sell }]}>
+                {enabledTpCount === 0 ? "—" : `${activeSplitSum}%`}
+              </Text>
+            </View>
+
+            {/* Validation warnings */}
             {!tpDraftValid && (
               <View style={styles.cascadeWarningBox}>
                 <Feather name="alert-triangle" size={14} color="#f59e0b" />
                 <Text style={styles.cascadeWarningText}>
-                  TP levels must be strictly increasing (TP1 &lt; TP2 &lt; TP3, and TP4 either 0 or &gt; TP3).
+                  TP pip distances must be strictly increasing for enabled TPs (TP4 can be 0 to skip).
                 </Text>
               </View>
             )}
+            {enabledTpCount > 0 && !splitValid && tpLotErrors.length === 0 && !tooManyTPs && (
+              <View style={styles.cascadeWarningBox}>
+                <Feather name="alert-triangle" size={14} color="#f59e0b" />
+                <Text style={styles.cascadeWarningText}>
+                  {activeSplitSum !== 100
+                    ? `Close % for enabled TPs must sum to 100 (currently ${activeSplitSum}%).`
+                    : "Each enabled TP must have a close % greater than 0."}
+                </Text>
+              </View>
+            )}
+            {tooManyTPs && (
+              <View style={styles.cascadeWarningBox}>
+                <Feather name="alert-triangle" size={14} color="#f59e0b" />
+                <Text style={styles.cascadeWarningText}>
+                  {`${cascadeLotDraft} lot only supports ${maxActiveTPs} active TP${maxActiveTPs === 1 ? "" : "s"} — each partial close needs at least 0.01 lot. Disable ${enabledTpCount - maxActiveTPs} TP${enabledTpCount - maxActiveTPs === 1 ? "" : "s"} or increase the lot size.`}
+                </Text>
+              </View>
+            )}
+            {tpLotErrors.map((e) => (
+              <View key={e.label} style={styles.cascadeWarningBox}>
+                <Feather name="alert-triangle" size={14} color="#f59e0b" />
+                <Text style={styles.cascadeWarningText}>
+                  {`${e.label} would close ${e.lots.toFixed(2)} lot — below the 0.01 minimum. Increase its % or the lot size.`}
+                </Text>
+              </View>
+            ))}
 
             <Pressable
               style={({ pressed }) => [
                 styles.saveBtn,
                 pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
-                (!tpDraftValid || !tpDraftDirty || tpSaveState === "saving") && { opacity: 0.5 },
+                (!tpCardValid || tpSaveState === "saving") && { opacity: 0.5 },
               ]}
-              disabled={!tpDraftValid || !tpDraftDirty || tpSaveState === "saving"}
+              disabled={!tpCardValid || tpSaveState === "saving"}
               onPress={async () => {
                 Keyboard.dismiss();
                 void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
                 setTpSaveState("saving");
                 try {
+                  const cLot = Math.max(0.01, parseFloat(parsedCascadeLot.toFixed(2)));
+                  await AsyncStorage.setItem(LOT_SIZE_CASCADE_KEY, String(cLot));
+                  setCascadeLotDraft(cLot.toFixed(2));
                   updateSettings({
-                    tp1Pips: parsedTp.tp1,
-                    tp2Pips: parsedTp.tp2,
-                    tp3Pips: parsedTp.tp3,
-                    tp4Pips: parsedTp.tp4,
+                    tp1Pips: parsedTp.tp1, tp2Pips: parsedTp.tp2,
+                    tp3Pips: parsedTp.tp3, tp4Pips: parsedTp.tp4,
+                    tp1Pct: parsedSplit.tp1, tp2Pct: parsedSplit.tp2,
+                    tp3Pct: parsedSplit.tp3, tp4Pct: parsedSplit.tp4,
                   });
                   const ok = await saveToServer();
                   setTpSaveState(ok ? "saved" : "error");
@@ -1063,119 +1178,9 @@ export default function SettingsScreen() {
               )}
               <Text style={[styles.saveBtnText, tpSaveState === "error" && { color: C.sell }]}>
                 {tpSaveState === "saving" ? "Saving…"
-                  : tpSaveState === "saved" ? "TP Levels Saved"
+                  : tpSaveState === "saved" ? "Zone TP Saved"
                   : tpSaveState === "error" ? "Save failed — check connection"
-                  : "Save TP Levels"}
-              </Text>
-            </Pressable>
-          </View>
-
-          {/* TP Close % per level */}
-          <View style={styles.cascadeCard}>
-            <View style={styles.cascadeCardHeader}>
-              <Feather name="sliders" size={16} color={C.gold} />
-              <Text style={styles.cascadeCardTitle}>TP Close %</Text>
-              <View style={styles.sourceBadge}>
-                <Text style={styles.sourceBadgeText}>IN-APP</Text>
-              </View>
-            </View>
-            <Text style={styles.cascadeCardDesc}>
-              What % of the original position to close at each enabled TP level. Enabled TPs must sum to 100. Disabled TPs (toggled off in Zone Take Profit above) are shown as "off" and excluded from the total.{"\n"}
-              Examples: 50/50 on two enabled TPs, 25/25/25/25 on all four.
-            </Text>
-
-            <View style={styles.cascadeDivider} />
-
-            {([
-              { key: "tp1" as const, label: "TP1", enKey: "tp1Enabled" as const },
-              { key: "tp2" as const, label: "TP2", enKey: "tp2Enabled" as const },
-              { key: "tp3" as const, label: "TP3", enKey: "tp3Enabled" as const },
-              { key: "tp4" as const, label: "TP4", enKey: "tp4Enabled" as const },
-            ]).map((tp) => {
-              const enabled = cs[tp.enKey];
-              return (
-                <View key={tp.key} style={[styles.tpRow, !enabled && { opacity: 0.4 }]}>
-                  <Text style={[styles.tpRowLabel, !enabled && { color: C.textMuted }]}>{tp.label}</Text>
-                  <View style={styles.tpInputWrap}>
-                    <TextInput
-                      style={styles.tpInput}
-                      value={enabled ? splitDraft[tp.key] : "0"}
-                      onChangeText={(v) => {
-                        setSplitDraft((d) => ({ ...d, [tp.key]: v.replace(/[^0-9]/g, "") }));
-                        if (splitSaveState !== "idle") setSplitSaveState("idle");
-                      }}
-                      placeholder="25"
-                      placeholderTextColor={C.textMuted}
-                      keyboardType="number-pad"
-                      inputMode="numeric"
-                      editable={enabled}
-                    />
-                    <Text style={styles.tpInputSuffix}>{enabled ? "%" : "off"}</Text>
-                  </View>
-                </View>
-              );
-            })}
-
-            <View style={[styles.infoRow, { marginTop: 4 }]}>
-              <Text style={styles.infoLabel}>Total</Text>
-              <Text style={[styles.infoValue, { color: activeSplitSum === 100 ? C.buy : C.sell }]}>
-                {activeSplitSum}%
-              </Text>
-            </View>
-
-            {!splitValid && (
-              <View style={styles.cascadeWarningBox}>
-                <Feather name="alert-triangle" size={14} color="#f59e0b" />
-                <Text style={styles.cascadeWarningText}>
-                  {activeSplitSum !== 100
-                    ? `Percentages must sum to exactly 100% (currently ${activeSplitSum}%).`
-                    : "Each active TP must have a value greater than 0%."}
-                </Text>
-              </View>
-            )}
-
-            <Pressable
-              style={({ pressed }) => [
-                styles.saveBtn,
-                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
-                (!splitValid || !splitDirty || splitSaveState === "saving") && { opacity: 0.5 },
-              ]}
-              disabled={!splitValid || !splitDirty || splitSaveState === "saving"}
-              onPress={() => {
-                Keyboard.dismiss();
-                void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                setSplitSaveState("saving");
-                try {
-                  updateSettings({
-                    tp1Pct: parsedSplit.tp1,
-                    tp2Pct: parsedSplit.tp2,
-                    tp3Pct: parsedSplit.tp3,
-                    tp4Pct: parsedSplit.tp4,
-                  });
-                  setSplitSaveState("saved");
-                  void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-                  setTimeout(() => setSplitSaveState("idle"), 2500);
-                } catch {
-                  setSplitSaveState("error");
-                  void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-                  setTimeout(() => setSplitSaveState("idle"), 3000);
-                }
-              }}
-            >
-              {splitSaveState === "saving" ? (
-                <ActivityIndicator size="small" color="#000" />
-              ) : (
-                <Feather
-                  name={splitSaveState === "saved" ? "check" : splitSaveState === "error" ? "alert-circle" : "save"}
-                  size={15}
-                  color={splitSaveState === "error" ? C.sell : "#000"}
-                />
-              )}
-              <Text style={[styles.saveBtnText, splitSaveState === "error" && { color: C.sell }]}>
-                {splitSaveState === "saving" ? "Saving…"
-                  : splitSaveState === "saved" ? "TP Split Saved"
-                  : splitSaveState === "error" ? "Save failed"
-                  : "Save TP Split"}
+                  : "Save Zone TP Settings"}
               </Text>
             </Pressable>
           </View>
@@ -1656,6 +1661,41 @@ const styles = StyleSheet.create({
   cascadeCardTitle: { fontSize: 16, fontFamily: "Inter_700Bold", color: C.text },
   cascadeCardDesc: { fontSize: 13, fontFamily: "Inter_400Regular", color: C.textSecondary, lineHeight: 19 },
   cascadeDivider: { height: 1, backgroundColor: C.border },
+  tpBlock: {
+    paddingVertical: 12,
+    gap: 8,
+  },
+  tpBlockHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  tpBlockTitle: {
+    fontSize: 15,
+    fontFamily: "Inter_700Bold",
+    color: C.text,
+  },
+  tpOffBadge: {
+    fontSize: 11,
+    fontFamily: "Inter_600SemiBold",
+    color: C.textMuted,
+    backgroundColor: C.border,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    overflow: "hidden",
+  },
+  tpSubRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingLeft: 4,
+  },
+  tpSubLabel: {
+    fontSize: 13,
+    fontFamily: "Inter_400Regular",
+    color: C.textSecondary,
+  },
   tpRow: {
     flexDirection: "row",
     alignItems: "center",
