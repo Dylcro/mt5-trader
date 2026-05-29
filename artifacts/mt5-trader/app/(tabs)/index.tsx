@@ -888,9 +888,9 @@ export default function TradeScreen() {
                   TP pip levels must be strictly increasing (TP1 &lt; TP2 &lt; TP3, TP4 either 0 or &gt; TP3). Fix in Settings.
                 </Text>
               )}
-              {cascadeLotSize < 0.04 && (
-                <Text style={[styles.sectionHint, { color: C.sell, marginTop: 6 }]}>
-                  Lot size must be at least 0.04 (25% of each TP partial = 0.01 broker minimum × 4 TPs).
+              {cascadeLotSize < 0.04 && cascadeLotSize >= 0.01 && (
+                <Text style={[styles.sectionHint, { color: C.textMuted, marginTop: 6 }]}>
+                  Small lot mode: {cascadeLotSize === 0.01 ? "full close at TP1" : cascadeLotSize === 0.02 ? "0.01 at TP1, remainder at TP2" : cascadeLotSize === 0.03 ? "0.01 at each of TP1 → TP3" : `${(cascadeLotSize * 0.25).toFixed(2)} lots per TP`}. Use 0.04+ for the standard 25% system.
                 </Text>
               )}
             </View>

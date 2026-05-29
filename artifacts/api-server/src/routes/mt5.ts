@@ -2158,8 +2158,14 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         if (level === 4) {
           return closeZonePosition(token, region, st.accountId, p.id);
         }
-        // skip if this entry already had its partial for this level applied
-        if (p.volume <= origVol * keepFractionGate) return true;
+        // skip if this entry already had its partial for this level applied.
+        // Exception: small lots where rounding made TP1 take >25% (e.g. 0.02 lots
+        // → TP1 closes 50%), so the remaining volume is already below the gate
+        // for TP2 — close whatever is left now rather than drifting to a later TP.
+        if (p.volume <= origVol * keepFractionGate) {
+          if (level > 1 && p.volume > 0) return closeZonePosition(token, region, st.accountId, p.id);
+          return true;
+        }
         const partial = Math.max(0.01, parseFloat((origVol * 0.25).toFixed(2)));
         const vol = Math.min(partial, p.volume);
         return vol < p.volume
