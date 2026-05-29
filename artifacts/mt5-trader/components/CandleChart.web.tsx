@@ -62,10 +62,11 @@ export default function CandleChart({
   const { zones } = useZones(accountId, { sseConnected });
   const { candles } = useCandles(accountId, timeframe);
 
-  // Only show overlay for the most-recent strictly OPEN zone
+  // Show overlay for the most-recent zone that is not yet closed (OPEN or
+  // RISK_FREE — both still have live positions/orders on the chart)
   const activeZone =
     zones
-      .filter((z) => z.status === "OPEN")
+      .filter((z) => z.status !== "CLOSED")
       .sort((a, b) => b.createdAt - a.createdAt)[0] ?? null;
 
   // ── Initialise chart (once) ───────────────────────────────────────────────
@@ -181,17 +182,18 @@ export default function CandleChart({
     const entryColor = isBuy ? "#2962FF" : "#F6465D";
     const tpColor = "#0ECB81";
     const slColor = "#F6465D";
-    // 200 pips = 20 price units for XAUUSD — used to scope orders/positions to
-    // this zone and exclude unrelated same-direction trades.
-    const PROXIMITY = 20;
     const lines: IPriceLine[] = [];
 
     // ── Market entry ──────────────────────────────────────────────────────────
     if (anchor > 0) {
-      // Derive lot size from open positions close to the anchor price
+      // Scope to positions placed by the cascade engine (comment "Cascade N/M")
+      // matching direction — deterministic, no proximity guessing.
       const dirType = isBuy ? "POSITION_TYPE_BUY" : "POSITION_TYPE_SELL";
       const zonePos = positions.filter(
-        (p) => p.type === dirType && Math.abs(p.openPrice - anchor) <= PROXIMITY,
+        (p) =>
+          p.type === dirType &&
+          typeof p.comment === "string" &&
+          p.comment.startsWith("Cascade"),
       );
       const vol = zonePos.length > 0 ? zonePos[0]!.volume : null;
       const entryLabel = vol != null ? `Entry  ${vol.toFixed(2)} lot` : "Entry";
@@ -207,7 +209,7 @@ export default function CandleChart({
         }),
       );
 
-      // ── SL — scoped to positions near anchor ─────────────────────────────
+      // ── SL — from cascade-tagged positions ───────────────────────────────
       const slCandidates = zonePos
         .filter((p) => p.stopLoss != null)
         .map((p) => p.stopLoss!);
@@ -225,15 +227,15 @@ export default function CandleChart({
       }
     }
 
-    // ── TP lines (not yet hit) — solid green ─────────────────────────────────
+    // ── TP lines — solid green, all enabled levels regardless of hit state ───
     const tpFields = [
-      { price: activeZone.tp1Price, hit: activeZone.tp1Hit, label: "TP1" },
-      { price: activeZone.tp2Price, hit: activeZone.tp2Hit, label: "TP2" },
-      { price: activeZone.tp3Price, hit: activeZone.tp3Hit, label: "TP3" },
-      { price: activeZone.tp4Price, hit: activeZone.tp4Hit, label: "TP4" },
+      { price: activeZone.tp1Price, label: "TP1" },
+      { price: activeZone.tp2Price, label: "TP2" },
+      { price: activeZone.tp3Price, label: "TP3" },
+      { price: activeZone.tp4Price, label: "TP4" },
     ];
     for (const tp of tpFields) {
-      if (tp.price == null || tp.hit) continue;
+      if (tp.price == null) continue;
       lines.push(
         series.createPriceLine({
           price: tp.price,
@@ -246,14 +248,15 @@ export default function CandleChart({
       );
     }
 
-    // ── Limit entries — scoped to orders within PROXIMITY of anchor ───────────
+    // ── Limit entries — scoped to cascade-tagged pending orders ──────────────
     const limitSide = isBuy ? "BUY" : "SELL";
     const limitOrders = pendingOrders
       .filter(
         (o) =>
           o.type.includes(limitSide) &&
           o.type.includes("LIMIT") &&
-          Math.abs(o.openPrice - anchor) <= PROXIMITY,
+          typeof o.comment === "string" &&
+          o.comment.startsWith("Cascade"),
       )
       .sort((a, b) =>
         isBuy ? b.openPrice - a.openPrice : a.openPrice - b.openPrice,
