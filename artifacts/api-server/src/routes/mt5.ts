@@ -1916,9 +1916,14 @@ async function cancelZoneLimits(
     // Neither in-memory map nor DB had tracked order IDs — this can happen after
     // a server restart or when the cascade-limit-attach race was lost. As a safety
     // net, cancel every live pending order that carries a "Cascade" comment: those
-    // are definitionally stale once this zone is fully closed. Only one zone is
-    // active per account at a time, so false-cancellations are not a risk here.
-    const cascadeLive = liveOrders.filter(o => String(o.comment ?? "").startsWith("Cascade"));
+    // are definitionally stale once this zone is fully closed.
+    // IMPORTANT: skip orders already claimed by a different active zone — multiple
+    // zones can run in parallel on the same account, so blind-cancelling their
+    // limits would wipe out a sibling zone's pending entries.
+    const cascadeLive = liveOrders.filter(o =>
+      String(o.comment ?? "").startsWith("Cascade") &&
+      !zoneLimitOrders.has(o.id)
+    );
     if (cascadeLive.length === 0) return;
     console.log(`[zone ${zoneId}] blind-cancel ${cascadeLive.length} untracked cascade limit(s) (no orderId records found)`);
     await Promise.all(cascadeLive.map(async (o) => {
