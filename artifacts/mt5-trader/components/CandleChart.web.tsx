@@ -62,11 +62,10 @@ export default function CandleChart({
   const { zones } = useZones(accountId, { sseConnected });
   const { candles } = useCandles(accountId, timeframe);
 
-  // Show overlay for the most-recent zone that is not yet closed (OPEN or
-  // RISK_FREE — both still have live positions/orders on the chart)
+  // Show overlay only for the most-recent strictly OPEN zone
   const activeZone =
     zones
-      .filter((z) => z.status !== "CLOSED")
+      .filter((z) => z.status === "OPEN")
       .sort((a, b) => b.createdAt - a.createdAt)[0] ?? null;
 
   // ── Initialise chart (once) ───────────────────────────────────────────────
@@ -186,15 +185,14 @@ export default function CandleChart({
 
     // ── Market entry ──────────────────────────────────────────────────────────
     if (anchor > 0) {
-      // Scope to positions placed by the cascade engine (comment "Cascade N/M")
-      // matching direction — deterministic, no proximity guessing.
-      const dirType = isBuy ? "POSITION_TYPE_BUY" : "POSITION_TYPE_SELL";
-      const zonePos = positions.filter(
-        (p) =>
-          p.type === dirType &&
-          typeof p.comment === "string" &&
-          p.comment.startsWith("Cascade"),
-      );
+      // Scope to positions whose IDs are registered in the zone (authoritative,
+      // no heuristics).  Falls back to empty array when positionIds not yet
+      // populated (e.g. old API version returning the field as undefined).
+      const zonePositionIds = new Set(activeZone.positionIds ?? []);
+      const zonePos = zonePositionIds.size > 0
+        ? positions.filter((p) => zonePositionIds.has(p.id))
+        : [];
+
       const vol = zonePos.length > 0 ? zonePos[0]!.volume : null;
       const entryLabel = vol != null ? `Entry  ${vol.toFixed(2)} lot` : "Entry";
 
@@ -209,7 +207,7 @@ export default function CandleChart({
         }),
       );
 
-      // ── SL — from cascade-tagged positions ───────────────────────────────
+      // ── SL — from zone-linked positions ──────────────────────────────────
       const slCandidates = zonePos
         .filter((p) => p.stopLoss != null)
         .map((p) => p.stopLoss!);
@@ -248,16 +246,12 @@ export default function CandleChart({
       );
     }
 
-    // ── Limit entries — scoped to cascade-tagged pending orders ──────────────
-    const limitSide = isBuy ? "BUY" : "SELL";
-    const limitOrders = pendingOrders
-      .filter(
-        (o) =>
-          o.type.includes(limitSide) &&
-          o.type.includes("LIMIT") &&
-          typeof o.comment === "string" &&
-          o.comment.startsWith("Cascade"),
-      )
+    // ── Limit entries — scoped to zone-linked pending orders (by ID) ─────────
+    const zoneOrderIds = new Set(activeZone.orderIds ?? []);
+    const limitOrders = (zoneOrderIds.size > 0
+      ? pendingOrders.filter((o) => zoneOrderIds.has(o.id) && o.type.includes("LIMIT"))
+      : []
+    )
       .sort((a, b) =>
         isBuy ? b.openPrice - a.openPrice : a.openPrice - b.openPrice,
       );

@@ -2684,6 +2684,8 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
       if (!includeClosed && z.status === "CLOSED") continue;
       const openPositions = await db.select().from(zonePositionsTable)
         .where(and(eq(zonePositionsTable.zoneId, z.zoneId), eq(zonePositionsTable.status, "OPEN")));
+      const zoneOrders = await db.select({ orderId: zoneOrdersTable.orderId })
+        .from(zoneOrdersTable).where(eq(zoneOrdersTable.zoneId, z.zoneId));
       const finalTpReached = z.tp4Hit ? 4 : z.tp3Hit ? 3 : z.tp2Hit ? 2 : z.tp1Hit ? 1 : 0;
 
       const dir = z.direction === "sell" ? "sell" : "buy";
@@ -2738,6 +2740,8 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         closedAt: z.closedAt != null ? Number(z.closedAt) : null,
         finalTpReached,
         positionCount: openPositions.length,
+        positionIds: openPositions.map(p => p.positionId),
+        orderIds: zoneOrders.map(o => o.orderId),
         currentPrice,
         nextTp,
         nextTpPrice,

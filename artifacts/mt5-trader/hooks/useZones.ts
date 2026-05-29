@@ -29,6 +29,10 @@ export interface Zone {
   closedAt?: number | null;
   finalTpReached?: 0 | 1 | 2 | 3 | 4;
   positionCount: number;
+  /** IDs of open positions belonging to this zone — used for deterministic overlay scoping. */
+  positionIds?: string[];
+  /** IDs of all pending orders belonging to this zone — used for deterministic overlay scoping. */
+  orderIds?: string[];
   currentPrice?: number | null;
   nextTp?: 0 | 1 | 2 | 3 | 4;
   nextTpPrice?: number | null;
