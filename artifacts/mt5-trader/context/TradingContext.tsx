@@ -9,7 +9,7 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { Platform } from "react-native";
+import { AppState, Platform } from "react-native";
 
 import { emitAccountEvent } from "@/lib/accountEventBus";
 import { getAuthToken } from "@/lib/authToken";
@@ -556,13 +556,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     let retryDelay = 2_000;
     let sseDroppedAt: number | null = null;
 
-    // Stop the 15 s fallback intervals (called when SSE (re)connects).
+    // Stop the fallback intervals (called when SSE (re)connects).
     const clearFallbackIntervals = () => {
       if (priceIntervalRef.current) { clearInterval(priceIntervalRef.current); priceIntervalRef.current = null; }
       if (positionsIntervalRef.current) { clearInterval(positionsIntervalRef.current); positionsIntervalRef.current = null; }
     };
 
-    // Start 15 s fallback intervals (called only after 30 s of SSE disconnection).
+    // Start fast fallback intervals (called only after 12 s of SSE disconnection).
     const startFallbackPolling = () => {
       if (priceIntervalRef.current) return; // already running
       const r = regionRef.current;
@@ -571,14 +571,34 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         fetchPriceData(a, r)
           .then(p => { priceFailCountRef.current = 0; setPriceError(false); setPrice(p); })
           .catch(() => { priceFailCountRef.current += 1; if (priceFailCountRef.current >= 3) setPriceError(true); });
-      }, 15_000);
+      }, 4_000);
       positionsIntervalRef.current = setInterval(() => {
         void Promise.all([
           fetchPositionsData(a, r).then(setPositions).catch(() => {}),
           fetchPendingOrdersData(a, r).then(setPendingOrders).catch(() => {}),
         ]);
-      }, 15_000);
+      }, 4_000);
     };
+
+    // Interruptible sleep — wakeUp() skips the wait immediately (used when
+    // the app returns to foreground so we don't wait out a long backoff).
+    let wakeUp: (() => void) | null = null;
+    const interruptibleSleep = (ms: number) =>
+      new Promise<void>(resolve => { wakeUp = resolve; setTimeout(resolve, ms); });
+    const wakeNow = () => { wakeUp?.(); wakeUp = null; };
+
+    // When the app returns to foreground (mobile) or tab becomes visible (web),
+    // immediately skip any pending backoff sleep and reconnect.
+    const onForeground = () => { retryDelay = 2_000; wakeNow(); };
+    const appStateSub = AppState.addEventListener("change", state => {
+      if (state === "active") onForeground();
+    });
+    const onVisibility = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "visible") onForeground();
+    };
+    if (Platform.OS === "web" && typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibility);
+    }
 
     const run = async () => {
       while (mounted && !controller.signal.aborted) {
@@ -653,13 +673,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
         if (!mounted || controller.signal.aborted) break;
 
-        // SSE dropped — update connection state and arm the 30 s grace timer.
+        // SSE dropped — update connection state and arm the 12 s grace timer.
         setSseConnected(false);
         if (sseDroppedAt === null) sseDroppedAt = Date.now();
-        if (Date.now() - sseDroppedAt >= 30_000) startFallbackPolling();
+        if (Date.now() - sseDroppedAt >= 12_000) startFallbackPolling();
 
-        await new Promise<void>(r => setTimeout(r, retryDelay));
-        retryDelay = Math.min(retryDelay * 2, 30_000);
+        await interruptibleSleep(retryDelay);
+        retryDelay = Math.min(retryDelay * 2, 8_000);
       }
     };
 
@@ -667,8 +687,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     return () => {
       mounted = false;
       controller.abort();
+      wakeNow();
       clearFallbackIntervals();
       setSseConnected(false);
+      appStateSub.remove();
+      if (Platform.OS === "web" && typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibility);
+      }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status, accountId]);

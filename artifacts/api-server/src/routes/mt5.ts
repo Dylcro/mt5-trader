@@ -2790,11 +2790,11 @@ router.get("/mt5/account/:accountId/stream", checkOwner, (req: Request, res: Res
     res.write(`event: price\ndata: ${JSON.stringify({ bid: tick.bid, ask: tick.ask })}\n\n`);
   }
 
-  // Heartbeat comment every 15 s — keeps the TCP connection alive through
+  // Heartbeat comment every 8 s — keeps the TCP connection alive through
   // Replit's proxy and mobile carrier NATs that close idle connections.
   const hb = setInterval(() => {
     try { res.write(": hb\n\n"); } catch { clearInterval(hb); }
-  }, 15_000);
+  }, 8_000);
 
   req.on("close", () => {
     clearInterval(hb);
