@@ -20,10 +20,6 @@ function NativeTabLayout() {
         <NativeTabs.Trigger.Icon sf={{ default: "chart.line.uptrend.xyaxis", selected: "chart.line.uptrend.xyaxis.circle.fill" }} />
         <NativeTabs.Trigger.Label>Trade</NativeTabs.Trigger.Label>
       </NativeTabs.Trigger>
-      <NativeTabs.Trigger name="chart">
-        <NativeTabs.Trigger.Icon sf={{ default: "chart.bar", selected: "chart.bar.fill" }} />
-        <NativeTabs.Trigger.Label>Chart</NativeTabs.Trigger.Label>
-      </NativeTabs.Trigger>
       <NativeTabs.Trigger name="positions">
         <NativeTabs.Trigger.Icon sf={{ default: "list.bullet.rectangle", selected: "list.bullet.rectangle.fill" }} />
         <NativeTabs.Trigger.Label>Positions</NativeTabs.Trigger.Label>
@@ -84,18 +80,6 @@ function ClassicTabLayout() {
               <SymbolView name="chart.line.uptrend.xyaxis" tintColor={color} size={size} />
             ) : (
               <MaterialCommunityIcons name="chart-line" size={size} color={color} />
-            ),
-        }}
-      />
-      <Tabs.Screen
-        name="chart"
-        options={{
-          title: "Chart",
-          tabBarIcon: ({ color, size }) =>
-            Platform.OS === "ios" ? (
-              <SymbolView name="chart.bar" tintColor={color} size={size} />
-            ) : (
-              <MaterialCommunityIcons name="chart-bar" size={size} color={color} />
             ),
         }}
       />

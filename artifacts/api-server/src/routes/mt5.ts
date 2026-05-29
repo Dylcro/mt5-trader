@@ -2684,8 +2684,6 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
       if (!includeClosed && z.status === "CLOSED") continue;
       const openPositions = await db.select().from(zonePositionsTable)
         .where(and(eq(zonePositionsTable.zoneId, z.zoneId), eq(zonePositionsTable.status, "OPEN")));
-      const zoneOrders = await db.select({ orderId: zoneOrdersTable.orderId })
-        .from(zoneOrdersTable).where(eq(zoneOrdersTable.zoneId, z.zoneId));
       const finalTpReached = z.tp4Hit ? 4 : z.tp3Hit ? 3 : z.tp2Hit ? 2 : z.tp1Hit ? 1 : 0;
 
       const dir = z.direction === "sell" ? "sell" : "buy";
@@ -2740,8 +2738,6 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         closedAt: z.closedAt != null ? Number(z.closedAt) : null,
         finalTpReached,
         positionCount: openPositions.length,
-        positionIds: openPositions.map(p => p.positionId),
-        orderIds: zoneOrders.map(o => o.orderId),
         currentPrice,
         nextTp,
         nextTpPrice,
@@ -3534,50 +3530,12 @@ router.get("/mt5/account/:accountId/info", checkOwner, async (req: Request, res:
 });
 
 // GET /api/mt5/account/:accountId/candles?region=london&timeframe=5m&limit=150
-// Primary: fetches real OHLCV from MetaAPI historical-market-data (Vantage MT5 feed).
-// Fallback: tick-store approximation if MetaAPI call fails.
-router.get("/mt5/account/:accountId/candles", checkOwner, async (req: Request, res: Response) => {
-  const { accountId } = req.params as { accountId: string };
+// Candles are built from live price ticks accumulated by the /price endpoint.
+router.get("/mt5/account/:accountId/candles", checkOwner, (req: Request, res: Response) => {
   const timeframe = qstr(req.query.timeframe) || "5m";
-  const limit = Math.min(parseInt(qstr(req.query.limit) || "200", 10) || 200, 1000);
-  const region = qstr(req.query.region)
-    || activeRegions.get(accountId)
-    || knownAccounts.get(accountId)?.region
-    || DEFAULT_REGION;
-
-  try {
-    const token = getToken();
-    // Request slightly more than needed so trimming to limit gives a full set.
-    const msPerBar = TF_MS[timeframe] ?? 300_000;
-    const fetchLimit = Math.min(limit + 10, 1000);
-    // startTime far enough back that limit candles fit between it and now.
-    const startTime = new Date(Date.now() - msPerBar * (fetchLimit + 2)).toISOString();
-
-    const url =
-      `${clientBase(region)}/users/current/accounts/${accountId}` +
-      `/historical-market-data/symbols/XAUUSD/timeframes/${encodeURIComponent(timeframe)}/candles` +
-      `?startTime=${encodeURIComponent(startTime)}&limit=${fetchLimit}`;
-
-    const metaRes = await fetch(url, { headers: authHeaders(token), signal: AbortSignal.timeout(8000) });
-
-    if (metaRes.ok) {
-      type MetaCandle = { time: string; open: number; high: number; low: number; close: number };
-      const raw = await metaRes.json() as MetaCandle[];
-      if (Array.isArray(raw) && raw.length > 0) {
-        const sorted = raw
-          .filter(c => c.time && c.open != null)
-          .sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime())
-          .slice(-limit)
-          .map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close }));
-        return res.json(sorted);
-      }
-    }
-  } catch {
-    // fall through to tick-store fallback
-  }
-
-  // Fallback: candles derived from accumulated ticks (max ~4 h of history).
-  return res.json(buildCandles(accountId, timeframe, limit));
+  const limit = Math.min(parseInt(qstr(req.query.limit) || "150", 10) || 150, 500);
+  const candles = buildCandles(req.params.accountId as string, timeframe, limit);
+  return res.json(candles);
 });
 
 // GET /api/mt5/account/:accountId/price?region=london
