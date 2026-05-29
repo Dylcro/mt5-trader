@@ -1,6 +1,6 @@
 import { Feather, MaterialCommunityIcons } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
-import { useRouter } from "expo-router";
+import { useFocusEffect, useRouter } from "expo-router";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -357,16 +357,14 @@ export default function TradeScreen() {
     limitPrices?: number[]; // to find filled limits that became positions
   };
 
-  // Load persisted lot sizes on mount
-  useEffect(() => {
+  // Load persisted lot sizes from AsyncStorage. Also runs on tab focus so that
+  // values set in the Settings tab are picked up without a full app restart.
+  const loadLotSizes = useCallback(() => {
     AsyncStorage.getMany([LOT_SIZE_SINGLE_KEY, LOT_SIZE_CASCADE_KEY]).then((record) => {
       const single = record[LOT_SIZE_SINGLE_KEY];
       const cascade = record[LOT_SIZE_CASCADE_KEY];
       if (single) setLotSizeRaw(parseFloat(single));
       if (cascade) {
-        // Cascade minimum is 0.01 (broker minimum). Lots ≥ 0.04 get 25% partial
-        // closes at each TP; smaller lots fully close at TP1 (25% of 0.01 rounds
-        // up to 0.01 = the full position). Snap any sub-0.01 stored value up.
         const parsed = parseFloat(cascade);
         const safe = Number.isFinite(parsed) && parsed >= 0.01 ? parsed : 0.01;
         setCascadeLotSizeRaw(safe);
@@ -374,6 +372,8 @@ export default function TradeScreen() {
       }
     });
   }, []);
+  useEffect(loadLotSizes, [loadLotSizes]);
+  useFocusEffect(loadLotSizes);
 
   const tpWatchersRef = useRef<WatcherEntry[]>([]); // take-profit queue
 

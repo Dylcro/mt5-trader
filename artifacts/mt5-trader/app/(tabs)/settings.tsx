@@ -19,6 +19,8 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
 import Colors from "@/constants/colors";
 import { useTrading } from "@/context/TradingContext";
 import { useCascadeSettings } from "@/hooks/useCascadeSettings";
@@ -26,6 +28,9 @@ import { useHapticSettings } from "@/hooks/useHapticSettings";
 import { useNotificationSettings } from "@/hooks/useNotificationSettings";
 
 const C = Colors.dark;
+
+const LOT_SIZE_SINGLE_KEY = "lot_size_single";
+const LOT_SIZE_CASCADE_KEY = "lot_size_cascade";
 
 const POPULAR_SERVERS = [
   "VantageInternational-Live",
@@ -251,6 +256,24 @@ export default function SettingsScreen() {
     parsedTp.tp3 !== cs.tp3Pips ||
     parsedTp.tp4 !== cs.tp4Pips;
 
+  // Lot sizes — shared with the trade tab via AsyncStorage
+  const [singleLotDraft, setSingleLotDraft] = useState("0.01");
+  const [cascadeLotDraft, setCascadeLotDraft] = useState("0.04");
+  const [lotSaveState, setLotSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  useEffect(() => {
+    AsyncStorage.getMany([LOT_SIZE_SINGLE_KEY, LOT_SIZE_CASCADE_KEY]).then((r) => {
+      const s = r[LOT_SIZE_SINGLE_KEY];
+      const c = r[LOT_SIZE_CASCADE_KEY];
+      if (s) setSingleLotDraft(parseFloat(s).toFixed(2));
+      if (c) setCascadeLotDraft(parseFloat(c).toFixed(2));
+    });
+  }, []);
+  const parsedSingleLot = parseFloat(singleLotDraft);
+  const parsedCascadeLot = parseFloat(cascadeLotDraft);
+  const lotDraftsValid =
+    Number.isFinite(parsedSingleLot) && parsedSingleLot >= 0.01 &&
+    Number.isFinite(parsedCascadeLot) && parsedCascadeLot >= 0.01;
+
   // TP split % per level
   const [splitDraft, setSplitDraft] = useState({
     tp1: String(cs.tp1Pct),
@@ -262,15 +285,14 @@ export default function SettingsScreen() {
   useEffect(() => {
     setSplitDraft({ tp1: String(cs.tp1Pct), tp2: String(cs.tp2Pct), tp3: String(cs.tp3Pct), tp4: String(cs.tp4Pct) });
   }, [cs.tp1Pct, cs.tp2Pct, cs.tp3Pct, cs.tp4Pct]);
-  const numActiveTps = cs.tp4Pips > 0 ? 4 : 3;
   const parsedSplit = {
     tp1: parseInt(splitDraft.tp1, 10) || 0,
     tp2: parseInt(splitDraft.tp2, 10) || 0,
     tp3: parseInt(splitDraft.tp3, 10) || 0,
     tp4: parseInt(splitDraft.tp4, 10) || 0,
   };
-  const activeSplitSum = parsedSplit.tp1 + parsedSplit.tp2 + parsedSplit.tp3 + (numActiveTps >= 4 ? parsedSplit.tp4 : 0);
-  const splitValid = activeSplitSum === 100 && parsedSplit.tp1 > 0 && parsedSplit.tp2 > 0 && parsedSplit.tp3 > 0 && (numActiveTps < 4 || parsedSplit.tp4 > 0);
+  const activeSplitSum = parsedSplit.tp1 + parsedSplit.tp2 + parsedSplit.tp3 + parsedSplit.tp4;
+  const splitValid = activeSplitSum === 100 && parsedSplit.tp1 > 0 && parsedSplit.tp2 > 0 && parsedSplit.tp3 > 0 && parsedSplit.tp4 > 0;
   const splitDirty = parsedSplit.tp1 !== cs.tp1Pct || parsedSplit.tp2 !== cs.tp2Pct || parsedSplit.tp3 !== cs.tp3Pct || parsedSplit.tp4 !== cs.tp4Pct;
 
   const { hapticEnabled, setHapticEnabled } = useHapticSettings();
@@ -755,6 +777,102 @@ export default function SettingsScreen() {
             </Pressable>
           </View>
 
+          {/* Lot Sizes */}
+          <View style={styles.cascadeCard}>
+            <View style={styles.cascadeCardHeader}>
+              <Feather name="layers" size={16} color={C.gold} />
+              <Text style={styles.cascadeCardTitle}>Lot Sizes</Text>
+              <View style={styles.sourceBadge}>
+                <Text style={styles.sourceBadgeText}>IN-APP</Text>
+              </View>
+            </View>
+            <Text style={styles.cascadeCardDesc}>
+              Default lot size for single trades and cascade orders. Changes take effect immediately on the trade screen.
+            </Text>
+
+            <View style={styles.cascadeDivider} />
+
+            {([
+              { key: "single" as const, label: "Single Trade", draft: singleLotDraft, setDraft: setSingleLotDraft },
+              { key: "cascade" as const, label: "Cascade", draft: cascadeLotDraft, setDraft: setCascadeLotDraft },
+            ]).map((row) => (
+              <View key={row.key} style={styles.tpRow}>
+                <Text style={styles.tpRowLabel}>{row.label}</Text>
+                <View style={styles.tpInputWrap}>
+                  <TextInput
+                    style={styles.tpInput}
+                    value={row.draft}
+                    onChangeText={(v) => {
+                      row.setDraft(v.replace(/[^0-9.]/g, ""));
+                      if (lotSaveState !== "idle") setLotSaveState("idle");
+                    }}
+                    placeholder="0.01"
+                    placeholderTextColor={C.textMuted}
+                    keyboardType="decimal-pad"
+                    inputMode="decimal"
+                  />
+                  <Text style={styles.tpInputSuffix}>lot</Text>
+                </View>
+              </View>
+            ))}
+
+            {!lotDraftsValid && (
+              <View style={styles.cascadeWarningBox}>
+                <Feather name="alert-triangle" size={14} color="#f59e0b" />
+                <Text style={styles.cascadeWarningText}>
+                  Minimum lot size is 0.01.
+                </Text>
+              </View>
+            )}
+
+            <Pressable
+              style={({ pressed }) => [
+                styles.saveBtn,
+                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
+                (!lotDraftsValid || lotSaveState === "saving") && { opacity: 0.5 },
+              ]}
+              disabled={!lotDraftsValid || lotSaveState === "saving"}
+              onPress={async () => {
+                Keyboard.dismiss();
+                void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                setLotSaveState("saving");
+                try {
+                  const sLot = parseFloat(parsedSingleLot.toFixed(2));
+                  const cLot = Math.max(0.01, parseFloat(parsedCascadeLot.toFixed(2)));
+                  await AsyncStorage.setMany({
+                    [LOT_SIZE_SINGLE_KEY]: String(sLot),
+                    [LOT_SIZE_CASCADE_KEY]: String(cLot),
+                  });
+                  setSingleLotDraft(sLot.toFixed(2));
+                  setCascadeLotDraft(cLot.toFixed(2));
+                  setLotSaveState("saved");
+                  void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                  setTimeout(() => setLotSaveState("idle"), 2500);
+                } catch {
+                  setLotSaveState("error");
+                  void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+                  setTimeout(() => setLotSaveState("idle"), 3000);
+                }
+              }}
+            >
+              {lotSaveState === "saving" ? (
+                <ActivityIndicator size="small" color="#000" />
+              ) : (
+                <Feather
+                  name={lotSaveState === "saved" ? "check" : lotSaveState === "error" ? "alert-circle" : "save"}
+                  size={15}
+                  color={lotSaveState === "error" ? C.sell : "#000"}
+                />
+              )}
+              <Text style={[styles.saveBtnText, lotSaveState === "error" && { color: C.sell }]}>
+                {lotSaveState === "saving" ? "Saving…"
+                  : lotSaveState === "saved" ? "Lot Sizes Saved"
+                  : lotSaveState === "error" ? "Save failed"
+                  : "Save Lot Sizes"}
+              </Text>
+            </Pressable>
+          </View>
+
           {/* Risk Free SL placement — signed pip offset from the surviving entry. */}
           <View style={styles.cascadeCard}>
             <View style={styles.cascadeCardHeader}>
@@ -940,8 +1058,8 @@ export default function SettingsScreen() {
               </View>
             </View>
             <Text style={styles.cascadeCardDesc}>
-              What % of the original position to close at each TP level. Must sum to 100. Saved locally and baked into each new cascade zone.{"\n"}
-              Examples: 50/50 (two TPs), 30/30/40 (three TPs), 25/25/25/25 (four TPs).
+              What % of the original position to close at each TP level. All four must sum to 100. TP4 is only triggered when the TP4 pip distance is set above zero; set it high or equal to TP3 if you don't need it.{"\n"}
+              Examples: 50/25/25/0 (no TP4), 25/25/25/25 (equal quarters), 30/30/30/10.
             </Text>
 
             <View style={styles.cascadeDivider} />
@@ -950,7 +1068,7 @@ export default function SettingsScreen() {
               { key: "tp1" as const, label: "TP1" },
               { key: "tp2" as const, label: "TP2" },
               { key: "tp3" as const, label: "TP3" },
-              ...(numActiveTps >= 4 ? [{ key: "tp4" as const, label: "TP4" }] : []),
+              { key: "tp4" as const, label: "TP4" },
             ]).map((tp) => (
               <View key={tp.key} style={styles.tpRow}>
                 <Text style={styles.tpRowLabel}>{tp.label}</Text>
