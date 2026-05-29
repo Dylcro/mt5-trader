@@ -2253,115 +2253,69 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       return results.every(Boolean);
     };
 
-    // Per-position TP evaluation. Positions are bucketed by their own tp1Hit/
-    // tp2Hit flags (not the zone-level flags), so a new limit fill that arrives
-    // after TP1 has already fired on the main entry will independently progress
-    // through TP1→TP2→TP3→TP4 without skipping to wherever the main entry is.
+    // Zone-level TP evaluation. All active positions in the zone advance
+    // through TPs together. A limit order that fills after TP1 has fired on
+    // the main entry automatically joins the zone at its current stage — when
+    // price then reaches TP2, that partial close fires on ALL live positions
+    // (main entry + new limit fills) as a unified group.
     //
-    // All four buckets are computed UPFRONT before any closes execute, so a
-    // position that moves from needTP1→tp1Hit in this tick is not mistakenly
-    // pulled into needTP2 in the same tick.
-    //
-    // Zone-level tp1Hit/tp2Hit flags are retained as: "has at least one position
-    // had this TP applied". They gate: near-TP notifications, cancelZoneLimits
-    // (fires at first TP2), SL→BE trigger, and UI progress display.
-    const needTP1 = live.filter(p => !st.trackedPositions.get(p.id)?.tp1Hit);
-    const needTP2 = live.filter(p =>  st.trackedPositions.get(p.id)?.tp1Hit && !st.trackedPositions.get(p.id)?.tp2Hit);
-    const needTP3 = live.filter(p =>  st.trackedPositions.get(p.id)?.tp2Hit && !st.trackedPositions.get(p.id)?.tp3Hit);
-    const needTP4 = live.filter(p =>  st.trackedPositions.get(p.id)?.tp3Hit && !st.trackedPositions.get(p.id)?.tp4Hit);
-
-    // TP1
-    if (needTP1.length > 0 && st.tp1Price != null && hit(st.tp1Price)) {
-      console.log(`[zone ${zoneId}] TP1 trigger @${cmpPrice} (tp1=${st.tp1Price}) — ${needTP1.length}/${live.length} position(s) need TP1`);
-      const ok = await closePartialForLevel(1, needTP1);
+    // Limits remain active from TP1 until TP2 (cancelled at first TP2 hit).
+    if (!st.tp1Hit && st.tp1Price != null && hit(st.tp1Price)) {
+      console.log(`[zone ${zoneId}] TP1 trigger @${cmpPrice} (tp1=${st.tp1Price}) — ${live.length} active entr${live.length === 1 ? "y" : "ies"}`);
+      const ok = await closePartialForLevel(1, live);
       if (ok) {
-        const ids = needTP1.map(p => p.id);
-        await db.update(zonePositionsTable).set({ tp1Hit: true })
-          .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
-        for (const p of needTP1) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp1Hit = true; }
-        if (!st.tp1Hit) {
-          await db.update(cascadeZonesTable).set({ tp1Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-          st.tp1Hit = true;
-          zoneNearNotifiedTp.set(zoneId, 0);
-          notifyZoneEvent(zoneId, "hit", 1, 0, st.direction);
-        }
+        await db.update(cascadeZonesTable).set({ tp1Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        st.tp1Hit = true;
+        zoneNearNotifiedTp.set(zoneId, 0);
+        notifyZoneEvent(zoneId, "hit", 1, 0, st.direction);
         broadcastZoneUpdate(zoneId);
-        console.log(`[zone ${zoneId}] TP1 complete (${ids.length} position(s))`);
+        console.log(`[zone ${zoneId}] TP1 complete`);
       } else {
         console.warn(`[zone ${zoneId}] TP1 partial failure — will retry next tick`);
       }
-    }
-
-    // TP2
-    if (needTP2.length > 0 && st.tp2Price != null && hit(st.tp2Price)) {
-      console.log(`[zone ${zoneId}] TP2 trigger @${cmpPrice} (tp2=${st.tp2Price}) — ${needTP2.length}/${live.length} position(s) need TP2`);
-      const ok = await closePartialForLevel(2, needTP2);
+    } else if (!st.tp2Hit && st.tp1Hit && st.tp2Price != null && hit(st.tp2Price)) {
+      console.log(`[zone ${zoneId}] TP2 trigger @${cmpPrice} (tp2=${st.tp2Price}) — ${live.length} active entr${live.length === 1 ? "y" : "ies"}`);
+      const ok = await closePartialForLevel(2, live);
       // Cancel any still-unfilled cascade limits at TP2 (we're now solidly in
-      // profit; no need to add to the position). Fires once, on first TP2.
-      if (!st.tp2Hit) await cancelZoneLimits(token, region, st.accountId, zoneId);
+      // profit; no need to add to the position).
+      await cancelZoneLimits(token, region, st.accountId, zoneId);
       if (ok) {
-        const ids = needTP2.map(p => p.id);
-        // Advance per-position flags before zone-level so a restart during this
-        // window doesn't lose the per-position state.
-        await db.update(zonePositionsTable).set({ tp2Hit: true })
-          .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
-        for (const p of needTP2) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp2Hit = true; }
-        if (!st.tp2Hit) {
-          // Do NOT gate this on the SL→BE move (see comment on sticky-BE block
-          // below). The BE move is attempted by the separate sticky-retry block;
-          // gating tp2Hit on it caused the zone to re-enter every tick when the
-          // broker rejected the SL (code 10016).
-          await db.update(cascadeZonesTable).set({ tp2Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-          st.tp2Hit = true;
-          zoneNearNotifiedTp.set(zoneId, 0);
-          notifyZoneEvent(zoneId, "hit", 2, 0, st.direction);
-          console.log(`[zone ${zoneId}] TP2 partial closed + limits cancelled — SL→BE will be attempted next`);
-        } else {
-          console.log(`[zone ${zoneId}] TP2 partial closed for ${ids.length} late-entry position(s)`);
-        }
+        // Advance to TP3 detection as soon as the partial close succeeds —
+        // do NOT gate this on the SL→BE move. The BE move is attempted by a
+        // separate sticky-retry block below; gating tp2Hit on it caused the
+        // zone to re-enter this branch every tick when the broker rejected
+        // the SL (code 10016), spamming logs and never advancing.
+        await db.update(cascadeZonesTable).set({ tp2Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        st.tp2Hit = true;
+        zoneNearNotifiedTp.set(zoneId, 0);
+        notifyZoneEvent(zoneId, "hit", 2, 0, st.direction);
         broadcastZoneUpdate(zoneId);
+        console.log(`[zone ${zoneId}] TP2 partial closed + limits cancelled — SL→BE will be attempted next`);
       } else {
         console.warn(`[zone ${zoneId}] TP2 partial close failed — will retry next tick`);
       }
-    }
-
-    // TP3
-    if (needTP3.length > 0 && st.tp3Price != null && hit(st.tp3Price)) {
-      console.log(`[zone ${zoneId}] TP3 trigger @${cmpPrice} (tp3=${st.tp3Price}) — ${needTP3.length}/${live.length} position(s) need TP3`);
-      const ok = await closePartialForLevel(3, needTP3);
+    } else if (!st.tp3Hit && st.tp2Hit && st.tp3Price != null && hit(st.tp3Price)) {
+      console.log(`[zone ${zoneId}] TP3 trigger @${cmpPrice} (tp3=${st.tp3Price}) — ${live.length} active entr${live.length === 1 ? "y" : "ies"}`);
+      const ok = await closePartialForLevel(3, live);
       if (ok) {
-        const ids = needTP3.map(p => p.id);
-        await db.update(zonePositionsTable).set({ tp3Hit: true })
-          .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
-        for (const p of needTP3) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp3Hit = true; }
-        if (!st.tp3Hit) {
-          await db.update(cascadeZonesTable).set({ tp3Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-          st.tp3Hit = true;
-          zoneNearNotifiedTp.set(zoneId, 0);
-          notifyZoneEvent(zoneId, "hit", 3, 0, st.direction);
-        }
+        await db.update(cascadeZonesTable).set({ tp3Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        st.tp3Hit = true;
+        zoneNearNotifiedTp.set(zoneId, 0);
+        notifyZoneEvent(zoneId, "hit", 3, 0, st.direction);
         broadcastZoneUpdate(zoneId);
-        console.log(`[zone ${zoneId}] TP3 complete (${ids.length} position(s))`);
+        console.log(`[zone ${zoneId}] TP3 complete`);
       } else {
         console.warn(`[zone ${zoneId}] TP3 partial failure — will retry next tick`);
       }
-    }
-
-    // TP4 (optional — when set, closes whatever's left of each entry)
-    if (needTP4.length > 0 && st.tp4Price != null && hit(st.tp4Price)) {
-      console.log(`[zone ${zoneId}] TP4 trigger @${cmpPrice} (tp4=${st.tp4Price}) — closing remaining ${needTP4.length} position(s)`);
-      const ok = await closePartialForLevel(4, needTP4);
+    } else if (!st.tp4Hit && st.tp3Hit && st.tp4Price != null && hit(st.tp4Price)) {
+      // TP4 is optional. When set, close whatever's left of each entry.
+      console.log(`[zone ${zoneId}] TP4 trigger @${cmpPrice} (tp4=${st.tp4Price}) — closing all remaining`);
+      const ok = await closePartialForLevel(4, live);
       if (ok) {
-        const ids = needTP4.map(p => p.id);
-        await db.update(zonePositionsTable).set({ tp4Hit: true })
-          .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
-        for (const p of needTP4) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp4Hit = true; }
-        if (!st.tp4Hit) {
-          await db.update(cascadeZonesTable).set({ tp4Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-          st.tp4Hit = true;
-        }
+        await db.update(cascadeZonesTable).set({ tp4Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+        st.tp4Hit = true;
         broadcastZoneUpdate(zoneId);
-        console.log(`[zone ${zoneId}] TP4 complete — final exit (${ids.length} position(s))`);
+        console.log(`[zone ${zoneId}] TP4 complete — final exit`);
       } else {
         console.warn(`[zone ${zoneId}] TP4 close failed — will retry next tick`);
       }
