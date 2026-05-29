@@ -2159,12 +2159,15 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     ): Promise<boolean> => {
       // Resolve this level's close % from the zone's baked-in split config.
       const tpPct = level === 1 ? st.tp1Pct : level === 2 ? st.tp2Pct : level === 3 ? st.tp3Pct : st.tp4Pct;
-      // Gate: "if position is already at or below the expected remaining fraction
-      // after this level fires, the level was already applied — skip (or close
+      // Gate: "if position is already at or below the fraction that would remain
+      // AFTER this level fires, the partial was already applied — skip (or close
       // remainder for small-lot cases where rounding over-took the expected %)."
       // Formula: remaining_after_level_N = (100 - sum_through_N) / 100.
+      // We subtract tpPct so the gate for TP1 (priorPct=0, tpPct=25) is 0.76,
+      // not 1.01 — a gate of 1.01 is always satisfied and silently skips every
+      // TP1 partial close, logging "TP1 complete" without actually closing.
       const priorPct = level === 1 ? 0 : level === 2 ? st.tp1Pct : level === 3 ? st.tp1Pct + st.tp2Pct : st.tp1Pct + st.tp2Pct + st.tp3Pct;
-      const keepFractionGate = Math.max(0, (100 - priorPct + 1) / 100);
+      const keepFractionGate = Math.max(0, (100 - priorPct - tpPct + 1) / 100);
       // Fire all per-entry closes IN PARALLEL — in a fast market, serially
       // awaiting each close can let later entries slip several pips past the
       // TP price before their close request hits the broker.
