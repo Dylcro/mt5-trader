@@ -38,6 +38,12 @@ export interface CascadeSettings {
   tp2Pct: number;
   tp3Pct: number;
   tp4Pct: number;
+  // Per-TP enabled flags. When false the TP is skipped in the zone engine
+  // (pre-marked as already hit at creation) and its pip/pct inputs are greyed.
+  tp1Enabled: boolean;
+  tp2Enabled: boolean;
+  tp3Enabled: boolean;
+  tp4Enabled: boolean;
 }
 
 const DEFAULTS: CascadeSettings = {
@@ -56,6 +62,10 @@ const DEFAULTS: CascadeSettings = {
   tp2Pct: 25,
   tp3Pct: 25,
   tp4Pct: 25,
+  tp1Enabled: true,
+  tp2Enabled: true,
+  tp3Enabled: true,
+  tp4Enabled: true,
 };
 
 const VALID_RISK_FREE_PIPS = [-30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30];
@@ -81,6 +91,10 @@ function storageKeys(accountId: string) {
     tp2Pct:            `${prefix}zone_tp2_pct`,
     tp3Pct:            `${prefix}zone_tp3_pct`,
     tp4Pct:            `${prefix}zone_tp4_pct`,
+    tp1Enabled:        `${prefix}zone_tp1_en`,
+    tp2Enabled:        `${prefix}zone_tp2_en`,
+    tp3Enabled:        `${prefix}zone_tp3_en`,
+    tp4Enabled:        `${prefix}zone_tp4_en`,
   };
 }
 
@@ -124,7 +138,7 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         const keys = storageKeys(accountId);
         const allKeys = [...Object.values(keys), GLOBAL_AUTO_CASCADE_KEY];
         const record = await AsyncStorage.getMany(allKeys);
-        const [num, between, sl, tpEnabled, tpPips, tp1, tp2, tp3, tp4, riskFree, tp1Pct, tp2Pct, tp3Pct, tp4Pct, globalAutoEnabled] = allKeys.map((k) => record[k]);
+        const [num, between, sl, tpEnabled, tpPips, tp1, tp2, tp3, tp4, riskFree, tp1Pct, tp2Pct, tp3Pct, tp4Pct, tp1En, tp2En, tp3En, tp4En, globalAutoEnabled] = allKeys.map((k) => record[k]);
 
         let autoCascadeEnabled = DEFAULTS.autoCascadeEnabled;
         if (globalAutoEnabled !== null) {
@@ -160,6 +174,10 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
           tp2Pct: tp2Pct != null ? parseFloat(tp2Pct) : DEFAULTS.tp2Pct,
           tp3Pct: tp3Pct != null ? parseFloat(tp3Pct) : DEFAULTS.tp3Pct,
           tp4Pct: tp4Pct != null ? parseFloat(tp4Pct) : DEFAULTS.tp4Pct,
+          tp1Enabled: tp1En != null ? tp1En === "true" : DEFAULTS.tp1Enabled,
+          tp2Enabled: tp2En != null ? tp2En === "true" : DEFAULTS.tp2Enabled,
+          tp3Enabled: tp3En != null ? tp3En === "true" : DEFAULTS.tp3Enabled,
+          tp4Enabled: tp4En != null ? tp4En === "true" : DEFAULTS.tp4Enabled,
         };
         setSettings(local);
         void pushToServer(local, accountId);
@@ -190,6 +208,10 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
         [keys.tp2Pct]: String(next.tp2Pct),
         [keys.tp3Pct]: String(next.tp3Pct),
         [keys.tp4Pct]: String(next.tp4Pct),
+        [keys.tp1Enabled]: String(next.tp1Enabled),
+        [keys.tp2Enabled]: String(next.tp2Enabled),
+        [keys.tp3Enabled]: String(next.tp3Enabled),
+        [keys.tp4Enabled]: String(next.tp4Enabled),
         [GLOBAL_AUTO_CASCADE_KEY]: String(next.autoCascadeEnabled),
       });
       return next;

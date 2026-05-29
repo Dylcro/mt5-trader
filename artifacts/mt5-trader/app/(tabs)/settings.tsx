@@ -291,8 +291,16 @@ export default function SettingsScreen() {
     tp3: parseInt(splitDraft.tp3, 10) || 0,
     tp4: parseInt(splitDraft.tp4, 10) || 0,
   };
-  const activeSplitSum = parsedSplit.tp1 + parsedSplit.tp2 + parsedSplit.tp3 + parsedSplit.tp4;
-  const splitValid = activeSplitSum === 100 && parsedSplit.tp1 > 0 && parsedSplit.tp2 > 0 && parsedSplit.tp3 > 0 && parsedSplit.tp4 > 0;
+  const activeSplitSum =
+    (cs.tp1Enabled ? parsedSplit.tp1 : 0) +
+    (cs.tp2Enabled ? parsedSplit.tp2 : 0) +
+    (cs.tp3Enabled ? parsedSplit.tp3 : 0) +
+    (cs.tp4Enabled ? parsedSplit.tp4 : 0);
+  const splitValid = activeSplitSum === 100 &&
+    (!cs.tp1Enabled || parsedSplit.tp1 > 0) &&
+    (!cs.tp2Enabled || parsedSplit.tp2 > 0) &&
+    (!cs.tp3Enabled || parsedSplit.tp3 > 0) &&
+    (!cs.tp4Enabled || parsedSplit.tp4 > 0);
   const splitDirty = parsedSplit.tp1 !== cs.tp1Pct || parsedSplit.tp2 !== cs.tp2Pct || parsedSplit.tp3 !== cs.tp3Pct || parsedSplit.tp4 !== cs.tp4Pct;
 
   const { hapticEnabled, setHapticEnabled } = useHapticSettings();
@@ -965,30 +973,44 @@ export default function SettingsScreen() {
             <View style={styles.cascadeDivider} />
 
             {([
-              { key: "tp1" as const, label: "TP1", placeholder: "20" },
-              { key: "tp2" as const, label: "TP2", placeholder: "60" },
-              { key: "tp3" as const, label: "TP3", placeholder: "100" },
-              { key: "tp4" as const, label: "TP4", placeholder: "0 = manual" },
-            ]).map((tp) => (
-              <View key={tp.key} style={styles.tpRow}>
-                <Text style={styles.tpRowLabel}>{tp.label}</Text>
-                <View style={styles.tpInputWrap}>
-                  <TextInput
-                    style={styles.tpInput}
-                    value={tpDraft[tp.key]}
-                    onChangeText={(v) => {
-                      setTpDraft((d) => ({ ...d, [tp.key]: v.replace(/[^0-9.]/g, "") }));
-                      if (tpSaveState !== "idle") setTpSaveState("idle");
+              { key: "tp1" as const, label: "TP1", placeholder: "20",      enKey: "tp1Enabled" as const },
+              { key: "tp2" as const, label: "TP2", placeholder: "60",      enKey: "tp2Enabled" as const },
+              { key: "tp3" as const, label: "TP3", placeholder: "100",     enKey: "tp3Enabled" as const },
+              { key: "tp4" as const, label: "TP4", placeholder: "0 = manual", enKey: "tp4Enabled" as const },
+            ]).map((tp) => {
+              const enabled = cs[tp.enKey];
+              return (
+                <View key={tp.key} style={[styles.tpRow, { gap: 8 }]}>
+                  <Switch
+                    value={enabled}
+                    onValueChange={(v) => {
+                      updateSettings({ [tp.enKey]: v });
+                      void Haptics.selectionAsync();
                     }}
-                    placeholder={tp.placeholder}
-                    placeholderTextColor={C.textMuted}
-                    keyboardType="number-pad"
-                    inputMode="numeric"
+                    trackColor={{ false: C.border, true: C.buy }}
+                    thumbColor="#fff"
+                    style={{ transform: [{ scaleX: 0.85 }, { scaleY: 0.85 }] }}
                   />
-                  <Text style={styles.tpInputSuffix}>pips</Text>
+                  <Text style={[styles.tpRowLabel, !enabled && { color: C.textMuted }]}>{tp.label}</Text>
+                  <View style={[styles.tpInputWrap, { flex: 1, opacity: enabled ? 1 : 0.35 }]}>
+                    <TextInput
+                      style={styles.tpInput}
+                      value={tpDraft[tp.key]}
+                      onChangeText={(v) => {
+                        setTpDraft((d) => ({ ...d, [tp.key]: v.replace(/[^0-9.]/g, "") }));
+                        if (tpSaveState !== "idle") setTpSaveState("idle");
+                      }}
+                      placeholder={tp.placeholder}
+                      placeholderTextColor={C.textMuted}
+                      keyboardType="number-pad"
+                      inputMode="numeric"
+                      editable={enabled}
+                    />
+                    <Text style={styles.tpInputSuffix}>pips</Text>
+                  </View>
                 </View>
-              </View>
-            ))}
+              );
+            })}
 
             {!tpDraftValid && (
               <View style={styles.cascadeWarningBox}>
@@ -1058,37 +1080,41 @@ export default function SettingsScreen() {
               </View>
             </View>
             <Text style={styles.cascadeCardDesc}>
-              What % of the original position to close at each TP level. All four must sum to 100. TP4 is only triggered when the TP4 pip distance is set above zero; set it high or equal to TP3 if you don't need it.{"\n"}
-              Examples: 50/25/25/0 (no TP4), 25/25/25/25 (equal quarters), 30/30/30/10.
+              What % of the original position to close at each enabled TP level. Enabled TPs must sum to 100. Disabled TPs (toggled off in Zone Take Profit above) are shown as "off" and excluded from the total.{"\n"}
+              Examples: 50/50 on two enabled TPs, 25/25/25/25 on all four.
             </Text>
 
             <View style={styles.cascadeDivider} />
 
             {([
-              { key: "tp1" as const, label: "TP1" },
-              { key: "tp2" as const, label: "TP2" },
-              { key: "tp3" as const, label: "TP3" },
-              { key: "tp4" as const, label: "TP4" },
-            ]).map((tp) => (
-              <View key={tp.key} style={styles.tpRow}>
-                <Text style={styles.tpRowLabel}>{tp.label}</Text>
-                <View style={styles.tpInputWrap}>
-                  <TextInput
-                    style={styles.tpInput}
-                    value={splitDraft[tp.key]}
-                    onChangeText={(v) => {
-                      setSplitDraft((d) => ({ ...d, [tp.key]: v.replace(/[^0-9]/g, "") }));
-                      if (splitSaveState !== "idle") setSplitSaveState("idle");
-                    }}
-                    placeholder="25"
-                    placeholderTextColor={C.textMuted}
-                    keyboardType="number-pad"
-                    inputMode="numeric"
-                  />
-                  <Text style={styles.tpInputSuffix}>%</Text>
+              { key: "tp1" as const, label: "TP1", enKey: "tp1Enabled" as const },
+              { key: "tp2" as const, label: "TP2", enKey: "tp2Enabled" as const },
+              { key: "tp3" as const, label: "TP3", enKey: "tp3Enabled" as const },
+              { key: "tp4" as const, label: "TP4", enKey: "tp4Enabled" as const },
+            ]).map((tp) => {
+              const enabled = cs[tp.enKey];
+              return (
+                <View key={tp.key} style={[styles.tpRow, !enabled && { opacity: 0.4 }]}>
+                  <Text style={[styles.tpRowLabel, !enabled && { color: C.textMuted }]}>{tp.label}</Text>
+                  <View style={styles.tpInputWrap}>
+                    <TextInput
+                      style={styles.tpInput}
+                      value={enabled ? splitDraft[tp.key] : "0"}
+                      onChangeText={(v) => {
+                        setSplitDraft((d) => ({ ...d, [tp.key]: v.replace(/[^0-9]/g, "") }));
+                        if (splitSaveState !== "idle") setSplitSaveState("idle");
+                      }}
+                      placeholder="25"
+                      placeholderTextColor={C.textMuted}
+                      keyboardType="number-pad"
+                      inputMode="numeric"
+                      editable={enabled}
+                    />
+                    <Text style={styles.tpInputSuffix}>{enabled ? "%" : "off"}</Text>
+                  </View>
                 </View>
-              </View>
-            ))}
+              );
+            })}
 
             <View style={[styles.infoRow, { marginTop: 4 }]}>
               <Text style={styles.infoLabel}>Total</Text>

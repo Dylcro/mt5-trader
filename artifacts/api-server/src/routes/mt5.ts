@@ -1598,7 +1598,9 @@ function prepareZoneForCascade(
     originalVolume,
     cashoutPips: ZONE_CASHOUT_PIPS_DEFAULT,
     cashoutDone: false,
-    tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
+    // Pre-mark any TP whose pct is 0 as already-hit so the zone engine skips
+    // it in the sequential chain, letting later enabled TPs fire normally.
+    tp1Hit: tps.tp1Pct === 0, tp2Hit: tps.tp2Pct === 0, tp3Hit: tps.tp3Pct === 0, tp4Hit: tps.tp4Pct === 0,
     tp2SlMoved: false, tp2BeAttempts: 0, tp2SlIsBestEffort: false,
     status: "OPEN", busy: false,
     trackedPositions: new Map(),
@@ -1655,7 +1657,7 @@ async function persistPreparedZone(
     tp1Pct: state.tp1Pct, tp2Pct: state.tp2Pct, tp3Pct: state.tp3Pct, tp4Pct: state.tp4Pct,
     originalVolume: state.originalVolume,
     cashoutPips: state.cashoutPips, cashoutDone: false,
-    tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
+    tp1Hit: state.tp1Hit, tp2Hit: state.tp2Hit, tp3Hit: state.tp3Hit, tp4Hit: state.tp4Hit,
     status: "OPEN", createdAt: now,
   }).onConflictDoNothing();
   await db.insert(zonePositionsTable).values({
