@@ -58,6 +58,14 @@ export const zonePositionsTable = pgTable("zone_positions", {
   volume:     doublePrecision("volume").notNull(),
   status:     text("status").notNull().default("OPEN"),
   createdAt:  bigint("created_at", { mode: "number" }).notNull(),
+  // Per-position TP hit flags. Set to true by evaluateZone when a TP level is
+  // applied to this specific position. Enables positions that fill into the zone
+  // after TP1 (e.g. cascade limits filling on a pullback) to run through the
+  // full TP ladder independently of the main entry position.
+  tp1Hit:     boolean("tp1_hit").notNull().default(false),
+  tp2Hit:     boolean("tp2_hit").notNull().default(false),
+  tp3Hit:     boolean("tp3_hit").notNull().default(false),
+  tp4Hit:     boolean("tp4_hit").notNull().default(false),
 });
 
 export type ZonePositionRow = typeof zonePositionsTable.$inferSelect;

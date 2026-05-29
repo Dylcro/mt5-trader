@@ -1412,7 +1412,7 @@ interface ZoneState {
   // {volume, entryPrice} because TP partial-close logic needs the original
   // per-entry volume to compute the 25% slice (a fallback row without volume
   // would silently advance TP flags without actually closing anything).
-  trackedPositions: Map<string, { volume: number; entryPrice: number }>;
+  trackedPositions: Map<string, { volume: number; entryPrice: number; tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean }>;
 }
 
 // Signed offset (pips) of the protective SL from the surviving entry:
@@ -1689,7 +1689,7 @@ async function persistPreparedZone(
   }).onConflictDoNothing();
   // Seed the in-memory cache for the anchor leg so a DB blip immediately
   // after zone creation can't blind evaluateZone to the market entry.
-  state.trackedPositions.set(positionId, { volume, entryPrice: state.anchorPrice });
+  state.trackedPositions.set(positionId, { volume, entryPrice: state.anchorPrice, tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false });
   if (userId) zoneIdToUserId.set(state.zoneId, userId);
   logEvent("zone.create", { accountId: state.accountId, zoneId: state.zoneId, direction: state.direction, anchorPrice: state.anchorPrice, positionId, volume });
 }
@@ -1736,7 +1736,7 @@ async function recordZonePositionFill(
       // Mirror into the in-memory cache so evaluateZone keeps working through
       // DB blips even if the next select() throws.
       const st = zoneStates.get(zoneId);
-      if (st) st.trackedPositions.set(positionId, { volume, entryPrice });
+      if (st) st.trackedPositions.set(positionId, { volume, entryPrice, tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false });
       console.log(`[zone ${zoneId}] linked filled positionId=${positionId} @${entryPrice} vol=${volume}${i > 0 ? ` (after ${i} retries)` : ""}`);
       return;
     } catch (e) {
@@ -2058,7 +2058,16 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       // Merge DB snapshot into existing cache (do NOT replace the Map wholesale)
       // — replacing would clobber a concurrent recordZonePositionFill().add()
       // landing between our SELECT and this assignment.
-      for (const z of zps) st.trackedPositions.set(z.positionId, { volume: z.volume, entryPrice: z.entryPrice });
+      for (const z of zps) {
+        const existing = st.trackedPositions.get(z.positionId);
+        st.trackedPositions.set(z.positionId, {
+          volume: z.volume, entryPrice: z.entryPrice,
+          tp1Hit: existing?.tp1Hit ?? false,
+          tp2Hit: existing?.tp2Hit ?? false,
+          tp3Hit: existing?.tp3Hit ?? false,
+          tp4Hit: existing?.tp4Hit ?? false,
+        });
+      }
       // Drop entries the authoritative DB view says are no longer OPEN.
       for (const id of Array.from(st.trackedPositions.keys())) {
         if (!trackedIds.has(id)) st.trackedPositions.delete(id);
@@ -2199,6 +2208,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     const zpsById = new Map(zps.map(z => [z.positionId, z]));
     const closePartialForLevel = async (
       level: 1 | 2 | 3 | 4,
+      positionsSubset: typeof live,
     ): Promise<boolean> => {
       // Resolve this level's close % from the zone's baked-in split config.
       const tpPct = level === 1 ? st.tp1Pct : level === 2 ? st.tp2Pct : level === 3 ? st.tp3Pct : st.tp4Pct;
@@ -2214,7 +2224,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       // Fire all per-entry closes IN PARALLEL — in a fast market, serially
       // awaiting each close can let later entries slip several pips past the
       // TP price before their close request hits the broker.
-      const results = await Promise.all(live.map(async p => {
+      const results = await Promise.all(positionsSubset.map(async p => {
         const row = zpsById.get(p.id);
         const origVol = row ? Number(row.volume) : p.volume;
         if (!(origVol > 0)) return true;
@@ -2243,62 +2253,115 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       return results.every(Boolean);
     };
 
-    if (!st.tp1Hit && st.tp1Price != null && hit(st.tp1Price)) {
-      console.log(`[zone ${zoneId}] TP1 trigger @${cmpPrice} (tp1=${st.tp1Price}) — ${live.length} active entr${live.length === 1 ? "y" : "ies"}`);
-      const ok = await closePartialForLevel(1);
+    // Per-position TP evaluation. Positions are bucketed by their own tp1Hit/
+    // tp2Hit flags (not the zone-level flags), so a new limit fill that arrives
+    // after TP1 has already fired on the main entry will independently progress
+    // through TP1→TP2→TP3→TP4 without skipping to wherever the main entry is.
+    //
+    // All four buckets are computed UPFRONT before any closes execute, so a
+    // position that moves from needTP1→tp1Hit in this tick is not mistakenly
+    // pulled into needTP2 in the same tick.
+    //
+    // Zone-level tp1Hit/tp2Hit flags are retained as: "has at least one position
+    // had this TP applied". They gate: near-TP notifications, cancelZoneLimits
+    // (fires at first TP2), SL→BE trigger, and UI progress display.
+    const needTP1 = live.filter(p => !st.trackedPositions.get(p.id)?.tp1Hit);
+    const needTP2 = live.filter(p =>  st.trackedPositions.get(p.id)?.tp1Hit && !st.trackedPositions.get(p.id)?.tp2Hit);
+    const needTP3 = live.filter(p =>  st.trackedPositions.get(p.id)?.tp2Hit && !st.trackedPositions.get(p.id)?.tp3Hit);
+    const needTP4 = live.filter(p =>  st.trackedPositions.get(p.id)?.tp3Hit && !st.trackedPositions.get(p.id)?.tp4Hit);
+
+    // TP1
+    if (needTP1.length > 0 && st.tp1Price != null && hit(st.tp1Price)) {
+      console.log(`[zone ${zoneId}] TP1 trigger @${cmpPrice} (tp1=${st.tp1Price}) — ${needTP1.length}/${live.length} position(s) need TP1`);
+      const ok = await closePartialForLevel(1, needTP1);
       if (ok) {
-        await db.update(cascadeZonesTable).set({ tp1Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-        st.tp1Hit = true;
-        zoneNearNotifiedTp.set(zoneId, 0);
-        notifyZoneEvent(zoneId, "hit", 1, 0, st.direction);
+        const ids = needTP1.map(p => p.id);
+        await db.update(zonePositionsTable).set({ tp1Hit: true })
+          .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
+        for (const p of needTP1) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp1Hit = true; }
+        if (!st.tp1Hit) {
+          await db.update(cascadeZonesTable).set({ tp1Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+          st.tp1Hit = true;
+          zoneNearNotifiedTp.set(zoneId, 0);
+          notifyZoneEvent(zoneId, "hit", 1, 0, st.direction);
+        }
         broadcastZoneUpdate(zoneId);
-        console.log(`[zone ${zoneId}] TP1 complete`);
+        console.log(`[zone ${zoneId}] TP1 complete (${ids.length} position(s))`);
       } else {
         console.warn(`[zone ${zoneId}] TP1 partial failure — will retry next tick`);
       }
-    } else if (!st.tp2Hit && st.tp1Hit && st.tp2Price != null && hit(st.tp2Price)) {
-      console.log(`[zone ${zoneId}] TP2 trigger @${cmpPrice} (tp2=${st.tp2Price}) — ${live.length} active entr${live.length === 1 ? "y" : "ies"}`);
-      const ok = await closePartialForLevel(2);
+    }
+
+    // TP2
+    if (needTP2.length > 0 && st.tp2Price != null && hit(st.tp2Price)) {
+      console.log(`[zone ${zoneId}] TP2 trigger @${cmpPrice} (tp2=${st.tp2Price}) — ${needTP2.length}/${live.length} position(s) need TP2`);
+      const ok = await closePartialForLevel(2, needTP2);
       // Cancel any still-unfilled cascade limits at TP2 (we're now solidly in
-      // profit; no need to add to the position).
-      await cancelZoneLimits(token, region, st.accountId, zoneId);
+      // profit; no need to add to the position). Fires once, on first TP2.
+      if (!st.tp2Hit) await cancelZoneLimits(token, region, st.accountId, zoneId);
       if (ok) {
-        // Advance to TP3 detection as soon as the partial close succeeds —
-        // do NOT gate this on the SL→BE move. The BE move is attempted by a
-        // separate sticky-retry block below; gating tp2Hit on it caused the
-        // zone to re-enter this branch every tick when the broker rejected
-        // the SL (code 10016), spamming logs and never advancing.
-        await db.update(cascadeZonesTable).set({ tp2Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-        st.tp2Hit = true;
-        zoneNearNotifiedTp.set(zoneId, 0);
-        notifyZoneEvent(zoneId, "hit", 2, 0, st.direction);
+        const ids = needTP2.map(p => p.id);
+        // Advance per-position flags before zone-level so a restart during this
+        // window doesn't lose the per-position state.
+        await db.update(zonePositionsTable).set({ tp2Hit: true })
+          .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
+        for (const p of needTP2) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp2Hit = true; }
+        if (!st.tp2Hit) {
+          // Do NOT gate this on the SL→BE move (see comment on sticky-BE block
+          // below). The BE move is attempted by the separate sticky-retry block;
+          // gating tp2Hit on it caused the zone to re-enter every tick when the
+          // broker rejected the SL (code 10016).
+          await db.update(cascadeZonesTable).set({ tp2Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+          st.tp2Hit = true;
+          zoneNearNotifiedTp.set(zoneId, 0);
+          notifyZoneEvent(zoneId, "hit", 2, 0, st.direction);
+          console.log(`[zone ${zoneId}] TP2 partial closed + limits cancelled — SL→BE will be attempted next`);
+        } else {
+          console.log(`[zone ${zoneId}] TP2 partial closed for ${ids.length} late-entry position(s)`);
+        }
         broadcastZoneUpdate(zoneId);
-        console.log(`[zone ${zoneId}] TP2 partial closed + limits cancelled — SL→BE will be attempted next`);
       } else {
         console.warn(`[zone ${zoneId}] TP2 partial close failed — will retry next tick`);
       }
-    } else if (!st.tp3Hit && st.tp2Hit && st.tp3Price != null && hit(st.tp3Price)) {
-      console.log(`[zone ${zoneId}] TP3 trigger @${cmpPrice} (tp3=${st.tp3Price}) — ${live.length} active entr${live.length === 1 ? "y" : "ies"}`);
-      const ok = await closePartialForLevel(3);
+    }
+
+    // TP3
+    if (needTP3.length > 0 && st.tp3Price != null && hit(st.tp3Price)) {
+      console.log(`[zone ${zoneId}] TP3 trigger @${cmpPrice} (tp3=${st.tp3Price}) — ${needTP3.length}/${live.length} position(s) need TP3`);
+      const ok = await closePartialForLevel(3, needTP3);
       if (ok) {
-        await db.update(cascadeZonesTable).set({ tp3Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-        st.tp3Hit = true;
-        zoneNearNotifiedTp.set(zoneId, 0);
-        notifyZoneEvent(zoneId, "hit", 3, 0, st.direction);
+        const ids = needTP3.map(p => p.id);
+        await db.update(zonePositionsTable).set({ tp3Hit: true })
+          .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
+        for (const p of needTP3) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp3Hit = true; }
+        if (!st.tp3Hit) {
+          await db.update(cascadeZonesTable).set({ tp3Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+          st.tp3Hit = true;
+          zoneNearNotifiedTp.set(zoneId, 0);
+          notifyZoneEvent(zoneId, "hit", 3, 0, st.direction);
+        }
         broadcastZoneUpdate(zoneId);
-        console.log(`[zone ${zoneId}] TP3 complete`);
+        console.log(`[zone ${zoneId}] TP3 complete (${ids.length} position(s))`);
       } else {
         console.warn(`[zone ${zoneId}] TP3 partial failure — will retry next tick`);
       }
-    } else if (!st.tp4Hit && st.tp3Hit && st.tp4Price != null && hit(st.tp4Price)) {
-      // TP4 is optional. When set, close whatever's left of each entry.
-      console.log(`[zone ${zoneId}] TP4 trigger @${cmpPrice} (tp4=${st.tp4Price}) — closing all remaining`);
-      const ok = await closePartialForLevel(4);
+    }
+
+    // TP4 (optional — when set, closes whatever's left of each entry)
+    if (needTP4.length > 0 && st.tp4Price != null && hit(st.tp4Price)) {
+      console.log(`[zone ${zoneId}] TP4 trigger @${cmpPrice} (tp4=${st.tp4Price}) — closing remaining ${needTP4.length} position(s)`);
+      const ok = await closePartialForLevel(4, needTP4);
       if (ok) {
-        await db.update(cascadeZonesTable).set({ tp4Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-        st.tp4Hit = true;
+        const ids = needTP4.map(p => p.id);
+        await db.update(zonePositionsTable).set({ tp4Hit: true })
+          .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
+        for (const p of needTP4) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp4Hit = true; }
+        if (!st.tp4Hit) {
+          await db.update(cascadeZonesTable).set({ tp4Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
+          st.tp4Hit = true;
+        }
         broadcastZoneUpdate(zoneId);
-        console.log(`[zone ${zoneId}] TP4 complete — final exit`);
+        console.log(`[zone ${zoneId}] TP4 complete — final exit (${ids.length} position(s))`);
       } else {
         console.warn(`[zone ${zoneId}] TP4 close failed — will retry next tick`);
       }
@@ -2445,7 +2508,18 @@ export async function loadZone(zoneId: string): Promise<ZoneState | null> {
       const zpRows = await db.select().from(zonePositionsTable)
         .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
       for (const zp of zpRows) {
-        st.trackedPositions.set(zp.positionId, { volume: Number(zp.volume), entryPrice: Number(zp.entryPrice) });
+        // Migration safety: positions created before per-position tracking was
+        // introduced have tp1Hit=false in DB even if TP1 already fired on them.
+        // Use zone-level flags as a floor so we don't re-fire TPs on old positions.
+        // New positions inserted by recordZonePositionFill carry tp1Hit=false
+        // intentionally and have their flags set by evaluateZone going forward.
+        st.trackedPositions.set(zp.positionId, {
+          volume: Number(zp.volume), entryPrice: Number(zp.entryPrice),
+          tp1Hit: Boolean(zp.tp1Hit) || st.tp1Hit,
+          tp2Hit: Boolean(zp.tp2Hit) || st.tp2Hit,
+          tp3Hit: Boolean(zp.tp3Hit) || st.tp3Hit,
+          tp4Hit: Boolean(zp.tp4Hit) || (st.tp4Hit ?? false),
+        });
       }
     } catch { /* non-fatal — evaluateZone will re-read from DB */ }
   }
@@ -2478,6 +2552,11 @@ export async function loadZoneState(): Promise<void> {
         const st = zoneStates.get(zp.zoneId);
         if (st) st.trackedPositions.set(zp.positionId, {
           volume: Number(zp.volume), entryPrice: Number(zp.entryPrice),
+          // Migration safety: same zone-level floor logic as loadZone.
+          tp1Hit: Boolean(zp.tp1Hit) || st.tp1Hit,
+          tp2Hit: Boolean(zp.tp2Hit) || st.tp2Hit,
+          tp3Hit: Boolean(zp.tp3Hit) || st.tp3Hit,
+          tp4Hit: Boolean(zp.tp4Hit) || (st.tp4Hit ?? false),
         });
       }
     } catch (e) {
@@ -3965,7 +4044,8 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
                   const me = positions.find(p => p.id === positionId);
                   if (me && me.openPrice > 0 && me.openPrice !== zoneState.anchorPrice) {
                     zoneState.anchorPrice = me.openPrice;
-                    zoneState.trackedPositions.set(positionId, { volume, entryPrice: me.openPrice });
+                    const existingPos = zoneState.trackedPositions.get(positionId);
+                    zoneState.trackedPositions.set(positionId, { volume, entryPrice: me.openPrice, tp1Hit: existingPos?.tp1Hit ?? false, tp2Hit: existingPos?.tp2Hit ?? false, tp3Hit: existingPos?.tp3Hit ?? false, tp4Hit: existingPos?.tp4Hit ?? false });
                     await Promise.all([
                       db.update(cascadeZonesTable)
                         .set({ anchorPrice: me.openPrice })
