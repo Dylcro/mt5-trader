@@ -1876,6 +1876,9 @@ async function cancelZoneLimits(
     console.log(`[zone ${zoneId}] blind-cancel ${cascadeLive.length} untracked cascade limit(s) (no orderId records found)`);
     await Promise.all(cascadeLive.map(async (o) => {
       const r = await tradeAction(token, region, accountId, { actionType: "ORDER_CANCEL", orderId: o.id });
+      // Mark completed regardless of result — 4754 means already gone, which is
+      // still a signal the order is no longer live. Ensures MetaAPI REST filter fires.
+      markOrderCompleted(accountId, o.id);
       if (r.ok || r.code === 10036) {
         console.log(`[zone ${zoneId}] blind-cancelled cascade orderId=${o.id}`);
       } else {
@@ -1891,8 +1894,16 @@ async function cancelZoneLimits(
       zoneLimitOrders.delete(oid);
       try { await db.delete(zoneOrdersTable).where(eq(zoneOrdersTable.orderId, oid)); } catch { /* ignore */ }
     };
-    if (pending.size > 0 && !pending.has(oid)) { await forget(); return; }
+    if (pending.size > 0 && !pending.has(oid)) {
+      // Not in the live list — already gone from broker. Mark completed so the
+      // /orders endpoint filters it out of MetaAPI REST's stale response.
+      markOrderCompleted(accountId, oid);
+      await forget(); return;
+    }
     const r = await tradeAction(token, region, accountId, { actionType: "ORDER_CANCEL", orderId: oid });
+    // Mark completed regardless of outcome: success = cancelled now, 4754 = already
+    // gone, 10036 = already closed — in all cases the order is no longer pending.
+    markOrderCompleted(accountId, oid);
     if (r.ok || r.code === 10036 /* already closed */) {
       await forget();
       console.log(`[zone ${zoneId}] cancelled limit orderId=${oid}`);
@@ -3579,6 +3590,8 @@ router.delete("/mt5/account/:accountId/order/:orderId", checkOwner, async (req: 
     const data = await tradeRes.json() as { numericCode?: number; message?: string };
     const code = data.numericCode ?? 0;
     const success = TRADE_SUCCESS_CODES.has(code);
+    // 4754 = order already gone — still mark completed so /orders filters it out.
+    if (success || code === 4754) markOrderCompleted(String(req.params.accountId), String(req.params.orderId));
     console.log(`[cancel-order] orderId=${req.params.orderId} code=${code} success=${success}`);
     return res.status(tradeRes.ok ? 200 : tradeRes.status).json({
       success,
