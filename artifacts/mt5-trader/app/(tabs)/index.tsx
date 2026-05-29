@@ -65,7 +65,7 @@ function PriceRow({
     <View style={[styles.priceRow, { overflow: "hidden" }]}>
       <Animated.View
         pointerEvents="none"
-        style={[StyleSheet.absoluteFill, { backgroundColor: "#22c55e", opacity: upFlash, marginHorizontal: -16 }]}
+        style={[StyleSheet.absoluteFill, { backgroundColor: "#3b82f6", opacity: upFlash, marginHorizontal: -16 }]}
       />
       <Animated.View
         pointerEvents="none"
