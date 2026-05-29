@@ -678,10 +678,30 @@ function makeDealListener(accountId: string) {
         let zoneId = zoneLimitOrders.get(String(deal.orderId));
         // Backstop: if the orderId is known as a cascade limit but somehow has
         // no zone mapping (orphan-drain race lost, server restart between
-        // POST and fill, etc.), recover by attaching the fill to the most
-        // recent still-active zone for this account+direction. Without this,
-        // the fill becomes an orphan position — invisible to the zone monitor
-        // and surfaced as "standalone" once the market leg closes.
+        // POST and fill, etc.), first try recovering the mapping from the DB
+        // (zone_orders table persists it at order-placement time). Only fall
+        // back to the "most recent active zone" heuristic when the DB also
+        // has no record — that heuristic can misattribute fills to the wrong
+        // zone when multiple zones are open simultaneously.
+        if (!zoneId && deal.positionId) {
+          // Step 1: DB lookup — the order was persisted to zone_orders when it
+          // was placed, so a restart between placement and fill won't lose the
+          // association.
+          try {
+            const dbRow = await db.select({ zoneId: zoneOrdersTable.zoneId })
+              .from(zoneOrdersTable)
+              .where(eq(zoneOrdersTable.orderId, String(deal.orderId)))
+              .limit(1);
+            if (dbRow[0]?.zoneId) {
+              zoneId = dbRow[0].zoneId;
+              zoneLimitOrders.set(String(deal.orderId), zoneId);
+              console.log(`[zone ${zoneId}] backstop-recovered from DB orderId=${deal.orderId} posId=${deal.positionId}`);
+            }
+          } catch (e) {
+            console.warn(`[stream ${accountId}] backstop DB lookup failed for orderId=${deal.orderId}:`, (e as Error).message);
+          }
+        }
+        // Step 2: heuristic fallback — only if DB also had no record.
         if (!zoneId && deal.positionId) {
           const direction: "buy" | "sell" | null =
             deal.type === "DEAL_TYPE_BUY" ? "buy" :
@@ -692,7 +712,10 @@ function makeDealListener(accountId: string) {
               if (st.accountId !== accountId) continue;
               if (st.direction !== direction) continue;
               if (st.status !== "OPEN" && st.status !== "RISK_FREE") continue;
-              if (!best || st.zoneId > best.zoneId) best = st;
+              // Prefer the OLDEST active zone — orphaned fills are more likely
+              // from an older zone whose limit hasn't filled yet than from a
+              // newly created one.
+              if (!best || st.zoneId < best.zoneId) best = st;
             }
             if (best) {
               zoneId = best.zoneId;
@@ -701,7 +724,7 @@ function makeDealListener(accountId: string) {
                 .values({ zoneId, orderId: String(deal.orderId), createdAt: Date.now() })
                 .onConflictDoNothing()
                 .catch((e: Error) => console.warn(`[zone ${zoneId}] backstop persist orderId=${deal.orderId} failed:`, e.message));
-              console.warn(`[zone ${zoneId}] backstop-attached orphan cascade fill orderId=${deal.orderId} posId=${deal.positionId} (no prior zoneLimitOrders mapping)`);
+              console.warn(`[zone ${zoneId}] backstop-heuristic attached orphan cascade fill orderId=${deal.orderId} posId=${deal.positionId} (no DB record, used oldest active zone)`);
             }
           }
         }
