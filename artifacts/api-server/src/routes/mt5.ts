@@ -1773,9 +1773,23 @@ async function markZonePositionClosed(accountId: string, positionId: string): Pr
     let token: string;
     try { token = getToken(); } catch { return; }
     // Give MT5 a moment to settle the position state after the exit deal.
+    // MetaAPI REST has eventual consistency — a partial close (e.g. TP1
+    // closing 25%) fires DEAL_ENTRY_OUT immediately but the position still
+    // exists at reduced volume. A single 750ms wait can race the REST cache:
+    // if the cache hasn't refreshed yet the position appears "gone" and we'd
+    // incorrectly mark it CLOSED and cancel limits. Retry once after another
+    // 1.5s (2.25s total) to cover the typical MetaAPI cache refresh window.
     await sleep(750);
     const live = await fetchOpenPositions(token, region, accountId);
-    const stillOpen = live.some(p => p.id === positionId);
+    let stillOpen = live.some(p => p.id === positionId);
+    if (!stillOpen) {
+      await sleep(1500);
+      const liveRetry = await fetchOpenPositions(token, region, accountId);
+      stillOpen = liveRetry.some(p => p.id === positionId);
+      if (stillOpen) {
+        console.log(`[markClosed] posId=${positionId} appeared on retry — partial close, leaving OPEN`);
+      }
+    }
     if (stillOpen) return; // partial close — leave row as OPEN
 
     await withDbRetry(`markClosed.update posId=${positionId}`, () => db.update(zonePositionsTable)
