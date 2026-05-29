@@ -364,11 +364,11 @@ export default function TradeScreen() {
       const cascade = record[LOT_SIZE_CASCADE_KEY];
       if (single) setLotSizeRaw(parseFloat(single));
       if (cascade) {
-        // Cascade needs ≥0.04 (4 × 0.01 broker min for 25% partials at TP1-4).
-        // Snap any stored sub-0.04 value up so the Buy/Sell button can't be
-        // silently blocked by a stale value from before this minimum existed.
+        // Cascade minimum is 0.01 (broker minimum). Lots ≥ 0.04 get 25% partial
+        // closes at each TP; smaller lots fully close at TP1 (25% of 0.01 rounds
+        // up to 0.01 = the full position). Snap any sub-0.01 stored value up.
         const parsed = parseFloat(cascade);
-        const safe = Number.isFinite(parsed) && parsed >= 0.04 ? parsed : 0.04;
+        const safe = Number.isFinite(parsed) && parsed >= 0.01 ? parsed : 0.01;
         setCascadeLotSizeRaw(safe);
         if (safe !== parsed) void AsyncStorage.setItem(LOT_SIZE_CASCADE_KEY, String(safe));
       }
@@ -592,10 +592,10 @@ export default function TradeScreen() {
         Alert.alert("Invalid TP Settings", "Open Settings → Zone Take Profit and make sure TP1 < TP2 < TP3 (and TP4 if used).");
         return;
       }
-      if (cascadeLotSize < 0.04) {
+      if (cascadeLotSize < 0.01) {
         isPlacingRef.current = false;
         setIsPlacing(false);
-        Alert.alert("Lot Too Small", "Cascade lot size must be at least 0.04 — the zone closes 25% of the best entry at each of TP1-4, which requires 4 × 0.01 broker minimum.");
+        Alert.alert("Lot Too Small", "Minimum cascade lot size is 0.01 (broker minimum).");
         return;
       }
       const PIP = 0.10;
@@ -854,7 +854,7 @@ export default function TradeScreen() {
                 <Text style={styles.sectionTitle}>Lot Size (per order)</Text>
                 <Text style={styles.sectionHint}>1 lot = 100 oz gold</Text>
               </View>
-              <StepInput value={cascadeLotSize} onChange={setCascadeLotSize} step={0.01} min={0.04} max={100} decimals={2} />
+              <StepInput value={cascadeLotSize} onChange={setCascadeLotSize} step={0.01} min={0.01} max={100} decimals={2} />
             </View>
 
             {/* Zone TP summary — sourced from Settings. Read-only here. */}

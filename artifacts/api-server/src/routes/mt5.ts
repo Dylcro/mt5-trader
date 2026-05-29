@@ -1396,7 +1396,7 @@ const ZONE_RISK_FREE_PIPS_MIN = -30;
 const ZONE_RISK_FREE_PIPS_MAX =  30;
 const ZONE_RISK_FREE_PIPS_STEP = 5;
 const ZONE_CASHOUT_PIPS_DEFAULT = 5;   // anchor + 5p covers spread
-const ZONE_MIN_LOT_PER_ENTRY    = 0.04; // 4 × 0.01 broker minimum for 25% slices
+const ZONE_MIN_LOT_PER_ENTRY    = 0.01; // broker minimum; lots ≥ 0.04 get 25% partials, smaller lots get a full close at TP1
 // How close (in pips) price must come to a TP target before the engine fires
 // the partial close. Lets TPs trigger through the broker spread instead of
 // requiring the comparison side to print the exact level.
@@ -3699,7 +3699,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
         if (vol < ZONE_MIN_LOT_PER_ENTRY) {
           return res.status(400).json({
             success: false, code: 0,
-            message: `Cascade lot size must be at least ${ZONE_MIN_LOT_PER_ENTRY} (each TP closes 25% of the original lot, broker minimum is 0.01).`,
+            message: `Cascade lot size must be at least ${ZONE_MIN_LOT_PER_ENTRY} (broker minimum). Lots ≥ 0.04 get 25% partial closes at each TP; smaller lots will fully close at TP1.`,
           });
         }
       }
@@ -3840,7 +3840,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
             if (!tpsValid) {
               console.warn(`[trade] cascade has invalid/missing TP prices — zone will NOT be created: tp1=${tp1Price} tp2=${tp2Price} tp3=${tp3Price} tp4=${tp4Price}`);
             } else if (volume < ZONE_MIN_LOT_PER_ENTRY) {
-              console.warn(`[trade] cascade lot ${volume} below ${ZONE_MIN_LOT_PER_ENTRY} minimum — zone will NOT be created`);
+              console.warn(`[trade] cascade lot ${volume} below broker minimum ${ZONE_MIN_LOT_PER_ENTRY} — zone will NOT be created`);
             } else {
               // SYNCHRONOUS: reserve zone + pending association *before* the
               // trade response returns, so any companion cascade limit that
