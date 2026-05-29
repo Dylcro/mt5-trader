@@ -2041,6 +2041,12 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     // positions CLOSED in the DB) when we're operating off the cache —
     // we can't trust "missing from live" without a confirmed DB view.
     if (live.length === 0 && !dbOk) return;
+    // Guard: don't reconcile a zone as CLOSED if the stream for this account
+    // hasn't completed its first deals-sync since server start. On startup the
+    // zone monitor fires within 3 s — long before the MetaAPI stream reconnects
+    // and re-populates live positions. Without this check, active zones get
+    // wrongly reconciled closed on every deployment/restart.
+    if (live.length === 0 && !syncReady.has(st.accountId)) return;
     if (live.length === 0) {
       // Reconciliation: all tracked positions are gone (possibly closed during
       // a server restart — DEAL_ENTRY_OUT events from that window are lost
@@ -2183,11 +2189,16 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         // its configured %, so remaining already fell below this level's gate.
         // Close whatever is left now rather than drifting to a later TP.
         if (p.volume <= origVol * keepFractionGate) {
-          if (level > 1 && p.volume > 0) return closeZonePosition(token, region, st.accountId, p.id);
+          if (level > 1 && p.volume > 0) {
+            console.log(`[zone ${zoneId}] TP${level} posId=${p.id} small-lot full-close (vol=${p.volume} <= gate=${(origVol * keepFractionGate).toFixed(4)})`);
+            return closeZonePosition(token, region, st.accountId, p.id);
+          }
+          console.log(`[zone ${zoneId}] TP${level} posId=${p.id} already-applied skip (vol=${p.volume} origVol=${origVol} gate=${(origVol * keepFractionGate).toFixed(4)})`);
           return true;
         }
         const partial = Math.max(0.01, parseFloat((origVol * (tpPct / 100)).toFixed(2)));
         const vol = Math.min(partial, p.volume);
+        console.log(`[zone ${zoneId}] TP${level} posId=${p.id} partial close vol=${vol} (origVol=${origVol} tpPct=${tpPct}% currentVol=${p.volume})`);
         return vol < p.volume
           ? closeZonePosition(token, region, st.accountId, p.id, vol)
           : closeZonePosition(token, region, st.accountId, p.id);
