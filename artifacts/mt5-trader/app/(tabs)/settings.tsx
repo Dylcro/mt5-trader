@@ -993,8 +993,8 @@ export default function SettingsScreen() {
 
             {/* Cascade lot size */}
             <View style={styles.tpRow}>
-              <Text style={styles.tpRowLabel}>Cascade Lot Size</Text>
-              <View style={styles.tpInputWrap}>
+              <Text style={[styles.tpRowLabel, { flex: 1, marginRight: 12 }]}>Cascade Lot Size</Text>
+              <View style={[styles.tpInputWrap, { width: 130, minWidth: 0 }]}>
                 <TextInput
                   style={styles.tpInput}
                   value={cascadeLotDraft}
@@ -1045,7 +1045,7 @@ export default function SettingsScreen() {
                   {/* Pip distance row */}
                   <View style={[styles.tpSubRow, !enabled && { opacity: 0.35 }]}>
                     <Text style={styles.tpSubLabel}>Pip distance</Text>
-                    <View style={[styles.tpInputWrap, { minWidth: 120 }]}>
+                    <View style={[styles.tpInputWrap, { width: 130, minWidth: 0 }]}>
                       <TextInput
                         style={styles.tpInput}
                         value={tpDraft[tp.key]}
@@ -1066,7 +1066,7 @@ export default function SettingsScreen() {
                   {/* Close % row */}
                   <View style={[styles.tpSubRow, !enabled && { opacity: 0.35 }]}>
                     <Text style={styles.tpSubLabel}>Close %</Text>
-                    <View style={[styles.tpInputWrap, { minWidth: 120 }]}>
+                    <View style={[styles.tpInputWrap, { width: 130, minWidth: 0 }]}>
                       <TextInput
                         style={styles.tpInput}
                         value={enabled ? splitDraft[tp.key] : "0"}
