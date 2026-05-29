@@ -2454,6 +2454,22 @@ export function startZoneTpMonitor(): void {
     }
   }, 3_000);
   console.log("[zone-monitor] started (3 s interval)");
+
+  // 1 s price heartbeat — supplements MetaAPI streaming ticks so the app
+  // display stays current even during quiet tick periods. Only broadcasts to
+  // accounts that have active SSE clients; zero-cost for disconnected accounts.
+  const lastBroadcastTick = new Map<string, string>(); // accountId → "bid:ask"
+  setInterval(() => {
+    for (const [accountId, clients] of sseClients.entries()) {
+      if (!clients.size) continue;
+      const tick = latestPrice(accountId);
+      if (!tick) continue;
+      const key = `${tick.bid}:${tick.ask}`;
+      if (lastBroadcastTick.get(accountId) === key) continue; // unchanged since last broadcast
+      lastBroadcastTick.set(accountId, key);
+      broadcastToAccount(accountId, "price", { bid: tick.bid, ask: tick.ask });
+    }
+  }, 1_000);
 }
 
 // Convert a cascadeZonesTable row to a ZoneState (transient fields get safe defaults).

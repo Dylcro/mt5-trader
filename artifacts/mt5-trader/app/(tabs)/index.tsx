@@ -47,8 +47,30 @@ function PriceRow({
   color: string;
   sublabel?: string;
 }) {
+  const upFlash = useRef(new Animated.Value(0)).current;
+  const downFlash = useRef(new Animated.Value(0)).current;
+  const prevValueRef = useRef(value);
+
+  useEffect(() => {
+    if (prevValueRef.current === value) return;
+    const prev = parseFloat(prevValueRef.current.replace(/,/g, ""));
+    const curr = parseFloat(value.replace(/,/g, ""));
+    prevValueRef.current = value;
+    const anim = curr >= prev ? upFlash : downFlash;
+    anim.setValue(0.45);
+    Animated.timing(anim, { toValue: 0, duration: 550, useNativeDriver: true }).start();
+  }, [value, upFlash, downFlash]);
+
   return (
-    <View style={styles.priceRow}>
+    <View style={[styles.priceRow, { overflow: "hidden" }]}>
+      <Animated.View
+        pointerEvents="none"
+        style={[StyleSheet.absoluteFill, { backgroundColor: "#22c55e", opacity: upFlash, marginHorizontal: -16 }]}
+      />
+      <Animated.View
+        pointerEvents="none"
+        style={[StyleSheet.absoluteFill, { backgroundColor: "#ef4444", opacity: downFlash, marginHorizontal: -16 }]}
+      />
       <Text style={styles.priceLabel}>{label}</Text>
       <View style={{ alignItems: "flex-end" }}>
         <Text style={[styles.priceValue, { color }]}>{value}</Text>
