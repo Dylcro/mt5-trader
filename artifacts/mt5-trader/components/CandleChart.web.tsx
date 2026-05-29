@@ -62,9 +62,10 @@ export default function CandleChart({
   const { zones } = useZones(accountId, { sseConnected });
   const { candles } = useCandles(accountId, timeframe);
 
+  // Only show overlay for the most-recent strictly OPEN zone
   const activeZone =
     zones
-      .filter((z) => z.status !== "CLOSED")
+      .filter((z) => z.status === "OPEN")
       .sort((a, b) => b.createdAt - a.createdAt)[0] ?? null;
 
   // ── Initialise chart (once) ───────────────────────────────────────────────
@@ -176,26 +177,55 @@ export default function CandleChart({
     if (!activeZone) return;
 
     const isBuy = activeZone.direction === "buy";
+    const anchor = activeZone.anchorPrice;
     const entryColor = isBuy ? "#2962FF" : "#F6465D";
     const tpColor = "#0ECB81";
     const slColor = "#F6465D";
+    // 200 pips = 20 price units for XAUUSD — used to scope orders/positions to
+    // this zone and exclude unrelated same-direction trades.
+    const PROXIMITY = 20;
     const lines: IPriceLine[] = [];
 
-    // Market entry line
-    if (activeZone.anchorPrice > 0) {
+    // ── Market entry ──────────────────────────────────────────────────────────
+    if (anchor > 0) {
+      // Derive lot size from open positions close to the anchor price
+      const dirType = isBuy ? "POSITION_TYPE_BUY" : "POSITION_TYPE_SELL";
+      const zonePos = positions.filter(
+        (p) => p.type === dirType && Math.abs(p.openPrice - anchor) <= PROXIMITY,
+      );
+      const vol = zonePos.length > 0 ? zonePos[0]!.volume : null;
+      const entryLabel = vol != null ? `Entry  ${vol.toFixed(2)} lot` : "Entry";
+
       lines.push(
         series.createPriceLine({
-          price: activeZone.anchorPrice,
+          price: anchor,
           color: entryColor,
           lineWidth: 2,
           lineStyle: LineStyle.Solid,
           axisLabelVisible: true,
-          title: isBuy ? "BUY" : "SELL",
+          title: entryLabel,
         }),
       );
+
+      // ── SL — scoped to positions near anchor ─────────────────────────────
+      const slCandidates = zonePos
+        .filter((p) => p.stopLoss != null)
+        .map((p) => p.stopLoss!);
+      if (slCandidates.length > 0) {
+        lines.push(
+          series.createPriceLine({
+            price: slCandidates[0]!,
+            color: slColor,
+            lineWidth: 2,
+            lineStyle: LineStyle.Solid,
+            axisLabelVisible: true,
+            title: "SL",
+          }),
+        );
+      }
     }
 
-    // TP lines (not yet hit)
+    // ── TP lines (not yet hit) — solid green ─────────────────────────────────
     const tpFields = [
       { price: activeZone.tp1Price, hit: activeZone.tp1Hit, label: "TP1" },
       { price: activeZone.tp2Price, hit: activeZone.tp2Hit, label: "TP2" },
@@ -209,35 +239,22 @@ export default function CandleChart({
           price: tp.price,
           color: tpColor,
           lineWidth: 1,
-          lineStyle: LineStyle.Dashed,
+          lineStyle: LineStyle.Solid,
           axisLabelVisible: true,
           title: tp.label,
         }),
       );
     }
 
-    // SL — first open position matching zone direction
-    const dirType = isBuy ? "POSITION_TYPE_BUY" : "POSITION_TYPE_SELL";
-    const slCandidates = positions
-      .filter((p) => p.type === dirType && p.stopLoss != null)
-      .map((p) => p.stopLoss!);
-    if (slCandidates.length > 0) {
-      lines.push(
-        series.createPriceLine({
-          price: slCandidates[0]!,
-          color: slColor,
-          lineWidth: 2,
-          lineStyle: LineStyle.Solid,
-          axisLabelVisible: true,
-          title: "SL",
-        }),
-      );
-    }
-
-    // Limit entries — from pending orders matching direction
+    // ── Limit entries — scoped to orders within PROXIMITY of anchor ───────────
     const limitSide = isBuy ? "BUY" : "SELL";
     const limitOrders = pendingOrders
-      .filter((o) => o.type.includes(limitSide) && o.type.includes("LIMIT"))
+      .filter(
+        (o) =>
+          o.type.includes(limitSide) &&
+          o.type.includes("LIMIT") &&
+          Math.abs(o.openPrice - anchor) <= PROXIMITY,
+      )
       .sort((a, b) =>
         isBuy ? b.openPrice - a.openPrice : a.openPrice - b.openPrice,
       );
@@ -250,7 +267,7 @@ export default function CandleChart({
           lineWidth: 1,
           lineStyle: LineStyle.Dashed,
           axisLabelVisible: true,
-          title: `${limitSide} LIMIT  ${ord.volume.toFixed(2)}`,
+          title: `Limit ${i + 1}`,
         }),
       );
     }
