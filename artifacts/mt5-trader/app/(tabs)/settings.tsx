@@ -994,7 +994,7 @@ export default function SettingsScreen() {
             {/* Cascade lot size */}
             <View style={styles.tpRow}>
               <Text style={[styles.tpRowLabel, { flex: 1, marginRight: 12 }]}>Cascade Lot Size</Text>
-              <View style={[styles.tpInputWrap, { flex: 1, maxWidth: 160 }]}>
+              <View style={styles.tpInputWrap}>
                 <TextInput
                   style={styles.tpInput}
                   value={cascadeLotDraft}
