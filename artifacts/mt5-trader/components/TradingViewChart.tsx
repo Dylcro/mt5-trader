@@ -184,11 +184,11 @@ const styles = StyleSheet.create({
     width: "100%",
     borderRadius: 12,
     overflow: "hidden",
-    backgroundColor: "#0d0d0d",
+    backgroundColor: "#F0F2F5",
     marginBottom: 12,
   },
   webview: {
     flex: 1,
-    backgroundColor: "#0d0d0d",
+    backgroundColor: "#F0F2F5",
   },
 });
