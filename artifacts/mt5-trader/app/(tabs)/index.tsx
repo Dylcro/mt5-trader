@@ -22,7 +22,6 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import { useTrading, type SLMode } from "@/context/TradingContext";
 import { buildCascadeLevels, useCascadeSettings } from "@/hooks/useCascadeSettings";
-import OnboardingModal from "@/components/OnboardingModal";
 
 const LOT_SIZE_SINGLE_KEY = "lot_size_single";
 const LOT_SIZE_CASCADE_KEY = "lot_size_cascade";
@@ -41,18 +40,22 @@ function PriceRow({
   value,
   color,
   sublabel,
+  onDark,
 }: {
   label: string;
   value: string;
   color: string;
   sublabel?: string;
+  onDark?: boolean;
 }) {
   return (
     <View style={styles.priceRow}>
-      <Text style={styles.priceLabel}>{label}</Text>
+      <Text style={[styles.priceLabel, onDark && styles.priceLabelOnDark]}>{label}</Text>
       <View style={{ alignItems: "flex-end" }}>
         <Text style={[styles.priceValue, { color }]}>{value}</Text>
-        {sublabel ? <Text style={styles.priceSublabel}>{sublabel}</Text> : null}
+        {sublabel ? (
+          <Text style={[styles.priceSublabel, onDark && styles.priceSublabelOnDark]}>{sublabel}</Text>
+        ) : null}
       </View>
     </View>
   );
@@ -660,7 +663,6 @@ export default function TradeScreen() {
   return (
     <View style={[styles.container, { paddingTop: insets.top + webTopPad }]}>
       <TradeToast toast={toast} insetTop={insets.top + webTopPad} />
-      <OnboardingModal accountId={accountId} status={status} />
       {/* Header */}
       <View style={styles.header}>
         <View style={styles.headerLeft}>
@@ -690,15 +692,15 @@ export default function TradeScreen() {
         contentContainerStyle={[styles.scroll, { paddingBottom: insets.bottom + 100 }]}
         keyboardShouldPersistTaps="handled"
       >
-        {/* Price Card */}
-        <View style={styles.card}>
+        {/* Price Card — navy hero */}
+        <View style={[styles.card, styles.navyPriceCard]}>
           {price ? (
             <>
-              <PriceRow label="BID" value={formatPrice(price.bid)} color={C.sell} sublabel="Sell at" />
-              <View style={styles.divider} />
-              <PriceRow label="ASK" value={formatPrice(price.ask)} color={C.buy} sublabel="Buy at" />
-              <View style={styles.divider} />
-              <PriceRow label="SPREAD" value={`${price.spread} pips`} color={C.textSecondary} />
+              <PriceRow label="BID" value={formatPrice(price.bid)} color={C.sell} sublabel="Sell at" onDark />
+              <View style={[styles.divider, styles.dividerOnDark]} />
+              <PriceRow label="ASK" value={formatPrice(price.ask)} color={C.buy} sublabel="Buy at" onDark />
+              <View style={[styles.divider, styles.dividerOnDark]} />
+              <PriceRow label="SPREAD" value={`${price.spread} pips`} color={C.onDarkMuted} onDark />
               {priceError && (
                 <View style={styles.priceErrorBanner}>
                   <Feather name="wifi-off" size={12} color={C.sell} />
@@ -1084,6 +1086,13 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
   },
+  navyPriceCard: {
+    backgroundColor: C.navy,
+    borderColor: C.navy,
+  },
+  priceLabelOnDark: { color: C.onDarkMuted },
+  priceSublabelOnDark: { color: C.onDarkMuted },
+  dividerOnDark: { backgroundColor: "rgba(255,255,255,0.15)" },
   card: {
     backgroundColor: C.card,
     borderRadius: 16,

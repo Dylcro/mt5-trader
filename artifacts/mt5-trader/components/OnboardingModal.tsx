@@ -1,270 +1,445 @@
-import { Feather } from "@expo/vector-icons";
-import AsyncStorage from "@react-native-async-storage/async-storage";
-import React, { useCallback, useEffect, useState } from "react";
+// XAUUSD Trader — 6-step onboarding wizard (light theme)
+
+import React, { useMemo, useState } from "react";
 import {
   Modal,
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Text,
   View,
+  Text,
+  ScrollView,
+  Pressable,
+  TextInput,
+  ActivityIndicator,
+  StyleSheet,
+  Linking,
+  NativeSyntheticEvent,
+  NativeScrollEvent,
 } from "react-native";
+import Colors from "../constants/colors";
 
-import Colors from "@/constants/colors";
+const colors = Colors.dark;
 
-const C = Colors.dark;
+type Props = {
+  visible: boolean;
+  onComplete: () => void;
+  onConnectMT5?: (creds: {
+    login: string;
+    password: string;
+    server: string;
+  }) => Promise<void>;
+  onSignIn?: (email: string, password: string) => Promise<void>;
+  onCreateAccount?: (email: string, password: string) => Promise<void>;
+  termsUrl?: string;
+};
 
-const KEY_LINK_DISMISSED = "onboarding_link_dismissed";
-const KEY_SETTINGS_DISMISSED = "onboarding_settings_dismissed";
-const KEY_TABS_DISMISSED = "onboarding_tabs_dismissed";
+const TOTAL_STEPS = 6;
 
-type Step = "link" | "settings" | "tabs";
+export default function OnboardingModal({
+  visible,
+  onComplete,
+  onConnectMT5,
+  onSignIn,
+  onCreateAccount,
+  termsUrl = "https://meta-trader-link.replit.app/terms",
+}: Props) {
+  const [step, setStep] = useState(0);
 
-interface BulletProps {
-  icon: string;
-  title: string;
-  body: string;
-}
+  const [scrolledToBottom, setScrolledToBottom] = useState(false);
+  const [agreed, setAgreed] = useState(false);
 
-function Bullet({ icon, title, body }: BulletProps) {
-  return (
-    <View style={styles.bullet}>
-      <View style={styles.bulletIcon}>
-        <Feather name={icon as any} size={16} color={C.gold} />
-      </View>
-      <View style={{ flex: 1 }}>
-        <Text style={styles.bulletTitle}>{title}</Text>
-        <Text style={styles.bulletBody}>{body}</Text>
-      </View>
-    </View>
-  );
-}
+  const [authMode, setAuthMode] = useState<"create" | "signin">("create");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
 
-function CheckboxRow({ checked, onToggle }: { checked: boolean; onToggle: () => void }) {
-  return (
-    <Pressable style={styles.checkRow} onPress={onToggle} hitSlop={8}>
-      <View style={[styles.checkbox, checked && styles.checkboxChecked]}>
-        {checked && <Feather name="check" size={11} color="#000" />}
-      </View>
-      <Text style={styles.checkLabel}>Don't show this again</Text>
-    </Pressable>
-  );
-}
+  const [login, setLogin] = useState("");
+  const [mtPassword, setMtPassword] = useState("");
+  const [server, setServer] = useState("");
+  const [mtBusy, setMtBusy] = useState(false);
+  const [mtError, setMtError] = useState<string | null>(null);
 
-interface OnboardingModalProps {
-  accountId: string | null | undefined;
-  status: string;
-}
+  const next = () => setStep((s) => Math.min(TOTAL_STEPS - 1, s + 1));
+  const back = () => setStep((s) => Math.max(0, s - 1));
 
-export default function OnboardingModal({ accountId, status }: OnboardingModalProps) {
-  const [visible, setVisible] = useState(false);
-  const [step, setStep] = useState<Step>("link");
-  const [dontShow, setDontShow] = useState(false);
-  const [ready, setReady] = useState(false);
+  const handleTermsScroll = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const { layoutMeasurement, contentOffset, contentSize } = e.nativeEvent;
+    const atBottom =
+      layoutMeasurement.height + contentOffset.y >= contentSize.height - 24;
+    if (atBottom) setScrolledToBottom(true);
+  };
 
-  useEffect(() => {
-    let cancelled = false;
-    async function check() {
-      const [linkVal, settingsVal, tabsVal] = await Promise.all([
-        AsyncStorage.getItem(KEY_LINK_DISMISSED),
-        AsyncStorage.getItem(KEY_SETTINGS_DISMISSED),
-        AsyncStorage.getItem(KEY_TABS_DISMISSED),
-      ]);
-      if (cancelled) return;
-      const linkDismissed = linkVal === "true";
-      const settingsDismissed = settingsVal === "true";
-      const tabsDismissed = tabsVal === "true";
-      const isConnected = !!accountId && status === "connected";
-
-      if (!isConnected && !linkDismissed) {
-        setStep("link");
-        setVisible(true);
-      } else if (isConnected && !settingsDismissed) {
-        setStep("settings");
-        setVisible(true);
-      } else if (isConnected && !tabsDismissed) {
-        setStep("tabs");
-        setVisible(true);
+  const doAuth = async () => {
+    setAuthError(null);
+    if (!email.trim() || !password) {
+      setAuthError("Enter your email and a password.");
+      return;
+    }
+    setAuthBusy(true);
+    try {
+      if (authMode === "create") {
+        await onCreateAccount?.(email.trim(), password);
+      } else {
+        await onSignIn?.(email.trim(), password);
       }
-      setReady(true);
+      next();
+    } catch (err: unknown) {
+      setAuthError(
+        humanError(err) ?? "Could not sign you in. Check your details and try again."
+      );
+    } finally {
+      setAuthBusy(false);
     }
-    void check();
-    return () => {
-      cancelled = true;
-    };
-  }, [accountId, status]);
+  };
 
-  const dismissKey = (s: Step) =>
-    s === "link" ? KEY_LINK_DISMISSED : s === "settings" ? KEY_SETTINGS_DISMISSED : KEY_TABS_DISMISSED;
+  const doConnect = async () => {
+    setMtError(null);
+    if (!login.trim() || !mtPassword || !server.trim()) {
+      setMtError("Fill in your login, password and server name.");
+      return;
+    }
+    if (server.trim().length < 4) {
+      setMtError("That server name looks too short — copy it exactly from the MT5 app.");
+      return;
+    }
+    setMtBusy(true);
+    try {
+      await onConnectMT5?.({
+        login: login.trim(),
+        password: mtPassword,
+        server: server.trim(),
+      });
+      next();
+    } catch (err: unknown) {
+      setMtError(
+        humanError(err) ??
+          "Couldn't connect. Double-check your login, password and server, then try again."
+      );
+    } finally {
+      setMtBusy(false);
+    }
+  };
 
-  const handleDismiss = useCallback(async () => {
-    if (dontShow) {
-      await AsyncStorage.setItem(dismissKey(step), "true");
-    }
-    const isConnected = !!accountId && status === "connected";
-    if (step === "link" && isConnected) {
-      setStep("settings");
-      setDontShow(false);
-      const settingsVal = await AsyncStorage.getItem(KEY_SETTINGS_DISMISSED);
-      if (settingsVal !== "true") return;
-    }
-    if (step === "settings" && isConnected) {
-      setStep("tabs");
-      setDontShow(false);
-      const tabsVal = await AsyncStorage.getItem(KEY_TABS_DISMISSED);
-      if (tabsVal !== "true") return;
-    }
-    setVisible(false);
-  }, [accountId, dontShow, status, step]);
-
-  if (!ready) return null;
+  const progress = useMemo(() => (step + 1) / TOTAL_STEPS, [step]);
 
   return (
-    <Modal visible={visible} transparent animationType="fade" statusBarTranslucent onRequestClose={() => setVisible(false)}>
-      <View style={styles.overlay}>
-        <View style={styles.card}>
-          <View style={styles.accentBar} />
-          <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.content} bounces={false}>
-            {step === "link" && (
-              <>
-                <View style={styles.iconCircle}>
-                  <Feather name="link" size={26} color={C.gold} />
-                </View>
-                <Text style={styles.title}>Welcome to XAUUSD Trader</Text>
-                <Text style={styles.subtitle}>Link your MT5 account before you trade.</Text>
-                <View style={styles.bullets}>
-                  <Bullet icon="settings" title="Open Settings" body="Use the Settings tab to enter MT5 credentials." />
-                  <Bullet icon="user" title="Account details" body="Login, password, and server from your broker." />
-                  <Bullet icon="globe" title="Region" body="Pick the region closest to your broker server." />
-                  <Bullet icon="zap" title="Connect" body="Live prices appear when status shows connected." />
-                </View>
-              </>
-            )}
-            {step === "settings" && (
-              <>
-                <View style={styles.iconCircle}>
-                  <Feather name="sliders" size={26} color={C.gold} />
-                </View>
-                <Text style={styles.title}>Configure cascade settings</Text>
-                <Text style={styles.subtitle}>Tune SL, entries, and take-profit levels before your first trade.</Text>
-                <View style={styles.bullets}>
-                  <Bullet icon="shield" title="Stop loss" body="Shared SL pips across all cascade limit orders." />
-                  <Bullet icon="layers" title="Cascade entries" body="Number of limits and pip spacing between entries." />
-                  <Bullet icon="target" title="TP1–TP4" body="Partial close distances; TP2 moves SL to break-even." />
-                  <Bullet icon="trending-up" title="TP4 open" body="Set TP4 to 0 to leave the final 25% manual." />
-                </View>
-              </>
-            )}
-            {step === "tabs" && (
-              <>
-                <View style={styles.iconCircle}>
-                  <Feather name="grid" size={26} color={C.gold} />
-                </View>
-                <Text style={styles.title}>Explore your tabs</Text>
-                <Text style={styles.subtitle}>New screens help you monitor performance and history.</Text>
-                <View style={styles.bullets}>
-                  <Bullet icon="bar-chart-2" title="Dashboard" body="Account equity, balance, and connection at a glance." />
-                  <Bullet icon="clock" title="History" body="Review closed cascade zones and final TP reached." />
-                  <Bullet icon="message-circle" title="Assistant" body="Tap the gold chat button for cascade and MT5 help." />
-                  <Bullet icon="bell" title="Alerts" body="Enable TP notifications in Settings when you're ready." />
-                </View>
-              </>
-            )}
-            <CheckboxRow checked={dontShow} onToggle={() => setDontShow((v) => !v)} />
-            <Pressable style={({ pressed }) => [styles.btn, pressed && { opacity: 0.8 }]} onPress={() => void handleDismiss()}>
-              <Text style={styles.btnText}>{step === "tabs" ? "Start trading" : "Next"}</Text>
+    <Modal visible={visible} animationType="slide" transparent={false}>
+      <View style={s.root}>
+        <View style={s.progressTrack}>
+          <View style={[s.progressFill, { width: `${progress * 100}%` }]} />
+        </View>
+
+        <View style={s.stepHeader}>
+          <Text style={s.stepCount}>
+            Step {step + 1} of {TOTAL_STEPS}
+          </Text>
+        </View>
+
+        {step === 0 && (
+          <ScrollView contentContainerStyle={s.body}>
+            <View style={s.logoCircle}>
+              <Text style={s.logoMark}>✦</Text>
+            </View>
+            <Text style={s.h1}>Welcome to{"\n"}XAUUSD Trader</Text>
+            <Text style={s.lead}>
+              Professional cascade trading for gold, connected to your Vantage MT5
+              account.
+            </Text>
+            <View style={s.featureList}>
+              <Feature icon="⚡" title="One-tap cascades" desc="Market + limit orders placed together" />
+              <Feature icon="🛡️" title="Automatic zones" desc="Take profits and break-even, hands-free" />
+              <Feature icon="✦" title="AI assistant" desc="Ask anything about your trades" />
+            </View>
+            <Pressable onPress={() => Linking.openURL(termsUrl)}>
+              <Text style={s.link}>Read the Terms &amp; Conditions</Text>
             </Pressable>
           </ScrollView>
+        )}
+
+        {step === 1 && (
+          <View style={s.bodyFill}>
+            <Text style={s.h2}>Terms &amp; Conditions</Text>
+            <Text style={s.sub}>Please scroll to the bottom and tick the box to continue.</Text>
+            <ScrollView style={s.termsBox} onScroll={handleTermsScroll} scrollEventThrottle={64}>
+              <Text style={s.terms}>{TERMS_TEXT}</Text>
+            </ScrollView>
+            <Pressable
+              style={s.checkRow}
+              onPress={() => scrolledToBottom && setAgreed((v) => !v)}
+              disabled={!scrolledToBottom}
+            >
+              <View style={[s.checkbox, agreed && s.checkboxOn, !scrolledToBottom && s.checkboxDisabled]}>
+                {agreed && <Text style={s.checkMark}>✓</Text>}
+              </View>
+              <Text style={[s.checkLabel, !scrolledToBottom && s.checkLabelDisabled]}>
+                I have read and agree to the Terms &amp; Conditions
+              </Text>
+            </Pressable>
+            {!scrolledToBottom && (
+              <Text style={s.hint}>Scroll to the end of the terms to enable this.</Text>
+            )}
+          </View>
+        )}
+
+        {step === 2 && (
+          <ScrollView contentContainerStyle={s.body}>
+            <Text style={s.h2}>{authMode === "create" ? "Create your account" : "Sign in"}</Text>
+            <View style={s.segment}>
+              <SegBtn label="Create account" active={authMode === "create"} onPress={() => setAuthMode("create")} />
+              <SegBtn label="Sign in" active={authMode === "signin"} onPress={() => setAuthMode("signin")} />
+            </View>
+            <Field label="Email" value={email} onChangeText={setEmail} placeholder="you@example.com"
+              keyboardType="email-address" autoCapitalize="none" />
+            <Field label="Password" value={password} onChangeText={setPassword} placeholder="••••••••" secureTextEntry />
+            {authError && <Text style={s.error}>{authError}</Text>}
+            <Pressable style={[s.primaryBtn, authBusy && s.btnBusy]} onPress={doAuth} disabled={authBusy}>
+              {authBusy ? <ActivityIndicator color={colors.onDark} /> :
+                <Text style={s.primaryBtnText}>{authMode === "create" ? "Create account" : "Sign in"}</Text>}
+            </Pressable>
+          </ScrollView>
+        )}
+
+        {step === 3 && (
+          <ScrollView contentContainerStyle={s.body}>
+            <Text style={s.h2}>Find your MT5 details</Text>
+            <Text style={s.lead}>You'll need three things from the Vantage MT5 app:</Text>
+            <Step n="1" title="Open the MT5 app" desc="On your phone, open MetaTrader 5 (Vantage)." />
+            <Step n="2" title="Tap Settings → Accounts" desc="Find the account you trade with." />
+            <Step n="3" title="Note the Login number" desc="A long number, e.g. 1009xxxxx." />
+            <Step n="4" title="Note the Server name" desc='Copy it exactly, e.g. "VantageInternational-Live 3".' />
+            <Step n="5" title="Have your password ready" desc="The master (trading) password, not the investor one." />
+            <View style={s.infoBox}>
+              <Text style={s.infoText}>
+                Tip: copy the server name exactly — capitalisation and spaces matter.
+              </Text>
+            </View>
+          </ScrollView>
+        )}
+
+        {step === 4 && (
+          <ScrollView contentContainerStyle={s.body}>
+            <Text style={s.h2}>Connect MT5</Text>
+            <Text style={s.sub}>Enter the details you just found.</Text>
+            <Field label="Login number" value={login} onChangeText={setLogin}
+              placeholder="1009xxxxx" keyboardType="number-pad" />
+            <Field label="Master password" value={mtPassword} onChangeText={setMtPassword}
+              placeholder="••••••••" secureTextEntry />
+            <Field label="Server name" value={server} onChangeText={setServer}
+              placeholder="VantageInternational-Live 3" autoCapitalize="none" />
+            {mtBusy && (
+              <View style={s.progressInline}>
+                <View style={s.progressInlineTrack}>
+                  <View style={s.progressInlineFill} />
+                </View>
+                <Text style={s.sub}>Connecting to your broker…</Text>
+              </View>
+            )}
+            {mtError && <Text style={s.error}>{mtError}</Text>}
+            <Pressable style={[s.primaryBtn, mtBusy && s.btnBusy]} onPress={doConnect} disabled={mtBusy}>
+              {mtBusy ? <ActivityIndicator color={colors.onDark} /> :
+                <Text style={s.primaryBtnText}>Connect</Text>}
+            </Pressable>
+          </ScrollView>
+        )}
+
+        {step === 5 && (
+          <ScrollView contentContainerStyle={s.body}>
+            <Text style={s.h2}>You're all set 🎉</Text>
+            <Text style={s.lead}>Here's what each tab does:</Text>
+            <Step n="📈" title="Trade" desc="Place cascades with one tap. Live bid/ask up top." />
+            <Step n="📋" title="Positions" desc="See open trades, live P&L and zone status." />
+            <Step n="📊" title="Dashboard" desc="Balance, equity, win rate at a glance." />
+            <Step n="🕐" title="History" desc="Every closed zone and which TPs it hit." />
+            <Step n="⚙️" title="Settings" desc="Cascade config, zone TPs, biometric lock." />
+            <View style={s.infoBox}>
+              <Text style={s.infoText}>
+                Tip: try everything on a demo account first. Tap the ✦ button any time to ask the AI assistant.
+              </Text>
+            </View>
+          </ScrollView>
+        )}
+
+        <View style={s.footer}>
+          {step > 0 ? (
+            <Pressable style={s.ghostBtn} onPress={back}>
+              <Text style={s.ghostBtnText}>Back</Text>
+            </Pressable>
+          ) : (
+            <View style={{ flex: 1 }} />
+          )}
+
+          {step !== 2 && step !== 4 && (
+            <Pressable
+              style={[
+                s.nextBtn,
+                step === 1 && !(scrolledToBottom && agreed) && s.nextDisabled,
+              ]}
+              disabled={step === 1 && !(scrolledToBottom && agreed)}
+              onPress={() => {
+                if (step === TOTAL_STEPS - 1) onComplete();
+                else next();
+              }}
+            >
+              <Text style={s.nextText}>
+                {step === TOTAL_STEPS - 1 ? "Start trading" : "Continue"}
+              </Text>
+            </Pressable>
+          )}
         </View>
       </View>
     </Modal>
   );
 }
 
-const styles = StyleSheet.create({
-  overlay: {
-    flex: 1,
-    backgroundColor: "rgba(0,0,0,0.75)",
-    justifyContent: "center",
-    alignItems: "center",
-    paddingHorizontal: 20,
-  },
-  card: {
-    width: "100%",
-    maxWidth: 420,
-    backgroundColor: C.card,
-    borderRadius: 20,
-    borderWidth: 1,
-    borderColor: C.border,
-    overflow: "hidden",
-    maxHeight: "85%",
-  },
-  accentBar: { height: 3, backgroundColor: C.gold },
-  content: { padding: 24, paddingBottom: 20 },
-  iconCircle: {
-    width: 56,
-    height: 56,
-    borderRadius: 28,
-    backgroundColor: "rgba(201,168,76,0.12)",
-    borderWidth: 1,
-    borderColor: "rgba(201,168,76,0.3)",
-    alignItems: "center",
-    justifyContent: "center",
-    marginBottom: 16,
-    alignSelf: "center",
-  },
-  title: {
-    fontSize: 20,
-    fontFamily: "Inter_700Bold",
-    color: C.text,
-    textAlign: "center",
-    marginBottom: 8,
-  },
-  subtitle: {
-    fontSize: 14,
-    fontFamily: "Inter_400Regular",
-    color: C.textSecondary,
-    textAlign: "center",
-    lineHeight: 20,
-    marginBottom: 20,
-  },
-  bullets: { gap: 16, marginBottom: 24 },
-  bullet: { flexDirection: "row", gap: 12, alignItems: "flex-start" },
-  bulletIcon: {
-    width: 32,
-    height: 32,
-    borderRadius: 8,
-    backgroundColor: "rgba(201,168,76,0.1)",
-    alignItems: "center",
-    justifyContent: "center",
-    flexShrink: 0,
-    marginTop: 1,
-  },
-  bulletTitle: {
-    fontSize: 14,
-    fontFamily: "Inter_600SemiBold",
-    color: C.text,
-    marginBottom: 3,
-  },
-  bulletBody: {
-    fontSize: 13,
-    fontFamily: "Inter_400Regular",
-    color: C.textSecondary,
-    lineHeight: 18,
-  },
-  checkRow: { flexDirection: "row", alignItems: "center", gap: 10, marginBottom: 16 },
-  checkbox: {
-    width: 20,
-    height: 20,
-    borderRadius: 5,
-    borderWidth: 1.5,
-    borderColor: C.border,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: C.surface,
-  },
-  checkboxChecked: { backgroundColor: C.gold, borderColor: C.gold },
-  checkLabel: { fontSize: 13, fontFamily: "Inter_400Regular", color: C.textSecondary },
-  btn: { backgroundColor: C.gold, borderRadius: 12, paddingVertical: 14, alignItems: "center" },
-  btnText: { fontSize: 16, fontFamily: "Inter_700Bold", color: "#000", letterSpacing: 0.5 },
+function Feature({ icon, title, desc }: { icon: string; title: string; desc: string }) {
+  return (
+    <View style={s.feature}>
+      <View style={s.featureIcon}><Text style={{ fontSize: 16 }}>{icon}</Text></View>
+      <View style={{ flex: 1 }}>
+        <Text style={s.featureTitle}>{title}</Text>
+        <Text style={s.featureDesc}>{desc}</Text>
+      </View>
+    </View>
+  );
+}
+
+function Step({ n, title, desc }: { n: string; title: string; desc: string }) {
+  return (
+    <View style={s.stepRow}>
+      <View style={s.stepNum}><Text style={s.stepNumText}>{n}</Text></View>
+      <View style={{ flex: 1 }}>
+        <Text style={s.stepTitle}>{title}</Text>
+        <Text style={s.stepDesc}>{desc}</Text>
+      </View>
+    </View>
+  );
+}
+
+function Field(props: React.ComponentProps<typeof TextInput> & { label: string }) {
+  const { label, ...rest } = props;
+  return (
+    <View style={{ marginBottom: 12 }}>
+      <Text style={s.fieldLabel}>{label}</Text>
+      <TextInput
+        style={s.input}
+        placeholderTextColor={colors.textMuted}
+        {...rest}
+      />
+    </View>
+  );
+}
+
+function SegBtn({ label, active, onPress }: { label: string; active: boolean; onPress: () => void }) {
+  return (
+    <Pressable style={[s.segBtn, active && s.segBtnOn]} onPress={onPress}>
+      <Text style={[s.segText, active && s.segTextOn]}>{label}</Text>
+    </Pressable>
+  );
+}
+
+function humanError(err: unknown): string | null {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  if (!msg) return null;
+  if (msg.includes("invalid") && msg.includes("password")) return "That password wasn't accepted.";
+  if (msg.includes("server")) return "Couldn't reach that server — check the server name.";
+  if (msg.includes("network") || msg.includes("timeout")) return "Network problem — check your connection and retry.";
+  if (msg.includes("exists")) return "An account with that email already exists — try signing in.";
+  return null;
+}
+
+const TERMS_TEXT = `XAUUSD Trader — Terms & Conditions
+
+1. Not financial advice. This app is an execution and educational tool. Nothing in it is financial, investment or trading advice. You trade entirely at your own risk.
+
+2. No liability for losses. Trading leveraged products such as gold (XAUUSD) carries a high risk of loss. You may lose more than expected. We accept no liability for any losses, missed trades, or costs arising from use of the app.
+
+3. Demo first. You should test all features on a demo account before trading real funds.
+
+4. Latency & slippage. Orders are routed to your broker over the internet. Prices, fills, slippage and execution speed depend on your broker, connection and market conditions, and are outside our control.
+
+5. High-volatility news. Avoid trading around major news releases where spreads widen and slippage increases. Cascade and zone logic may behave unexpectedly in fast markets.
+
+6. App availability. The app and its servers may be unavailable, delayed, or interrupted. We do not guarantee uptime and are not responsible for consequences of downtime.
+
+7. Broker relationship. Your account, funds and trades are held with your broker (Vantage). We are not your broker and do not hold your funds. Your broker's terms apply.
+
+8. Your credentials. You are responsible for keeping your login details secure. The app stores MT5 credentials in encrypted form for the sole purpose of connecting to your account.
+
+9. Educational purpose. Features such as the AI assistant provide general information only and may be incomplete or wrong. Always verify before acting.
+
+10. Acceptance. By ticking the box below you confirm you have read, understood and agree to these terms, and that you are using the app at your own risk.
+
+(End of terms — you may now tick the box.)`;
+
+const s = StyleSheet.create({
+  root: { flex: 1, backgroundColor: colors.background, paddingTop: 56 },
+  progressTrack: { height: 4, backgroundColor: colors.border, marginHorizontal: 20, borderRadius: 2, overflow: "hidden" },
+  progressFill: { height: 4, backgroundColor: colors.gold, borderRadius: 2 },
+  stepHeader: { paddingHorizontal: 24, paddingTop: 10 },
+  stepCount: { fontSize: 11, color: colors.textMuted, letterSpacing: 1, textTransform: "uppercase", fontWeight: "600" },
+
+  body: { paddingHorizontal: 24, paddingTop: 14, paddingBottom: 28 },
+  bodyFill: { flex: 1, paddingHorizontal: 24, paddingTop: 14 },
+
+  logoCircle: { width: 64, height: 64, borderRadius: 32, backgroundColor: colors.navy, alignItems: "center", justifyContent: "center", marginBottom: 18 },
+  logoMark: { fontSize: 28, color: colors.gold, fontWeight: "700" },
+
+  h1: { fontSize: 30, fontWeight: "800", color: colors.text, lineHeight: 34, marginBottom: 10 },
+  h2: { fontSize: 24, fontWeight: "800", color: colors.text, marginBottom: 6 },
+  lead: { fontSize: 15, color: colors.textSecondary, lineHeight: 22, marginBottom: 18 },
+  sub: { fontSize: 13, color: colors.textMuted, marginBottom: 14 },
+
+  featureList: { gap: 12, marginBottom: 18 },
+  feature: { flexDirection: "row", gap: 12, alignItems: "center", backgroundColor: colors.card, borderColor: colors.border, borderWidth: 1, borderRadius: 12, padding: 12 },
+  featureIcon: { width: 34, height: 34, borderRadius: 9, backgroundColor: colors.goldLight, alignItems: "center", justifyContent: "center" },
+  featureTitle: { fontSize: 14, fontWeight: "700", color: colors.text },
+  featureDesc: { fontSize: 12, color: colors.textSecondary, marginTop: 1 },
+
+  link: { fontSize: 14, color: colors.gold, fontWeight: "600", textDecorationLine: "underline" },
+
+  termsBox: { flex: 1, backgroundColor: colors.card, borderColor: colors.border, borderWidth: 1, borderRadius: 12, padding: 14, marginBottom: 14 },
+  terms: { fontSize: 13, color: colors.textSecondary, lineHeight: 20 },
+
+  checkRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 6 },
+  checkbox: { width: 24, height: 24, borderRadius: 6, borderWidth: 2, borderColor: colors.border, alignItems: "center", justifyContent: "center", backgroundColor: colors.card },
+  checkboxOn: { backgroundColor: colors.buy, borderColor: colors.buy },
+  checkboxDisabled: { opacity: 0.4 },
+  checkMark: { color: colors.onDark, fontWeight: "800", fontSize: 14 },
+  checkLabel: { flex: 1, fontSize: 14, color: colors.text },
+  checkLabelDisabled: { color: colors.textMuted },
+  hint: { fontSize: 12, color: colors.textMuted, marginTop: 4, paddingBottom: 8 },
+
+  segment: { flexDirection: "row", backgroundColor: colors.surface, borderColor: colors.border, borderWidth: 1, borderRadius: 12, padding: 3, gap: 3, marginBottom: 16 },
+  segBtn: { flex: 1, paddingVertical: 9, alignItems: "center", borderRadius: 9 },
+  segBtnOn: { backgroundColor: colors.gold },
+  segText: { fontSize: 13, fontWeight: "600", color: colors.textSecondary },
+  segTextOn: { color: colors.onDark },
+
+  fieldLabel: { fontSize: 11, fontWeight: "600", color: colors.textSecondary, marginBottom: 6, letterSpacing: 0.4, textTransform: "uppercase" },
+  input: { backgroundColor: colors.surface, borderColor: colors.border, borderWidth: 1, borderRadius: 10, paddingHorizontal: 14, paddingVertical: 12, fontSize: 15, color: colors.text },
+
+  primaryBtn: { backgroundColor: colors.navy, borderRadius: 12, paddingVertical: 14, alignItems: "center", marginTop: 8 },
+  primaryBtnText: { color: colors.onDark, fontSize: 15, fontWeight: "700" },
+  btnBusy: { opacity: 0.7 },
+
+  progressInline: { marginVertical: 12, gap: 8 },
+  progressInlineTrack: { height: 6, backgroundColor: colors.border, borderRadius: 3, overflow: "hidden" },
+  progressInlineFill: { height: 6, width: "70%", backgroundColor: colors.gold, borderRadius: 3 },
+
+  error: { color: colors.sell, fontSize: 13, marginVertical: 8 },
+
+  stepRow: { flexDirection: "row", gap: 12, marginBottom: 14, alignItems: "flex-start" },
+  stepNum: { width: 30, height: 30, borderRadius: 15, backgroundColor: colors.goldLight, alignItems: "center", justifyContent: "center" },
+  stepNumText: { fontSize: 14, fontWeight: "700", color: colors.gold },
+  stepTitle: { fontSize: 14, fontWeight: "700", color: colors.text },
+  stepDesc: { fontSize: 13, color: colors.textSecondary, marginTop: 1, lineHeight: 18 },
+
+  infoBox: { backgroundColor: colors.goldLight, borderColor: colors.goldBorder, borderWidth: 1, borderRadius: 12, padding: 12, marginTop: 8 },
+  infoText: { fontSize: 13, color: colors.textSecondary, lineHeight: 19 },
+
+  footer: { flexDirection: "row", gap: 12, alignItems: "center", paddingHorizontal: 24, paddingVertical: 16, borderTopColor: colors.border, borderTopWidth: 1, backgroundColor: colors.card },
+  ghostBtn: { paddingVertical: 12, paddingHorizontal: 18, borderRadius: 10 },
+  ghostBtnText: { fontSize: 15, color: colors.textSecondary, fontWeight: "600" },
+  nextBtn: { flex: 1, backgroundColor: colors.gold, borderRadius: 12, paddingVertical: 14, alignItems: "center" },
+  nextDisabled: { opacity: 0.4 },
+  nextText: { color: colors.onDark, fontSize: 15, fontWeight: "700" },
 });

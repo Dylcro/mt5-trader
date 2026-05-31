@@ -7,6 +7,7 @@ import {
 } from "@expo-google-fonts/inter";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Stack } from "expo-router";
+import { StatusBar } from "expo-status-bar";
 import * as SplashScreen from "expo-splash-screen";
 import React, { useEffect } from "react";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
@@ -68,6 +69,7 @@ export default function RootLayout() {
         <ErrorBoundary onError={(error) => captureException(error, { componentStack: true })}>
           <QueryClientProvider client={queryClient}>
             <GestureHandlerRootView style={{ flex: 1 }}>
+              <StatusBar style="dark" />
               <KeyboardProvider>
                 <TradingProvider>
                   <HapticSettingsProvider>
