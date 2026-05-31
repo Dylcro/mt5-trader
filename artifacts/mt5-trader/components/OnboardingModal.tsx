@@ -16,6 +16,9 @@ const C = Colors.dark;
 
 const KEY_LINK_DISMISSED = "onboarding_link_dismissed";
 const KEY_SETTINGS_DISMISSED = "onboarding_settings_dismissed";
+const KEY_TABS_DISMISSED = "onboarding_tabs_dismissed";
+
+type Step = "link" | "settings" | "tabs";
 
 interface BulletProps {
   icon: string;
@@ -37,12 +40,7 @@ function Bullet({ icon, title, body }: BulletProps) {
   );
 }
 
-interface CheckboxRowProps {
-  checked: boolean;
-  onToggle: () => void;
-}
-
-function CheckboxRow({ checked, onToggle }: CheckboxRowProps) {
+function CheckboxRow({ checked, onToggle }: { checked: boolean; onToggle: () => void }) {
   return (
     <Pressable style={styles.checkRow} onPress={onToggle} hitSlop={8}>
       <View style={[styles.checkbox, checked && styles.checkboxChecked]}>
@@ -60,20 +58,22 @@ interface OnboardingModalProps {
 
 export default function OnboardingModal({ accountId, status }: OnboardingModalProps) {
   const [visible, setVisible] = useState(false);
-  const [step, setStep] = useState<"link" | "settings">("link");
+  const [step, setStep] = useState<Step>("link");
   const [dontShow, setDontShow] = useState(false);
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     async function check() {
-      const [linkVal, settingsVal] = await Promise.all([
+      const [linkVal, settingsVal, tabsVal] = await Promise.all([
         AsyncStorage.getItem(KEY_LINK_DISMISSED),
         AsyncStorage.getItem(KEY_SETTINGS_DISMISSED),
+        AsyncStorage.getItem(KEY_TABS_DISMISSED),
       ]);
       if (cancelled) return;
       const linkDismissed = linkVal === "true";
       const settingsDismissed = settingsVal === "true";
+      const tabsDismissed = tabsVal === "true";
       const isConnected = !!accountId && status === "connected";
 
       if (!isConnected && !linkDismissed) {
@@ -82,118 +82,97 @@ export default function OnboardingModal({ accountId, status }: OnboardingModalPr
       } else if (isConnected && !settingsDismissed) {
         setStep("settings");
         setVisible(true);
+      } else if (isConnected && !tabsDismissed) {
+        setStep("tabs");
+        setVisible(true);
       }
       setReady(true);
     }
     void check();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [accountId, status]);
+
+  const dismissKey = (s: Step) =>
+    s === "link" ? KEY_LINK_DISMISSED : s === "settings" ? KEY_SETTINGS_DISMISSED : KEY_TABS_DISMISSED;
 
   const handleDismiss = useCallback(async () => {
     if (dontShow) {
-      await AsyncStorage.setItem(
-        step === "link" ? KEY_LINK_DISMISSED : KEY_SETTINGS_DISMISSED,
-        "true",
-      );
+      await AsyncStorage.setItem(dismissKey(step), "true");
+    }
+    const isConnected = !!accountId && status === "connected";
+    if (step === "link" && isConnected) {
+      setStep("settings");
+      setDontShow(false);
+      const settingsVal = await AsyncStorage.getItem(KEY_SETTINGS_DISMISSED);
+      if (settingsVal !== "true") return;
+    }
+    if (step === "settings" && isConnected) {
+      setStep("tabs");
+      setDontShow(false);
+      const tabsVal = await AsyncStorage.getItem(KEY_TABS_DISMISSED);
+      if (tabsVal !== "true") return;
     }
     setVisible(false);
-  }, [dontShow, step]);
+  }, [accountId, dontShow, status, step]);
 
   if (!ready) return null;
 
   return (
-    <Modal
-      visible={visible}
-      transparent
-      animationType="fade"
-      statusBarTranslucent
-      onRequestClose={() => setVisible(false)}
-    >
+    <Modal visible={visible} transparent animationType="fade" statusBarTranslucent onRequestClose={() => setVisible(false)}>
       <View style={styles.overlay}>
         <View style={styles.card}>
-          {/* Gold accent bar */}
           <View style={styles.accentBar} />
-
-          <ScrollView
-            showsVerticalScrollIndicator={false}
-            contentContainerStyle={styles.content}
-            bounces={false}
-          >
-            {step === "link" ? (
+          <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.content} bounces={false}>
+            {step === "link" && (
               <>
                 <View style={styles.iconCircle}>
                   <Feather name="link" size={26} color={C.gold} />
                 </View>
-                <Text style={styles.title}>Welcome to MT5 Trader</Text>
-                <Text style={styles.subtitle}>
-                  Before you can trade, you need to link your MT5 account.
-                </Text>
-
+                <Text style={styles.title}>Welcome to XAUUSD Trader</Text>
+                <Text style={styles.subtitle}>Link your MT5 account before you trade.</Text>
                 <View style={styles.bullets}>
-                  <Bullet
-                    icon="settings"
-                    title="Open Settings"
-                    body="Tap the Settings tab in the bottom-right corner of the screen."
-                  />
-                  <Bullet
-                    icon="user"
-                    title="Enter Your Account Details"
-                    body="Fill in your MT5 Account ID, Login, Password, and Server name from your broker."
-                  />
-                  <Bullet
-                    icon="globe"
-                    title="Choose Your Region"
-                    body="Select the region closest to your broker's server for the best connection speed."
-                  />
-                  <Bullet
-                    icon="zap"
-                    title="Tap Connect"
-                    body="Your live price feed and account data will appear as soon as the link is active."
-                  />
+                  <Bullet icon="settings" title="Open Settings" body="Use the Settings tab to enter MT5 credentials." />
+                  <Bullet icon="user" title="Account details" body="Login, password, and server from your broker." />
+                  <Bullet icon="globe" title="Region" body="Pick the region closest to your broker server." />
+                  <Bullet icon="zap" title="Connect" body="Live prices appear when status shows connected." />
                 </View>
               </>
-            ) : (
+            )}
+            {step === "settings" && (
               <>
                 <View style={styles.iconCircle}>
                   <Feather name="sliders" size={26} color={C.gold} />
                 </View>
-                <Text style={styles.title}>Configure Your Settings</Text>
-                <Text style={styles.subtitle}>
-                  Your account is connected. Tune these settings before placing your first cascade trade.
-                </Text>
-
+                <Text style={styles.title}>Configure cascade settings</Text>
+                <Text style={styles.subtitle}>Tune SL, entries, and take-profit levels before your first trade.</Text>
                 <View style={styles.bullets}>
-                  <Bullet
-                    icon="shield"
-                    title="Stop Loss (SL Pips)"
-                    body="How many pips below (buy) or above (sell) your entry the shared stop loss is placed across all cascade orders."
-                  />
-                  <Bullet
-                    icon="layers"
-                    title="Cascade Entries"
-                    body="Choose how many limit orders to layer (e.g. 5) and the pip gap between each entry level."
-                  />
-                  <Bullet
-                    icon="target"
-                    title="Take Profit Levels (TP1–TP4)"
-                    body="Set pip distances for each 25% partial close. TP2 automatically moves your SL to break-even once hit."
-                  />
-                  <Bullet
-                    icon="trending-up"
-                    title="TP4 — Leave It Open"
-                    body="Set TP4 to 0 pips to leave the final 25% running with no auto-close. You close it manually."
-                  />
+                  <Bullet icon="shield" title="Stop loss" body="Shared SL pips across all cascade limit orders." />
+                  <Bullet icon="layers" title="Cascade entries" body="Number of limits and pip spacing between entries." />
+                  <Bullet icon="target" title="TP1–TP4" body="Partial close distances; TP2 moves SL to break-even." />
+                  <Bullet icon="trending-up" title="TP4 open" body="Set TP4 to 0 to leave the final 25% manual." />
                 </View>
               </>
             )}
-
+            {step === "tabs" && (
+              <>
+                <View style={styles.iconCircle}>
+                  <Feather name="grid" size={26} color={C.gold} />
+                </View>
+                <Text style={styles.title}>Explore your tabs</Text>
+                <Text style={styles.subtitle}>New screens help you monitor performance and history.</Text>
+                <View style={styles.bullets}>
+                  <Bullet icon="bar-chart-2" title="Dashboard" body="Account equity, balance, and connection at a glance." />
+                  <Bullet icon="clock" title="History" body="Review closed cascade zones and final TP reached." />
+                  <Bullet icon="message-circle" title="Assistant" body="Tap the gold chat button for cascade and MT5 help." />
+                  <Bullet icon="bell" title="Alerts" body="Enable TP notifications in Settings when you're ready." />
+                </View>
+              </>
+            )}
             <CheckboxRow checked={dontShow} onToggle={() => setDontShow((v) => !v)} />
-
-            <Pressable
-              style={({ pressed }) => [styles.btn, pressed && { opacity: 0.8 }]}
-              onPress={handleDismiss}
-            >
-              <Text style={styles.btnText}>Got it</Text>
+            <Pressable style={({ pressed }) => [styles.btn, pressed && { opacity: 0.8 }]} onPress={() => void handleDismiss()}>
+              <Text style={styles.btnText}>{step === "tabs" ? "Start trading" : "Next"}</Text>
             </Pressable>
           </ScrollView>
         </View>
@@ -220,14 +199,8 @@ const styles = StyleSheet.create({
     overflow: "hidden",
     maxHeight: "85%",
   },
-  accentBar: {
-    height: 3,
-    backgroundColor: C.gold,
-  },
-  content: {
-    padding: 24,
-    paddingBottom: 20,
-  },
+  accentBar: { height: 3, backgroundColor: C.gold },
+  content: { padding: 24, paddingBottom: 20 },
   iconCircle: {
     width: 56,
     height: 56,
@@ -255,15 +228,8 @@ const styles = StyleSheet.create({
     lineHeight: 20,
     marginBottom: 20,
   },
-  bullets: {
-    gap: 16,
-    marginBottom: 24,
-  },
-  bullet: {
-    flexDirection: "row",
-    gap: 12,
-    alignItems: "flex-start",
-  },
+  bullets: { gap: 16, marginBottom: 24 },
+  bullet: { flexDirection: "row", gap: 12, alignItems: "flex-start" },
   bulletIcon: {
     width: 32,
     height: 32,
@@ -286,12 +252,7 @@ const styles = StyleSheet.create({
     color: C.textSecondary,
     lineHeight: 18,
   },
-  checkRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-    marginBottom: 16,
-  },
+  checkRow: { flexDirection: "row", alignItems: "center", gap: 10, marginBottom: 16 },
   checkbox: {
     width: 20,
     height: 20,
@@ -302,25 +263,8 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     backgroundColor: C.surface,
   },
-  checkboxChecked: {
-    backgroundColor: C.gold,
-    borderColor: C.gold,
-  },
-  checkLabel: {
-    fontSize: 13,
-    fontFamily: "Inter_400Regular",
-    color: C.textSecondary,
-  },
-  btn: {
-    backgroundColor: C.gold,
-    borderRadius: 12,
-    paddingVertical: 14,
-    alignItems: "center",
-  },
-  btnText: {
-    fontSize: 16,
-    fontFamily: "Inter_700Bold",
-    color: "#000",
-    letterSpacing: 0.5,
-  },
+  checkboxChecked: { backgroundColor: C.gold, borderColor: C.gold },
+  checkLabel: { fontSize: 13, fontFamily: "Inter_400Regular", color: C.textSecondary },
+  btn: { backgroundColor: C.gold, borderRadius: 12, paddingVertical: 14, alignItems: "center" },
+  btnText: { fontSize: 16, fontFamily: "Inter_700Bold", color: "#000", letterSpacing: 0.5 },
 });
