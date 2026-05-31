@@ -1,0 +1,20 @@
+---
+description: After mt5-trader mobile app code changes, run typecheck and EAS preview build for a new install QR.
+globs: artifacts/mt5-trader/**
+alwaysApply: false
+---
+
+# MT5 Trader app — QR after every update
+
+When you change code under `artifacts/mt5-trader/`:
+
+1. Run `pnpm --filter @workspace/mt5-trader run typecheck` and fix errors.
+2. Start an iOS preview build so the user gets a **new install QR / link**:
+   ```bash
+   cd artifacts/mt5-trader && npm_config_user_agent='pnpm/10.0.0' pnpm exec eas build --platform ios --profile preview --non-interactive
+   ```
+3. When the build finishes, surface the **expo.dev build URL** and QR from the command output (user installs on phone from that link).
+
+Do not assume code edits alone update the installed app — there is no OTA configured.
+
+For quick in-Expo-Go iteration only (not a new standalone install), `pnpm exec expo start --tunnel` shows a dev QR in Terminal faster; default to **EAS preview** unless the user asks for dev-only.
