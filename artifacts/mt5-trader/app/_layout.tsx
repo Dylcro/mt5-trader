@@ -15,6 +15,7 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { CascadeToast } from "@/components/CascadeToast";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
+import { captureException, initSentry } from "@/lib/sentry";
 import { AuthProvider } from "@/context/AuthContext";
 import { TradingProvider } from "@/context/TradingContext";
 import { CascadeSettingsProvider } from "@/hooks/useCascadeSettings";
@@ -23,6 +24,7 @@ import { NotificationSettingsProvider } from "@/hooks/useNotificationSettings";
 import { useNotificationDeepLink } from "@/hooks/useNotificationDeepLink";
 
 SplashScreen.preventAutoHideAsync();
+initSentry();
 
 const queryClient = new QueryClient();
 
@@ -63,7 +65,7 @@ export default function RootLayout() {
   return (
     <AuthProvider>
       <SafeAreaProvider>
-        <ErrorBoundary>
+        <ErrorBoundary onError={(error) => captureException(error, { componentStack: true })}>
           <QueryClientProvider client={queryClient}>
             <GestureHandlerRootView style={{ flex: 1 }}>
               <KeyboardProvider>
