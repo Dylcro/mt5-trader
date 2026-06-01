@@ -5,7 +5,7 @@ import { NativeTabs } from "expo-router/unstable-native-tabs";
 import { MaterialCommunityIcons, Feather } from "@expo/vector-icons";
 import { SymbolView } from "expo-symbols";
 import React, { useCallback, useEffect, useRef } from "react";
-import { ActivityIndicator, Platform, StyleSheet, View } from "react-native";
+import { ActivityIndicator, Platform, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import AIAssistantPanel from "@/components/AIAssistantPanel";
@@ -17,6 +17,12 @@ import { useAuth } from "@/context/AuthContext";
 import { useTrading } from "@/context/TradingContext";
 import { useOnboardingGate } from "@/hooks/useOnboardingGate";
 import { setAuthTokenGetter } from "@/lib/authToken";
+
+const C = Colors.dark;
+
+function TabEmoji({ emoji, focused }: { emoji: string; focused: boolean }) {
+  return <Text style={{ fontSize: 22, opacity: focused ? 1 : 0.5 }}>{emoji}</Text>;
+}
 
 function TabChrome({
   children,
@@ -133,27 +139,23 @@ function ClassicTabLayout({
       <Tabs
         screenOptions={{
           headerShown: false,
-          tabBarActiveTintColor: Colors.dark.gold,
-          tabBarInactiveTintColor: Colors.dark.tabIconDefault,
+          tabBarActiveTintColor: C.gold,
+          tabBarInactiveTintColor: C.tabIconDefault,
           tabBarStyle: {
             position: "absolute",
-            backgroundColor: isIOS ? "transparent" : Colors.dark.card,
+            backgroundColor: C.card,
             borderTopWidth: 1,
-            borderTopColor: Colors.dark.border,
+            borderTopColor: C.border,
             elevation: 0,
             paddingBottom: isWeb ? 0 : insets.bottom,
             ...(isWeb ? { height: 84 } : {}),
           },
-          tabBarBackground: () =>
-            isIOS ? (
-              <BlurView intensity={80} tint="light" style={StyleSheet.absoluteFill} />
-            ) : isWeb ? (
-              <View style={[StyleSheet.absoluteFill, { backgroundColor: Colors.dark.card }]} />
-            ) : null,
           tabBarLabelStyle: {
-            fontFamily: "Inter_500Medium",
-            fontSize: 10,
+            fontFamily: "Inter_600SemiBold",
+            fontSize: 9,
             marginTop: -2,
+            letterSpacing: 0.6,
+            textTransform: "uppercase",
           },
         }}
       >
@@ -161,60 +163,35 @@ function ClassicTabLayout({
           name="index"
           options={{
             title: "Trade",
-            tabBarIcon: ({ color, size }) =>
-              Platform.OS === "ios" ? (
-                <SymbolView name="chart.line.uptrend.xyaxis" tintColor={color} size={size} />
-              ) : (
-                <MaterialCommunityIcons name="chart-line" size={size} color={color} />
-              ),
-          }}
-        />
-        <Tabs.Screen
-          name="dashboard"
-          options={{
-            title: "Dashboard",
-            tabBarIcon: ({ color, size }) =>
-              Platform.OS === "ios" ? (
-                <SymbolView name="square.grid.2x2" tintColor={color} size={size} />
-              ) : (
-                <Feather name="grid" size={size} color={color} />
-              ),
+            tabBarIcon: ({ focused }) => <TabEmoji emoji="📈" focused={focused} />,
           }}
         />
         <Tabs.Screen
           name="positions"
           options={{
             title: "Positions",
-            tabBarIcon: ({ color, size }) =>
-              Platform.OS === "ios" ? (
-                <SymbolView name="list.bullet.rectangle" tintColor={color} size={size} />
-              ) : (
-                <Feather name="list" size={size} color={color} />
-              ),
+            tabBarIcon: ({ focused }) => <TabEmoji emoji="📋" focused={focused} />,
+          }}
+        />
+        <Tabs.Screen
+          name="dashboard"
+          options={{
+            title: "Dashboard",
+            tabBarIcon: ({ focused }) => <TabEmoji emoji="📊" focused={focused} />,
           }}
         />
         <Tabs.Screen
           name="history"
           options={{
             title: "History",
-            tabBarIcon: ({ color, size }) =>
-              Platform.OS === "ios" ? (
-                <SymbolView name="clock" tintColor={color} size={size} />
-              ) : (
-                <Feather name="clock" size={size} color={color} />
-              ),
+            tabBarIcon: ({ focused }) => <TabEmoji emoji="🕐" focused={focused} />,
           }}
         />
         <Tabs.Screen
           name="settings"
           options={{
             title: "Settings",
-            tabBarIcon: ({ color, size }) =>
-              Platform.OS === "ios" ? (
-                <SymbolView name="gearshape" tintColor={color} size={size} />
-              ) : (
-                <Feather name="settings" size={size} color={color} />
-              ),
+            tabBarIcon: ({ focused }) => <TabEmoji emoji="⚙️" focused={focused} />,
           }}
         />
       </Tabs>
@@ -255,14 +232,7 @@ export default function TabLayout() {
     return <Redirect href="/(auth)/sign-in" />;
   }
 
-  if (isLiquidGlassAvailable()) {
-    return (
-      <NativeTabLayout
-        showOnboarding={false}
-        onOnboardingComplete={completeOnboarding}
-      />
-    );
-  }
+  // Classic cream/gold tab bar (mockup). Native liquid-glass tabs use system blue styling.
   return (
     <ClassicTabLayout
       showOnboarding={false}
