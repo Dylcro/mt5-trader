@@ -19,13 +19,18 @@ const app: Express = express();
 app.use(helmet({ contentSecurityPolicy: false }));
 
 // ── CORS — only allow the production domain and local dev ────────────────────
-const ALLOWED_ORIGINS = [
+const ALLOWED_ORIGINS: (string | RegExp)[] = [
   "https://meta-trader-link.replit.app",
   /^https:\/\/.*\.replit\.dev$/,
+  /^https:\/\/.*\.up\.railway\.app$/,
   /^https:\/\/.*\.expo\.dev$/,
   "http://localhost:19006",
   "http://localhost:8081",
 ];
+const railwayDomain = process.env["RAILWAY_PUBLIC_DOMAIN"];
+if (railwayDomain) {
+  ALLOWED_ORIGINS.push(`https://${railwayDomain}`);
+}
 app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 
 // ── Rate limiting (defined in ./lib/rateLimiters so admin can reset them) ────
