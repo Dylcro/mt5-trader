@@ -38,9 +38,9 @@ app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
-// ── Health check — mounted at root, outside rate limiting, so the deployment
-//    platform can probe /healthz without being throttled or blocked by /api middleware.
+// ── Health check — public, no JWT. Root path for Railway; /api path for Replit routing.
 app.use(healthRouter);
+app.use("/api", healthRouter);
 
 app.use("/api/admin", adminRouter);
 app.use("/api/auth", authLimiter, authRouter);
