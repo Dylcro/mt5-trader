@@ -9,6 +9,8 @@ import {
   parseZoneIdFromComment,
   commentBelongsToZone,
   computeFinalTpReached,
+  dealIndicatesStopLoss,
+  resolveCloseOutcome,
   countEnabledTps,
   countHitEnabledTps,
   tpDisplayState,
@@ -520,6 +522,37 @@ describe("disabled TP history", () => {
       tp1Enabled: true, tp2Enabled: true, tp3Enabled: false, tp4Enabled: true,
       tp1Hit: true, tp2Hit: true, tp3Hit: true, tp4Hit: false,
     })).toBe(2);
+  });
+
+  it("dealIndicatesStopLoss detects broker SL reasons", () => {
+    expect(dealIndicatesStopLoss({ reason: "DEAL_REASON_SL" })).toBe(true);
+    expect(dealIndicatesStopLoss({ reason: "STOP_LOSS" })).toBe(true);
+    expect(dealIndicatesStopLoss({ comment: "stop loss" })).toBe(true);
+    expect(dealIndicatesStopLoss({ reason: "CLIENT" })).toBe(false);
+  });
+
+  it("resolveCloseOutcome backfills manual close when TP4 not done", () => {
+    expect(resolveCloseOutcome({
+      status: "CLOSED",
+      tp4Enabled: true,
+      tp4Hit: false,
+      manualClose: false,
+      slHit: false,
+    })).toEqual({ manualClose: true, slHit: false });
+    expect(resolveCloseOutcome({
+      status: "CLOSED",
+      tp4Enabled: true,
+      tp4Hit: true,
+      manualClose: false,
+      slHit: false,
+    })).toEqual({ manualClose: false, slHit: false });
+    expect(resolveCloseOutcome({
+      status: "CLOSED",
+      tp4Enabled: true,
+      tp4Hit: false,
+      manualClose: false,
+      slHit: true,
+    })).toEqual({ manualClose: false, slHit: true });
   });
 
   it("hit/enabled counts use only enabled TPs as denominator", () => {

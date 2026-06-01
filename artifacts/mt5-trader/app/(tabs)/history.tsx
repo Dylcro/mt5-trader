@@ -19,6 +19,8 @@ import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
 import { formatDuration, formatHistoryDate, formatPrice } from "@/lib/formatters";
 import { tpDisplayState } from "@/lib/zoneComments";
 import {
+  countManualCloses,
+  countSlHits,
   countTpHits,
   filterClosedZonesByPeriod,
   tpPillStyle,
@@ -48,13 +50,7 @@ function TpChip({ n, zone }: { n: 1 | 2 | 3 | 4; zone: Zone }) {
   const enabled = zone[`tp${n}Enabled` as keyof Zone] !== false;
   const hit = Boolean(zone[`tp${n}Hit` as keyof Zone]);
   const state = tpDisplayState(enabled, hit);
-  if (state === "disabled") {
-    return (
-      <View style={[styles.tpChip, styles.tpChipDisabled]}>
-        <Text style={styles.tpChipTextDisabled}>N/A</Text>
-      </View>
-    );
-  }
+  if (state === "disabled") return null;
   const isHit = state === "hit";
   return (
     <View style={[styles.tpChip, isHit ? styles.tpChipHit : styles.tpChipPending]}>
@@ -64,6 +60,29 @@ function TpChip({ n, zone }: { n: 1 | 2 | 3 | 4; zone: Zone }) {
         <View style={styles.tpChipCircle} />
       )}
       <Text style={[styles.tpChipText, isHit && { color: C.buy }]}>TP{n}</Text>
+    </View>
+  );
+}
+
+function ExitChip({
+  label,
+  hit,
+  variant,
+}: {
+  label: string;
+  hit: boolean;
+  variant: "manual" | "sl";
+}) {
+  const hitStyle = variant === "sl" ? styles.tpChipSlHit : styles.tpChipManualHit;
+  const hitColor = variant === "sl" ? C.sell : C.gold;
+  return (
+    <View style={[styles.tpChip, hit ? hitStyle : styles.tpChipPending]}>
+      {hit ? (
+        <Feather name="check" size={10} color={hitColor} />
+      ) : (
+        <View style={styles.tpChipCircle} />
+      )}
+      <Text style={[styles.tpChipText, hit && { color: hitColor }]}>{label}</Text>
     </View>
   );
 }
@@ -136,6 +155,8 @@ function HistoryCard({ zone }: { zone: Zone }) {
         {([1, 2, 3, 4] as const).map((n) => (
           <TpChip key={n} n={n} zone={zone} />
         ))}
+        <ExitChip label="MANUAL" hit={Boolean(zone.manualClose)} variant="manual" />
+        <ExitChip label="SL" hit={Boolean(zone.slHit)} variant="sl" />
       </View>
     </View>
   );
@@ -210,7 +231,12 @@ export default function HistoryScreen() {
         )}
       </View>
 
-      <View style={styles.summaryBar}>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        style={styles.summaryScroll}
+        contentContainerStyle={styles.summaryBar}
+      >
         <SummaryCell label="ZONES" value={String(periodZones.length)} />
         <View style={styles.summaryDivider} />
         <SummaryCell label="TP1" value={String(countTpHits(periodZones, 1))} color={C.buy} />
@@ -218,7 +244,13 @@ export default function HistoryScreen() {
         <SummaryCell label="TP2" value={String(countTpHits(periodZones, 2))} color={C.buy} />
         <View style={styles.summaryDivider} />
         <SummaryCell label="TP3" value={String(countTpHits(periodZones, 3))} color={C.gold} />
-      </View>
+        <View style={styles.summaryDivider} />
+        <SummaryCell label="TP4" value={String(countTpHits(periodZones, 4))} color={C.gold} />
+        <View style={styles.summaryDivider} />
+        <SummaryCell label="MANUAL" value={String(countManualCloses(periodZones))} color={C.gold} />
+        <View style={styles.summaryDivider} />
+        <SummaryCell label="SL" value={String(countSlHits(periodZones))} color={C.sell} />
+      </ScrollView>
 
       {!accountId && (
         <Text style={styles.empty}>Connect MT5 in Settings to load history.</Text>
@@ -267,28 +299,36 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_700Bold",
     color: C.textSecondary,
   },
+  summaryScroll: {
+    marginBottom: 16,
+    flexGrow: 0,
+  },
   summaryBar: {
     flexDirection: "row",
     backgroundColor: C.card,
     borderRadius: 14,
     borderWidth: 1,
     borderColor: C.border,
-    paddingVertical: 14,
-    marginBottom: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 4,
     alignItems: "center",
   },
-  summaryCell: { flex: 1, alignItems: "center" },
+  summaryCell: {
+    minWidth: 52,
+    paddingHorizontal: 6,
+    alignItems: "center",
+  },
   summaryValue: {
-    fontSize: 22,
+    fontSize: 18,
     fontFamily: "Inter_700Bold",
     color: C.text,
   },
   summaryLabel: {
-    fontSize: 10,
+    fontSize: 8,
     fontFamily: "Inter_600SemiBold",
     color: C.textMuted,
     marginTop: 4,
-    letterSpacing: 0.8,
+    letterSpacing: 0.5,
   },
   summaryDivider: {
     width: 1,
@@ -387,6 +427,14 @@ const styles = StyleSheet.create({
   tpChipHit: {
     backgroundColor: C.buyDim,
     borderColor: C.buyBorder,
+  },
+  tpChipManualHit: {
+    backgroundColor: C.goldLight,
+    borderColor: C.gold,
+  },
+  tpChipSlHit: {
+    backgroundColor: C.sellDim,
+    borderColor: C.sell,
   },
   tpChipPending: {
     backgroundColor: C.card,

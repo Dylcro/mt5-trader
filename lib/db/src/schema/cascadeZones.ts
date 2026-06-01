@@ -40,6 +40,10 @@ export const cascadeZonesTable = pgTable("cascade_zones", {
   tp2Hit:      boolean("tp2_hit").notNull().default(false),
   tp3Hit:      boolean("tp3_hit").notNull().default(false),
   tp4Hit:      boolean("tp4_hit").notNull().default(false),
+  /** Zone fully closed by user/app or MT5 exit without TP4 automation. */
+  manualClose: boolean("manual_close").notNull().default(false),
+  /** Zone fully closed because broker stop loss was hit. */
+  slHit:       boolean("sl_hit").notNull().default(false),
   // When TP2 fires but price has retraced through the entry, true BE
   // (SL = openPrice) would be rejected by the broker (SL below current ask
   // for a SELL would close the position instantly). We instead apply a

@@ -419,6 +419,8 @@ function broadcastZoneUpdate(zoneId: string): void {
     tp3Enabled: st.tp3Enabled,
     tp4Enabled: st.tp4Enabled,
     tp2SlIsBestEffort: (st as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
+    manualClose: (st as { manualClose?: boolean }).manualClose ?? false,
+    slHit: (st as { slHit?: boolean }).slHit ?? false,
   });
 }
 
@@ -661,7 +663,7 @@ function makeDealListener(accountId: string) {
       // re-checks live positions via REST before marking the row CLOSED.
       if (deal?.entryType === "DEAL_ENTRY_OUT") {
         const posId = String(deal.positionId ?? "");
-        if (posId) void markZonePositionClosed(accountId, posId);
+        if (posId) void markZonePositionClosed(accountId, posId, deal);
         broadcastToAccount(accountId, "deal", { type: "position_changed" });
         // MetaAPI REST has eventual consistency — the first broadcast above races
         // the cache. A second broadcast ~1500ms later ensures the client re-fetches
@@ -1553,6 +1555,76 @@ export function computeFinalTpReached(z: {
   return last;
 }
 
+/** True when a broker deal indicates the position exited via stop loss. */
+export function dealIndicatesStopLoss(deal: unknown): boolean {
+  if (!deal || typeof deal !== "object") return false;
+  const d = deal as Record<string, unknown>;
+  const reason = String(d.reason ?? d.closeReason ?? "").toUpperCase();
+  if (reason.includes("SL") || reason.includes("STOP_LOSS") || reason.includes("STOP LOSS")) {
+    return true;
+  }
+  const comment = String(d.comment ?? "").toUpperCase();
+  return comment.includes("STOP LOSS") || comment.includes("[SL");
+}
+
+type CloseFinalizeOpts = { userInitiated?: boolean; stopLossExit?: boolean };
+
+/** Resolve close outcome for API/history (backfills legacy CLOSED rows missing flags). */
+export function resolveCloseOutcome(row: {
+  status: string;
+  tp4Enabled: boolean;
+  tp4Hit: boolean;
+  manualClose?: boolean;
+  slHit?: boolean;
+}): { manualClose: boolean; slHit: boolean } {
+  if (row.manualClose || row.slHit) {
+    return { manualClose: Boolean(row.manualClose), slHit: Boolean(row.slHit) };
+  }
+  if (row.status !== "CLOSED") return { manualClose: false, slHit: false };
+  const tp4Done = Boolean(row.tp4Enabled) && Boolean(row.tp4Hit);
+  return { manualClose: !tp4Done, slHit: false };
+}
+
+/** Persist how a closed zone ended (manual app/MT5 exit vs SL vs TP ladder). */
+async function finalizeZoneClose(
+  accountId: string,
+  zoneId: string,
+  opts: CloseFinalizeOpts = {},
+): Promise<void> {
+  try {
+    const [row] = await db.select().from(cascadeZonesTable)
+      .where(and(eq(cascadeZonesTable.zoneId, zoneId), eq(cascadeZonesTable.accountId, accountId)))
+      .limit(1);
+    if (!row || row.status !== "CLOSED") return;
+
+    let slHit = Boolean(opts.stopLossExit);
+    let manualClose = Boolean(opts.userInitiated);
+    const tp4Done = Boolean(row.tp4Enabled) && Boolean(row.tp4Hit);
+
+    if (!slHit && !manualClose) {
+      if (tp4Done) {
+        manualClose = false;
+      } else {
+        // Closed without TP4 automation — treat as manual exit (app or MT5).
+        manualClose = true;
+      }
+    }
+    if (slHit) manualClose = false;
+
+    await db.update(cascadeZonesTable)
+      .set({ slHit, manualClose })
+      .where(eq(cascadeZonesTable.zoneId, zoneId));
+    const st = zoneStates.get(zoneId);
+    if (st) {
+      (st as ZoneState & { slHit?: boolean; manualClose?: boolean }).slHit = slHit;
+      (st as ZoneState & { manualClose?: boolean }).manualClose = manualClose;
+    }
+    console.log(`[zone ${zoneId}] close outcome sl=${slHit} manual=${manualClose}`);
+  } catch (e) {
+    console.warn(`[zone ${zoneId}] finalizeZoneClose failed:`, (e as Error).message);
+  }
+}
+
 // ── Zone TP Engine ───────────────────────────────────────────────────────────
 // When a cascade is placed, create a "zone" anchored at the market price + direction.
 // A background monitor watches each zone's open positions against TP1/TP2/TP3
@@ -2021,7 +2093,11 @@ async function recordZonePositionFill(
 // the closed slice as `volume` — the position stays open with its remaining
 // volume. To avoid marking a still-open position CLOSED, verify the position
 // no longer exists on MetaAPI before flipping the row.
-async function markZonePositionClosed(accountId: string, positionId: string): Promise<void> {
+async function markZonePositionClosed(
+  accountId: string,
+  positionId: string,
+  exitDeal?: unknown,
+): Promise<void> {
   try {
     // Join through cascade_zones so we only act on rows belonging to *this*
     // account — MT5 position IDs can be reused across accounts/brokers.
@@ -2101,6 +2177,9 @@ async function markZonePositionClosed(accountId: string, positionId: string): Pr
         .where(eq(cascadeZonesTable.zoneId, zoneId))
       );
       if (st) st.status = "CLOSED";
+      await finalizeZoneClose(accountId, zoneId, {
+        stopLossExit: dealIndicatesStopLoss(exitDeal),
+      });
       void settleZoneClosedPnl(accountId, zoneId);
       logEvent("zone.close", { accountId, zoneId, trigger: "position.closed" });
       // Cancel any outstanding cascade limit orders — when the user manually
@@ -2471,6 +2550,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
             .where(eq(cascadeZonesTable.zoneId, zoneId))
         ).catch(() => {/* logged inside withDbRetry */});
         st.status = "CLOSED";
+        await finalizeZoneClose(st.accountId, zoneId, {});
         void settleZoneClosedPnl(st.accountId, zoneId);
         logEvent("zone.close", { accountId: st.accountId, zoneId, trigger: "reconciliation" });
         // Cancel any outstanding cascade limit orders so they don't orphan on
@@ -3216,15 +3296,24 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
     // Reuse the cached tick from the existing /price poll — no extra backend load.
     const price = latestPrice(accountId);
     const out = [];
+    let settleBudget = 8;
     for (const z of zones) {
+      try {
       if (!includeClosed && z.status === "CLOSED") continue;
       let row = z;
-      if (z.status === "CLOSED" && z.closedPnl == null) {
-        await settleZoneClosedPnl(accountId, z.zoneId);
-        const [fresh] = await db.select().from(cascadeZonesTable)
-          .where(eq(cascadeZonesTable.zoneId, z.zoneId))
-          .limit(1);
-        if (fresh) row = fresh;
+      if (z.status === "CLOSED" && z.closedPnl == null && settleBudget > 0) {
+        settleBudget -= 1;
+        try {
+          await settleZoneClosedPnl(accountId, z.zoneId);
+          const [fresh] = await db.select().from(cascadeZonesTable)
+            .where(eq(cascadeZonesTable.zoneId, z.zoneId))
+            .limit(1);
+          if (fresh) row = fresh;
+        } catch (settleErr) {
+          console.warn(`[zones] settle ${z.zoneId}:`, (settleErr as Error).message);
+        }
+      } else if (z.status === "CLOSED" && z.closedPnl == null) {
+        void settleZoneClosedPnl(accountId, z.zoneId);
       }
       const openPositions = await db.select().from(zonePositionsTable)
         .where(and(eq(zonePositionsTable.zoneId, row.zoneId), eq(zonePositionsTable.status, "OPEN")));
@@ -3299,6 +3388,7 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         closedAt: row.closedAt != null ? Number(row.closedAt) : null,
         closedPnl: row.closedPnl != null ? Number(row.closedPnl) : null,
         finalTpReached,
+        ...resolveCloseOutcome(row),
         positionCount: openPositions.length,
         originalVolume: row.originalVolume != null ? Number(row.originalVolume) : 0,
         currentPrice,
@@ -3307,6 +3397,9 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         pipsToNextTp,
         progressPct,
       });
+      } catch (zoneErr) {
+        console.warn(`[zones] skip zone ${z.zoneId}:`, (zoneErr as Error).message);
+      }
     }
     res.json(out);
   } catch (err) {
@@ -3465,6 +3558,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
       .set({ status: "CLOSED", closedAt })
       .where(eq(cascadeZonesTable.zoneId, zoneId));
     if (st) st.status = "CLOSED";
+    await finalizeZoneClose(accountId, zoneId, { userInitiated: true });
     void settleZoneClosedPnl(accountId, zoneId);
     broadcastZoneUpdate(zoneId);
     logEvent("zone.close", { accountId, zoneId, closedCount: live.length, trigger: "user" });

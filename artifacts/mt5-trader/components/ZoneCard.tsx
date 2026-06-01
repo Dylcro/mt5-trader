@@ -77,7 +77,7 @@ function tpChipState(zone: Zone, level: 1 | 2 | 3 | 4): TpChipState {
 function tpChipLabel(zone: Zone, level: 1 | 2 | 3 | 4): string {
   const price = zone[`tp${level}Price` as keyof Zone] as number | null | undefined;
   if (!tpEnabledAtPlacement(zone, level)) {
-    return level === 4 ? "TP4 OFF" : `TP${level} OFF`;
+    return level === 4 ? "MANUAL" : `TP${level} OFF`;
   }
   if (price != null) return `TP${level} ${formatPrice(price)}`;
   return level === 4 ? "TP4 manual" : `TP${level} —`;
