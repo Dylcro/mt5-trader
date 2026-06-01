@@ -1,9 +1,10 @@
 import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { createRequire } from "module";
-import { db, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable, cascadeZonesTable, zonePositionsTable, zoneOrdersTable, notificationPrefsTable } from "@workspace/db";
+import { db, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable, cascadeZonesTable, zonePositionsTable, zoneOrdersTable, notificationPrefsTable, usersTable } from "@workspace/db";
 import { and, eq, inArray, isNotNull } from "drizzle-orm";
 import { JWT_SECRET } from "./auth";
+import { getTradingStatus } from "../lib/platformFlags";
 import { logEvent } from "../logger";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
 // In dev (tsx/ESM) import.meta.url is the real file URL.
@@ -21,7 +22,7 @@ const router: IRouter = Router();
 // userId → accountId in-memory ownership cache. Populated on /connect.
 const userAccountCache = new Map<string, string>(); // userId → accountId
 
-function requireAuth(req: Request, res: Response, next: NextFunction): void {
+async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer ")) {
     res.status(401).json({ error: "Unauthorized" });
@@ -29,7 +30,16 @@ function requireAuth(req: Request, res: Response, next: NextFunction): void {
   }
   try {
     const payload = jwt.verify(authHeader.slice(7), JWT_SECRET) as { sub: string };
-    (req as unknown as Record<string, unknown>)["userId"] = payload.sub;
+    const userId = payload.sub;
+    const [user] = await db.select({ locked: usersTable.locked })
+      .from(usersTable)
+      .where(eq(usersTable.id, Number(userId)))
+      .limit(1);
+    if (user?.locked) {
+      res.status(403).json({ error: "Your account is locked. Contact support." });
+      return;
+    }
+    (req as unknown as Record<string, unknown>)["userId"] = userId;
     next();
   } catch {
     res.status(401).json({ error: "Invalid or expired token." });
@@ -872,6 +882,17 @@ async function stopStreaming(accountId: string): Promise<void> {
     recoveryTimers.delete(accountId);
   }
   console.log(`[stream ${accountId}] stopped and cleaned up`);
+}
+
+/** Admin: drop broker stream and remove stored link for a user. */
+export async function disconnectUserMt5(userId: string): Promise<number> {
+  const rows = await db.select().from(storedAccountsTable).where(eq(storedAccountsTable.userId, userId));
+  for (const row of rows) {
+    await stopStreaming(row.accountId);
+    await db.delete(storedAccountsTable).where(eq(storedAccountsTable.accountId, row.accountId));
+  }
+  userAccountCache.delete(userId);
+  return rows.length;
 }
 
 async function startStreaming(token: string, accountId: string, region: string = DEFAULT_REGION, userId?: string): Promise<void> {
@@ -4433,6 +4454,11 @@ const TRADE_ERROR_MESSAGES: Record<number, string> = {
 // Falls back to REST if the connection is unavailable or the SDK call throws.
 router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, res: Response) => {
   const accountId = String(req.params.accountId);
+  const trading = getTradingStatus();
+  if (!trading.trading_enabled) {
+    res.status(503).json({ error: trading.message });
+    return;
+  }
   try {
     const token = getToken();
     const region = qstr(req.query.region) || DEFAULT_REGION;

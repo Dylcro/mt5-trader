@@ -23,6 +23,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useTrading, type SLMode } from "@/context/TradingContext";
 import { buildCascadeLevels, useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
+import { usePlatformStatus } from "@/hooks/usePlatformStatus";
 
 const LOT_SIZE_SINGLE_KEY = "lot_size_single";
 const LOT_SIZE_CASCADE_KEY = "lot_size_cascade";
@@ -325,6 +326,9 @@ export default function TradeScreen() {
     else void syncSession(true);
   }, [status, connect, syncSession]);
   const { formatMoney } = useDisplayCurrency();
+  const { status: platformStatus } = usePlatformStatus();
+  const platformRef = useRef(platformStatus);
+  useEffect(() => { platformRef.current = platformStatus; }, [platformStatus]);
   const { settings: cascadeSettings } = useCascadeSettings();
   const cascadeSettingsRef = useRef(cascadeSettings);
   useEffect(() => { cascadeSettingsRef.current = cascadeSettings; }, [cascadeSettings]);
@@ -588,6 +592,10 @@ export default function TradeScreen() {
       Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
       return;
     }
+    if (!platformRef.current.trading_enabled) {
+      Alert.alert("Trading paused", platformRef.current.message || "Trading is temporarily paused.");
+      return;
+    }
     // Lock button and fire haptics simultaneously — don't await haptics before locking
     isPlacingRef.current = true;
     setIsPlacing(true);
@@ -622,6 +630,10 @@ export default function TradeScreen() {
     }
     if (statusRef.current !== "connected") {
       Alert.alert("Not Connected", "Please connect your MT5 account in Settings first, then return here to trade.");
+      return;
+    }
+    if (!platformRef.current.trading_enabled) {
+      Alert.alert("Trading paused", platformRef.current.message || "Trading is temporarily paused.");
       return;
     }
     const mktPrice = dir === "buy" ? (p?.ask ?? 0) : (p?.bid ?? 0);
@@ -801,6 +813,14 @@ export default function TradeScreen() {
         contentContainerStyle={[styles.scroll, { paddingBottom: insets.bottom + 100 }]}
         keyboardShouldPersistTaps="handled"
       >
+        {!platformStatus.trading_enabled ? (
+          <View style={styles.advisoryBanner}>
+            <Feather name="pause-circle" size={16} color={C.sell} />
+            <Text style={styles.advisoryText}>
+              {platformStatus.message || "Trading is temporarily paused."}
+            </Text>
+          </View>
+        ) : null}
         {/* Price Card — navy hero */}
         <View style={[styles.card, styles.navyPriceCard]}>
           {price ? (

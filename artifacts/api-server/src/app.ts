@@ -8,6 +8,7 @@ import router from "./routes";
 import adminRouter from "./routes/admin";
 import authRouter from "./routes/auth";
 import healthRouter from "./routes/health";
+import systemRouter from "./routes/system";
 import { authLimiter, apiLimiter } from "./lib/rateLimiters";
 import { STATUS_PAGE_CSS } from "./lib/appTheme";
 
@@ -44,6 +45,7 @@ app.use(healthRouter);
 app.use("/api", healthRouter);
 
 app.use("/api/admin", adminRouter);
+app.use("/api/system", systemRouter);
 app.use("/api/auth", authLimiter, authRouter);
 app.use("/api", apiLimiter);
 

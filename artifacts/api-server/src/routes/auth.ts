@@ -3,6 +3,11 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { db, usersTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
+import {
+  addWaitlistEmail,
+  countRealUsers,
+  getPlatformFlags,
+} from "../lib/platformFlags";
 
 const router = Router();
 
@@ -14,7 +19,7 @@ function makeToken(userId: number, email: string): string {
 }
 
 router.post("/register", async (req: Request, res: Response): Promise<void> => {
-  const { email, password, fullName } = req.body ?? {};
+  const { email, password, fullName, inviteCode } = req.body ?? {};
 
   if (!fullName || typeof fullName !== "string" || fullName.trim().length < 2) {
     res.status(400).json({ error: "Please enter your full name." });
@@ -26,6 +31,32 @@ router.post("/register", async (req: Request, res: Response): Promise<void> => {
   }
   if (!password || typeof password !== "string" || password.length < 8) {
     res.status(400).json({ error: "Password must be at least 8 characters." });
+    return;
+  }
+
+  const flags = getPlatformFlags();
+  if (!flags.signupsOpen) {
+    await addWaitlistEmail(email);
+    res.status(403).json({
+      error: "Registration is closed. You've been added to the waitlist — we'll email you when a spot opens.",
+      waitlist: true,
+    });
+    return;
+  }
+  if (flags.inviteOnly) {
+    const code = typeof inviteCode === "string" ? inviteCode.trim() : "";
+    if (!flags.inviteCode || code !== flags.inviteCode) {
+      res.status(403).json({ error: "A valid invite code is required to sign up." });
+      return;
+    }
+  }
+  const realCount = await countRealUsers();
+  if (realCount >= flags.membershipCap) {
+    await addWaitlistEmail(email);
+    res.status(403).json({
+      error: "We're full for now. You've been added to the waitlist — we'll contact you when a spot opens.",
+      waitlist: true,
+    });
     return;
   }
 
@@ -70,6 +101,10 @@ router.post("/login", async (req: Request, res: Response): Promise<void> => {
       res.status(401).json({ error: "Incorrect email or password." });
       return;
     }
+    if (user.locked) {
+      res.status(403).json({ error: user.lockedReason ?? "Your account is locked. Contact support." });
+      return;
+    }
 
     const match = await bcrypt.compare(password, user.passwordHash);
     if (!match) {
@@ -95,6 +130,22 @@ router.get("/me", async (req: Request, res: Response): Promise<void> => {
     res.json({ user: { id: Number(payload.sub), email: payload.email } });
   } catch {
     res.status(401).json({ error: "Invalid or expired token." });
+  }
+});
+
+/** Join waitlist without registering (when cap is full). */
+router.post("/waitlist", async (req: Request, res: Response): Promise<void> => {
+  const { email } = req.body ?? {};
+  if (!email || typeof email !== "string" || !email.includes("@")) {
+    res.status(400).json({ error: "A valid email is required." });
+    return;
+  }
+  try {
+    await addWaitlistEmail(email);
+    res.json({ ok: true, message: "You're on the waitlist." });
+  } catch (err) {
+    console.error("[auth/waitlist]", err);
+    res.status(500).json({ error: "Could not add to waitlist." });
   }
 });
 

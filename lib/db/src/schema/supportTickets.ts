@@ -7,6 +7,8 @@ export const supportTicketsTable = pgTable("support_tickets", {
   accountNumber: text("account_number"),
   query:         text("query").notNull(),
   createdAt:     bigint("created_at", { mode: "number" }).notNull(),
+  /** unread | read | resolved */
+  status:        text("status").notNull().default("unread"),
 });
 
 export type SupportTicket = typeof supportTicketsTable.$inferSelect;

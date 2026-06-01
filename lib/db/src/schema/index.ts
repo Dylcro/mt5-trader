@@ -17,6 +17,7 @@
 //   export type InsertPost = z.infer<typeof insertPostSchema>;
 //   export type Post = typeof postsTable.$inferSelect;
 
+export * from "./adminSettings";
 export * from "./cascadeConfig";
 export * from "./cascadeHistory";
 export * from "./cascadeOrders";
@@ -25,3 +26,4 @@ export * from "./notificationPrefs";
 export * from "./storedAccounts";
 export * from "./supportTickets";
 export * from "./users";
+export * from "./waitlist";
