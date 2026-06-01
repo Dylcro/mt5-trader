@@ -264,27 +264,15 @@ export default function PositionsScreen() {
 
   const handleCancelOrder = useCallback(
     async (order: PendingOrder) => {
-      Alert.alert(
-        "Cancel Order",
-        `Cancel ${order.type.includes("BUY") ? "BUY" : "SELL"} LIMIT @ ${formatPrice(order.openPrice)} (${order.volume} lots)?`,
-        [
-          { text: "Keep", style: "cancel" },
-          {
-            text: "Cancel Order",
-            style: "destructive",
-            onPress: async () => {
-              setBusyId(order.id);
-              const result = await cancelOrder(order.id);
-              setBusyId(null);
-              if (!result.success) {
-                Alert.alert("Error", result.message);
-              } else {
-                await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-              }
-            },
-          },
-        ]
-      );
+      setBusyId(order.id);
+      await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      const result = await cancelOrder(order.id);
+      setBusyId(null);
+      if (!result.success) {
+        Alert.alert("Error", result.message);
+      } else {
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      }
     },
     [cancelOrder]
   );
@@ -295,32 +283,17 @@ export default function PositionsScreen() {
   const handleCloseGroup = useCallback(
     async (group: Position[]) => {
       if (group.length === 0) return;
-      const totalLots = group.reduce((s, p) => s + p.volume, 0);
-      const totalProfit = group.reduce((s, p) => s + p.profit, 0);
-      const dir = group[0]!.type === "POSITION_TYPE_BUY" ? "BUY" : "SELL";
-      Alert.alert(
-        group.length === 1 ? "Close Position" : `Close ${group.length} Positions`,
-        `Close ${dir} ${totalLots.toFixed(2)} lots${group.length > 1 ? ` across ${group.length} positions` : ""}?\n\nP&L: ${totalProfit >= 0 ? "+" : ""}${totalProfit.toFixed(2)}`,
-        [
-          { text: "Cancel", style: "cancel" },
-          {
-            text: "Close",
-            style: "destructive",
-            onPress: async () => {
-              const results = await Promise.all(group.map((p) => closePosition(p.id)));
-              const failed = results.filter((r) => !r.success);
-              if (failed.length === 0) {
-                await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-              } else {
-                Alert.alert(
-                  "Some Positions Failed",
-                  `${results.length - failed.length}/${results.length} closed. ${failed[0]!.message}`,
-                );
-              }
-            },
-          },
-        ]
-      );
+      await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+      const results = await Promise.all(group.map((p) => closePosition(p.id)));
+      const failed = results.filter((r) => !r.success);
+      if (failed.length === 0) {
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      } else {
+        Alert.alert(
+          "Some Positions Failed",
+          `${results.length - failed.length}/${results.length} closed. ${failed[0]!.message}`,
+        );
+      }
     },
     [closePosition]
   );

@@ -21,7 +21,7 @@ import { setAuthTokenGetter } from "@/lib/authToken";
 const C = Colors.dark;
 
 function TabEmoji({ emoji, focused }: { emoji: string; focused: boolean }) {
-  return <Text style={{ fontSize: 22, opacity: focused ? 1 : 0.5 }}>{emoji}</Text>;
+  return <Text style={{ fontSize: 26, lineHeight: 30, opacity: focused ? 1 : 0.55 }}>{emoji}</Text>;
 }
 
 function TabChrome({
@@ -147,14 +147,18 @@ function ClassicTabLayout({
             borderTopWidth: 1,
             borderTopColor: C.border,
             elevation: 0,
-            paddingBottom: isWeb ? 0 : insets.bottom,
-            ...(isWeb ? { height: 84 } : {}),
+            paddingTop: 6,
+            paddingBottom: isWeb ? 8 : Math.max(insets.bottom, 8),
+            height: isWeb ? 84 : 56 + Math.max(insets.bottom, 8),
+          },
+          tabBarItemStyle: {
+            paddingVertical: 4,
           },
           tabBarLabelStyle: {
             fontFamily: "Inter_600SemiBold",
-            fontSize: 9,
-            marginTop: -2,
-            letterSpacing: 0.6,
+            fontSize: 11,
+            marginTop: 2,
+            letterSpacing: 0.5,
             textTransform: "uppercase",
           },
         }}

@@ -162,15 +162,7 @@ export default function ZoneCard({
   };
 
   const handleCloseZone = () => {
-    if (!onCloseZone || closeBusy) return;
-    Alert.alert(
-      "Close Zone",
-      "Close all open positions in this zone and cancel its pending limits? Other zones are not affected.",
-      [
-        { text: "Keep", style: "cancel" },
-        { text: "Close Zone", style: "destructive", onPress: () => void runCloseZone() },
-      ],
-    );
+    void runCloseZone();
   };
 
   const runCancelOrders = async () => {
@@ -193,15 +185,7 @@ export default function ZoneCard({
   };
 
   const handleCancelOrders = () => {
-    if (!onCancelOrders || delBusy) return;
-    Alert.alert(
-      "Delete Orders",
-      "Cancel all pending limit orders for this zone only? Open positions are not closed.",
-      [
-        { text: "Keep", style: "cancel" },
-        { text: "Delete Orders", style: "destructive", onPress: () => void runCancelOrders() },
-      ],
-    );
+    void runCancelOrders();
   };
 
   return (
