@@ -29,6 +29,37 @@ const LOT_SIZE_CASCADE_KEY = "lot_size_cascade";
 
 const C = Colors.dark;
 
+type SyncUiVariant = "ready" | "sync" | "wait" | "connect";
+
+/** Single source of truth for the header sync button and the XAUUSD status chip. */
+function resolveSyncUi(
+  status: "connected" | "connecting" | "disconnected" | string,
+  syncReady: boolean,
+  connectionWarm: boolean,
+  hasPrice: boolean,
+  priceError: boolean,
+): { variant: SyncUiVariant; actionLabel: string; statusLabel: string } {
+  if (status === "disconnected") {
+    return { variant: "connect", actionLabel: "Connect MT5", statusLabel: "OFFLINE" };
+  }
+  if (status === "connecting") {
+    return { variant: "wait", actionLabel: "Connecting…", statusLabel: "CONNECTING" };
+  }
+  if (status === "connected" && !connectionWarm) {
+    return { variant: "wait", actionLabel: "Syncing…", statusLabel: "SYNCING" };
+  }
+  if (status === "connected" && !hasPrice) {
+    return { variant: "wait", actionLabel: "Syncing…", statusLabel: "FETCHING" };
+  }
+  if (priceError) {
+    return { variant: "sync", actionLabel: "Tap to sync", statusLabel: "STALE" };
+  }
+  if (syncReady) {
+    return { variant: "ready", actionLabel: "Ready to trade", statusLabel: "LIVE" };
+  }
+  return { variant: "sync", actionLabel: "Tap to sync", statusLabel: "NEEDS SYNC" };
+}
+
 type Direction = "buy" | "sell";
 type TradeMode = "single" | "cascade";
 
@@ -279,13 +310,20 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, connectionWarm, sseConnected, syncSession } = useTrading();
+  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, connectionWarm, syncSession } = useTrading();
 
   const syncReady =
     status === "connected" &&
     connectionWarm &&
     price != null &&
     !priceError;
+
+  const syncUi = resolveSyncUi(status, syncReady, connectionWarm, price != null, priceError);
+
+  const handleHeaderSync = useCallback(() => {
+    if (status === "disconnected") void connect();
+    else void syncSession(true);
+  }, [status, connect, syncSession]);
   const { formatMoney } = useDisplayCurrency();
   const { settings: cascadeSettings } = useCascadeSettings();
   const cascadeSettingsRef = useRef(cascadeSettings);
@@ -686,52 +724,74 @@ export default function TradeScreen() {
         <View style={styles.headerLeft}>
           <Text style={styles.symbol}>XAUUSD</Text>
           <Pressable
-            onPress={() => {
-              if (status === "disconnected") void connect();
-              else if (status === "connected") void syncSession(true);
-            }}
-            hitSlop={12}
+            onPress={() => void handleHeaderSync()}
+            hitSlop={8}
+            accessibilityLabel={`${syncUi.statusLabel}. ${syncUi.actionLabel}`}
+            style={({ pressed }) => [
+              styles.liveDot,
+              syncUi.variant === "ready" && styles.liveDotReady,
+              syncUi.variant === "sync" && styles.liveDotSync,
+              syncUi.variant === "wait" && styles.liveDotWait,
+              syncUi.variant === "connect" && styles.liveDotConnect,
+              pressed && { opacity: 0.85 },
+            ]}
           >
-            <View style={styles.liveDot}>
-              <Animated.View style={[styles.dot, { opacity: status === "connected" ? blinkAnim : 0.2, backgroundColor: status === "connected" ? C.buy : status === "connecting" ? C.gold : C.sell }]} />
-              <Text style={[styles.liveLabel, status === "disconnected" && { color: C.sell }]}>
-                {status === "connected"
-                  ? !price
-                    ? "FETCHING PRICE…"
-                    : !connectionWarm
-                      ? "SYNCING…"
-                      : sseConnected
-                        ? "LIVE"
-                        : "CONNECTED"
-                  : status === "connecting"
-                    ? "CONNECTING MT5…"
-                  : status === "disconnected"
-                    ? "TAP TO RECONNECT"
-                    : status.toUpperCase()}
-              </Text>
-            </View>
+            <Animated.View
+              style={[
+                styles.dot,
+                {
+                  opacity: syncUi.variant === "ready" ? blinkAnim : 0.9,
+                  backgroundColor:
+                    syncUi.variant === "ready"
+                      ? C.buy
+                      : syncUi.variant === "wait"
+                        ? C.gold
+                        : C.sell,
+                },
+              ]}
+            />
+            <Text
+              style={[
+                styles.liveLabel,
+                syncUi.variant === "ready" && { color: C.buy },
+                syncUi.variant === "wait" && { color: C.gold },
+                (syncUi.variant === "sync" || syncUi.variant === "connect") && { color: C.sell },
+              ]}
+            >
+              {syncUi.statusLabel}
+            </Text>
           </Pressable>
         </View>
         <Pressable
-          onPress={() => {
-            if (status === "disconnected") void connect();
-            else if (status === "connected") void syncSession(true);
-          }}
+          onPress={() => void handleHeaderSync()}
           hitSlop={8}
-          accessibilityLabel={syncReady ? "Connection ready, tap to refresh" : "Tap to sync MT5 connection"}
+          accessibilityLabel={`${syncUi.actionLabel}. Refreshes broker connection and live price.`}
           style={({ pressed }) => [
-            styles.headerSyncBtn,
-            syncReady ? styles.headerSyncBtnReady : styles.headerSyncBtnRefresh,
-            pressed && { opacity: 0.8, transform: [{ scale: 0.96 }] },
+            styles.headerSyncPill,
+            syncUi.variant === "ready" && styles.headerSyncPillReady,
+            syncUi.variant === "sync" && styles.headerSyncPillSync,
+            syncUi.variant === "wait" && styles.headerSyncPillWait,
+            syncUi.variant === "connect" && styles.headerSyncPillConnect,
+            pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
           ]}
         >
-          {status === "connected" && !connectionWarm ? (
-            <ActivityIndicator size="small" color={C.sell} />
-          ) : syncReady ? (
-            <Feather name="check" size={22} color={C.buy} />
+          {syncUi.variant === "wait" ? (
+            <ActivityIndicator size="small" color={C.gold} />
+          ) : syncUi.variant === "ready" ? (
+            <Feather name="check-circle" size={18} color={C.buy} />
           ) : (
-            <Feather name="refresh-cw" size={20} color={C.sell} />
+            <Feather name="refresh-cw" size={16} color={C.sell} />
           )}
+          <Text
+            style={[
+              styles.headerSyncPillText,
+              syncUi.variant === "ready" && { color: C.buy },
+              (syncUi.variant === "sync" || syncUi.variant === "connect") && { color: C.sell },
+              syncUi.variant === "wait" && { color: C.gold },
+            ]}
+          >
+            {syncUi.actionLabel}
+          </Text>
         </Pressable>
       </View>
 
@@ -754,7 +814,7 @@ export default function TradeScreen() {
                 <View style={styles.priceErrorBanner}>
                   <Feather name="wifi-off" size={12} color={C.sell} />
                   <Text style={styles.priceErrorText}>
-                    Price feed interrupted — tap the red sync button (top right) to retry
+                    Price feed interrupted — tap Tap to sync at the top right
                   </Text>
                 </View>
               )}
@@ -764,7 +824,7 @@ export default function TradeScreen() {
               <MaterialCommunityIcons name="chart-line" size={28} color={C.textMuted} />
               <Text style={styles.noPriceText}>
                 {priceError
-                  ? "Price feed failed — tap sync (top right)"
+                  ? "Price feed failed — tap Tap to sync at the top right"
                   : status === "connecting"
                     ? "Fetching price..."
                     : "Connect account to see live price"}
@@ -857,14 +917,9 @@ export default function TradeScreen() {
             Fetching live price…
           </Text>
         )}
-        {status === "connected" && price && !connectionWarm && (
+        {status === "connected" && !syncReady && (
           <Text style={styles.cascadeStatusHint}>
-            Warming broker link — red sync (top right) turns green ✓ when ready
-          </Text>
-        )}
-        {status === "connected" && syncReady && (
-          <Text style={styles.cascadeStatusHint}>
-            Green ✓ top right — good to trade (tap to refresh anytime)
+            After a break, use Tap to sync (top right) — turns green when Ready to trade
           </Text>
         )}
         {status !== "connected" && status !== "connecting" && (
@@ -1136,28 +1191,60 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 5,
-    backgroundColor: C.surface,
     paddingHorizontal: 8,
-    paddingVertical: 3,
+    paddingVertical: 5,
     borderRadius: 20,
+    borderWidth: 1,
   },
-  dot: { width: 6, height: 6, borderRadius: 3, backgroundColor: C.buy },
-  liveLabel: { fontSize: 10, fontFamily: "Inter_600SemiBold", color: C.buy, letterSpacing: 0.5 },
-  headerSyncBtn: {
-    width: 44,
-    height: 44,
-    borderRadius: 12,
-    borderWidth: 1.5,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  headerSyncBtnReady: {
+  liveDotReady: {
     backgroundColor: C.buyDim,
     borderColor: C.buy,
   },
-  headerSyncBtnRefresh: {
+  liveDotSync: {
     backgroundColor: C.sellDim,
     borderColor: C.sell,
+  },
+  liveDotWait: {
+    backgroundColor: C.goldLight,
+    borderColor: C.goldBorder,
+  },
+  liveDotConnect: {
+    backgroundColor: C.sellDim,
+    borderColor: C.sell,
+  },
+  dot: { width: 6, height: 6, borderRadius: 3, backgroundColor: C.buy },
+  liveLabel: { fontSize: 10, fontFamily: "Inter_700Bold", color: C.buy, letterSpacing: 0.6 },
+  headerSyncPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 20,
+    borderWidth: 1.5,
+    maxWidth: 148,
+  },
+  headerSyncPillReady: {
+    backgroundColor: C.buyDim,
+    borderColor: C.buy,
+  },
+  headerSyncPillSync: {
+    backgroundColor: C.sellDim,
+    borderColor: C.sell,
+  },
+  headerSyncPillWait: {
+    backgroundColor: C.goldLight,
+    borderColor: C.goldBorder,
+  },
+  headerSyncPillConnect: {
+    backgroundColor: C.sellDim,
+    borderColor: C.sell,
+  },
+  headerSyncPillText: {
+    fontSize: 11,
+    fontFamily: "Inter_700Bold",
+    letterSpacing: 0.3,
+    flexShrink: 1,
   },
   scroll: { padding: 16, gap: 12 },
   stickyFooter: {
