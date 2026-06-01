@@ -27,6 +27,14 @@ export function countTpHits(zones: Zone[], level: 1 | 2 | 3): number {
   return zones.filter((z) => Boolean(z[key])).length;
 }
 
+export function countManualCloses(zones: Zone[]): number {
+  return zones.filter((z) => Boolean(z.manualClose)).length;
+}
+
+export function countSlHits(zones: Zone[]): number {
+  return zones.filter((z) => Boolean(z.slHit)).length;
+}
+
 /** Win = closed zone with positive realized P&L; falls back to TP hits when P&L not settled yet. */
 export function isZoneWin(z: Zone): boolean {
   if (typeof z.closedPnl === "number" && Number.isFinite(z.closedPnl)) {

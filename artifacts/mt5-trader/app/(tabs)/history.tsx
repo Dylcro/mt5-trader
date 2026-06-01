@@ -19,6 +19,8 @@ import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
 import { formatDuration, formatHistoryDate, formatPrice } from "@/lib/formatters";
 import { tpDisplayState } from "@/lib/zoneComments";
 import {
+  countManualCloses,
+  countSlHits,
   countTpHits,
   filterClosedZonesByPeriod,
   tpPillStyle,
@@ -48,13 +50,7 @@ function TpChip({ n, zone }: { n: 1 | 2 | 3 | 4; zone: Zone }) {
   const enabled = zone[`tp${n}Enabled` as keyof Zone] !== false;
   const hit = Boolean(zone[`tp${n}Hit` as keyof Zone]);
   const state = tpDisplayState(enabled, hit);
-  if (state === "disabled") {
-    return (
-      <View style={[styles.tpChip, styles.tpChipDisabled]}>
-        <Text style={styles.tpChipTextDisabled}>N/A</Text>
-      </View>
-    );
-  }
+  if (state === "disabled") return null;
   const isHit = state === "hit";
   return (
     <View style={[styles.tpChip, isHit ? styles.tpChipHit : styles.tpChipPending]}>
@@ -64,6 +60,29 @@ function TpChip({ n, zone }: { n: 1 | 2 | 3 | 4; zone: Zone }) {
         <View style={styles.tpChipCircle} />
       )}
       <Text style={[styles.tpChipText, isHit && { color: C.buy }]}>TP{n}</Text>
+    </View>
+  );
+}
+
+function ExitChip({
+  label,
+  hit,
+  variant,
+}: {
+  label: string;
+  hit: boolean;
+  variant: "manual" | "sl";
+}) {
+  const hitStyle = variant === "sl" ? styles.tpChipSlHit : styles.tpChipManualHit;
+  const hitColor = variant === "sl" ? C.sell : C.gold;
+  return (
+    <View style={[styles.tpChip, hit ? hitStyle : styles.tpChipPending]}>
+      {hit ? (
+        <Feather name="check" size={10} color={hitColor} />
+      ) : (
+        <View style={styles.tpChipCircle} />
+      )}
+      <Text style={[styles.tpChipText, hit && { color: hitColor }]}>{label}</Text>
     </View>
   );
 }
@@ -136,6 +155,8 @@ function HistoryCard({ zone }: { zone: Zone }) {
         {([1, 2, 3, 4] as const).map((n) => (
           <TpChip key={n} n={n} zone={zone} />
         ))}
+        <ExitChip label="MANUAL" hit={Boolean(zone.manualClose)} variant="manual" />
+        <ExitChip label="SL" hit={Boolean(zone.slHit)} variant="sl" />
       </View>
     </View>
   );
@@ -217,7 +238,9 @@ export default function HistoryScreen() {
         <View style={styles.summaryDivider} />
         <SummaryCell label="TP2" value={String(countTpHits(periodZones, 2))} color={C.buy} />
         <View style={styles.summaryDivider} />
-        <SummaryCell label="TP3" value={String(countTpHits(periodZones, 3))} color={C.gold} />
+        <SummaryCell label="MAN" value={String(countManualCloses(periodZones))} color={C.gold} />
+        <View style={styles.summaryDivider} />
+        <SummaryCell label="SL" value={String(countSlHits(periodZones))} color={C.sell} />
       </View>
 
       {!accountId && (
@@ -387,6 +410,14 @@ const styles = StyleSheet.create({
   tpChipHit: {
     backgroundColor: C.buyDim,
     borderColor: C.buyBorder,
+  },
+  tpChipManualHit: {
+    backgroundColor: C.goldLight,
+    borderColor: C.gold,
+  },
+  tpChipSlHit: {
+    backgroundColor: C.sellDim,
+    borderColor: C.sell,
   },
   tpChipPending: {
     backgroundColor: C.card,
