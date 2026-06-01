@@ -5,7 +5,6 @@ import { ActivityIndicator, Alert, Platform, Pressable, StyleSheet, Text, View }
 
 import Colors from "@/constants/colors";
 import type { Zone } from "@/hooks/useZones";
-import { tpDisplayState } from "@/lib/zoneComments";
 
 const C = Colors.dark;
 
@@ -26,7 +25,9 @@ function formatClosedAt(ms: number): string {
   return `${date} ${time}`;
 }
 
-function TpChip({ label, state }: { label: string; state: "pending" | "hit" | "disabled" }) {
+type TpChipState = "pending" | "hit" | "disabled" | "manual";
+
+function TpChip({ label, state }: { label: string; state: TpChipState }) {
   if (state === "disabled") {
     return (
       <View style={[styles.tpChip, styles.tpChipDisabled]}>
@@ -35,12 +36,51 @@ function TpChip({ label, state }: { label: string; state: "pending" | "hit" | "d
     );
   }
   const hit = state === "hit";
+  const manual = state === "manual";
   return (
-    <View style={[styles.tpChip, hit ? styles.tpChipHit : styles.tpChipPending]}>
+    <View
+      style={[
+        styles.tpChip,
+        hit ? styles.tpChipHit : manual ? styles.tpChipManual : styles.tpChipPending,
+      ]}
+    >
       {hit && <Feather name="check" size={10} color="#000" />}
-      <Text style={[styles.tpChipText, hit && { color: "#000" }]}>{label}</Text>
+      <Text
+        style={[
+          styles.tpChipText,
+          hit && { color: "#000" },
+          manual && { color: C.gold },
+        ]}
+      >
+        {label}
+      </Text>
     </View>
   );
+}
+
+function tpEnabledAtPlacement(zone: Zone, level: 1 | 2 | 3 | 4): boolean {
+  if (level === 1) return zone.tp1Enabled === true;
+  if (level === 2) return zone.tp2Enabled === true;
+  if (level === 3) return zone.tp3Enabled === true;
+  return zone.tp4Enabled === true;
+}
+
+function tpChipState(zone: Zone, level: 1 | 2 | 3 | 4): TpChipState {
+  const enabled = tpEnabledAtPlacement(zone, level);
+  const hit = Boolean(zone[`tp${level}Hit` as keyof Zone]);
+  if (!enabled) return "disabled";
+  if (hit) return "hit";
+  if (level === 4 && zone.nextTp === 4) return "manual";
+  return "pending";
+}
+
+function tpChipLabel(zone: Zone, level: 1 | 2 | 3 | 4): string {
+  const price = zone[`tp${level}Price` as keyof Zone] as number | null | undefined;
+  if (!tpEnabledAtPlacement(zone, level)) {
+    return level === 4 ? "TP4 OFF" : `TP${level} OFF`;
+  }
+  if (price != null) return `TP${level} ${formatPrice(price)}`;
+  return level === 4 ? "TP4 manual" : `TP${level} —`;
 }
 
 interface ZoneCardProps {
@@ -64,8 +104,6 @@ export default function ZoneCard({
   const [closeBusy, setCloseBusy] = useState(false);
   const [delBusy, setDelBusy] = useState(false);
 
-  // One-tap: no confirm dialog. The button fires the API call immediately
-  // and only surfaces an alert if the operation FAILS.
   const handleRiskFree = async () => {
     if (!onRiskFree || busy) return;
     setBusy(true);
@@ -104,10 +142,7 @@ export default function ZoneCard({
   const canCancelOrders =
     !historical && zone.status !== "CLOSED" && !!onCancelOrders;
 
-  // One-tap: no confirm dialog. The user asked for instant action —
-  // misfires are recoverable (re-place from the trade tab) and the extra
-  // OK button was just adding friction.
-  const handleCloseZone = async () => {
+  const runCloseZone = async () => {
     if (!onCloseZone || closeBusy) return;
     setCloseBusy(true);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
@@ -126,8 +161,19 @@ export default function ZoneCard({
     }
   };
 
-  // One-tap cancel of all pending cascade limit orders for this zone.
-  const handleCancelOrders = async () => {
+  const handleCloseZone = () => {
+    if (!onCloseZone || closeBusy) return;
+    Alert.alert(
+      "Close Zone",
+      "Close all open positions in this zone and cancel its pending limits? Other zones are not affected.",
+      [
+        { text: "Keep", style: "cancel" },
+        { text: "Close Zone", style: "destructive", onPress: () => void runCloseZone() },
+      ],
+    );
+  };
+
+  const runCancelOrders = async () => {
     if (!onCancelOrders || delBusy) return;
     setDelBusy(true);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
@@ -144,6 +190,18 @@ export default function ZoneCard({
     } else {
       Alert.alert("Couldn't delete orders", errMsg);
     }
+  };
+
+  const handleCancelOrders = () => {
+    if (!onCancelOrders || delBusy) return;
+    Alert.alert(
+      "Delete Orders",
+      "Cancel all pending limit orders for this zone only? Open positions are not closed.",
+      [
+        { text: "Keep", style: "cancel" },
+        { text: "Delete Orders", style: "destructive", onPress: () => void runCancelOrders() },
+      ],
+    );
   };
 
   return (
@@ -180,22 +238,10 @@ export default function ZoneCard({
           </Text>
         </View>
         <View style={styles.chipsRow}>
-          <TpChip
-            label={zone.tp1Price != null ? `TP1 ${formatPrice(zone.tp1Price)}` : "TP1 —"}
-            state={tpDisplayState(zone.tp1Enabled !== false, zone.tp1Hit)}
-          />
-          <TpChip
-            label={zone.tp2Price != null ? `TP2 ${formatPrice(zone.tp2Price)}` : "TP2 —"}
-            state={tpDisplayState(zone.tp2Enabled !== false, zone.tp2Hit)}
-          />
-          <TpChip
-            label={zone.tp3Price != null ? `TP3 ${formatPrice(zone.tp3Price)}` : "TP3 —"}
-            state={tpDisplayState(zone.tp3Enabled !== false, zone.tp3Hit)}
-          />
-          <TpChip
-            label={zone.tp4Price != null ? `TP4 ${formatPrice(zone.tp4Price)}` : "TP4 manual"}
-            state={tpDisplayState(zone.tp4Enabled !== false, zone.tp4Hit)}
-          />
+          <TpChip label={tpChipLabel(zone, 1)} state={tpChipState(zone, 1)} />
+          <TpChip label={tpChipLabel(zone, 2)} state={tpChipState(zone, 2)} />
+          <TpChip label={tpChipLabel(zone, 3)} state={tpChipState(zone, 3)} />
+          <TpChip label={tpChipLabel(zone, 4)} state={tpChipState(zone, 4)} />
         </View>
         {zone.enabledTpCount != null && zone.enabledTpCount > 0 && (
           <Text style={styles.tpTally}>
@@ -426,6 +472,10 @@ const styles = StyleSheet.create({
   tpChipPending: {
     borderColor: C.border,
     backgroundColor: "transparent",
+  },
+  tpChipManual: {
+    borderColor: C.gold,
+    backgroundColor: C.goldLight,
   },
   tpChipHit: {
     borderColor: C.gold,

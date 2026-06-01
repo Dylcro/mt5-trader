@@ -12,6 +12,8 @@ import {
   countEnabledTps,
   countHitEnabledTps,
   tpDisplayState,
+  shouldCancelCascadeLimitsAtTpStage,
+  shouldAutoCloseZoneAfterPositionExit,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
@@ -532,5 +534,36 @@ describe("disabled TP history", () => {
     } as Parameters<typeof makeRow>[0]));
     expect(st.tp3Hit).toBe(false);
     expect(st.tp3Enabled).toBe(false);
+  });
+});
+
+describe("cascade limit cancel timing", () => {
+  it("does not cancel limits on TP1", () => {
+    expect(shouldCancelCascadeLimitsAtTpStage(1, { tp1Hit: true, tp2Hit: false })).toBe(false);
+    expect(shouldCancelCascadeLimitsAtTpStage(1, { tp1Hit: false, tp2Hit: false })).toBe(false);
+  });
+
+  it("cancels limits only on first TP2 after TP1 hit", () => {
+    expect(shouldCancelCascadeLimitsAtTpStage(2, { tp1Hit: true, tp2Hit: false })).toBe(true);
+    expect(shouldCancelCascadeLimitsAtTpStage(2, { tp1Hit: false, tp2Hit: false })).toBe(false);
+    expect(shouldCancelCascadeLimitsAtTpStage(2, { tp1Hit: true, tp2Hit: true })).toBe(false);
+  });
+
+  it("defers auto zone-close while OPEN pre-TP2 with pending limits", () => {
+    expect(shouldAutoCloseZoneAfterPositionExit(
+      { status: "OPEN", tp2Hit: false },
+      false,
+      true,
+    )).toBe(false);
+    expect(shouldAutoCloseZoneAfterPositionExit(
+      { status: "OPEN", tp2Hit: true },
+      false,
+      true,
+    )).toBe(true);
+    expect(shouldAutoCloseZoneAfterPositionExit(
+      { status: "OPEN", tp2Hit: false },
+      false,
+      false,
+    )).toBe(true);
   });
 });

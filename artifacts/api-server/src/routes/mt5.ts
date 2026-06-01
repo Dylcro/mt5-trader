@@ -1390,6 +1390,28 @@ export function commentBelongsToZone(comment: string | undefined | null, zoneId:
   return parsed != null && parsed === zoneId;
 }
 
+/** Cascade limits are cancelled only on the first successful TP2, never on TP1. */
+export function shouldCancelCascadeLimitsAtTpStage(
+  tpStage: 1 | 2 | 3 | 4,
+  zone: { tp1Hit: boolean; tp2Hit: boolean },
+): boolean {
+  return tpStage === 2 && zone.tp1Hit && !zone.tp2Hit;
+}
+
+/**
+ * When the last tracked position row closes, defer auto zone-close + limit cancel
+ * if the zone is still OPEN pre-TP2 and unfilled cascade limits remain on the broker.
+ */
+export function shouldAutoCloseZoneAfterPositionExit(
+  zone: { status: string; tp2Hit: boolean },
+  hasOpenPositionsInDb: boolean,
+  hasLivePendingLimits: boolean,
+): boolean {
+  if (hasOpenPositionsInDb) return false;
+  if (zone.status === "OPEN" && !zone.tp2Hit && hasLivePendingLimits) return false;
+  return true;
+}
+
 /** Deterministic magic number derived from zoneId for broker-side tagging. */
 export function zoneMagicNumber(zoneId: string): number {
   let h = 47182;
@@ -1913,6 +1935,29 @@ async function markZonePositionClosed(accountId: string, positionId: string): Pr
       .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
     );
     if (openInZone.length === 0) {
+      const zoneMetaRows = await withDbRetry(`markClosed.zoneMeta zone=${zoneId}`, () => db
+        .select({ status: cascadeZonesTable.status, tp2Hit: cascadeZonesTable.tp2Hit })
+        .from(cascadeZonesTable)
+        .where(eq(cascadeZonesTable.zoneId, zoneId))
+        .limit(1)
+      ).catch(() => []);
+      const zoneMeta = zoneMetaRows[0];
+      const zoneStatus = st?.status ?? zoneMeta?.status ?? "CLOSED";
+      const tp2Hit = st?.tp2Hit ?? Boolean(zoneMeta?.tp2Hit);
+      const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, accountId, zoneId);
+      const brokerStillOpen = await zoneHasLiveTrackedPositionsOnBroker(token, region, accountId, zoneId);
+      if (brokerStillOpen) {
+        console.log(`[markClosed] zone ${zoneId} DB empty but broker still has open legs — skip auto-close`);
+        return;
+      }
+      if (!shouldAutoCloseZoneAfterPositionExit(
+        { status: zoneStatus, tp2Hit },
+        false,
+        pendingLeft,
+      )) {
+        console.log(`[markClosed] zone ${zoneId} pre-TP2 with ${pendingLeft ? "live" : "no"} pending limits — skip auto-close`);
+        return;
+      }
       await withDbRetry(`markClosed.zoneClose zone=${zoneId}`, () => db.update(cascadeZonesTable)
         .set({ status: "CLOSED", closedAt: Date.now() })
         .where(eq(cascadeZonesTable.zoneId, zoneId))
@@ -2096,6 +2141,43 @@ async function fetchOpenPositions(token: string, region: string, accountId: stri
   })).filter(p => p.id);
 }
 
+async function fetchLivePendingOrders(
+  token: string, region: string, accountId: string,
+): Promise<Array<{ id: string; comment?: string }>> {
+  try {
+    const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`, {
+      headers: authHeaders(token),
+    });
+    if (!r.ok) return [];
+    const raw = await r.json() as Array<{ id?: string; _id?: string; comment?: string }>;
+    return raw.map(o => ({ id: String(o.id ?? o._id ?? ""), comment: o.comment })).filter(o => o.id);
+  } catch {
+    return [];
+  }
+}
+
+async function zoneHasLivePendingCascadeLimits(
+  token: string, region: string, accountId: string, zoneId: string,
+): Promise<boolean> {
+  const liveOrders = await fetchLivePendingOrders(token, region, accountId);
+  return liveOrders.some((o) => {
+    if (zoneLimitOrders.get(o.id) === zoneId) return true;
+    return commentBelongsToZone(o.comment, zoneId);
+  });
+}
+
+async function zoneHasLiveTrackedPositionsOnBroker(
+  token: string, region: string, accountId: string, zoneId: string,
+): Promise<boolean> {
+  const openRows = await db.select({ positionId: zonePositionsTable.positionId })
+    .from(zonePositionsTable)
+    .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
+  if (openRows.length === 0) return false;
+  const live = await fetchOpenPositions(token, region, accountId);
+  const liveIds = new Set(live.map(p => p.id));
+  return openRows.some(r => liveIds.has(r.positionId));
+}
+
 // Live bid/ask straight from MetaAPI — independent of tickStore (which only
 // fills while the app is open and polling /price). Falls back to tickStore
 // if the REST call fails, then null if neither has data.
@@ -2233,6 +2315,16 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
           .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
       ).catch(() => null);
       if (stillOpen && stillOpen.length === 0) {
+        const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, st.accountId, zoneId);
+        const brokerStillOpen = await zoneHasLiveTrackedPositionsOnBroker(token, region, st.accountId, zoneId);
+        if (brokerStillOpen) {
+          console.log(`[zone ${zoneId}] reconcile: broker still has open legs — skip zone close`);
+          return;
+        }
+        if (!shouldAutoCloseZoneAfterPositionExit(st, false, pendingLeft)) {
+          console.log(`[zone ${zoneId}] reconcile: pre-TP2 pending limits remain — skip zone close`);
+          return;
+        }
         await withDbRetry(`evalZone.reconcileZoneClose zone=${zoneId}`,
           () => db.update(cascadeZonesTable)
             .set({ status: "CLOSED", closedAt: Date.now() })
@@ -2430,14 +2522,16 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     if (needTP2.length > 0 && st.tp2Price != null && hit(st.tp2Price)) {
       console.log(`[zone ${zoneId}] TP2 trigger @${cmpPrice} (tp2=${st.tp2Price}) — ${needTP2.length}/${live.length} position(s) need TP2`);
       const ok = await closePartialForLevel(2, needTP2);
-      // Cancel any still-unfilled cascade limits at TP2. Fires once (first TP2).
-      if (!st.tp2Hit) await cancelZoneLimits(token, region, st.accountId, zoneId);
       if (ok) {
         const ids = needTP2.map(p => p.id);
         await db.update(zonePositionsTable).set({ tp2Hit: true })
           .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
         for (const p of needTP2) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp2Hit = true; }
         if (!st.tp2Hit) {
+          // Cancel unfilled cascade limits only after a successful TP2 partial (never on TP1).
+          if (shouldCancelCascadeLimitsAtTpStage(2, st)) {
+            await cancelZoneLimits(token, region, st.accountId, zoneId);
+          }
           // Advance zone-level flag. Do NOT gate on SL→BE — the sticky-retry
           // block below handles that; gating here caused the zone to re-enter
           // every tick when the broker rejected the SL (code 10016).
