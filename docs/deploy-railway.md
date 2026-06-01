@@ -2,89 +2,123 @@
 
 Use this instead of Replit **Publishing** when the monorepo keeps failing `pnpm install` on Replit. The phone app only needs a stable HTTPS API URL.
 
-## What Railway runs
+## Why Railway created 5 services
 
-- **Dockerfile** at repo root: installs `@workspace/api-server` only (no Expo), starts with `tsx`.
-- **Health check:** `GET /healthz` → `{"status":"ok"}` (or `unhealthy` if streams are idle).
-- **Postgres:** Railway plugin sets `DATABASE_URL` automatically.
+Importing this repo as a **pnpm workspace** makes Railway auto-stage one service per package (`api-server`, `mt5-trader`, `mockup-sandbox`, etc.). Only **`@workspace/api-server`** should deploy.
 
-## 1. Create the project
+## 1. Keep one service, delete the rest
 
-1. Go to [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo**.
-2. Select **mt5-trader**.
-3. Branch: **`cursor/bugfix-batch`** (or `main` after merge).
-4. Railway should detect **`Dockerfile`** / `railway.toml`.
-5. **Important:** Service → **Settings** → **Build** → Builder = **Dockerfile** (not Nixpacks/Railpack).  
-   If logs show `Scope: all 10 workspace projects`, the Dockerfile is **not** being used.
-6. Deploy branch must include `Dockerfile` (e.g. **`cursor/bugfix-batch`** or `main` after merge).
+In the Railway project canvas:
 
-## 2. Add PostgreSQL
+1. **Keep** the service for `@workspace/api-server` (rename it **api-server** if you like).
+2. **Delete** every other auto-created service (mt5-trader, mockup-sandbox, onboarding-demo, scripts, …):  
+   Service → **Settings** → scroll to **Danger** → **Delete Service**.
 
-1. In the project → **+ New** → **Database** → **PostgreSQL**.
-2. Open your **API service** → **Variables** → **Add reference** → link **`DATABASE_URL`** from the Postgres service.
+## 2. Configure the api-server service
 
-Tables are created on startup by `artifacts/api-server/src/index.ts` (`ensureTables`).
+| Setting | Value |
+|--------|--------|
+| **Root Directory** | *(empty — repository root `/`)* |
+| **Builder** | **Dockerfile** |
+| **Dockerfile path** | `Dockerfile` |
+| **Branch** | `main` |
 
-## 3. Required environment variables
+Do **not** set Root Directory to `artifacts/api-server`. The API depends on `lib/*` and workspace files at the repo root; Docker copies `artifacts/api-server` + `lib` from `/`.
 
-Copy values from your working Replit **Secrets** / deployment config:
+**Watch paths** (optional; also in `railway.toml`):
+
+```text
+artifacts/api-server/**
+lib/**
+Dockerfile
+railway.toml
+package.json
+pnpm-lock.yaml
+```
+
+### If build logs show Railpack / Nixpacks (wrong)
+
+Symptoms:
+
+- `Scope: all 10 workspace projects`
+- `export:web` or Expo errors
+- Building `mockup-sandbox` or `mt5-trader`
+
+**Fix:** Settings → Build → **Builder = Dockerfile** (not Railpack/Nixpacks). Redeploy.
+
+### If you must use Nixpacks (no Docker)
+
+Root Directory = `/` (empty). Override commands:
+
+| Field | Command |
+|-------|---------|
+| **Build** | `CI=true npm_config_user_agent=pnpm/10.0.0 pnpm install --frozen-lockfile --filter @workspace/api-server...` |
+| **Start** | `pnpm --filter @workspace/api-server exec tsx ./src/index.ts` |
+
+Repo includes `nixpacks.toml` with the same intent. Do **not** use `pnpm --filter @workspace/api-server run build` as the deploy build unless Builder is Dockerfile (that was the old script that pulled Expo).
+
+## 3. Add PostgreSQL
+
+1. Project → **+ New** → **Database** → **PostgreSQL**.
+2. Open **api-server** → **Variables** → **Add reference** → `DATABASE_URL` from Postgres.
+
+Tables are created on startup (`ensureTables` in `artifacts/api-server/src/index.ts`).
+
+## 4. Required environment variables
+
+Copy values from working Replit **Secrets**:
 
 | Variable | Required | Notes |
 |----------|----------|--------|
-| `DATABASE_URL` | Yes | From Postgres plugin (reference) |
-| `METAAPI_TOKEN` | Yes | MetaAPI cloud token |
-| `ADMIN_KEY` | Yes | Strong secret; also used as JWT signing key in current code |
-| `PORT` | Auto | Railway sets this; Dockerfile defaults to `8080` |
+| `DATABASE_URL` | **Yes** | Reference from Postgres plugin |
+| `METAAPI_TOKEN` | **Yes** | MetaAPI cloud token |
+| `ADMIN_KEY` | **Yes** | Strong secret; JWT signing + admin routes (server **won’t start** if missing/placeholder) |
+| `PORT` | Auto | Railway sets this; image defaults to `8080` |
 
-Optional (if you use them on Replit):
+Optional:
 
 | Variable | Notes |
 |----------|--------|
 | `STREAM_FRESHNESS_MS` | Default `60000` |
 | `CASCADE_CONFIG_OVERRIDE` | JSON override for cascade config |
+| `RAILWAY_PUBLIC_DOMAIN` | Set automatically when you add a public domain |
 
-## 4. Deploy
+Clerk packages are in `package.json` but no `CLERK_*` env is required for current routes.
 
-1. **Deploy** (or push to the connected branch).
-2. Open **Settings** → **Networking** → **Generate domain** (e.g. `mt5-trader-production.up.railway.app`).
-3. Check logs for: `Server listening on port …`
-4. Test: `https://YOUR-DOMAIN.up.railway.app/healthz`
+## 5. Deploy and verify
 
-## 5. Point the mobile app at Railway
+1. **Deploy** (or push to `main`).
+2. **Settings** → **Networking** → **Generate domain**.
+3. Logs should show: `Server listening on port …`
+4. Test: `https://YOUR-DOMAIN.up.railway.app/healthz` → `{"status":"ok"}` (or unhealthy if no MT5 streams yet).
 
-When the API works, update **`artifacts/mt5-trader/eas.json`** (all profiles):
+## 6. Point the mobile app at Railway
+
+Update `artifacts/mt5-trader/eas.json` (all profiles):
 
 ```json
 "EXPO_PUBLIC_API_URL": "https://YOUR-DOMAIN.up.railway.app/api"
 ```
 
-Rebuild iOS preview:
+Rebuild:
 
 ```bash
 cd artifacts/mt5-trader
 pnpm exec eas build --platform ios --profile preview --non-interactive
 ```
 
-CORS already allows `*.up.railway.app` and your `RAILWAY_PUBLIC_DOMAIN`.
-
-## 6. Cutover from Replit
-
-| Step | Action |
-|------|--------|
-| Keep Replit running | Old app builds still hit `meta-trader-link.replit.app` until you change `eas.json` |
-| New users / test | Use Railway URL in a new EAS build |
-| Database | Railway Postgres is **empty** unless you migrate data from Replit (pg dump/restore) |
-| DNS | Optional custom domain in Railway → update `eas.json` again |
+CORS allows `*.up.railway.app` and `RAILWAY_PUBLIC_DOMAIN`.
 
 ## 7. Troubleshooting
 
 | Issue | Fix |
 |-------|-----|
-| Build fails in Docker | Check build logs; ensure branch has `Dockerfile` |
-| `DATABASE_URL must be set` | Link Postgres `DATABASE_URL` to the service |
-| `METAAPI_TOKEN` / `ADMIN_KEY` errors | Add secrets in Railway Variables |
-| App can’t connect | Confirm `EXPO_PUBLIC_API_URL` ends with `/api` |
-| CORS error | Redeploy after setting domain; `RAILWAY_PUBLIC_DOMAIN` is added automatically |
+| Five services, all failed | Delete extras; keep api-server; use Dockerfile builder |
+| Root Directory `artifacts/api-server` | Clear it (use repo root) |
+| `METAAPI_TOKEN is not configured` | Add `METAAPI_TOKEN` variable |
+| `ADMIN_KEY environment variable is required` | Add `ADMIN_KEY` (not `changeme`) |
+| `DATABASE_URL must be set` | Link Postgres `DATABASE_URL` |
+| Build still runs Expo | Switch builder to **Dockerfile** |
 
 ## Local smoke (optional)
 

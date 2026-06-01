@@ -1,0 +1,14 @@
+# Fallback if Railway service builder is Nixpacks instead of Dockerfile.
+# Prefer railway.toml builder = DOCKERFILE. Install/start only @workspace/api-server.
+[phases.setup]
+nixPkgs = ["nodejs_24"]
+
+[phases.install]
+cmds = [
+  "corepack enable",
+  "corepack prepare pnpm@10.26.1 --activate",
+  "CI=true npm_config_user_agent=pnpm/10.0.0 pnpm install --frozen-lockfile --filter @workspace/api-server...",
+]
+
+[start]
+cmd = "pnpm --filter @workspace/api-server exec tsx ./src/index.ts"

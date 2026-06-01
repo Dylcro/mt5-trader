@@ -1,13 +1,12 @@
+# API Docker build only copies api-server + lib; shrink upload context anyway.
+node_modules
+**/node_modules
 .git
 .cursor
-**/.pnpm-store
-**/node_modules
-.pnpm-store
 artifacts/mt5-trader
 artifacts/mockup-sandbox
 artifacts/onboarding-demo
-**/.expo
-**/dist
-terminals
+scripts
+docs
 *.md
-!replit.md
+!artifacts/api-server/**/*.md
