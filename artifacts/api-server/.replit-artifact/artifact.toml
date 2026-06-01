@@ -14,7 +14,7 @@ run = "pnpm --filter @workspace/api-server run dev"
 
 [services.production]
 deploymentTarget = "vm"
-build = "bash scripts/replit-api-build.sh"
+build = "bash -lc 'ROOT=\"${REPLIT_WORKSPACE:-$PWD}\"; cd \"$ROOT\" && test -f scripts/replit-api-build.sh && bash scripts/replit-api-build.sh'"
 
 [services.production.run]
 args = ["bash", "scripts/post-deploy-smoke.sh"]
