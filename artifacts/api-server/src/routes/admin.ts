@@ -1,12 +1,18 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import bcrypt from "bcryptjs";
-import { db, storedAccountsTable, supportTicketsTable, usersTable, cascadeZonesTable } from "@workspace/db";
+import {
+  db,
+  storedAccountsTable,
+  supportTicketsTable,
+  usersTable,
+  cascadeZonesTable,
+  type StoredAccount,
+} from "@workspace/db";
 import { desc, eq, inArray, sql } from "drizzle-orm";
 import { resetAuthLockouts } from "../lib/rateLimiters";
 import { getStreamHealth, getZoneCounts, listProvisioningAccounts } from "./mt5";
 import { getTelemetry } from "../telemetry";
 import { ADMIN_PAGE_CSS, APP_THEME } from "../lib/appTheme";
-import type { StoredAccount } from "@workspace/db/schema/storedAccounts";
 
 const router: IRouter = Router();
 
