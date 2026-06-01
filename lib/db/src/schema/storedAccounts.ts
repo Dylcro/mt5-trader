@@ -6,6 +6,10 @@ export const storedAccountsTable = pgTable("stored_accounts", {
   region:      text("region").notNull().default("london"),
   storedAt:    bigint("stored_at", { mode: "number" }),
   userId:      text("user_id"),
+  /** Broker MT5 login number (e.g. 12345678). */
+  mt5Login:    text("mt5_login"),
+  /** Broker server name (e.g. VantageInternational-Live). */
+  mt5Server:   text("mt5_server"),
 });
 
 export type StoredAccount = typeof storedAccountsTable.$inferSelect;

@@ -109,6 +109,39 @@ interface KnownAccount { accountId: string; userId?: string; region: string; }
 const knownAccounts = new Map<string, KnownAccount>(); // accountId → KnownAccount
 let sdkInstance: InstanceType<typeof MetaApi> | null = null;
 
+async function upsertStoredAccount(params: {
+  accountId: string;
+  region: string;
+  userId?: string | null;
+  mt5Login?: string | null;
+  mt5Server?: string | null;
+}): Promise<void> {
+  const now = Date.now();
+  const set: {
+    region: string;
+    storedAt: number;
+    userId?: string;
+    mt5Login?: string;
+    mt5Server?: string;
+  } = { region: params.region, storedAt: now };
+  if (params.userId) set.userId = params.userId;
+  if (params.mt5Login) set.mt5Login = params.mt5Login;
+  if (params.mt5Server) set.mt5Server = params.mt5Server;
+  await db.insert(storedAccountsTable)
+    .values({
+      accountId: params.accountId,
+      region: params.region,
+      storedAt: now,
+      userId: params.userId ?? undefined,
+      mt5Login: params.mt5Login ?? undefined,
+      mt5Server: params.mt5Server ?? undefined,
+    })
+    .onConflictDoUpdate({
+      target: storedAccountsTable.accountId,
+      set,
+    });
+}
+
 // ── Cascade Config ────────────────────────────────────────────────────────────
 // Persisted to DB, keyed per trading account.
 // The empty-string key "" represents the global (account-agnostic) config.
@@ -920,15 +953,14 @@ async function startStreaming(token: string, accountId: string, region: string =
     // without waiting for the app to call /connect again.
     // userId is included when available so /my-account lookups work reliably.
     try {
-      const now = Date.now();
-      const updateFields: Record<string, unknown> = { region, storedAt: now };
-      if (userId) updateFields["userId"] = userId;
-      await db.insert(storedAccountsTable)
-        .values({ accountId, region, storedAt: now, ...(userId ? { userId } : {}) })
-        .onConflictDoUpdate({
-          target: storedAccountsTable.accountId,
-          set: updateFields,
-        });
+      const known = knownAccounts.get(accountId);
+      await upsertStoredAccount({
+        accountId,
+        region,
+        userId: userId ?? known?.userId,
+        mt5Login: null,
+        mt5Server: null,
+      });
       if (userId) userAccountCache.set(userId, accountId);
       console.log(`[stream ${accountId}] credentials saved to DB for auto-reconnect`);
     } catch (dbErr) {
@@ -1271,6 +1303,31 @@ async function getProvisioningAccount(token: string, accountId: string): Promise
     throw new Error(err.message ?? `Account lookup failed: ${res.status}`);
   }
   return res.json() as Promise<ProvisioningAccount>;
+}
+
+/** Admin dashboard: broker login/server for each MetaAPI account id. */
+export async function listProvisioningAccounts(): Promise<
+  Map<string, { login: string; server: string; region?: string; connectionStatus?: string }>
+> {
+  const token = getToken();
+  const listRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
+    headers: authHeaders(token),
+  });
+  if (!listRes.ok) return new Map();
+  const all = await listRes.json() as ProvisioningAccount[];
+  const map = new Map<string, { login: string; server: string; region?: string; connectionStatus?: string }>();
+  if (!Array.isArray(all)) return map;
+  for (const a of all) {
+    const accountId = a._id ?? a.id;
+    if (!accountId) continue;
+    map.set(accountId, {
+      login: String(a.login ?? ""),
+      server: String(a.server ?? ""),
+      region: a.region,
+      connectionStatus: a.connectionStatus,
+    });
+  }
+  return map;
 }
 
 async function getAccountInfo(token: string, accountId: string, region: string | undefined = DEFAULT_REGION) {
@@ -3689,6 +3746,13 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         return res.status(404).json({ error: "Account not found. Please log in again with your credentials." });
       }
       const region = normalizeRegion(acct.region);
+      void upsertStoredAccount({
+        accountId: existingId,
+        region,
+        userId,
+        mt5Login: acct.login ?? storedRow.mt5Login,
+        mt5Server: acct.server ?? storedRow.mt5Server,
+      });
       console.log(`[connect] reconnect status=${acct.connectionStatus} region=${region}`);
 
       if (acct.connectionStatus === "CONNECTED") {
@@ -3761,19 +3825,17 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       // Eagerly transfer DB ownership to the current user so checkOwner
       // passes immediately on subsequent requests (startStreaming also does
       // this, but it runs asynchronously after this response returns).
+      const region = normalizeRegion(existing.region);
       if (userId) {
-        const now = Date.now();
-        await db.insert(storedAccountsTable)
-          .values({ accountId: foundId, region: normalizeRegion(existing.region), storedAt: now, userId })
-          .onConflictDoUpdate({
-            target: storedAccountsTable.accountId,
-            set: { userId, storedAt: now },
-          })
-          .catch((e: Error) => console.warn(`[connect] eager ownership transfer failed:`, e.message));
+        await upsertStoredAccount({
+          accountId: foundId,
+          region,
+          userId,
+          mt5Login: login,
+          mt5Server: server,
+        }).catch((e: Error) => console.warn(`[connect] eager ownership transfer failed:`, e.message));
         userAccountCache.set(userId, foundId);
       }
-
-      const region = normalizeRegion(existing.region);
 
       if (existing.connectionStatus === "CONNECTED") {
         try {
@@ -3874,6 +3936,15 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       if (queued && queuedId) {
         console.log(`[connect] found queued account ${queuedId} — deploying`);
         const region = normalizeRegion(queued.region);
+        if (userId) {
+          await upsertStoredAccount({
+            accountId: queuedId,
+            region,
+            userId,
+            mt5Login: login,
+            mt5Server: server,
+          }).catch((e: Error) => console.warn(`[connect] queued account persist failed:`, e.message));
+        }
         if (queued.connectionStatus !== "CONNECTED") await deployAccount(token, queuedId);
         return res.json({ status: "deploying", accountId: queuedId, region });
       }
@@ -3892,6 +3963,16 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
 
     const region = normalizeRegion(created.region);
     console.log(`[connect] created accountId=${newId} region=${region} — deploying`);
+
+    if (userId) {
+      await upsertStoredAccount({
+        accountId: newId,
+        region,
+        userId,
+        mt5Login: login,
+        mt5Server: server,
+      }).catch((e: Error) => console.warn(`[connect] new account persist failed:`, e.message));
+    }
 
     // Kick off deploy and return immediately — client will poll /status
     await deployAccount(token, newId);
@@ -4132,11 +4213,12 @@ async function migrateRegionHandler(req: Request, res: Response): Promise<void> 
     // 9. Restore userId binding in DB (upsert). Failure here is logged but the
     //    migration is still considered successful — admin can rebind manually.
     try {
-      await db.insert(storedAccountsTable).values({
-        accountId: newId, region: newRegion, userId: preservedUserId, storedAt: Date.now(),
-      }).onConflictDoUpdate({
-        target: storedAccountsTable.accountId,
-        set: { region: newRegion, userId: preservedUserId, storedAt: Date.now() },
+      await upsertStoredAccount({
+        accountId: newId,
+        region: newRegion,
+        userId: preservedUserId,
+        mt5Login: loginStr,
+        mt5Server: server,
       });
       if (preservedUserId) userAccountCache.set(preservedUserId, newId);
     } catch (e) {

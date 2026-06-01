@@ -85,6 +85,9 @@ async function ensureTables(): Promise<void> {
       ADD COLUMN IF NOT EXISTS manual_close BOOLEAN NOT NULL DEFAULT FALSE,
       ADD COLUMN IF NOT EXISTS sl_hit BOOLEAN NOT NULL DEFAULT FALSE,
       ADD COLUMN IF NOT EXISTS auto_be_at_tp DOUBLE PRECISION NOT NULL DEFAULT 2;
+    ALTER TABLE stored_accounts
+      ADD COLUMN IF NOT EXISTS mt5_login TEXT,
+      ADD COLUMN IF NOT EXISTS mt5_server TEXT;
     ALTER TABLE cascade_zones ALTER COLUMN tp1_pips DROP NOT NULL;
     ALTER TABLE cascade_zones ALTER COLUMN tp2_pips DROP NOT NULL;
     ALTER TABLE cascade_zones ALTER COLUMN tp3_pips DROP NOT NULL;

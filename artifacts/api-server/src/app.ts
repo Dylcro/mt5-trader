@@ -9,6 +9,7 @@ import adminRouter from "./routes/admin";
 import authRouter from "./routes/auth";
 import healthRouter from "./routes/health";
 import { authLimiter, apiLimiter } from "./lib/rateLimiters";
+import { STATUS_PAGE_CSS } from "./lib/appTheme";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -123,40 +124,21 @@ app.get("/status", (_req: Request, res: Response) => {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>XAUUSD Trader — Status</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0f; color: #e8e6de; min-height: 100vh; padding: 32px 24px; }
-  h1 { font-size: 22px; font-weight: 700; color: #c9a84c; letter-spacing: 2px; margin-bottom: 4px; }
-  .subtitle { font-size: 13px; color: #6e6e8a; margin-bottom: 32px; }
-  h2 { font-size: 13px; font-weight: 600; color: #c9a84c; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 12px; }
-  .section { margin-bottom: 36px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; margin-bottom: 0; }
-  .card { background: #111118; border: 1px solid #1e1e2e; border-radius: 10px; padding: 16px 20px; }
-  .card-label { font-size: 11px; color: #6e6e8a; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
-  .card-value { font-size: 28px; font-weight: 700; color: #e8e6de; }
-  .card-sub { font-size: 12px; color: #6e6e8a; margin-top: 4px; }
-  table { width: 100%; border-collapse: collapse; background: #111118; border-radius: 10px; overflow: hidden; border: 1px solid #1e1e2e; font-size: 13px; }
-  thead { background: #1a1a28; }
-  th { padding: 10px 14px; text-align: left; font-size: 11px; font-weight: 600; color: #6e6e8a; letter-spacing: 0.5px; text-transform: uppercase; border-bottom: 1px solid #1e1e2e; }
-  td { padding: 11px 14px; border-bottom: 1px solid #1a1a28; vertical-align: top; }
-  tr:last-child td { border-bottom: none; }
-  .mono { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; color: #c9a84c; }
-  .muted { color: #6e6e8a; }
-  .ok { color: #2ed573; }
-  .warn { color: #ffa502; }
-  .err { color: #ff4757; }
-  .empty { color: #6e6e8a; font-style: italic; padding: 20px; text-align: center; }
-  .badge { display: inline-block; background: rgba(201,168,76,0.15); color: #c9a84c; border: 1px solid rgba(201,168,76,0.3); border-radius: 20px; font-size: 11px; font-weight: 600; padding: 3px 10px; margin-left: 8px; }
-  .key-form { background: #111118; border: 1px solid #1e1e2e; border-radius: 12px; padding: 28px; max-width: 400px; }
-  .key-form input { width: 100%; padding: 10px 14px; background: #0a0a0f; border: 1px solid #1e1e2e; color: #e8e6de; border-radius: 6px; font-family: inherit; font-size: 13px; margin-bottom: 12px; }
-  .key-form button { padding: 12px 20px; background: #c9a84c; color: #0a0a0f; border: 0; border-radius: 6px; font-weight: 700; cursor: pointer; font-size: 13px; width: 100%; }
-  #refresh-bar { font-size: 12px; color: #6e6e8a; margin-top: -20px; margin-bottom: 28px; }
-</style>
+<style>${STATUS_PAGE_CSS}</style>
 </head>
 <body>
-<h1>XAUUSD TRADER</h1>
-<p class="subtitle">Live system status</p>
-<div id="root"></div>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <span class="symbol">XAUUSD</span>
+      <span class="brand-sub">System status</span>
+    </div>
+  </div>
+</header>
+<div class="page">
+  <div class="nav nav-back"><a href="/api/admin?key=" id="adminLink">← Clients</a></div>
+  <div id="root"></div>
+</div>
 <script>
 (function() {
   var key = new URLSearchParams(location.search).get('key') || '';
@@ -179,8 +161,11 @@ app.get("/status", (_req: Request, res: Response) => {
     return Math.round(s/3600) + 'h ago';
   }
 
+  var adminLink = document.getElementById('adminLink');
+  if (adminLink && key) adminLink.href = '/api/admin?key=' + encodeURIComponent(key);
+
   if (!key) {
-    root.innerHTML = '<div class="key-form"><h2 style="margin-bottom:16px">Admin Key Required</h2><form id="kf"><input type="password" id="ki" placeholder="Enter admin key" autocomplete="off"><button type="submit">OPEN STATUS PAGE</button></form></div>';
+    root.innerHTML = '<div class="key-form"><h2 style="margin-bottom:16px;color:#1A2B4A">Admin Key Required</h2><form id="kf"><input type="password" id="ki" placeholder="Enter admin key" autocomplete="off"><button type="submit">OPEN STATUS PAGE</button></form></div>';
     document.getElementById('kf').addEventListener('submit', function(e) {
       e.preventDefault();
       var k = document.getElementById('ki').value.trim();
@@ -228,10 +213,10 @@ app.get("/status", (_req: Request, res: Response) => {
       '<div id="refresh-bar">Auto-refreshes every 10 s &mdash; last updated ' + ago(d.ts) + '</div>' +
       '<div class="section">' +
         '<div class="grid">' +
-          '<div class="card"><div class="card-label">Stream Health</div><div class="card-value" style="font-size:18px;margin-top:4px">' + health + '</div><div class="card-sub">' + streams.accounts.length + ' account(s)</div></div>' +
-          '<div class="card"><div class="card-label">Open Zones</div><div class="card-value">' + zones.open + '</div><div class="card-sub">' + zones.riskFree + ' risk-free \u2022 ' + (zones.closedLast24h ?? 0) + ' closed (24h)</div></div>' +
-          '<div class="card"><div class="card-label">Trade Failures</div><div class="card-value">' + failures.length + '</div><div class="card-sub">in ring buffer</div></div>' +
-          '<div class="card"><div class="card-label">Rate Limit Hits</div><div class="card-value">' + rateLimits.length + '</div><div class="card-sub">in ring buffer</div></div>' +
+          '<div class="metric-card"><div class="card-label">Stream Health</div><div class="card-value" style="font-size:18px;margin-top:4px">' + health + '</div><div class="card-sub">' + streams.accounts.length + ' account(s)</div></div>' +
+          '<div class="metric-card"><div class="card-label">Open Zones</div><div class="card-value">' + zones.open + '</div><div class="card-sub">' + zones.riskFree + ' risk-free \u2022 ' + (zones.closedLast24h ?? 0) + ' closed (24h)</div></div>' +
+          '<div class="metric-card"><div class="card-label">Trade Failures</div><div class="card-value">' + failures.length + '</div><div class="card-sub">in ring buffer</div></div>' +
+          '<div class="metric-card"><div class="card-label">Rate Limit Hits</div><div class="card-value">' + rateLimits.length + '</div><div class="card-sub">in ring buffer</div></div>' +
         '</div>' +
       '</div>' +
       '<div class="section"><h2>Streams <span class="badge">' + streams.accounts.length + '</span></h2>' +
@@ -273,6 +258,7 @@ app.get("/status", (_req: Request, res: Response) => {
   load();
 })();
 </script>
+</div>
 </body>
 </html>`);
 });
