@@ -1,6 +1,6 @@
 import { Feather } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
-import React, { useCallback, useState } from "react";
+import React, { useCallback, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -21,6 +21,11 @@ import { useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useZones } from "@/hooks/useZones";
 import ZoneCard from "@/components/ZoneCard";
 import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
+import {
+  buildDisplayActiveZones,
+  pendingWithoutZone,
+  positionsWithoutZone,
+} from "@/lib/zoneDisplay";
 
 const C = Colors.dark;
 
@@ -235,10 +240,25 @@ function PendingOrderCard({ order, onCancel }: { order: PendingOrder; onCancel: 
 export default function PositionsScreen() {
   const insets = useSafeAreaInsets();
   const { formatMoney } = useDisplayCurrency();
-  const { positions, pendingOrders, status, refreshPositions, refreshPendingOrders, closePosition, cancelOrder, accountId, sseConnected } = useTrading();
-  const { zones, riskFree, closeZone, cancelZoneOrders } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000, sseConnected });
+  const { positions, pendingOrders, status, refreshPositions, refreshPendingOrders, closePosition, cancelOrder, accountId, sseConnected, price } = useTrading();
+  const { zones, refresh: refreshZones, riskFree, closeZone, cancelZoneOrders } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000, sseConnected });
   const { settings: cs } = useCascadeSettings();
-  const activeZones = zones.filter((z) => z.status !== "CLOSED");
+  const displayActiveZones = useMemo(
+    () => buildDisplayActiveZones(zones, positions, cs, price),
+    [zones, positions, cs, price],
+  );
+  const displayZoneIds = useMemo(
+    () => new Set(displayActiveZones.map((z) => z.zoneId)),
+    [displayActiveZones],
+  );
+  const standalonePositions = useMemo(
+    () => positionsWithoutZone(positions, displayZoneIds),
+    [positions, displayZoneIds],
+  );
+  const orphanPendingOrders = useMemo(
+    () => pendingWithoutZone(pendingOrders, displayZoneIds),
+    [pendingOrders, displayZoneIds],
+  );
   const pastZones = zones
     .filter((z) => z.status === "CLOSED")
     .sort((a, b) => (b.closedAt ?? b.createdAt) - (a.closedAt ?? a.createdAt))
@@ -249,19 +269,19 @@ export default function PositionsScreen() {
 
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
-    await Promise.all([refreshPositions(), refreshPendingOrders()]);
+    await Promise.all([refreshZones(), refreshPositions(), refreshPendingOrders()]);
     setRefreshing(false);
-  }, [refreshPositions, refreshPendingOrders]);
+  }, [refreshZones, refreshPositions, refreshPendingOrders]);
 
   // Poll while focused so MT5-side closes/cancels appear without manual refresh.
   useFocusEffect(
     useCallback(() => {
       if (status !== "connected" || !accountId) return;
-      const sync = () => void Promise.all([refreshPositions(), refreshPendingOrders()]);
+      const sync = () => void Promise.all([refreshZones(), refreshPositions(), refreshPendingOrders()]);
       sync();
       const id = setInterval(sync, 4_000);
       return () => clearInterval(id);
-    }, [status, accountId, refreshPositions, refreshPendingOrders]),
+    }, [status, accountId, refreshZones, refreshPositions, refreshPendingOrders]),
   );
 
   const handleCancelOrder = useCallback(
@@ -303,22 +323,19 @@ export default function PositionsScreen() {
   const [cancellingAll, setCancellingAll] = useState(false);
 
   const handleCancelAllLimits = useCallback(async () => {
-    if (cancellingAll || pendingOrders.length === 0) return;
+    if (cancellingAll || orphanPendingOrders.length === 0) return;
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
     setCancellingAll(true);
-    await Promise.all(pendingOrders.map((o) => cancelOrder(o.id)));
+    await Promise.all(orphanPendingOrders.map((o) => cancelOrder(o.id)));
     await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     setCancellingAll(false);
-  }, [cancellingAll, pendingOrders, cancelOrder]);
+  }, [cancellingAll, orphanPendingOrders, cancelOrder]);
 
   const totalPL = positions.reduce((sum, p) => sum + p.profit, 0);
   const webTopPad = Platform.OS === "web" ? 67 : 0;
-  // When zones are active, positions/limits in those zones are already shown
-  // inside each ZoneCard — hide the redundant flat OPEN/PENDING lists to cut
-  // visual noise. Only surface standalone positions when no zone is active
-  // (e.g. a manual non-cascade trade with nothing else going on).
-  const showStandalone = activeZones.length === 0 && positions.length > 0;
-  const hasAnything = activeZones.length > 0 || showStandalone || pendingOrders.length > 0;
+  const showStandalone = standalonePositions.length > 0;
+  const hasAnything =
+    displayActiveZones.length > 0 || showStandalone || orphanPendingOrders.length > 0;
 
   return (
     <View style={[styles.container, { paddingTop: insets.top + webTopPad }]}>
@@ -338,8 +355,8 @@ export default function PositionsScreen() {
             <Text style={styles.plBannerLabel}>TOTAL FLOATING P&L</Text>
             <Text style={styles.plBannerSub}>
               {positions.length} position{positions.length === 1 ? "" : "s"} open
-              {activeZones.length > 0
-                ? ` · ${activeZones.length} zone${activeZones.length === 1 ? "" : "s"}`
+              {displayActiveZones.length > 0
+                ? ` · ${displayActiveZones.length} zone${displayActiveZones.length === 1 ? "" : "s"}`
                 : ""}
             </Text>
           </View>
@@ -374,11 +391,11 @@ export default function PositionsScreen() {
           </View>
         ) : (
           <>
-            {activeZones.length > 0 && (
+            {displayActiveZones.length > 0 && (
               <>
-                <Text style={styles.sectionLabel}>ACTIVE ZONES  ·  {activeZones.length}</Text>
-                <View style={{ gap: 10, marginBottom: showStandalone || pendingOrders.length > 0 ? 20 : 0 }}>
-                  {activeZones.map((z) => (
+                <Text style={styles.sectionLabel}>ACTIVE ZONES  ·  {displayActiveZones.length}</Text>
+                <View style={{ gap: 10, marginBottom: showStandalone || orphanPendingOrders.length > 0 ? 20 : 0 }}>
+                  {displayActiveZones.map((z) => (
                     <ZoneCard
                       key={z.zoneId}
                       zone={z}
@@ -392,11 +409,8 @@ export default function PositionsScreen() {
               </>
             )}
             {showStandalone && (() => {
-              // Group standalone (non-zone) positions by symbol + direction so
-              // a cascade that wasn't successfully registered as a zone still
-              // shows as ONE roll-up card per side instead of N separate cards.
               const groups = new Map<string, Position[]>();
-              for (const p of positions) {
+              for (const p of standalonePositions) {
                 const dir = p.type === "POSITION_TYPE_BUY" ? "buy" : "sell";
                 const key = `${p.symbol}|${dir}`;
                 const arr = groups.get(key) ?? [];
@@ -407,7 +421,7 @@ export default function PositionsScreen() {
               return (
                 <>
                   <Text style={styles.sectionLabel}>
-                    OPEN  ·  {positions.length}
+                    OPEN  ·  {standalonePositions.length}
                   </Text>
                   <View style={{ gap: 10 }}>
                     {groupList.map(([key, group]) => {
@@ -426,10 +440,10 @@ export default function PositionsScreen() {
                 </>
               );
             })()}
-            {activeZones.length === 0 && pendingOrders.length > 0 && (
+            {orphanPendingOrders.length > 0 && (
               <>
                 <View style={[styles.sectionRow, { marginTop: positions.length > 0 ? 20 : 0 }]}>
-                  <Text style={styles.sectionLabel}>PENDING  ·  {pendingOrders.length}</Text>
+                  <Text style={styles.sectionLabel}>PENDING  ·  {orphanPendingOrders.length}</Text>
                   <Pressable
                     style={({ pressed }) => [styles.cancelAllBtn, (pressed || cancellingAll) && { opacity: 0.6 }]}
                     onPress={handleCancelAllLimits}
@@ -445,7 +459,7 @@ export default function PositionsScreen() {
                     )}
                   </Pressable>
                 </View>
-                {pendingOrders.map((order) => (
+                {orphanPendingOrders.map((order) => (
                   <PendingOrderCard
                     key={order.id}
                     order={order}
