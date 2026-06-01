@@ -14,6 +14,9 @@ Use this instead of Replit **Publishing** when the monorepo keeps failing `pnpm 
 2. Select **mt5-trader**.
 3. Branch: **`cursor/bugfix-batch`** (or `main` after merge).
 4. Railway should detect **`Dockerfile`** / `railway.toml`.
+5. **Important:** Service → **Settings** → **Build** → Builder = **Dockerfile** (not Nixpacks/Railpack).  
+   If logs show `Scope: all 10 workspace projects`, the Dockerfile is **not** being used.
+6. Deploy branch must include `Dockerfile` (e.g. **`cursor/bugfix-batch`** or `main` after merge).
 
 ## 2. Add PostgreSQL
 

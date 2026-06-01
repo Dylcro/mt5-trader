@@ -14,10 +14,8 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc tsconfig.base.json t
 COPY artifacts/api-server ./artifacts/api-server
 COPY lib ./lib
 
-RUN pnpm install --frozen-lockfile \
-  --config.minimumReleaseAge=0 \
-  --config.node-linker=isolated \
-  --filter @workspace/api-server...
+# Match .npmrc / lockfile (hoisted). Do not pass conflicting --config.* flags.
+RUN pnpm install --frozen-lockfile --filter @workspace/api-server...
 
 EXPOSE 8080
 
