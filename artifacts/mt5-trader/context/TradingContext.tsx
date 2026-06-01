@@ -9,10 +9,11 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { AppState, Platform } from "react-native";
+import { AppState, Platform, type AppStateStatus } from "react-native";
 
 import { emitAccountEvent } from "@/lib/accountEventBus";
 import { getAuthToken } from "@/lib/authToken";
+import { buildCascadeComment, newCascadeZoneId } from "@/lib/zoneComments";
 
 // Secure credential helpers — used to silently re-establish the MetaAPI account
 // when the server tells us the previous accountId is dead (HTTP 410). The
@@ -120,6 +121,8 @@ interface TradingContextValue {
   refreshPrice: () => Promise<void>;
   refreshAccountInfo: () => Promise<void>;
   sseConnected: boolean;
+  /** False briefly after foreground wake — trade buttons stay disabled until warm. */
+  connectionWarm: boolean;
 }
 
 export interface PlaceTradeParams {
@@ -144,6 +147,8 @@ export interface PlaceTradeParams {
   tp2Pct?: number;
   tp3Pct?: number;
   tp4Pct?: number;
+  /** Pre-generated zone id for cascade legs — ties all orders to one zone. */
+  zoneId?: string;
 }
 
 export interface CascadeOrderParams {
@@ -166,6 +171,8 @@ export interface CascadeOrderParams {
   tp2Pct?: number;
   tp3Pct?: number;
   tp4Pct?: number;
+  /** Optional — generated automatically when omitted. */
+  zoneId?: string;
 }
 
 // Determine the API base URL.
@@ -231,12 +238,15 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const [price, setPrice] = useState<Price | null>(null);
   const [priceError, setPriceError] = useState(false);
   const [sseConnected, setSseConnected] = useState(false);
+  const [connectionWarm, setConnectionWarm] = useState(true);
 
   const [cascadeNotification, setCascadeNotification] = useState<CascadeNotification | null>(null);
 
   const priceIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const positionsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const eventsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const heartbeatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState);
   const lastEventPollTimeRef = useRef<number>(Date.now());
   const priceFailCountRef = useRef(0);
   const startPollingRef = useRef<((accId: string, accRegion: string) => void) | null>(null);
@@ -540,7 +550,66 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     if (priceIntervalRef.current) clearInterval(priceIntervalRef.current);
     if (positionsIntervalRef.current) clearInterval(positionsIntervalRef.current);
     if (eventsIntervalRef.current) clearInterval(eventsIntervalRef.current);
+    if (heartbeatIntervalRef.current) clearInterval(heartbeatIntervalRef.current);
   }, []);
+
+  const wakeConnection = useCallback(async () => {
+    if (!accountId || status !== "connected") return;
+    setConnectionWarm(false);
+    const r = regionRef.current;
+    try {
+      await authFetch(`${API_BASE}/healthz`);
+      await authFetch(`${API_BASE}/mt5/account/${accountId}/status?region=${r}`);
+      await Promise.all([
+        fetchPriceData(accountId, r).then(setPrice).catch(() => {}),
+        fetchPositionsData(accountId, r).then(setPositions).catch(() => {}),
+        fetchPendingOrdersData(accountId, r).then(setPendingOrders).catch(() => {}),
+      ]);
+    } catch {
+      // Trade path will auto-retry if still stale.
+    } finally {
+      setConnectionWarm(true);
+    }
+  }, [accountId, status, fetchPriceData, fetchPositionsData, fetchPendingOrdersData]);
+
+  const wakeConnectionRef = useRef<() => void>(() => {});
+  wakeConnectionRef.current = () => { void wakeConnection(); };
+
+  // Foreground wake + session heartbeat — keeps backend/MetaAPI warm after idle.
+  useEffect(() => {
+    if (status !== "connected" || !accountId) {
+      setConnectionWarm(status !== "connecting");
+      return;
+    }
+    const startHeartbeat = () => {
+      if (heartbeatIntervalRef.current) return;
+      heartbeatIntervalRef.current = setInterval(() => {
+        void authFetch(`${API_BASE}/healthz`).catch(() => {});
+        void authFetch(`${API_BASE}/mt5/account/${accountId}/status?region=${regionRef.current}`).catch(() => {});
+      }, 25_000);
+    };
+    const stopHeartbeat = () => {
+      if (heartbeatIntervalRef.current) {
+        clearInterval(heartbeatIntervalRef.current);
+        heartbeatIntervalRef.current = null;
+      }
+    };
+    const onChange = (next: AppStateStatus) => {
+      const prev = appStateRef.current;
+      appStateRef.current = next;
+      if (prev.match(/inactive|background/) && next === "active") {
+        wakeConnectionRef.current();
+        startHeartbeat();
+      }
+      if (next.match(/inactive|background/)) stopHeartbeat();
+    };
+    const sub = AppState.addEventListener("change", onChange);
+    if (AppState.currentState === "active") startHeartbeat();
+    return () => {
+      sub.remove();
+      stopHeartbeat();
+    };
+  }, [status, accountId]);
 
   // ── SSE live stream ────────────────────────────────────────────────────────────
   // SSE is the PRIMARY source for price and position data.
@@ -589,7 +658,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
     // When the app returns to foreground (mobile) or tab becomes visible (web),
     // immediately skip any pending backoff sleep and reconnect.
-    const onForeground = () => { retryDelay = 2_000; wakeNow(); };
+    const onForeground = () => { retryDelay = 2_000; wakeNow(); wakeConnectionRef.current(); };
     const appStateSub = AppState.addEventListener("change", state => {
       if (state === "active") onForeground();
     });
@@ -954,11 +1023,19 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       if (params.tp2Pct != null) body.tp2Pct = params.tp2Pct;
       if (params.tp3Pct != null) body.tp3Pct = params.tp3Pct;
       if (params.tp4Pct != null) body.tp4Pct = params.tp4Pct;
+      if (params.zoneId) body.zoneId = params.zoneId;
 
-      const isTransient = (msg?: string) =>
-        msg?.toLowerCase().includes("failed to execute a callable") ||
-        msg?.toLowerCase().includes("not connected to broker") ||
-        msg?.toLowerCase().includes("account is not connected");
+      const isTransient = (msg?: string) => {
+        const m = msg?.toLowerCase() ?? "";
+        return m.includes("failed to execute a callable") ||
+          m.includes("not connected to broker") ||
+          m.includes("account is not connected") ||
+          m.includes("validation failed") ||
+          m.includes("not ready") ||
+          m.includes("unexpected server") ||
+          m.includes("trade request timed out") ||
+          m.includes("no connection to the trade server");
+      };
 
       // Effective accountId/region for this trade — may be replaced mid-flight
       // if the server reports the MetaAPI account is dead and we silently
@@ -998,8 +1075,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         }
         // Retry once on transient broker-not-ready errors with a short delay
         if (attempt < MAX_ATTEMPTS && isTransient(errMsg)) {
-          console.log("[submitOrderRaw] transient error — retrying in 500ms");
-          await new Promise((r) => setTimeout(r, 500));
+          const delayMs = errMsg?.toLowerCase().includes("validation") ? 1200 : 500;
+          console.log(`[submitOrderRaw] transient error — retrying in ${delayMs}ms`);
+          await new Promise((r) => setTimeout(r, delayMs));
           continue;
         }
         return { success: false, message: errMsg ?? `Trade failed (code ${data.code ?? res.status})` };
@@ -1012,6 +1090,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const placeTrade = useCallback(
     async (params: PlaceTradeParams): Promise<{ success: boolean; message: string }> => {
       if (status !== "connected") return { success: false, message: "Not connected" };
+      if (!connectionWarm) {
+        await wakeConnection();
+      }
       try {
         const result = await submitOrderRaw(params);
         // Refresh in background — don't block the success toast
@@ -1023,15 +1104,19 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         return { success: false, message: err instanceof Error ? err.message : "Trade failed" };
       }
     },
-    [status, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo]
+    [status, connectionWarm, wakeConnection, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo]
   );
 
   const placeCascadeOrders = useCallback(
     async (params: CascadeOrderParams): Promise<{ success: boolean; placed: number; failed: number; message: string; marketPositionId?: string; limitOrderIds?: string[] }> => {
       if (status !== "connected") return { success: false, placed: 0, failed: 0, message: "Not connected" };
+      if (!connectionWarm) {
+        await wakeConnection();
+      }
       let placed = 0;
       let failed = 0;
       const errors: string[] = [];
+      const zoneId = params.zoneId ?? newCascadeZoneId();
       const total = 1 + params.limitEntries.length;
       let marketPositionId: string | undefined;
       const limitOrderIds: string[] = [];
@@ -1048,7 +1133,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
                 volume: params.volume,
                 limitPrice,
                 stopLoss: params.stopLoss,
-                comment: `Cascade ${i + 2}/${total}`,
+                comment: buildCascadeComment(zoneId, i + 2, total),
+                zoneId,
               })
             )
           );
@@ -1068,7 +1154,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
               direction: params.direction,
               volume: params.volume,
               stopLoss: params.stopLoss,
-              comment: `Cascade 1/${total}`,
+              comment: buildCascadeComment(zoneId, 1, total),
+              zoneId,
               // Absolute TP prices ride along on the market leg — that's the
               // trade that triggers zone creation server-side.
               tp1Price: params.tp1Price,
@@ -1087,7 +1174,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
                 volume: params.volume,
                 limitPrice,
                 stopLoss: params.stopLoss,
-                comment: `Cascade ${i + 2}/${total}`,
+                comment: buildCascadeComment(zoneId, i + 2, total),
+                zoneId,
               })
             ),
           ]);
@@ -1132,7 +1220,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       }
       return { success: true, placed, failed, message: `${placed} orders placed — 1 market + ${params.limitEntries.length} limit`, marketPositionId, limitOrderIds };
     },
-    [status, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo]
+    [status, connectionWarm, wakeConnection, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, accountId, region]
   );
 
   const closePosition = useCallback(
@@ -1206,6 +1294,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         refreshPrice,
         refreshAccountInfo,
         sseConnected,
+        connectionWarm,
       }}
     >
       {children}

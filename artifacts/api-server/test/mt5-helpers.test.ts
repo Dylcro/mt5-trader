@@ -5,6 +5,13 @@ import {
   ZONE_RISK_FREE_PIPS,
   rowToZoneState,
   _zoneStatesForTest,
+  buildCascadeComment,
+  parseZoneIdFromComment,
+  commentBelongsToZone,
+  computeFinalTpReached,
+  countEnabledTps,
+  countHitEnabledTps,
+  tpDisplayState,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
@@ -460,5 +467,70 @@ describe("Restart-hydration integration (pod-restart safety)", () => {
     expect(retrieved.anchorPrice).toBe(stA.anchorPrice);
     expect(retrieved.status).toBe(stA.status);
     expect(retrieved.direction).toBe(stA.direction);
+  });
+});
+
+describe("zone isolation — comment tagging", () => {
+  const zoneA = "z_abc123";
+  const zoneB = "z_def456";
+
+  it("buildCascadeComment embeds zoneId for broker-side isolation", () => {
+    expect(buildCascadeComment(zoneA, 1, 4)).toBe("Cascade|z_abc123|1/4");
+    expect(parseZoneIdFromComment("Cascade|z_abc123|2/4")).toBe(zoneA);
+  });
+
+  it("commentBelongsToZone only matches the owning zone", () => {
+    const commentA = buildCascadeComment(zoneA, 3, 4);
+    expect(commentBelongsToZone(commentA, zoneA)).toBe(true);
+    expect(commentBelongsToZone(commentA, zoneB)).toBe(false);
+    expect(commentBelongsToZone("Cascade 1/4", zoneA)).toBe(false);
+  });
+
+  it("parallel zones: sibling cascade comments never match wrong zone close filter", () => {
+    const sellLimits = [2, 3, 4].map((leg) => buildCascadeComment(zoneA, leg, 4));
+    const buyLimits = [2, 3, 4].map((leg) => buildCascadeComment(zoneB, leg, 4));
+    for (const c of sellLimits) {
+      expect(commentBelongsToZone(c, zoneA)).toBe(true);
+      expect(commentBelongsToZone(c, zoneB)).toBe(false);
+    }
+    for (const c of buyLimits) {
+      expect(commentBelongsToZone(c, zoneB)).toBe(true);
+      expect(commentBelongsToZone(c, zoneA)).toBe(false);
+    }
+  });
+});
+
+describe("disabled TP history", () => {
+  it("tpDisplayState: disabled is never hit", () => {
+    expect(tpDisplayState(false, true)).toBe("disabled");
+    expect(tpDisplayState(false, false)).toBe("disabled");
+    expect(tpDisplayState(true, false)).toBe("pending");
+    expect(tpDisplayState(true, true)).toBe("hit");
+  });
+
+  it("computeFinalTpReached ignores disabled TPs", () => {
+    expect(computeFinalTpReached({
+      tp1Enabled: true, tp2Enabled: true, tp3Enabled: false, tp4Enabled: true,
+      tp1Hit: true, tp2Hit: true, tp3Hit: true, tp4Hit: false,
+    })).toBe(2);
+  });
+
+  it("hit/enabled counts use only enabled TPs as denominator", () => {
+    const flags = { tp1Enabled: true, tp2Enabled: true, tp3Enabled: false, tp4Enabled: true };
+    expect(countEnabledTps(flags)).toBe(3);
+    expect(countHitEnabledTps({
+      ...flags,
+      tp1Hit: true, tp2Hit: true, tp3Hit: true, tp4Hit: false,
+    })).toBe(2);
+  });
+
+  it("rowToZoneState does not pre-mark disabled TPs as hit", () => {
+    const st = rowToZoneState(makeRow({
+      tp1Pct: 25, tp2Pct: 25, tp3Pct: 0, tp4Pct: 25,
+      tp1Enabled: true, tp2Enabled: true, tp3Enabled: false, tp4Enabled: true,
+      tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
+    } as Parameters<typeof makeRow>[0]));
+    expect(st.tp3Hit).toBe(false);
+    expect(st.tp3Enabled).toBe(false);
   });
 });

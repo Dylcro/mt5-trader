@@ -12,6 +12,7 @@ import {
   Text,
   View,
 } from "react-native";
+import { useFocusEffect } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import Colors from "@/constants/colors";
@@ -231,7 +232,7 @@ function PendingOrderCard({ order, onCancel }: { order: PendingOrder; onCancel: 
 
 export default function PositionsScreen() {
   const insets = useSafeAreaInsets();
-  const { positions, pendingOrders, status, refreshPositions, closePosition, cancelOrder, accountInfo, accountId, sseConnected } = useTrading();
+  const { positions, pendingOrders, status, refreshPositions, refreshPendingOrders, closePosition, cancelOrder, accountInfo, accountId, sseConnected } = useTrading();
   const { zones, riskFree, closeZone, cancelZoneOrders } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000, sseConnected });
   const { settings: cs } = useCascadeSettings();
   const activeZones = zones.filter((z) => z.status !== "CLOSED");
@@ -245,9 +246,20 @@ export default function PositionsScreen() {
 
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
-    await refreshPositions();
+    await Promise.all([refreshPositions(), refreshPendingOrders()]);
     setRefreshing(false);
-  }, [refreshPositions]);
+  }, [refreshPositions, refreshPendingOrders]);
+
+  // Poll while focused so MT5-side closes/cancels appear without manual refresh.
+  useFocusEffect(
+    useCallback(() => {
+      if (status !== "connected" || !accountId) return;
+      const sync = () => void Promise.all([refreshPositions(), refreshPendingOrders()]);
+      sync();
+      const id = setInterval(sync, 4_000);
+      return () => clearInterval(id);
+    }, [status, accountId, refreshPositions, refreshPendingOrders]),
+  );
 
   const handleCancelOrder = useCallback(
     async (order: PendingOrder) => {
@@ -374,7 +386,9 @@ export default function PositionsScreen() {
         ) : (
           <Feather name="refresh-cw" size={12} color={C.textMuted} />
         )}
-        <Text style={styles.refreshRowText}>{refreshing ? "Refreshing…" : "Refresh"}</Text>
+        <Text style={styles.refreshRowText}>
+          {refreshing ? "Refreshing…" : sseConnected ? "Live sync" : "Polling · refresh"}
+        </Text>
       </Pressable>
 
       <ScrollView

@@ -13,6 +13,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Colors from "@/constants/colors";
 import { useTrading } from "@/context/TradingContext";
 import { useZones, type Zone } from "@/hooks/useZones";
+import { tpDisplayState } from "@/lib/zoneComments";
 
 const C = Colors.dark;
 
@@ -27,7 +28,14 @@ function formatDate(ts: number) {
 
 function HistoryRow({ zone }: { zone: Zone }) {
   const isBuy = zone.direction === "buy";
-  const tpLabel = zone.finalTpReached ? `TP${zone.finalTpReached}` : "—";
+  const enabled = zone.enabledTpCount ?? 4;
+  const hits = zone.hitEnabledTpCount ?? 0;
+  const tpSummary =
+    enabled > 0 ? `${hits}/${enabled} TPs` : "—";
+  const finalLabel =
+    zone.finalTpReached && zone.finalTpReached > 0
+      ? `TP${zone.finalTpReached}`
+      : "—";
   return (
     <View style={styles.row}>
       <View style={[styles.dirBadge, isBuy ? styles.dirBuy : styles.dirSell]}>
@@ -38,8 +46,28 @@ function HistoryRow({ zone }: { zone: Zone }) {
       <View style={styles.rowBody}>
         <Text style={styles.rowTitle}>Zone {zone.zoneId.slice(0, 8)}…</Text>
         <Text style={styles.rowMeta}>
-          Entry {zone.anchorPrice.toFixed(2)} · Final {tpLabel}
+          Entry {zone.anchorPrice.toFixed(2)} · {tpSummary} · Final {finalLabel}
         </Text>
+        <View style={styles.tpRow}>
+          {([1, 2, 3, 4] as const).map((n) => {
+            const enabledFlag = zone[`tp${n}Enabled` as keyof Zone] !== false;
+            const hitFlag = Boolean(zone[`tp${n}Hit` as keyof Zone]);
+            const state = tpDisplayState(enabledFlag, hitFlag);
+            const label = state === "disabled" ? "—" : state === "hit" ? "✓" : "○";
+            return (
+              <Text
+                key={n}
+                style={[
+                  styles.tpDot,
+                  state === "disabled" && styles.tpDotDisabled,
+                  state === "hit" && styles.tpDotHit,
+                ]}
+              >
+                TP{n}{label}
+              </Text>
+            );
+          })}
+        </View>
         <Text style={styles.rowTime}>
           {zone.closedAt ? formatDate(zone.closedAt) : formatDate(zone.createdAt)}
         </Text>
@@ -51,10 +79,11 @@ function HistoryRow({ zone }: { zone: Zone }) {
 
 export default function HistoryScreen() {
   const insets = useSafeAreaInsets();
-  const { accountId } = useTrading();
+  const { accountId, sseConnected } = useTrading();
   const { zones, loading, error, refresh } = useZones(accountId, {
     includeClosed: true,
     pollIntervalMs: 30_000,
+    sseConnected,
   });
   const [refreshing, setRefreshing] = React.useState(false);
 
@@ -150,6 +179,24 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontFamily: "Inter_400Regular",
     color: C.textSecondary,
+    marginBottom: 4,
+  },
+  tpRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+    marginBottom: 2,
+  },
+  tpDot: {
+    fontSize: 10,
+    fontFamily: "Inter_600SemiBold",
+    color: C.textMuted,
+  },
+  tpDotDisabled: {
+    opacity: 0.45,
+  },
+  tpDotHit: {
+    color: C.buy,
   },
   rowTime: {
     fontSize: 11,

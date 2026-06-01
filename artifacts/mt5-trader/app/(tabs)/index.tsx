@@ -278,7 +278,7 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition } = useTrading();
+  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, connectionWarm, sseConnected } = useTrading();
   const { settings: cascadeSettings } = useCascadeSettings();
   const cascadeSettingsRef = useRef(cascadeSettings);
   useEffect(() => { cascadeSettingsRef.current = cascadeSettings; }, [cascadeSettings]);
@@ -676,7 +676,15 @@ export default function TradeScreen() {
             <View style={styles.liveDot}>
               <Animated.View style={[styles.dot, { opacity: status === "connected" ? blinkAnim : 0.2, backgroundColor: status === "connected" ? C.buy : status === "connecting" ? C.gold : C.sell }]} />
               <Text style={[styles.liveLabel, status === "disconnected" && { color: C.sell }]}>
-                {status === "connected" ? "LIVE" : status === "disconnected" ? "TAP TO RECONNECT" : status.toUpperCase()}
+                {status === "connected"
+                  ? connectionWarm
+                    ? sseConnected
+                      ? "LIVE"
+                      : "SYNCING"
+                    : "CONNECTING…"
+                  : status === "disconnected"
+                    ? "TAP TO RECONNECT"
+                    : status.toUpperCase()}
               </Text>
             </View>
           </Pressable>
@@ -726,7 +734,7 @@ export default function TradeScreen() {
 
         {/* BUY / SELL — always visible, above mode toggle */}
         {(() => {
-          const tradeReady = status === "connected" && !!price;
+          const tradeReady = status === "connected" && !!price && connectionWarm;
           return (
             <View style={styles.cascadeExecRow}>
               <Pressable

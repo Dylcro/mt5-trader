@@ -27,6 +27,11 @@ export const cascadeZonesTable = pgTable("cascade_zones", {
   tp2Pct:      doublePrecision("tp2_pct").notNull().default(25),
   tp3Pct:      doublePrecision("tp3_pct").notNull().default(25),
   tp4Pct:      doublePrecision("tp4_pct").notNull().default(25),
+  // Snapshot of which TP levels were enabled when the zone was placed.
+  tp1Enabled:  boolean("tp1_enabled").notNull().default(true),
+  tp2Enabled:  boolean("tp2_enabled").notNull().default(true),
+  tp3Enabled:  boolean("tp3_enabled").notNull().default(true),
+  tp4Enabled:  boolean("tp4_enabled").notNull().default(true),
   // Cashout trigger pip offset from the anchor (default 5p covers spread).
   cashoutPips: doublePrecision("cashout_pips").notNull().default(5),
   // Step flags — once true, that step won't fire again.

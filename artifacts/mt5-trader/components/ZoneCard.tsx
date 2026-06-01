@@ -5,6 +5,7 @@ import { ActivityIndicator, Alert, Platform, Pressable, StyleSheet, Text, View }
 
 import Colors from "@/constants/colors";
 import type { Zone } from "@/hooks/useZones";
+import { tpDisplayState } from "@/lib/zoneComments";
 
 const C = Colors.dark;
 
@@ -25,7 +26,15 @@ function formatClosedAt(ms: number): string {
   return `${date} ${time}`;
 }
 
-function TpChip({ label, hit }: { label: string; hit: boolean }) {
+function TpChip({ label, state }: { label: string; state: "pending" | "hit" | "disabled" }) {
+  if (state === "disabled") {
+    return (
+      <View style={[styles.tpChip, styles.tpChipDisabled]}>
+        <Text style={styles.tpChipTextDisabled}>{label}</Text>
+      </View>
+    );
+  }
+  const hit = state === "hit";
   return (
     <View style={[styles.tpChip, hit ? styles.tpChipHit : styles.tpChipPending]}>
       {hit && <Feather name="check" size={10} color="#000" />}
@@ -173,21 +182,26 @@ export default function ZoneCard({
         <View style={styles.chipsRow}>
           <TpChip
             label={zone.tp1Price != null ? `TP1 ${formatPrice(zone.tp1Price)}` : "TP1 —"}
-            hit={zone.tp1Hit}
+            state={tpDisplayState(zone.tp1Enabled !== false, zone.tp1Hit)}
           />
           <TpChip
             label={zone.tp2Price != null ? `TP2 ${formatPrice(zone.tp2Price)}` : "TP2 —"}
-            hit={zone.tp2Hit}
+            state={tpDisplayState(zone.tp2Enabled !== false, zone.tp2Hit)}
           />
           <TpChip
             label={zone.tp3Price != null ? `TP3 ${formatPrice(zone.tp3Price)}` : "TP3 —"}
-            hit={zone.tp3Hit}
+            state={tpDisplayState(zone.tp3Enabled !== false, zone.tp3Hit)}
           />
           <TpChip
             label={zone.tp4Price != null ? `TP4 ${formatPrice(zone.tp4Price)}` : "TP4 manual"}
-            hit={zone.tp4Hit}
+            state={tpDisplayState(zone.tp4Enabled !== false, zone.tp4Hit)}
           />
         </View>
+        {zone.enabledTpCount != null && zone.enabledTpCount > 0 && (
+          <Text style={styles.tpTally}>
+            {zone.hitEnabledTpCount ?? 0}/{zone.enabledTpCount} TPs hit
+          </Text>
+        )}
       </View>
 
       {!historical && zone.tp2Hit && zone.tp2SlIsBestEffort && zone.status !== "CLOSED" && (
@@ -416,6 +430,23 @@ const styles = StyleSheet.create({
   tpChipHit: {
     borderColor: C.gold,
     backgroundColor: C.gold,
+  },
+  tpChipDisabled: {
+    borderColor: C.border,
+    backgroundColor: "transparent",
+    opacity: 0.45,
+  },
+  tpChipTextDisabled: {
+    fontSize: 10,
+    fontFamily: "Inter_600SemiBold",
+    color: C.textMuted,
+    letterSpacing: 0.3,
+  },
+  tpTally: {
+    fontSize: 10,
+    fontFamily: "Inter_500Medium",
+    color: C.textMuted,
+    marginTop: 4,
   },
   tpChipText: {
     fontSize: 10,
