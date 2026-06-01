@@ -16,7 +16,8 @@ import Colors from "@/constants/colors";
 import { useTrading } from "@/context/TradingContext";
 import { useRealizedPnl } from "@/hooks/useRealizedPnl";
 import { useZones } from "@/hooks/useZones";
-import { formatMoney, formatPrice } from "@/lib/formatters";
+import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
+import { formatPrice } from "@/lib/formatters";
 import {
   filterClosedZonesByPeriod,
   tp2HitRatePct,
@@ -107,6 +108,7 @@ export default function DashboardScreen() {
     setRefreshing(false);
   };
 
+  const { currency: displayCurrency, formatMoney } = useDisplayCurrency();
   const leverageLabel = accountInfo ? `1:${accountInfo.leverage}` : "—";
   const serverLabel = credentials.server || region || "—";
   const streaming = sseConnected && !priceError && price != null;
@@ -141,7 +143,7 @@ export default function DashboardScreen() {
           {accountInfo ? formatMoney(accountInfo.balance) : "—"}
         </Text>
         <Text style={styles.heroMeta}>
-          {accountInfo?.currency ?? "USD"} · {leverageLabel} · {serverLabel}
+          {displayCurrency} · {leverageLabel} · {serverLabel}
         </Text>
         <View style={styles.heroTiles}>
           <View style={styles.heroTile}>

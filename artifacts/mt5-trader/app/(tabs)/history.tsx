@@ -15,7 +15,8 @@ import Colors from "@/constants/colors";
 import { useTrading } from "@/context/TradingContext";
 import { useRealizedPnl } from "@/hooks/useRealizedPnl";
 import { useZones, type Zone } from "@/hooks/useZones";
-import { formatDuration, formatHistoryDate, formatMoney, formatPrice } from "@/lib/formatters";
+import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
+import { formatDuration, formatHistoryDate, formatPrice } from "@/lib/formatters";
 import { tpDisplayState } from "@/lib/zoneComments";
 import {
   countTpHits,
@@ -142,6 +143,7 @@ function HistoryCard({ zone }: { zone: Zone }) {
 
 export default function HistoryScreen() {
   const insets = useSafeAreaInsets();
+  const { formatMoney } = useDisplayCurrency();
   const { accountId, region, sseConnected } = useTrading();
   const { zones, loading, error, refresh } = useZones(accountId, {
     includeClosed: true,

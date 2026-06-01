@@ -21,6 +21,7 @@ import { AuthProvider } from "@/context/AuthContext";
 import { TradingProvider } from "@/context/TradingContext";
 import { CascadeSettingsProvider } from "@/hooks/useCascadeSettings";
 import { HapticSettingsProvider } from "@/hooks/useHapticSettings";
+import { DisplayCurrencyProvider } from "@/hooks/useDisplayCurrency";
 import { NotificationSettingsProvider } from "@/hooks/useNotificationSettings";
 import { useNotificationDeepLink } from "@/hooks/useNotificationDeepLink";
 
@@ -72,6 +73,7 @@ export default function RootLayout() {
               <StatusBar style="dark" />
               <KeyboardProvider>
                 <TradingProvider>
+                  <DisplayCurrencyProvider>
                   <HapticSettingsProvider>
                     <CascadeSettingsProvider>
                       <NotificationSettingsProvider>
@@ -80,6 +82,7 @@ export default function RootLayout() {
                       </NotificationSettingsProvider>
                     </CascadeSettingsProvider>
                   </HapticSettingsProvider>
+                  </DisplayCurrencyProvider>
                 </TradingProvider>
               </KeyboardProvider>
             </GestureHandlerRootView>

@@ -20,7 +20,7 @@ import { useTrading, type PendingOrder, type Position } from "@/context/TradingC
 import { useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useZones } from "@/hooks/useZones";
 import ZoneCard from "@/components/ZoneCard";
-import { formatMoney } from "@/lib/formatters";
+import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
 
 const C = Colors.dark;
 
@@ -29,6 +29,7 @@ function formatPrice(n: number) {
 }
 
 function ProfitBadge({ profit }: { profit: number }) {
+  const { formatMoney } = useDisplayCurrency();
   const positive = profit >= 0;
   return (
     <View style={[styles.profitBadge, positive ? styles.profitPositive : styles.profitNegative]}>
@@ -38,7 +39,7 @@ function ProfitBadge({ profit }: { profit: number }) {
         color={positive ? C.buy : C.sell}
       />
       <Text style={[styles.profitText, { color: positive ? C.buy : C.sell }]}>
-        {positive ? "+" : ""}${profit.toFixed(2)}
+        {formatMoney(profit, { signed: true })}
       </Text>
     </View>
   );
@@ -233,6 +234,7 @@ function PendingOrderCard({ order, onCancel }: { order: PendingOrder; onCancel: 
 
 export default function PositionsScreen() {
   const insets = useSafeAreaInsets();
+  const { formatMoney } = useDisplayCurrency();
   const { positions, pendingOrders, status, refreshPositions, refreshPendingOrders, closePosition, cancelOrder, accountId, sseConnected } = useTrading();
   const { zones, riskFree, closeZone, cancelZoneOrders } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000, sseConnected });
   const { settings: cs } = useCascadeSettings();
