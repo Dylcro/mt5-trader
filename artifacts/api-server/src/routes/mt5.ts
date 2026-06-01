@@ -2120,12 +2120,12 @@ async function markZonePositionClosed(accountId: string, positionId: string): Pr
             broadcastToAccount(accountId, "deal", { type: "position_changed" });
             // Use a direct zone_update broadcast (not broadcastZoneUpdate) so it
             // fires even when zoneStates entry is absent after a server restart.
-            broadcastToAccount(accountId, "zone_update", { zoneId, status: "CLOSED" });
+            broadcastToAccount(accountId, "zone_update", { zoneId, status: "CLOSED", closedAt });
           });
       } catch {
         console.warn(`[zone ${zoneId}] could not cancel limits after external close — token unavailable`);
         broadcastToAccount(accountId, "deal", { type: "position_changed" });
-        broadcastToAccount(accountId, "zone_update", { zoneId, status: "CLOSED" });
+        broadcastToAccount(accountId, "zone_update", { zoneId, status: "CLOSED", closedAt });
       }
     }
   } catch (e) {
@@ -3218,49 +3218,54 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
     const out = [];
     for (const z of zones) {
       if (!includeClosed && z.status === "CLOSED") continue;
+      let row = z;
       if (z.status === "CLOSED" && z.closedPnl == null) {
-        void settleZoneClosedPnl(accountId, z.zoneId);
+        await settleZoneClosedPnl(accountId, z.zoneId);
+        const [fresh] = await db.select().from(cascadeZonesTable)
+          .where(eq(cascadeZonesTable.zoneId, z.zoneId))
+          .limit(1);
+        if (fresh) row = fresh;
       }
       const openPositions = await db.select().from(zonePositionsTable)
-        .where(and(eq(zonePositionsTable.zoneId, z.zoneId), eq(zonePositionsTable.status, "OPEN")));
+        .where(and(eq(zonePositionsTable.zoneId, row.zoneId), eq(zonePositionsTable.status, "OPEN")));
       const finalTpReached = computeFinalTpReached({
-        tp1Enabled: (z as { tp1Enabled?: boolean }).tp1Enabled ?? (Number(z.tp1Pct ?? 25) > 0),
-        tp2Enabled: (z as { tp2Enabled?: boolean }).tp2Enabled ?? (Number(z.tp2Pct ?? 25) > 0),
-        tp3Enabled: (z as { tp3Enabled?: boolean }).tp3Enabled ?? (Number(z.tp3Pct ?? 25) > 0),
-        tp4Enabled: (z as { tp4Enabled?: boolean }).tp4Enabled ?? (Number(z.tp4Pct ?? 25) > 0),
-        tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit, tp4Hit: z.tp4Hit ?? false,
+        tp1Enabled: (row as { tp1Enabled?: boolean }).tp1Enabled ?? (Number(row.tp1Pct ?? 25) > 0),
+        tp2Enabled: (row as { tp2Enabled?: boolean }).tp2Enabled ?? (Number(row.tp2Pct ?? 25) > 0),
+        tp3Enabled: (row as { tp3Enabled?: boolean }).tp3Enabled ?? (Number(row.tp3Pct ?? 25) > 0),
+        tp4Enabled: (row as { tp4Enabled?: boolean }).tp4Enabled ?? (Number(row.tp4Pct ?? 25) > 0),
+        tp1Hit: row.tp1Hit, tp2Hit: row.tp2Hit, tp3Hit: row.tp3Hit, tp4Hit: row.tp4Hit ?? false,
       });
-      const tp1Enabled = (z as { tp1Enabled?: boolean }).tp1Enabled ?? (Number(z.tp1Pct ?? 25) > 0);
-      const tp2Enabled = (z as { tp2Enabled?: boolean }).tp2Enabled ?? (Number(z.tp2Pct ?? 25) > 0);
-      const tp3Enabled = (z as { tp3Enabled?: boolean }).tp3Enabled ?? (Number(z.tp3Pct ?? 25) > 0);
-      const tp4Enabled = (z as { tp4Enabled?: boolean }).tp4Enabled ?? (Number(z.tp4Pct ?? 25) > 0);
+      const tp1Enabled = (row as { tp1Enabled?: boolean }).tp1Enabled ?? (Number(row.tp1Pct ?? 25) > 0);
+      const tp2Enabled = (row as { tp2Enabled?: boolean }).tp2Enabled ?? (Number(row.tp2Pct ?? 25) > 0);
+      const tp3Enabled = (row as { tp3Enabled?: boolean }).tp3Enabled ?? (Number(row.tp3Pct ?? 25) > 0);
+      const tp4Enabled = (row as { tp4Enabled?: boolean }).tp4Enabled ?? (Number(row.tp4Pct ?? 25) > 0);
       const enabledTpCount = countEnabledTps({ tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled });
       const hitEnabledTpCount = countHitEnabledTps({
         tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
-        tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit, tp4Hit: z.tp4Hit ?? false,
+        tp1Hit: row.tp1Hit, tp2Hit: row.tp2Hit, tp3Hit: row.tp3Hit, tp4Hit: row.tp4Hit ?? false,
       });
 
-      const dir = z.direction === "sell" ? "sell" : "buy";
-      const anchor = Number(z.anchorPrice);
+      const dir = row.direction === "sell" ? "sell" : "buy";
+      const anchor = Number(row.anchorPrice);
       // Resolve absolute TP prices, falling back to anchor + legacy pip distance.
       const fromPips = (pips: number) => dir === "buy" ? anchor + pips * PIP : anchor - pips * PIP;
-      const tp1Price = z.tp1Price != null ? Number(z.tp1Price) : (z.tp1Pips ? fromPips(Number(z.tp1Pips)) : null);
-      const tp2Price = z.tp2Price != null ? Number(z.tp2Price) : (z.tp2Pips ? fromPips(Number(z.tp2Pips)) : null);
-      const tp3Price = z.tp3Price != null ? Number(z.tp3Price) : (z.tp3Pips ? fromPips(Number(z.tp3Pips)) : null);
-      const tp4Price = z.tp4Price != null ? Number(z.tp4Price) : null;
+      const tp1Price = row.tp1Price != null ? Number(row.tp1Price) : (row.tp1Pips ? fromPips(Number(row.tp1Pips)) : null);
+      const tp2Price = row.tp2Price != null ? Number(row.tp2Price) : (row.tp2Pips ? fromPips(Number(row.tp2Pips)) : null);
+      const tp3Price = row.tp3Price != null ? Number(row.tp3Price) : (row.tp3Pips ? fromPips(Number(row.tp3Pips)) : null);
+      const tp4Price = row.tp4Price != null ? Number(row.tp4Price) : null;
 
       let nextTp: 0 | 1 | 2 | 3 | 4 = 0;
-      if (tp1Enabled && !z.tp1Hit) nextTp = 1;
-      else if (tp2Enabled && !z.tp2Hit) nextTp = 2;
-      else if (tp3Enabled && !z.tp3Hit) nextTp = 3;
-      else if (tp4Enabled && !z.tp4Hit && tp4Price != null) nextTp = 4;
+      if (tp1Enabled && !row.tp1Hit) nextTp = 1;
+      else if (tp2Enabled && !row.tp2Hit) nextTp = 2;
+      else if (tp3Enabled && !row.tp3Hit) nextTp = 3;
+      else if (tp4Enabled && !row.tp4Hit && tp4Price != null) nextTp = 4;
 
       let currentPrice: number | null = null;
       let nextTpPrice: number | null = null;
       let pipsToNextTp: number | null = null;
       let progressPct: number | null = null;
 
-      if (price && anchor > 0 && z.status !== "CLOSED" && nextTp > 0) {
+      if (price && anchor > 0 && row.status !== "CLOSED" && nextTp > 0) {
         const cmp = dir === "buy" ? price.bid : price.ask;
         currentPrice = cmp;
         const tps = [tp1Price, tp2Price, tp3Price, tp4Price];
@@ -3280,22 +3285,22 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
       }
 
       out.push({
-        zoneId: z.zoneId,
-        direction: z.direction,
+        zoneId: row.zoneId,
+        direction: row.direction,
         anchorPrice: anchor,
         tp1Price, tp2Price, tp3Price, tp4Price,
-        tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit, tp4Hit: z.tp4Hit ?? false,
+        tp1Hit: row.tp1Hit, tp2Hit: row.tp2Hit, tp3Hit: row.tp3Hit, tp4Hit: row.tp4Hit ?? false,
         tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
         enabledTpCount, hitEnabledTpCount,
-        tp2SlIsBestEffort: (z as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
-        cashoutDone: z.cashoutDone ?? false,
-        status: z.status,
-        createdAt: Number(z.createdAt),
-        closedAt: z.closedAt != null ? Number(z.closedAt) : null,
-        closedPnl: z.closedPnl != null ? Number(z.closedPnl) : null,
+        tp2SlIsBestEffort: (row as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
+        cashoutDone: row.cashoutDone ?? false,
+        status: row.status,
+        createdAt: Number(row.createdAt),
+        closedAt: row.closedAt != null ? Number(row.closedAt) : null,
+        closedPnl: row.closedPnl != null ? Number(row.closedPnl) : null,
         finalTpReached,
         positionCount: openPositions.length,
-        originalVolume: z.originalVolume != null ? Number(z.originalVolume) : 0,
+        originalVolume: row.originalVolume != null ? Number(row.originalVolume) : 0,
         currentPrice,
         nextTp,
         nextTpPrice,

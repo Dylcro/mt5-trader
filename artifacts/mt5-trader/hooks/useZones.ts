@@ -112,7 +112,16 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
         const update = data as Partial<Zone> & { zoneId?: string };
         if (!update.zoneId) return;
         setZones(prev =>
-          prev.map(z => z.zoneId === update.zoneId ? { ...z, ...update } : z)
+          prev.map((z) => {
+            if (z.zoneId !== update.zoneId) return z;
+            const next: Zone = { ...z, ...update };
+            if (update.status === "CLOSED") {
+              if (next.closedAt == null || next.closedAt <= 0) {
+                next.closedAt = Date.now();
+              }
+            }
+            return next;
+          }),
         );
       } else if (type === "deal") {
         void refresh();

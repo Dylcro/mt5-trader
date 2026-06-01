@@ -21,7 +21,7 @@ import { normalizeDisplayCurrency } from "@/lib/displayCurrency";
 import { formatMoney as formatMoneyRaw, formatPrice } from "@/lib/formatters";
 import {
   filterClosedZonesByPeriod,
-  avgClosedZonePnl,
+  avgClosedZonePnlFromTotal,
   winRatePct,
   type Period,
 } from "@/lib/zoneStats";
@@ -90,17 +90,20 @@ export default function DashboardScreen() {
 
   const riskFreeCount = openZones.filter((z) => z.status === "RISK_FREE").length;
 
-  const winRate = winRatePct(periodClosed);
-  const avgZonePnl = useMemo(() => avgClosedZonePnl(periodClosed), [periodClosed]);
-  const floatingPnl =
-    accountInfo != null ? accountInfo.equity - accountInfo.balance : null;
-
   const { pnl: closedPnl, loading: closedPnlLoading } = useRealizedPnl(
     accountId,
     period,
     region,
     refreshKey,
   );
+
+  const winRate = winRatePct(periodClosed);
+  const avgZonePnl = useMemo(
+    () => avgClosedZonePnlFromTotal(periodClosed, closedPnl ?? null),
+    [periodClosed, closedPnl],
+  );
+  const floatingPnl =
+    accountInfo != null ? accountInfo.equity - accountInfo.balance : null;
 
   const onRefresh = async () => {
     setRefreshing(true);
