@@ -1,29 +1,36 @@
+import { currencySymbol, type DisplayCurrency } from "@/lib/displayCurrency";
+
 const PIP = 0.1;
 
 export function formatPrice(n: number): string {
   return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-export function formatMoney(n: number, opts?: { signed?: boolean; decimals?: number }): string {
+export function formatMoney(
+  n: number,
+  opts?: { signed?: boolean; decimals?: number; currency?: DisplayCurrency },
+): string {
+  const sym = currencySymbol(opts?.currency ?? "USD");
   const decimals = opts?.decimals ?? 2;
   const abs = Math.abs(n).toLocaleString("en-US", {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
   });
   if (opts?.signed) {
-    if (n >= 0) return `+$${abs}`;
-    return `-$${abs}`;
+    if (n >= 0) return `+${sym}${abs}`;
+    return `-${sym}${abs}`;
   }
-  return `$${abs}`;
+  return `${sym}${abs}`;
 }
 
-export function formatCompactMoney(n: number): string {
+export function formatCompactMoney(n: number, currency: DisplayCurrency = "USD"): string {
+  const sym = currencySymbol(currency);
   const sign = n >= 0 ? "+" : "-";
   const abs = Math.abs(n);
   if (abs >= 1000) {
-    return `${sign}$${(abs / 1000).toLocaleString("en-US", { maximumFractionDigits: 1 })}k`;
+    return `${sign}${sym}${(abs / 1000).toLocaleString("en-US", { maximumFractionDigits: 1 })}k`;
   }
-  return formatMoney(n, { signed: true, decimals: abs >= 100 ? 0 : 2 });
+  return formatMoney(n, { signed: true, decimals: abs >= 100 ? 0 : 2, currency });
 }
 
 export function formatDuration(ms: number): string {

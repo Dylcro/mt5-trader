@@ -22,6 +22,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import { useTrading, type SLMode } from "@/context/TradingContext";
 import { buildCascadeLevels, useCascadeSettings } from "@/hooks/useCascadeSettings";
+import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
 
 const LOT_SIZE_SINGLE_KEY = "lot_size_single";
 const LOT_SIZE_CASCADE_KEY = "lot_size_cascade";
@@ -279,6 +280,7 @@ export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
   const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, connectionWarm, sseConnected } = useTrading();
+  const { formatMoney } = useDisplayCurrency();
   const { settings: cascadeSettings } = useCascadeSettings();
   const cascadeSettingsRef = useRef(cascadeSettings);
   useEffect(() => { cascadeSettingsRef.current = cascadeSettings; }, [cascadeSettings]);
@@ -995,7 +997,7 @@ export default function TradeScreen() {
                   <StepInput value={slPercent} onChange={setSlPercent} step={0.1} min={0.1} max={20} decimals={1} />
                   <Text style={styles.slNote}>
                     {marketEntry > 0 && sl != null
-                      ? `Risk ${riskDollars.toFixed(2)} → SL ${formatPrice(sl)}`
+                      ? `Risk ${formatMoney(riskDollars)} → SL ${formatPrice(sl)}`
                       : "Connect to calculate"}
                   </Text>
                 </View>
@@ -1039,12 +1041,12 @@ export default function TradeScreen() {
                 </View>
                 <View style={styles.riskRow}>
                   <Text style={styles.riskLabel}>Est. Risk</Text>
-                  <Text style={[styles.riskValue, { color: C.gold }]}>{riskDollars.toFixed(2)}</Text>
+                  <Text style={[styles.riskValue, { color: C.gold }]}>{formatMoney(riskDollars)}</Text>
                 </View>
                 {accountInfo && (
                   <View style={styles.riskRow}>
                     <Text style={styles.riskLabel}>Balance</Text>
-                    <Text style={styles.riskValue}>{formatPrice(accountInfo.balance)}</Text>
+                    <Text style={styles.riskValue}>{formatMoney(accountInfo.balance)}</Text>
                   </View>
                 )}
               </View>

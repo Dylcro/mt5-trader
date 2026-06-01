@@ -21,9 +21,11 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
+import CurrencyPicker from "@/components/CurrencyPicker";
 import Colors from "@/constants/colors";
 import { useTrading } from "@/context/TradingContext";
 import { useCascadeSettings } from "@/hooks/useCascadeSettings";
+import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
 import { useHapticSettings } from "@/hooks/useHapticSettings";
 import { useNotificationSettings } from "@/hooks/useNotificationSettings";
 
@@ -214,6 +216,7 @@ export default function SettingsScreen() {
   const router = useRouter();
   const { signOut } = useAuth();
   const { credentials, status, errorMsg, accountInfo, connect, disconnect } = useTrading();
+  const { currency: displayCurrency, brokerCurrency, setCurrency, formatMoney } = useDisplayCurrency();
   const { settings: cs, updateSettings, saveToServer } = useCascadeSettings();
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [tpDraft, setTpDraft] = useState({
@@ -544,25 +547,25 @@ export default function SettingsScreen() {
                   <View style={styles.balanceItem}>
                     <Text style={styles.balanceLabel}>BALANCE</Text>
                     <Text style={styles.balanceValue}>
-                      {accountInfo.currency} {accountInfo.balance.toLocaleString("en-US", { minimumFractionDigits: 2 })}
+                      {formatMoney(accountInfo.balance)}
                     </Text>
                   </View>
                   <View style={styles.balanceDivider} />
                   <View style={styles.balanceItem}>
                     <Text style={styles.balanceLabel}>EQUITY</Text>
                     <Text style={[styles.balanceValue, { color: accountInfo.equity >= accountInfo.balance ? C.buy : C.sell }]}>
-                      {accountInfo.currency} {accountInfo.equity.toLocaleString("en-US", { minimumFractionDigits: 2 })}
+                      {formatMoney(accountInfo.equity)}
                     </Text>
                   </View>
                 </View>
               </View>
 
               <View style={styles.infoCard}>
-                <InfoRow label="Free Margin" value={`${accountInfo.currency} ${accountInfo.freeMargin.toLocaleString("en-US", { minimumFractionDigits: 2 })}`} />
+                <InfoRow label="Free Margin" value={formatMoney(accountInfo.freeMargin)} />
                 <View style={styles.infoDivider} />
                 <InfoRow label="Leverage" value={`1:${accountInfo.leverage}`} />
                 <View style={styles.infoDivider} />
-                <InfoRow label="Currency" value={accountInfo.currency} />
+                <InfoRow label="MT5 account currency" value={accountInfo.currency} />
               </View>
             </>
           )}
@@ -628,6 +631,23 @@ export default function SettingsScreen() {
                 </Text>
               </View>
             </View>
+          </View>
+
+          {/* Display currency */}
+          <View style={styles.cascadeCard}>
+            <View style={styles.cascadeCardHeader}>
+              <Feather name="dollar-sign" size={16} color={C.gold} />
+              <Text style={styles.cascadeCardTitle}>Display currency</Text>
+            </View>
+            <Text style={styles.cascadeCardDesc}>
+              Choose how balances and P&L are shown in the app. Amounts are still in your MT5 account currency
+              {brokerCurrency ? ` (${brokerCurrency})` : ""} — only the symbol changes.
+            </Text>
+            <View style={styles.cascadeDivider} />
+            <CurrencyPicker
+              value={displayCurrency}
+              onChange={(c) => { void setCurrency(c); }}
+            />
           </View>
 
           {/* TP Alerts */}
