@@ -15,6 +15,7 @@ import {
   shouldCancelCascadeLimitsAtTpStage,
   shouldAutoCloseZoneAfterPositionExit,
   sumDealPnlForPositions,
+  sumRealizedTradePnlFromDeals,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
@@ -566,6 +567,18 @@ describe("cascade limit cancel timing", () => {
       false,
       false,
     )).toBe(true);
+  });
+});
+
+describe("sumRealizedTradePnlFromDeals (dashboard period P&L)", () => {
+  it("counts only BUY/SELL exit deals with a symbol", () => {
+    const deals = [
+      { type: "DEAL_TYPE_BUY", entryType: "DEAL_ENTRY_IN", symbol: "XAUUSD", profit: 0, commission: -1, swap: 0 },
+      { type: "DEAL_TYPE_BUY", entryType: "DEAL_ENTRY_OUT", symbol: "XAUUSD", profit: 50, commission: -0.5, swap: 0 },
+      { type: "DEAL_TYPE_BALANCE", entryType: "DEAL_ENTRY_IN", profit: 1000, commission: 0, swap: 0 },
+      { type: "DEAL_TYPE_SELL", entryType: "DEAL_ENTRY_OUT", symbol: "XAUUSD", profit: -10, commission: 0, swap: -0.2 },
+    ];
+    expect(sumRealizedTradePnlFromDeals(deals)).toBe(39.3);
   });
 });
 

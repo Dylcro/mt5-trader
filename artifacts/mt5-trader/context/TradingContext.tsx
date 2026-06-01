@@ -478,6 +478,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       void Promise.all([
         fetchPositionsData(a, r).then(setPositions).catch(() => {}),
         fetchPendingOrdersData(a, r).then(setPendingOrders).catch(() => {}),
+        fetchAccountInfoData(a, r).then(setAccountInfo).catch(() => {}),
       ]);
     },
     onPendingOrder: () => {
@@ -535,12 +536,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       // (fallback-only, started only after 30 s of SSE disconnection).
       pollPrice();
       pollPositions();
+      void fetchAccountInfoData(accId, accRegion).then(setAccountInfo).catch(() => {});
       void pollEvents();
       priceIntervalRef.current = null;
       positionsIntervalRef.current = null;
       eventsIntervalRef.current = setInterval(pollEvents, 5000);
     },
-    [fetchPriceData, fetchPositionsData, fetchPendingOrdersData]
+    [fetchPriceData, fetchPositionsData, fetchPendingOrdersData, fetchAccountInfoData]
   );
 
   // Keep the ref in sync so pollUntilConnected (declared before startPolling) can access it
@@ -564,13 +566,14 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         fetchPriceData(accountId, r).then(setPrice).catch(() => {}),
         fetchPositionsData(accountId, r).then(setPositions).catch(() => {}),
         fetchPendingOrdersData(accountId, r).then(setPendingOrders).catch(() => {}),
+        fetchAccountInfoData(accountId, r).then(setAccountInfo).catch(() => {}),
       ]);
     } catch {
       // Trade path will auto-retry if still stale.
     } finally {
       setConnectionWarm(true);
     }
-  }, [accountId, status, fetchPriceData, fetchPositionsData, fetchPendingOrdersData]);
+  }, [accountId, status, fetchPriceData, fetchPositionsData, fetchPendingOrdersData, fetchAccountInfoData]);
 
   const wakeConnectionRef = useRef<() => void>(() => {});
   wakeConnectionRef.current = () => { void wakeConnection(); };
@@ -585,7 +588,31 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       if (heartbeatIntervalRef.current) return;
       heartbeatIntervalRef.current = setInterval(() => {
         void authFetch(`${API_BASE}/healthz`).catch(() => {});
-        void authFetch(`${API_BASE}/mt5/account/${accountId}/status?region=${regionRef.current}`).catch(() => {});
+        void authFetch(`${API_BASE}/mt5/account/${accountId}/status?region=${regionRef.current}`)
+          .then(async (res) => {
+            if (!res.ok) return;
+            const d = await safeJson<{
+              connectionStatus?: string;
+              balance?: number;
+              equity?: number;
+              margin?: number;
+              freeMargin?: number;
+              currency?: string;
+              leverage?: number;
+              name?: string;
+            }>(res);
+            if (d.connectionStatus !== "CONNECTED" || d.balance == null) return;
+            setAccountInfo((prev) => ({
+              balance: Number(d.balance ?? 0),
+              equity: Number(d.equity ?? 0),
+              margin: Number(d.margin ?? 0),
+              freeMargin: Number(d.freeMargin ?? 0),
+              currency: String(d.currency ?? prev?.currency ?? "USD"),
+              leverage: Number(d.leverage ?? prev?.leverage ?? 100),
+              name: String(d.name ?? prev?.name ?? "Account"),
+            }));
+          })
+          .catch(() => {});
       }, 25_000);
     };
     const stopHeartbeat = () => {

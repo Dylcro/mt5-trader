@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { getAuthToken } from "@/lib/authToken";
+import { subscribeAccountEvents } from "@/lib/accountEventBus";
 import { periodStartMs, type Period } from "@/lib/zoneStats";
 
 const API_BASE = process.env.EXPO_PUBLIC_API_URL ?? "";
@@ -57,6 +58,13 @@ export function useRealizedPnl(
   useEffect(() => {
     void refresh();
   }, [refresh, refreshKey]);
+
+  useEffect(() => {
+    if (!accountId) return;
+    return subscribeAccountEvents(accountId, (type) => {
+      if (type === "deal") void refresh();
+    });
+  }, [accountId, refresh]);
 
   return { pnl, loading, error, refresh };
 }
