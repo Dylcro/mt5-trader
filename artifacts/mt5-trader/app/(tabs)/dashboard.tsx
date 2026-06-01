@@ -17,7 +17,8 @@ import { useTrading } from "@/context/TradingContext";
 import { useRealizedPnl } from "@/hooks/useRealizedPnl";
 import { useZones } from "@/hooks/useZones";
 import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
-import { formatPrice } from "@/lib/formatters";
+import { normalizeDisplayCurrency } from "@/lib/displayCurrency";
+import { formatMoney as formatMoneyRaw, formatPrice } from "@/lib/formatters";
 import {
   filterClosedZonesByPeriod,
   tp2HitRatePct,
@@ -108,7 +109,10 @@ export default function DashboardScreen() {
     setRefreshing(false);
   };
 
-  const { currency: displayCurrency, formatMoney } = useDisplayCurrency();
+  const { brokerCurrency } = useDisplayCurrency();
+  const moneyCurrency = brokerCurrency ?? normalizeDisplayCurrency(accountInfo?.currency);
+  const formatMoney = (n: number, opts?: { signed?: boolean; decimals?: number }) =>
+    formatMoneyRaw(n, { ...opts, currency: moneyCurrency });
   const leverageLabel = accountInfo ? `1:${accountInfo.leverage}` : "—";
   const serverLabel = credentials.server || region || "—";
   const streaming = sseConnected && !priceError && price != null;
@@ -143,7 +147,7 @@ export default function DashboardScreen() {
           {accountInfo ? formatMoney(accountInfo.balance) : "—"}
         </Text>
         <Text style={styles.heroMeta}>
-          {displayCurrency} · {leverageLabel} · {serverLabel}
+          {accountInfo?.currency ?? "—"} · {leverageLabel} · {serverLabel}
         </Text>
         <View style={styles.heroTiles}>
           <View style={styles.heroTile}>
@@ -209,7 +213,7 @@ export default function DashboardScreen() {
           valueColor={
             closedPnl != null ? (closedPnl >= 0 ? C.buy : C.sell) : C.text
           }
-          label={period === "today" ? "Closed Today" : "Closed This Week"}
+          label={period === "today" ? "Realized P&L Today" : "Realized P&L Week"}
         />
         <DashStatCard
           icon={<MaterialCommunityIcons name="target" size={16} color={C.buy} />}
