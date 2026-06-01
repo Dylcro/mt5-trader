@@ -231,17 +231,26 @@ export default function HistoryScreen() {
         )}
       </View>
 
-      <View style={styles.summaryBar}>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        style={styles.summaryScroll}
+        contentContainerStyle={styles.summaryBar}
+      >
         <SummaryCell label="ZONES" value={String(periodZones.length)} />
         <View style={styles.summaryDivider} />
         <SummaryCell label="TP1" value={String(countTpHits(periodZones, 1))} color={C.buy} />
         <View style={styles.summaryDivider} />
         <SummaryCell label="TP2" value={String(countTpHits(periodZones, 2))} color={C.buy} />
         <View style={styles.summaryDivider} />
-        <SummaryCell label="MAN" value={String(countManualCloses(periodZones))} color={C.gold} />
+        <SummaryCell label="TP3" value={String(countTpHits(periodZones, 3))} color={C.gold} />
+        <View style={styles.summaryDivider} />
+        <SummaryCell label="TP4" value={String(countTpHits(periodZones, 4))} color={C.gold} />
+        <View style={styles.summaryDivider} />
+        <SummaryCell label="MANUAL" value={String(countManualCloses(periodZones))} color={C.gold} />
         <View style={styles.summaryDivider} />
         <SummaryCell label="SL" value={String(countSlHits(periodZones))} color={C.sell} />
-      </View>
+      </ScrollView>
 
       {!accountId && (
         <Text style={styles.empty}>Connect MT5 in Settings to load history.</Text>
@@ -290,28 +299,36 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_700Bold",
     color: C.textSecondary,
   },
+  summaryScroll: {
+    marginBottom: 16,
+    flexGrow: 0,
+  },
   summaryBar: {
     flexDirection: "row",
     backgroundColor: C.card,
     borderRadius: 14,
     borderWidth: 1,
     borderColor: C.border,
-    paddingVertical: 14,
-    marginBottom: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 4,
     alignItems: "center",
   },
-  summaryCell: { flex: 1, alignItems: "center" },
+  summaryCell: {
+    minWidth: 52,
+    paddingHorizontal: 6,
+    alignItems: "center",
+  },
   summaryValue: {
-    fontSize: 22,
+    fontSize: 18,
     fontFamily: "Inter_700Bold",
     color: C.text,
   },
   summaryLabel: {
-    fontSize: 10,
+    fontSize: 8,
     fontFamily: "Inter_600SemiBold",
     color: C.textMuted,
     marginTop: 4,
-    letterSpacing: 0.8,
+    letterSpacing: 0.5,
   },
   summaryDivider: {
     width: 1,

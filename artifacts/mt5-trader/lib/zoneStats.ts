@@ -22,7 +22,7 @@ export function filterClosedZonesByPeriod(zones: Zone[], period: Period): Zone[]
   });
 }
 
-export function countTpHits(zones: Zone[], level: 1 | 2 | 3): number {
+export function countTpHits(zones: Zone[], level: 1 | 2 | 3 | 4): number {
   const key = `tp${level}Hit` as const;
   return zones.filter((z) => Boolean(z[key])).length;
 }
