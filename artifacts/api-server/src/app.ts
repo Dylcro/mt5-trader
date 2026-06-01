@@ -19,13 +19,18 @@ const app: Express = express();
 app.use(helmet({ contentSecurityPolicy: false }));
 
 // ── CORS — only allow the production domain and local dev ────────────────────
-const ALLOWED_ORIGINS = [
+const ALLOWED_ORIGINS: (string | RegExp)[] = [
   "https://meta-trader-link.replit.app",
   /^https:\/\/.*\.replit\.dev$/,
+  /^https:\/\/.*\.up\.railway\.app$/,
   /^https:\/\/.*\.expo\.dev$/,
   "http://localhost:19006",
   "http://localhost:8081",
 ];
+const railwayDomain = process.env["RAILWAY_PUBLIC_DOMAIN"];
+if (railwayDomain) {
+  ALLOWED_ORIGINS.push(`https://${railwayDomain}`);
+}
 app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 
 // ── Rate limiting (defined in ./lib/rateLimiters so admin can reset them) ────
@@ -33,9 +38,9 @@ app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
-// ── Health check — mounted at root, outside rate limiting, so the deployment
-//    platform can probe /healthz without being throttled or blocked by /api middleware.
+// ── Health check — public, no JWT. Root path for Railway; /api path for Replit routing.
 app.use(healthRouter);
+app.use("/api", healthRouter);
 
 app.use("/api/admin", adminRouter);
 app.use("/api/auth", authLimiter, authRouter);

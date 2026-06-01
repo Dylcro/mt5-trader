@@ -1,40 +1,116 @@
-import { Feather } from "@expo/vector-icons";
-import React from "react";
-import { RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Feather, MaterialCommunityIcons } from "@expo/vector-icons";
+import React, { useMemo, useState } from "react";
+import {
+  ActivityIndicator,
+  Pressable,
+  RefreshControl,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import PeriodToggle from "@/components/PeriodToggle";
 import Colors from "@/constants/colors";
 import { useTrading } from "@/context/TradingContext";
+import { useRealizedPnl } from "@/hooks/useRealizedPnl";
 import { useZones } from "@/hooks/useZones";
+import { formatMoney, formatPrice } from "@/lib/formatters";
+import {
+  filterClosedZonesByPeriod,
+  tp2HitRatePct,
+  winRatePct,
+  type Period,
+} from "@/lib/zoneStats";
 
 const C = Colors.dark;
 
-function StatCard({ label, value, sub }: { label: string; value: string; sub?: string }) {
+function DashStatCard({
+  icon,
+  iconColor,
+  note,
+  value,
+  valueColor,
+  label,
+}: {
+  icon: React.ReactNode;
+  iconColor?: string;
+  note: string;
+  value: string;
+  valueColor?: string;
+  label: string;
+}) {
   return (
-    <View style={styles.statCard}>
-      <Text style={styles.statLabel}>{label}</Text>
-      <Text style={styles.statValue}>{value}</Text>
-      {sub ? <Text style={styles.statSub}>{sub}</Text> : null}
+    <View style={styles.dashStat}>
+      <View style={styles.dashStatTop}>
+        <View style={[styles.dashStatIcon, iconColor ? { backgroundColor: `${iconColor}18` } : null]}>
+          {icon}
+        </View>
+        <Text style={styles.dashStatNote}>{note}</Text>
+      </View>
+      <Text style={[styles.dashStatValue, valueColor ? { color: valueColor } : null]}>{value}</Text>
+      <Text style={styles.dashStatLabel}>{label}</Text>
     </View>
   );
 }
 
 export default function DashboardScreen() {
   const insets = useSafeAreaInsets();
-  const { status, accountInfo, price, accountId, refreshPositions } = useTrading();
-  const { zones, refresh, loading } = useZones(accountId, { pollIntervalMs: 10_000 });
-  const [refreshing, setRefreshing] = React.useState(false);
+  const {
+    status,
+    accountInfo,
+    price,
+    priceError,
+    accountId,
+    region,
+    credentials,
+    refreshPositions,
+    refreshAccountInfo,
+    refreshPrice,
+    sseConnected,
+  } = useTrading();
+  const { zones, refresh, loading } = useZones(accountId, {
+    includeClosed: true,
+    pollIntervalMs: 10_000,
+    sseConnected,
+  });
+  const [period, setPeriod] = useState<Period>("today");
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
 
   const openZones = zones.filter((z) => z.status === "OPEN" || z.status === "RISK_FREE");
-  const closedZones = zones.filter((z) => z.status === "CLOSED");
+  const closedAll = zones.filter((z) => z.status === "CLOSED");
+  const periodClosed = useMemo(
+    () => filterClosedZonesByPeriod(zones, period),
+    [zones, period],
+  );
+
+  const riskFreeCount = openZones.filter((z) => z.status === "RISK_FREE").length;
+
+  const winRate = winRatePct(periodClosed);
+  const tp2Rate = tp2HitRatePct(closedAll);
+  const floatingPnl =
+    accountInfo != null ? accountInfo.equity - accountInfo.balance : null;
+
+  const { pnl: closedPnl, loading: closedPnlLoading } = useRealizedPnl(
+    accountId,
+    period,
+    region,
+    refreshKey,
+  );
 
   const onRefresh = async () => {
     setRefreshing(true);
-    await Promise.all([refresh(), refreshPositions()]);
+    await Promise.all([refresh(), refreshPositions(), refreshAccountInfo(), refreshPrice()]);
+    setRefreshKey((k) => k + 1);
     setRefreshing(false);
   };
 
-  const connected = status === "connected";
+  const leverageLabel = accountInfo ? `1:${accountInfo.leverage}` : "—";
+  const serverLabel = credentials.server || region || "—";
+  const streaming = sseConnected && !priceError && price != null;
+  const periodNote = period === "today" ? "today" : "this week";
 
   return (
     <ScrollView
@@ -44,41 +120,140 @@ export default function DashboardScreen() {
         <RefreshControl refreshing={refreshing} onRefresh={() => void onRefresh()} tintColor={C.gold} />
       }
     >
-      <Text style={styles.title}>Dashboard</Text>
-      <View style={[styles.statusPill, connected ? styles.statusOk : styles.statusOff]}>
-        <View style={[styles.statusDot, connected ? styles.dotOk : styles.dotOff]} />
-        <Text style={styles.statusText}>{connected ? "MT5 connected" : status}</Text>
+      <View style={styles.headerRow}>
+        <Text style={styles.title}>Dashboard</Text>
+        <Pressable
+          onPress={() => void onRefresh()}
+          style={({ pressed }) => [styles.refreshBtn, pressed && { opacity: 0.6 }]}
+          hitSlop={8}
+        >
+          {refreshing ? (
+            <ActivityIndicator size="small" color={C.navy} />
+          ) : (
+            <Feather name="refresh-cw" size={18} color={C.navy} />
+          )}
+        </Pressable>
       </View>
 
-      <View style={styles.statRow}>
-        <StatCard
-          label="Balance"
-          value={accountInfo ? `$${accountInfo.balance.toFixed(2)}` : "—"}
-          sub={accountInfo?.currency}
-        />
-        <StatCard
-          label="Equity"
-          value={accountInfo ? `$${accountInfo.equity.toFixed(2)}` : "—"}
-        />
-      </View>
-      <View style={styles.statRow}>
-        <StatCard
-          label="Free margin"
-          value={accountInfo ? `$${accountInfo.freeMargin.toFixed(2)}` : "—"}
-        />
-        <StatCard
-          label="XAUUSD"
-          value={price ? price.bid.toFixed(2) : "—"}
-          sub={price ? `spread ${price.spread.toFixed(1)}` : undefined}
-        />
-      </View>
-
-      <Text style={styles.sectionTitle}>Zones</Text>
-      <View style={styles.zoneSummary}>
-        <Feather name="layers" size={18} color={C.gold} />
-        <Text style={styles.zoneSummaryText}>
-          {loading ? "Loading…" : `${openZones.length} active · ${closedZones.length} closed`}
+      <View style={styles.hero}>
+        <Text style={styles.heroLabel}>ACCOUNT BALANCE</Text>
+        <Text style={styles.heroBalance}>
+          {accountInfo ? formatMoney(accountInfo.balance) : "—"}
         </Text>
+        <Text style={styles.heroMeta}>
+          {accountInfo?.currency ?? "USD"} · {leverageLabel} · {serverLabel}
+        </Text>
+        <View style={styles.heroTiles}>
+          <View style={styles.heroTile}>
+            <Text style={styles.heroTileLabel}>EQUITY</Text>
+            <Text style={[styles.heroTileValue, { color: C.buy }]}>
+              {accountInfo ? formatMoney(accountInfo.equity) : "—"}
+            </Text>
+          </View>
+          <View style={styles.heroTileDivider} />
+          <View style={styles.heroTile}>
+            <Text style={styles.heroTileLabel}>FREE MARGIN</Text>
+            <Text style={styles.heroTileValue}>
+              {accountInfo ? formatMoney(accountInfo.freeMargin) : "—"}
+            </Text>
+          </View>
+          <View style={styles.heroTileDivider} />
+          <View style={styles.heroTile}>
+            <Text style={styles.heroTileLabel}>P&L</Text>
+            <Text
+              style={[
+                styles.heroTileValue,
+                floatingPnl != null && floatingPnl >= 0 ? { color: C.buy } : { color: C.sell },
+              ]}
+            >
+              {floatingPnl != null ? formatMoney(floatingPnl, { signed: true }) : "—"}
+            </Text>
+          </View>
+        </View>
+      </View>
+
+      <View style={styles.periodRow}>
+        <Text style={styles.periodHint}>Win rate & closed P&L</Text>
+        <PeriodToggle value={period} onChange={setPeriod} />
+      </View>
+
+      <View style={styles.statGrid}>
+        <DashStatCard
+          icon={<Feather name="zap" size={16} color={C.gold} />}
+          iconColor={C.gold}
+          note={`${riskFreeCount} risk-free`}
+          value={loading ? "…" : String(openZones.length)}
+          valueColor={C.gold}
+          label="Active Zones"
+        />
+        <DashStatCard
+          icon={<Feather name="award" size={16} color={C.buy} />}
+          iconColor={C.buy}
+          note={periodNote}
+          value={winRate != null ? `${winRate}%` : "—"}
+          valueColor={C.buy}
+          label="Win Rate"
+        />
+        <DashStatCard
+          icon={<Feather name="calendar" size={16} color={C.textSecondary} />}
+          note={`${periodClosed.length} zone${periodClosed.length === 1 ? "" : "s"}`}
+          value={
+            closedPnlLoading && closedPnl == null
+              ? "…"
+              : closedPnl != null
+                ? formatMoney(closedPnl, { signed: true })
+                : "—"
+          }
+          valueColor={
+            closedPnl != null ? (closedPnl >= 0 ? C.buy : C.sell) : C.text
+          }
+          label={period === "today" ? "Closed Today" : "Closed This Week"}
+        />
+        <DashStatCard
+          icon={<MaterialCommunityIcons name="target" size={16} color={C.buy} />}
+          iconColor={C.buy}
+          note="all time"
+          value={tp2Rate != null ? `${tp2Rate}%` : "—"}
+          valueColor={C.buy}
+          label="TP2 Hit Rate"
+        />
+      </View>
+
+      <View style={styles.liveCard}>
+        <View style={styles.liveHeader}>
+          <Text style={styles.liveTitle}>XAUUSD LIVE</Text>
+          <View style={styles.streamRow}>
+            <View
+              style={[
+                styles.streamDot,
+                streaming ? { backgroundColor: C.buy } : { backgroundColor: C.textMuted },
+              ]}
+            />
+            <Text style={[styles.streamText, streaming ? { color: C.buy } : { color: C.textMuted }]}>
+              {streaming ? "STREAMING" : status === "connected" ? "RECONNECTING" : status.toUpperCase()}
+            </Text>
+          </View>
+        </View>
+        <View style={styles.livePrices}>
+          <View style={styles.liveCol}>
+            <Text style={styles.liveLabel}>BID</Text>
+            <Text style={[styles.livePrice, { color: C.sell }]}>
+              {price ? formatPrice(price.bid) : "—"}
+            </Text>
+          </View>
+          <View style={styles.liveCol}>
+            <Text style={styles.liveLabel}>ASK</Text>
+            <Text style={[styles.livePrice, { color: C.buy }]}>
+              {price ? formatPrice(price.ask) : "—"}
+            </Text>
+          </View>
+          <View style={styles.liveCol}>
+            <Text style={styles.liveLabel}>SPREAD</Text>
+            <Text style={styles.liveSpread}>
+              {price ? `${Math.round(price.spread)}p` : "—"}
+            </Text>
+          </View>
+        </View>
       </View>
     </ScrollView>
   );
@@ -87,74 +262,175 @@ export default function DashboardScreen() {
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: C.background },
   content: { paddingHorizontal: 16, paddingBottom: 120 },
+  headerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 16,
+  },
   title: {
     fontSize: 28,
     fontFamily: "Inter_700Bold",
     color: C.text,
-    marginBottom: 12,
   },
-  statusPill: {
+  refreshBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: C.card,
+    borderWidth: 1,
+    borderColor: C.border,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  hero: {
+    backgroundColor: C.navy,
+    borderRadius: 18,
+    padding: 20,
+    marginBottom: 16,
+  },
+  heroLabel: {
+    fontSize: 10,
+    fontFamily: "Inter_600SemiBold",
+    color: C.onDarkMuted,
+    letterSpacing: 1,
+    marginBottom: 6,
+  },
+  heroBalance: {
+    fontSize: 32,
+    fontFamily: "Inter_700Bold",
+    color: C.onDark,
+    marginBottom: 6,
+  },
+  heroMeta: {
+    fontSize: 12,
+    fontFamily: "Inter_400Regular",
+    color: C.onDarkMuted,
+    marginBottom: 16,
+  },
+  heroTiles: {
+    flexDirection: "row",
+    backgroundColor: "rgba(255,255,255,0.08)",
+    borderRadius: 12,
+    paddingVertical: 12,
+  },
+  heroTile: { flex: 1, alignItems: "center", gap: 4 },
+  heroTileDivider: {
+    width: 1,
+    backgroundColor: "rgba(255,255,255,0.12)",
+    marginVertical: 4,
+  },
+  heroTileLabel: {
+    fontSize: 9,
+    fontFamily: "Inter_600SemiBold",
+    color: C.onDarkMuted,
+    letterSpacing: 0.8,
+  },
+  heroTileValue: {
+    fontSize: 15,
+    fontFamily: "Inter_700Bold",
+    color: C.onDark,
+  },
+  periodRow: {
     flexDirection: "row",
     alignItems: "center",
-    alignSelf: "flex-start",
-    gap: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 20,
-    marginBottom: 20,
+    justifyContent: "space-between",
+    marginBottom: 12,
   },
-  statusOk: { backgroundColor: "rgba(14,203,129,0.12)" },
-  statusOff: { backgroundColor: "rgba(136,136,136,0.12)" },
-  statusDot: { width: 8, height: 8, borderRadius: 4 },
-  dotOk: { backgroundColor: C.buy },
-  dotOff: { backgroundColor: C.textSecondary },
-  statusText: { fontSize: 13, fontFamily: "Inter_600SemiBold", color: C.text },
-  statRow: { flexDirection: "row", gap: 12, marginBottom: 12 },
-  statCard: {
-    flex: 1,
+  periodHint: {
+    fontSize: 12,
+    fontFamily: "Inter_400Regular",
+    color: C.textMuted,
+  },
+  statGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 12,
+    marginBottom: 16,
+  },
+  dashStat: {
+    width: "47%",
+    flexGrow: 1,
     backgroundColor: C.card,
     borderRadius: 14,
     borderWidth: 1,
     borderColor: C.border,
     padding: 14,
+    minWidth: 150,
   },
-  statLabel: {
+  dashStatTop: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 10,
+  },
+  dashStatIcon: {
+    width: 28,
+    height: 28,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: C.surface,
+  },
+  dashStatNote: {
+    fontSize: 10,
+    fontFamily: "Inter_400Regular",
+    color: C.textMuted,
+    flex: 1,
+    textAlign: "right",
+  },
+  dashStatValue: {
+    fontSize: 26,
+    fontFamily: "Inter_700Bold",
+    color: C.text,
+    marginBottom: 2,
+  },
+  dashStatLabel: {
     fontSize: 12,
     fontFamily: "Inter_500Medium",
     color: C.textSecondary,
-    marginBottom: 6,
   },
-  statValue: {
-    fontSize: 20,
-    fontFamily: "Inter_700Bold",
-    color: C.text,
-  },
-  statSub: {
-    fontSize: 11,
-    fontFamily: "Inter_400Regular",
-    color: C.textMuted,
-    marginTop: 4,
-  },
-  sectionTitle: {
-    fontSize: 16,
-    fontFamily: "Inter_600SemiBold",
-    color: C.text,
-    marginTop: 8,
-    marginBottom: 10,
-  },
-  zoneSummary: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
+  liveCard: {
     backgroundColor: C.card,
     borderRadius: 14,
     borderWidth: 1,
     borderColor: C.border,
-    padding: 14,
+    padding: 16,
   },
-  zoneSummaryText: {
-    fontSize: 14,
-    fontFamily: "Inter_500Medium",
-    color: C.text,
+  liveHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 14,
+  },
+  liveTitle: {
+    fontSize: 11,
+    fontFamily: "Inter_700Bold",
+    color: C.textSecondary,
+    letterSpacing: 0.8,
+  },
+  streamRow: { flexDirection: "row", alignItems: "center", gap: 6 },
+  streamDot: { width: 6, height: 6, borderRadius: 3 },
+  streamText: {
+    fontSize: 10,
+    fontFamily: "Inter_700Bold",
+    letterSpacing: 0.5,
+  },
+  livePrices: { flexDirection: "row" },
+  liveCol: { flex: 1, alignItems: "center", gap: 4 },
+  liveLabel: {
+    fontSize: 9,
+    fontFamily: "Inter_600SemiBold",
+    color: C.textMuted,
+    letterSpacing: 0.8,
+  },
+  livePrice: {
+    fontSize: 18,
+    fontFamily: "Inter_700Bold",
+  },
+  liveSpread: {
+    fontSize: 18,
+    fontFamily: "Inter_700Bold",
+    color: C.textSecondary,
   },
 });

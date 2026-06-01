@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "NODE_ENV=development tsx ./src/index.ts",
     "build": "pnpm --filter @workspace/mt5-trader run export:web && tsx ./build.ts",
+    "build:replit": "tsx ./build.ts",
+    "start": "NODE_ENV=production tsx ./src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "smoke": "playwright test"

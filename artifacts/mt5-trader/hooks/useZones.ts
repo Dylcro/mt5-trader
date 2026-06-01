@@ -18,6 +18,12 @@ export interface Zone {
   tp2Hit: boolean;
   tp3Hit: boolean;
   tp4Hit: boolean;
+  tp1Enabled?: boolean;
+  tp2Enabled?: boolean;
+  tp3Enabled?: boolean;
+  tp4Enabled?: boolean;
+  enabledTpCount?: number;
+  hitEnabledTpCount?: number;
   // True when TP2 fired but the broker rejected true break-even (SL at entry)
   // because price had retraced through entry. The engine applied the safest
   // protective SL it could and will keep trying to upgrade to true BE on
@@ -29,6 +35,7 @@ export interface Zone {
   closedAt?: number | null;
   finalTpReached?: 0 | 1 | 2 | 3 | 4;
   positionCount: number;
+  originalVolume?: number;
   currentPrice?: number | null;
   nextTp?: 0 | 1 | 2 | 3 | 4;
   nextTpPrice?: number | null;

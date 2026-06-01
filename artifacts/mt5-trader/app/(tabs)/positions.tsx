@@ -12,6 +12,7 @@ import {
   Text,
   View,
 } from "react-native";
+import { useFocusEffect } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import Colors from "@/constants/colors";
@@ -19,6 +20,7 @@ import { useTrading, type PendingOrder, type Position } from "@/context/TradingC
 import { useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useZones } from "@/hooks/useZones";
 import ZoneCard from "@/components/ZoneCard";
+import { formatMoney } from "@/lib/formatters";
 
 const C = Colors.dark;
 
@@ -231,7 +233,7 @@ function PendingOrderCard({ order, onCancel }: { order: PendingOrder; onCancel: 
 
 export default function PositionsScreen() {
   const insets = useSafeAreaInsets();
-  const { positions, pendingOrders, status, refreshPositions, closePosition, cancelOrder, accountInfo, accountId, sseConnected } = useTrading();
+  const { positions, pendingOrders, status, refreshPositions, refreshPendingOrders, closePosition, cancelOrder, accountId, sseConnected } = useTrading();
   const { zones, riskFree, closeZone, cancelZoneOrders } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000, sseConnected });
   const { settings: cs } = useCascadeSettings();
   const activeZones = zones.filter((z) => z.status !== "CLOSED");
@@ -245,9 +247,20 @@ export default function PositionsScreen() {
 
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
-    await refreshPositions();
+    await Promise.all([refreshPositions(), refreshPendingOrders()]);
     setRefreshing(false);
-  }, [refreshPositions]);
+  }, [refreshPositions, refreshPendingOrders]);
+
+  // Poll while focused so MT5-side closes/cancels appear without manual refresh.
+  useFocusEffect(
+    useCallback(() => {
+      if (status !== "connected" || !accountId) return;
+      const sync = () => void Promise.all([refreshPositions(), refreshPendingOrders()]);
+      sync();
+      const id = setInterval(sync, 4_000);
+      return () => clearInterval(id);
+    }, [status, accountId, refreshPositions, refreshPendingOrders]),
+  );
 
   const handleCancelOrder = useCallback(
     async (order: PendingOrder) => {
@@ -336,46 +349,30 @@ export default function PositionsScreen() {
     <View style={[styles.container, { paddingTop: insets.top + webTopPad }]}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Positions</Text>
-        {positions.length > 0 && (
-          <Text style={[styles.totalPL, { color: totalPL >= 0 ? C.buy : C.sell }]}>
-            {totalPL >= 0 ? "+" : ""}{totalPL.toFixed(2)}
-          </Text>
-        )}
+        <Text style={styles.openCount}>{positions.length} open</Text>
       </View>
 
-      {accountInfo && (
-        <View style={styles.accountBar}>
-          <View style={styles.accountItem}>
-            <Text style={styles.accountLabel}>BALANCE</Text>
-            <Text style={styles.accountVal}>{formatPrice(accountInfo.balance)}</Text>
-          </View>
-          <View style={styles.accountDivider} />
-          <View style={styles.accountItem}>
-            <Text style={styles.accountLabel}>EQUITY</Text>
-            <Text style={[styles.accountVal, { color: accountInfo.equity >= accountInfo.balance ? C.buy : C.sell }]}>
-              {formatPrice(accountInfo.equity)}
+      {positions.length > 0 && (
+        <View
+          style={[
+            styles.plBanner,
+            totalPL >= 0 ? styles.plBannerPositive : styles.plBannerNegative,
+          ]}
+        >
+          <View>
+            <Text style={styles.plBannerLabel}>TOTAL FLOATING P&L</Text>
+            <Text style={styles.plBannerSub}>
+              {positions.length} position{positions.length === 1 ? "" : "s"} open
+              {activeZones.length > 0
+                ? ` · ${activeZones.length} zone${activeZones.length === 1 ? "" : "s"}`
+                : ""}
             </Text>
           </View>
-          <View style={styles.accountDivider} />
-          <View style={styles.accountItem}>
-            <Text style={styles.accountLabel}>FREE MARGIN</Text>
-            <Text style={styles.accountVal}>{formatPrice(accountInfo.freeMargin)}</Text>
-          </View>
+          <Text style={[styles.plBannerValue, { color: totalPL >= 0 ? C.buy : C.sell }]}>
+            {formatMoney(totalPL, { signed: true })}
+          </Text>
         </View>
       )}
-
-      <Pressable
-        style={({ pressed }) => [styles.refreshRow, pressed && { opacity: 0.6 }]}
-        onPress={handleRefresh}
-        disabled={refreshing}
-      >
-        {refreshing ? (
-          <ActivityIndicator size={12} color={C.textMuted} />
-        ) : (
-          <Feather name="refresh-cw" size={12} color={C.textMuted} />
-        )}
-        <Text style={styles.refreshRowText}>{refreshing ? "Refreshing…" : "Refresh"}</Text>
-      </Pressable>
 
       <ScrollView
         contentContainerStyle={[styles.scroll, { paddingBottom: insets.bottom + 100 }]}
@@ -485,6 +482,23 @@ export default function PositionsScreen() {
           </>
         )}
 
+        {status === "connected" && (
+          <Pressable
+            style={({ pressed }) => [styles.syncRow, pressed && { opacity: 0.6 }]}
+            onPress={handleRefresh}
+            disabled={refreshing}
+          >
+            {refreshing ? (
+              <ActivityIndicator size={12} color={C.textMuted} />
+            ) : (
+              <Feather name="refresh-cw" size={12} color={C.textMuted} />
+            )}
+            <Text style={styles.syncText}>
+              {refreshing ? "Refreshing…" : sseConnected ? "Live sync" : "Polling · refresh"}
+            </Text>
+          </Pressable>
+        )}
+
         {status === "connected" && pastZones.length > 0 && (
           <View style={{ marginTop: hasAnything ? 20 : 0 }}>
             <Pressable
@@ -522,69 +536,73 @@ const styles = StyleSheet.create({
   },
   header: {
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "baseline",
     justifyContent: "space-between",
-    paddingHorizontal: 20,
-    paddingVertical: 14,
-    borderBottomWidth: 1,
-    borderBottomColor: C.border,
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 8,
   },
   headerTitle: {
-    fontSize: 22,
+    fontSize: 28,
     fontFamily: "Inter_700Bold",
     color: C.text,
   },
-  totalPL: {
-    fontSize: 18,
-    fontFamily: "Inter_700Bold",
+  openCount: {
+    fontSize: 14,
+    fontFamily: "Inter_500Medium",
+    color: C.textMuted,
   },
-  accountBar: {
+  plBanner: {
     flexDirection: "row",
-    backgroundColor: C.card,
-    borderBottomWidth: 1,
-    borderBottomColor: C.border,
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-  },
-  accountItem: {
-    flex: 1,
     alignItems: "center",
-    gap: 3,
+    justifyContent: "space-between",
+    marginHorizontal: 16,
+    marginBottom: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    borderRadius: 14,
   },
-  accountLabel: {
+  plBannerPositive: {
+    backgroundColor: C.buyDim,
+    borderWidth: 1,
+    borderColor: C.buyBorder,
+  },
+  plBannerNegative: {
+    backgroundColor: C.sellDim,
+    borderWidth: 1,
+    borderColor: C.sellBorder,
+  },
+  plBannerLabel: {
     fontSize: 9,
-    fontFamily: "Inter_600SemiBold",
+    fontFamily: "Inter_700Bold",
     color: C.textSecondary,
     letterSpacing: 0.8,
   },
-  accountVal: {
-    fontSize: 13,
+  plBannerSub: {
+    fontSize: 11,
+    fontFamily: "Inter_400Regular",
+    color: C.textMuted,
+    marginTop: 2,
+  },
+  plBannerValue: {
+    fontSize: 24,
     fontFamily: "Inter_700Bold",
-    color: C.text,
   },
-  accountDivider: {
-    width: 1,
-    backgroundColor: C.border,
-    marginVertical: 2,
-  },
-  refreshRow: {
+  syncRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
     gap: 5,
-    paddingVertical: 7,
-    backgroundColor: C.card,
-    borderBottomWidth: 1,
-    borderBottomColor: C.border,
+    paddingVertical: 16,
   },
-  refreshRowText: {
+  syncText: {
     fontSize: 11,
     fontFamily: "Inter_400Regular",
     color: C.textMuted,
-    letterSpacing: 0.3,
   },
   scroll: {
-    padding: 16,
+    paddingHorizontal: 16,
+    paddingTop: 4,
     gap: 12,
   },
   emptyState: {

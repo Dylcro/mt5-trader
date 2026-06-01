@@ -414,6 +414,10 @@ function broadcastZoneUpdate(zoneId: string): void {
     tp2Hit: st.tp2Hit,
     tp3Hit: st.tp3Hit,
     tp4Hit: st.tp4Hit ?? false,
+    tp1Enabled: st.tp1Enabled,
+    tp2Enabled: st.tp2Enabled,
+    tp3Enabled: st.tp3Enabled,
+    tp4Enabled: st.tp4Enabled,
     tp2SlIsBestEffort: (st as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
   });
 }
@@ -684,9 +688,17 @@ function makeDealListener(accountId: string) {
         // has no record — that heuristic can misattribute fills to the wrong
         // zone when multiple zones are open simultaneously.
         if (!zoneId && deal.positionId) {
-          // Step 1: DB lookup — the order was persisted to zone_orders when it
-          // was placed, so a restart between placement and fill won't lose the
-          // association.
+          const commentZone = parseZoneIdFromComment(String(deal.comment ?? ""));
+          if (commentZone) {
+            zoneId = commentZone;
+            zoneLimitOrders.set(String(deal.orderId), zoneId);
+            console.log(`[zone ${zoneId}] backstop-recovered from deal comment orderId=${deal.orderId}`);
+          }
+        }
+        // Step 1: DB lookup — the order was persisted to zone_orders when it
+        // was placed, so a restart between placement and fill won't lose the
+        // association.
+        if (!zoneId && deal.positionId) {
           try {
             const dbRow = await db.select({ zoneId: zoneOrdersTable.zoneId })
               .from(zoneOrdersTable)
@@ -1358,6 +1370,96 @@ async function recoverStuckSync(token: string, accountId: string): Promise<void>
   }
 }
 
+// ── Zone comment / isolation helpers ─────────────────────────────────────────
+// Every cascade leg carries `Cascade|<zoneId>|<leg>/<total>` in the MT5 comment
+// so parallel zones on the same symbol stay isolated after restarts.
+
+export function buildCascadeComment(zoneId: string, leg: number, total: number): string {
+  return `Cascade|${zoneId}|${leg}/${total}`;
+}
+
+export function parseZoneIdFromComment(comment: string | undefined | null): string | null {
+  if (!comment) return null;
+  const pipeMatch = comment.match(/^Cascade\|([^|]+)\|\d+\/\d+$/);
+  if (pipeMatch?.[1]) return pipeMatch[1];
+  return null;
+}
+
+export function commentBelongsToZone(comment: string | undefined | null, zoneId: string): boolean {
+  const parsed = parseZoneIdFromComment(comment);
+  return parsed != null && parsed === zoneId;
+}
+
+/** Cascade limits are cancelled only on the first successful TP2, never on TP1. */
+export function shouldCancelCascadeLimitsAtTpStage(
+  tpStage: 1 | 2 | 3 | 4,
+  zone: { tp1Hit: boolean; tp2Hit: boolean },
+): boolean {
+  return tpStage === 2 && zone.tp1Hit && !zone.tp2Hit;
+}
+
+/**
+ * When the last tracked position row closes, defer auto zone-close + limit cancel
+ * if the zone is still OPEN pre-TP2 and unfilled cascade limits remain on the broker.
+ */
+export function shouldAutoCloseZoneAfterPositionExit(
+  zone: { status: string; tp2Hit: boolean },
+  hasOpenPositionsInDb: boolean,
+  hasLivePendingLimits: boolean,
+): boolean {
+  if (hasOpenPositionsInDb) return false;
+  if (zone.status === "OPEN" && !zone.tp2Hit && hasLivePendingLimits) return false;
+  return true;
+}
+
+/** Deterministic magic number derived from zoneId for broker-side tagging. */
+export function zoneMagicNumber(zoneId: string): number {
+  let h = 47182;
+  for (let i = 0; i < zoneId.length; i++) {
+    h = ((h << 5) - h + zoneId.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h % 900_000) + 100_000;
+}
+
+export type TpDisplayState = "pending" | "hit" | "disabled";
+
+export function tpDisplayState(
+  enabled: boolean,
+  hit: boolean,
+): TpDisplayState {
+  if (!enabled) return "disabled";
+  if (hit) return "hit";
+  return "pending";
+}
+
+export function countEnabledTps(flags: { tp1Enabled: boolean; tp2Enabled: boolean; tp3Enabled: boolean; tp4Enabled: boolean }): number {
+  return [flags.tp1Enabled, flags.tp2Enabled, flags.tp3Enabled, flags.tp4Enabled].filter(Boolean).length;
+}
+
+export function countHitEnabledTps(z: {
+  tp1Enabled: boolean; tp2Enabled: boolean; tp3Enabled: boolean; tp4Enabled: boolean;
+  tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean;
+}): number {
+  let n = 0;
+  if (z.tp1Enabled && z.tp1Hit) n++;
+  if (z.tp2Enabled && z.tp2Hit) n++;
+  if (z.tp3Enabled && z.tp3Hit) n++;
+  if (z.tp4Enabled && z.tp4Hit) n++;
+  return n;
+}
+
+export function computeFinalTpReached(z: {
+  tp1Enabled: boolean; tp2Enabled: boolean; tp3Enabled: boolean; tp4Enabled: boolean;
+  tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean;
+}): 0 | 1 | 2 | 3 | 4 {
+  let last: 0 | 1 | 2 | 3 | 4 = 0;
+  if (z.tp1Enabled && z.tp1Hit) last = 1;
+  if (z.tp2Enabled && z.tp2Hit) last = 2;
+  if (z.tp3Enabled && z.tp3Hit) last = 3;
+  if (z.tp4Enabled && z.tp4Hit) last = 4;
+  return last;
+}
+
 // ── Zone TP Engine ───────────────────────────────────────────────────────────
 // When a cascade is placed, create a "zone" anchored at the market price + direction.
 // A background monitor watches each zone's open positions against TP1/TP2/TP3
@@ -1379,6 +1481,10 @@ interface ZoneState {
   tp2Pct: number;
   tp3Pct: number;
   tp4Pct: number;
+  tp1Enabled: boolean;
+  tp2Enabled: boolean;
+  tp3Enabled: boolean;
+  tp4Enabled: boolean;
   // Original best-entry volume — configured-pct slices are computed from this so
   // partials stay consistent across TP1/2/3/4.
   originalVolume: number;
@@ -1589,7 +1695,8 @@ const ZONE_ORPHAN_DRAIN_WINDOW_MS = 30_000;
 // In-memory state, hydrated from DB on startup.
 const zoneStates = new Map<string, ZoneState>();          // zoneId → state
 const zoneLimitOrders = new Map<string, string>();        // orderId → zoneId
-const pendingZoneAssoc = new Map<string, { zoneId: string; direction: "buy" | "sell"; expiresAt: number }>(); // accountId → recent zone for limit attach
+const pendingZoneAssoc = new Map<string, { zoneId: string; direction: "buy" | "sell"; expiresAt: number }>(); // accountId → most recent zone (legacy fallback)
+const pendingZoneByZone = new Map<string, Map<string, { zoneId: string; direction: "buy" | "sell"; expiresAt: number }>>(); // accountId → zoneId → assoc
 // Race buffer: when a cascade limit POST response arrives BEFORE the market
 // POST response has set up pendingZoneAssoc (the app fires them in parallel),
 // stash the orderId here so the next prepareZoneForCascade for this account
@@ -1611,19 +1718,24 @@ function prepareZoneForCascade(
   accountId: string, direction: "buy" | "sell", userId: string | undefined,
   tps: { tp1Price: number; tp2Price: number; tp3Price: number; tp4Price: number | null; tp1Pct: number; tp2Pct: number; tp3Pct: number; tp4Pct: number },
   originalVolume: number,
+  explicitZoneId?: string,
 ): ZoneState {
   void userId;
-  const zoneId = newZoneId();
+  const zoneId = explicitZoneId && /^z_[a-z0-9_]+$/i.test(explicitZoneId) ? explicitZoneId : newZoneId();
+  const tp1Enabled = tps.tp1Pct > 0;
+  const tp2Enabled = tps.tp2Pct > 0;
+  const tp3Enabled = tps.tp3Pct > 0;
+  const tp4Enabled = tps.tp4Pct > 0;
   const state: ZoneState = {
     zoneId, accountId, direction, anchorPrice: 0,
     tp1Price: tps.tp1Price, tp2Price: tps.tp2Price, tp3Price: tps.tp3Price, tp4Price: tps.tp4Price,
     tp1Pct: tps.tp1Pct, tp2Pct: tps.tp2Pct, tp3Pct: tps.tp3Pct, tp4Pct: tps.tp4Pct,
+    tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
     originalVolume,
     cashoutPips: ZONE_CASHOUT_PIPS_DEFAULT,
     cashoutDone: false,
-    // Pre-mark any TP whose pct is 0 as already-hit so the zone engine skips
-    // it in the sequential chain, letting later enabled TPs fire normally.
-    tp1Hit: tps.tp1Pct === 0, tp2Hit: tps.tp2Pct === 0, tp3Hit: tps.tp3Pct === 0, tp4Hit: tps.tp4Pct === 0,
+    // Disabled TPs stay false — they are not "hit", they are skipped by the engine.
+    tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
     tp2SlMoved: false, tp2BeAttempts: 0, tp2SlIsBestEffort: false,
     status: "OPEN", busy: false,
     trackedPositions: new Map(),
@@ -1631,6 +1743,10 @@ function prepareZoneForCascade(
   // Do NOT set zoneStates here — the zone is added to the in-memory map only
   // after earlyPersist succeeds in the caller's async block (DB-first ordering).
   pendingZoneAssoc.set(accountId, { zoneId, direction, expiresAt: Date.now() + ZONE_ASSOC_WINDOW_MS });
+  // Also index by zoneId so concurrent zones on the same account don't overwrite each other.
+  const accountPending = pendingZoneByZone.get(accountId) ?? new Map();
+  accountPending.set(zoneId, { zoneId, direction, expiresAt: Date.now() + ZONE_ASSOC_WINDOW_MS });
+  pendingZoneByZone.set(accountId, accountPending);
   // Drain any cascade limit orderIds whose POST response landed before this
   // market response. Only consider orphans buffered very recently (sibling
   // race resolves in ms) so stale orphans from a previous cascade attempt
@@ -1678,6 +1794,7 @@ async function persistPreparedZone(
     tp1Price: state.tp1Price, tp2Price: state.tp2Price,
     tp3Price: state.tp3Price, tp4Price: state.tp4Price,
     tp1Pct: state.tp1Pct, tp2Pct: state.tp2Pct, tp3Pct: state.tp3Pct, tp4Pct: state.tp4Pct,
+    tp1Enabled: state.tp1Enabled, tp2Enabled: state.tp2Enabled, tp3Enabled: state.tp3Enabled, tp4Enabled: state.tp4Enabled,
     originalVolume: state.originalVolume,
     cashoutPips: state.cashoutPips, cashoutDone: false,
     tp1Hit: state.tp1Hit, tp2Hit: state.tp2Hit, tp3Hit: state.tp3Hit, tp4Hit: state.tp4Hit,
@@ -1694,7 +1811,20 @@ async function persistPreparedZone(
   logEvent("zone.create", { accountId: state.accountId, zoneId: state.zoneId, direction: state.direction, anchorPrice: state.anchorPrice, positionId, volume });
 }
 
-async function attachLimitOrderToZone(accountId: string, orderId: string): Promise<void> {
+async function attachLimitOrderToZone(accountId: string, orderId: string, comment?: string): Promise<void> {
+  const zoneFromComment = parseZoneIdFromComment(comment);
+  if (zoneFromComment) {
+    zoneLimitOrders.set(orderId, zoneFromComment);
+    try {
+      await db.insert(zoneOrdersTable).values({
+        zoneId: zoneFromComment, orderId, createdAt: Date.now(),
+      }).onConflictDoNothing();
+    } catch (e) {
+      console.warn(`[zone ${zoneFromComment}] persist order=${orderId} failed:`, (e as Error).message);
+    }
+    console.log(`[zone ${zoneFromComment}] tracking limit orderId=${orderId} (from comment)`);
+    return;
+  }
   const pending = pendingZoneAssoc.get(accountId);
   if (!pending || Date.now() > pending.expiresAt) {
     if (pending) pendingZoneAssoc.delete(accountId);
@@ -1805,6 +1935,29 @@ async function markZonePositionClosed(accountId: string, positionId: string): Pr
       .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
     );
     if (openInZone.length === 0) {
+      const zoneMetaRows = await withDbRetry(`markClosed.zoneMeta zone=${zoneId}`, () => db
+        .select({ status: cascadeZonesTable.status, tp2Hit: cascadeZonesTable.tp2Hit })
+        .from(cascadeZonesTable)
+        .where(eq(cascadeZonesTable.zoneId, zoneId))
+        .limit(1)
+      ).catch(() => []);
+      const zoneMeta = zoneMetaRows[0];
+      const zoneStatus = st?.status ?? zoneMeta?.status ?? "CLOSED";
+      const tp2Hit = st?.tp2Hit ?? Boolean(zoneMeta?.tp2Hit);
+      const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, accountId, zoneId);
+      const brokerStillOpen = await zoneHasLiveTrackedPositionsOnBroker(token, region, accountId, zoneId);
+      if (brokerStillOpen) {
+        console.log(`[markClosed] zone ${zoneId} DB empty but broker still has open legs — skip auto-close`);
+        return;
+      }
+      if (!shouldAutoCloseZoneAfterPositionExit(
+        { status: zoneStatus, tp2Hit },
+        false,
+        pendingLeft,
+      )) {
+        console.log(`[markClosed] zone ${zoneId} pre-TP2 with ${pendingLeft ? "live" : "no"} pending limits — skip auto-close`);
+        return;
+      }
       await withDbRetry(`markClosed.zoneClose zone=${zoneId}`, () => db.update(cascadeZonesTable)
         .set({ status: "CLOSED", closedAt: Date.now() })
         .where(eq(cascadeZonesTable.zoneId, zoneId))
@@ -1920,10 +2073,13 @@ async function cancelZoneLimits(
     // IMPORTANT: skip orders already claimed by a different active zone — multiple
     // zones can run in parallel on the same account, so blind-cancelling their
     // limits would wipe out a sibling zone's pending entries.
-    const cascadeLive = liveOrders.filter(o =>
-      String(o.comment ?? "").startsWith("Cascade") &&
-      !zoneLimitOrders.has(o.id)
-    );
+    const cascadeLive = liveOrders.filter(o => {
+      const c = String(o.comment ?? "");
+      if (!c.startsWith("Cascade")) return false;
+      if (zoneLimitOrders.has(o.id)) return false;
+      // Only blind-cancel orders explicitly tagged with THIS zoneId in the comment.
+      return commentBelongsToZone(c, zoneId);
+    });
     if (cascadeLive.length === 0) return;
     console.log(`[zone ${zoneId}] blind-cancel ${cascadeLive.length} untracked cascade limit(s) (no orderId records found)`);
     await Promise.all(cascadeLive.map(async (o) => {
@@ -1983,6 +2139,43 @@ async function fetchOpenPositions(token: string, region: string, accountId: stri
     type: String(p.type ?? ""),
     symbol: String(p.symbol ?? ""),
   })).filter(p => p.id);
+}
+
+async function fetchLivePendingOrders(
+  token: string, region: string, accountId: string,
+): Promise<Array<{ id: string; comment?: string }>> {
+  try {
+    const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`, {
+      headers: authHeaders(token),
+    });
+    if (!r.ok) return [];
+    const raw = await r.json() as Array<{ id?: string; _id?: string; comment?: string }>;
+    return raw.map(o => ({ id: String(o.id ?? o._id ?? ""), comment: o.comment })).filter(o => o.id);
+  } catch {
+    return [];
+  }
+}
+
+async function zoneHasLivePendingCascadeLimits(
+  token: string, region: string, accountId: string, zoneId: string,
+): Promise<boolean> {
+  const liveOrders = await fetchLivePendingOrders(token, region, accountId);
+  return liveOrders.some((o) => {
+    if (zoneLimitOrders.get(o.id) === zoneId) return true;
+    return commentBelongsToZone(o.comment, zoneId);
+  });
+}
+
+async function zoneHasLiveTrackedPositionsOnBroker(
+  token: string, region: string, accountId: string, zoneId: string,
+): Promise<boolean> {
+  const openRows = await db.select({ positionId: zonePositionsTable.positionId })
+    .from(zonePositionsTable)
+    .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
+  if (openRows.length === 0) return false;
+  const live = await fetchOpenPositions(token, region, accountId);
+  const liveIds = new Set(live.map(p => p.id));
+  return openRows.some(r => liveIds.has(r.positionId));
 }
 
 // Live bid/ask straight from MetaAPI — independent of tickStore (which only
@@ -2122,6 +2315,16 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
           .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
       ).catch(() => null);
       if (stillOpen && stillOpen.length === 0) {
+        const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, st.accountId, zoneId);
+        const brokerStillOpen = await zoneHasLiveTrackedPositionsOnBroker(token, region, st.accountId, zoneId);
+        if (brokerStillOpen) {
+          console.log(`[zone ${zoneId}] reconcile: broker still has open legs — skip zone close`);
+          return;
+        }
+        if (!shouldAutoCloseZoneAfterPositionExit(st, false, pendingLeft)) {
+          console.log(`[zone ${zoneId}] reconcile: pre-TP2 pending limits remain — skip zone close`);
+          return;
+        }
         await withDbRetry(`evalZone.reconcileZoneClose zone=${zoneId}`,
           () => db.update(cascadeZonesTable)
             .set({ status: "CLOSED", closedAt: Date.now() })
@@ -2172,7 +2375,9 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     // distances), and skips silently if the next TP price isn't set yet.
     {
       const nextTpIdx: 0 | 1 | 2 | 3 =
-        !st.tp1Hit ? 1 : !st.tp2Hit ? 2 : !st.tp3Hit ? 3 : 0;
+        st.tp1Enabled && !st.tp1Hit ? 1 :
+        st.tp2Enabled && !st.tp2Hit ? 2 :
+        st.tp3Enabled && !st.tp3Hit ? 3 : 0;
       const nextTpPrice =
         nextTpIdx === 1 ? st.tp1Price :
         nextTpIdx === 2 ? st.tp2Price :
@@ -2274,10 +2479,22 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     // Zone-level tp1Hit/tp2Hit flags mean "at least one position has reached
     // this level" and gate: near-TP notifications, cancelZoneLimits (first TP2),
     // SL→BE trigger, and UI progress display.
-    const needTP1 = live.filter(p => !st.trackedPositions.get(p.id)?.tp1Hit);
-    const needTP2 = live.filter(p =>  st.trackedPositions.get(p.id)?.tp1Hit && !st.trackedPositions.get(p.id)?.tp2Hit);
-    const needTP3 = live.filter(p =>  st.trackedPositions.get(p.id)?.tp2Hit && !st.trackedPositions.get(p.id)?.tp3Hit);
-    const needTP4 = live.filter(p =>  st.trackedPositions.get(p.id)?.tp3Hit && !st.trackedPositions.get(p.id)?.tp4Hit);
+    const tp1Satisfied = (p: LivePosition) => {
+      const pos = st.trackedPositions.get(p.id);
+      return !st.tp1Enabled || Boolean(pos?.tp1Hit);
+    };
+    const tp2Satisfied = (p: LivePosition) => {
+      const pos = st.trackedPositions.get(p.id);
+      return !st.tp2Enabled || Boolean(pos?.tp2Hit);
+    };
+    const tp3Satisfied = (p: LivePosition) => {
+      const pos = st.trackedPositions.get(p.id);
+      return !st.tp3Enabled || Boolean(pos?.tp3Hit);
+    };
+    const needTP1 = st.tp1Enabled ? live.filter(p => !st.trackedPositions.get(p.id)?.tp1Hit) : [];
+    const needTP2 = st.tp2Enabled ? live.filter(p => tp1Satisfied(p) && !st.trackedPositions.get(p.id)?.tp2Hit) : [];
+    const needTP3 = st.tp3Enabled ? live.filter(p => tp1Satisfied(p) && tp2Satisfied(p) && !st.trackedPositions.get(p.id)?.tp3Hit) : [];
+    const needTP4 = st.tp4Enabled ? live.filter(p => tp1Satisfied(p) && tp2Satisfied(p) && tp3Satisfied(p) && !st.trackedPositions.get(p.id)?.tp4Hit) : [];
 
     // TP1 — positions that haven't had their first partial yet
     if (needTP1.length > 0 && st.tp1Price != null && hit(st.tp1Price)) {
@@ -2305,14 +2522,16 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     if (needTP2.length > 0 && st.tp2Price != null && hit(st.tp2Price)) {
       console.log(`[zone ${zoneId}] TP2 trigger @${cmpPrice} (tp2=${st.tp2Price}) — ${needTP2.length}/${live.length} position(s) need TP2`);
       const ok = await closePartialForLevel(2, needTP2);
-      // Cancel any still-unfilled cascade limits at TP2. Fires once (first TP2).
-      if (!st.tp2Hit) await cancelZoneLimits(token, region, st.accountId, zoneId);
       if (ok) {
         const ids = needTP2.map(p => p.id);
         await db.update(zonePositionsTable).set({ tp2Hit: true })
           .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
         for (const p of needTP2) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp2Hit = true; }
         if (!st.tp2Hit) {
+          // Cancel unfilled cascade limits only after a successful TP2 partial (never on TP1).
+          if (shouldCancelCascadeLimitsAtTpStage(2, st)) {
+            await cancelZoneLimits(token, region, st.accountId, zoneId);
+          }
           // Advance zone-level flag. Do NOT gate on SL→BE — the sticky-retry
           // block below handles that; gating here caused the zone to re-enter
           // every tick when the broker rejected the SL (code 10016).
@@ -2475,6 +2694,10 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
     tp2Pct: z.tp2Pct != null ? Number(z.tp2Pct) : 25,
     tp3Pct: z.tp3Pct != null ? Number(z.tp3Pct) : 25,
     tp4Pct: z.tp4Pct != null ? Number(z.tp4Pct) : 25,
+    tp1Enabled: (z as { tp1Enabled?: boolean }).tp1Enabled ?? (Number(z.tp1Pct ?? 25) > 0),
+    tp2Enabled: (z as { tp2Enabled?: boolean }).tp2Enabled ?? (Number(z.tp2Pct ?? 25) > 0),
+    tp3Enabled: (z as { tp3Enabled?: boolean }).tp3Enabled ?? (Number(z.tp3Pct ?? 25) > 0),
+    tp4Enabled: (z as { tp4Enabled?: boolean }).tp4Enabled ?? (Number(z.tp4Pct ?? 25) > 0),
     originalVolume: z.originalVolume != null ? Number(z.originalVolume) : 0,
     cashoutPips: Number(z.cashoutPips ?? ZONE_CASHOUT_PIPS_DEFAULT),
     cashoutDone: z.cashoutDone ?? false,
@@ -2819,7 +3042,22 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
       if (!includeClosed && z.status === "CLOSED") continue;
       const openPositions = await db.select().from(zonePositionsTable)
         .where(and(eq(zonePositionsTable.zoneId, z.zoneId), eq(zonePositionsTable.status, "OPEN")));
-      const finalTpReached = z.tp4Hit ? 4 : z.tp3Hit ? 3 : z.tp2Hit ? 2 : z.tp1Hit ? 1 : 0;
+      const finalTpReached = computeFinalTpReached({
+        tp1Enabled: (z as { tp1Enabled?: boolean }).tp1Enabled ?? (Number(z.tp1Pct ?? 25) > 0),
+        tp2Enabled: (z as { tp2Enabled?: boolean }).tp2Enabled ?? (Number(z.tp2Pct ?? 25) > 0),
+        tp3Enabled: (z as { tp3Enabled?: boolean }).tp3Enabled ?? (Number(z.tp3Pct ?? 25) > 0),
+        tp4Enabled: (z as { tp4Enabled?: boolean }).tp4Enabled ?? (Number(z.tp4Pct ?? 25) > 0),
+        tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit, tp4Hit: z.tp4Hit ?? false,
+      });
+      const tp1Enabled = (z as { tp1Enabled?: boolean }).tp1Enabled ?? (Number(z.tp1Pct ?? 25) > 0);
+      const tp2Enabled = (z as { tp2Enabled?: boolean }).tp2Enabled ?? (Number(z.tp2Pct ?? 25) > 0);
+      const tp3Enabled = (z as { tp3Enabled?: boolean }).tp3Enabled ?? (Number(z.tp3Pct ?? 25) > 0);
+      const tp4Enabled = (z as { tp4Enabled?: boolean }).tp4Enabled ?? (Number(z.tp4Pct ?? 25) > 0);
+      const enabledTpCount = countEnabledTps({ tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled });
+      const hitEnabledTpCount = countHitEnabledTps({
+        tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+        tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit, tp4Hit: z.tp4Hit ?? false,
+      });
 
       const dir = z.direction === "sell" ? "sell" : "buy";
       const anchor = Number(z.anchorPrice);
@@ -2831,10 +3069,10 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
       const tp4Price = z.tp4Price != null ? Number(z.tp4Price) : null;
 
       let nextTp: 0 | 1 | 2 | 3 | 4 = 0;
-      if (!z.tp1Hit) nextTp = 1;
-      else if (!z.tp2Hit) nextTp = 2;
-      else if (!z.tp3Hit) nextTp = 3;
-      else if (!z.tp4Hit && tp4Price != null) nextTp = 4;
+      if (tp1Enabled && !z.tp1Hit) nextTp = 1;
+      else if (tp2Enabled && !z.tp2Hit) nextTp = 2;
+      else if (tp3Enabled && !z.tp3Hit) nextTp = 3;
+      else if (tp4Enabled && !z.tp4Hit && tp4Price != null) nextTp = 4;
 
       let currentPrice: number | null = null;
       let nextTpPrice: number | null = null;
@@ -2866,6 +3104,8 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         anchorPrice: anchor,
         tp1Price, tp2Price, tp3Price, tp4Price,
         tp1Hit: z.tp1Hit, tp2Hit: z.tp2Hit, tp3Hit: z.tp3Hit, tp4Hit: z.tp4Hit ?? false,
+        tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+        enabledTpCount, hitEnabledTpCount,
         tp2SlIsBestEffort: (z as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
         cashoutDone: z.cashoutDone ?? false,
         status: z.status,
@@ -2873,6 +3113,7 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         closedAt: z.closedAt != null ? Number(z.closedAt) : null,
         finalTpReached,
         positionCount: openPositions.length,
+        originalVolume: z.originalVolume != null ? Number(z.originalVolume) : 0,
         currentPrice,
         nextTp,
         nextTpPrice,
@@ -3652,6 +3893,35 @@ router.post("/mt5/account/:accountId/disconnect", checkOwner, async (req: Reques
   }
 });
 
+// GET /api/mt5/account/:accountId/realized-pnl?since=<ms>&region=london
+// Sums profit+commission+swap from MetaAPI history deals since `since` (ms epoch).
+router.get("/mt5/account/:accountId/realized-pnl", checkOwner, async (req: Request, res: Response) => {
+  try {
+    const token = getToken();
+    const { accountId } = req.params as { accountId: string };
+    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
+    const sinceMs = parseInt(qstr(req.query.since) ?? "0", 10) || 0;
+    const startTime = new Date(sinceMs).toISOString();
+    const endTime = new Date().toISOString();
+    const res2 = await fetch(
+      `${clientBase(region)}/users/current/accounts/${accountId}/history-deals/time/${encodeURIComponent(startTime)}/${encodeURIComponent(endTime)}`,
+      { headers: authHeaders(token) },
+    );
+    if (!res2.ok) {
+      const err = await res2.json().catch(() => ({})) as { message?: string };
+      return res.status(res2.status).json({ error: err.message ?? `History deals failed: ${res2.status}` });
+    }
+    const deals = await res2.json() as Array<{ profit?: number; commission?: number; swap?: number }>;
+    const pnl = (Array.isArray(deals) ? deals : []).reduce(
+      (sum, d) => sum + Number(d.profit ?? 0) + Number(d.commission ?? 0) + Number(d.swap ?? 0),
+      0,
+    );
+    return res.json({ pnl: Math.round(pnl * 100) / 100 });
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
+  }
+});
+
 // GET /api/mt5/account/:accountId/info?region=london
 router.get("/mt5/account/:accountId/info", checkOwner, async (req: Request, res: Response) => {
   try {
@@ -3816,6 +4086,12 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
     const token = getToken();
     const region = qstr(req.query.region) || DEFAULT_REGION;
     const body = req.body as Record<string, unknown>;
+    const clientZoneTag =
+      typeof body.zoneId === "string" ? body.zoneId.trim()
+        : parseZoneIdFromComment(String(body.comment ?? ""));
+    if (clientZoneTag) {
+      body.magic = zoneMagicNumber(clientZoneTag);
+    }
     let code: number;
     let data: { numericCode?: number; message?: string; orderId?: string; positionId?: string };
     let httpStatus = 200;
@@ -3961,7 +4237,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
           console.log(`[trade] tracked cascade limit orderId=${data.orderId}`);
           // Attach this limit to the most recently created zone for this account
           // (if any limit-association window is still open).
-          void attachLimitOrderToZone(accountId, data.orderId);
+          void attachLimitOrderToZone(accountId, data.orderId, comment);
         }
         // Market order placed by the app: mark its positionId immediately so the
         // hasBeenCascaded guard blocks it even if the comment is later stripped.
@@ -3997,6 +4273,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
             const tp3Pct = pickPct(rawBody.tp3Pct, 25);
             const tp4Pct = pickPct(rawBody.tp4Pct, 25);
             const anchorHint = Number(rawBody.anchorPrice ?? 0) || 0;
+            const clientZoneId = typeof rawBody.zoneId === "string" ? rawBody.zoneId.trim() : "";
             const cmp = direction === "buy"
               ? (a: number, b: number) => a > b
               : (a: number, b: number) => a < b;
@@ -4019,6 +4296,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
                 accountId, direction, uId,
                 { tp1Price: tp1Price!, tp2Price: tp2Price!, tp3Price: tp3Price!, tp4Price, tp1Pct, tp2Pct, tp3Pct, tp4Pct },
                 volume,
+                clientZoneId || parseZoneIdFromComment(comment) || undefined,
               );
               // Seed best-known anchor from caller-provided value / cached tick.
               const tick = latestPrice(accountId);

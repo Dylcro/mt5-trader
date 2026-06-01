@@ -1,5 +1,5 @@
 import { Feather } from "@expo/vector-icons";
-import React from "react";
+import React, { useMemo, useState } from "react";
 import {
   ActivityIndicator,
   RefreshControl,
@@ -10,63 +10,175 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import PeriodToggle from "@/components/PeriodToggle";
 import Colors from "@/constants/colors";
 import { useTrading } from "@/context/TradingContext";
+import { useRealizedPnl } from "@/hooks/useRealizedPnl";
 import { useZones, type Zone } from "@/hooks/useZones";
+import { formatDuration, formatHistoryDate, formatMoney, formatPrice } from "@/lib/formatters";
+import { tpDisplayState } from "@/lib/zoneComments";
+import {
+  countTpHits,
+  filterClosedZonesByPeriod,
+  tpPillStyle,
+  type Period,
+} from "@/lib/zoneStats";
 
 const C = Colors.dark;
 
-function formatDate(ts: number) {
-  return new Date(ts).toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+function SummaryCell({
+  label,
+  value,
+  color,
+}: {
+  label: string;
+  value: string;
+  color?: string;
+}) {
+  return (
+    <View style={styles.summaryCell}>
+      <Text style={[styles.summaryValue, color ? { color } : null]}>{value}</Text>
+      <Text style={styles.summaryLabel}>{label}</Text>
+    </View>
+  );
 }
 
-function HistoryRow({ zone }: { zone: Zone }) {
-  const isBuy = zone.direction === "buy";
-  const tpLabel = zone.finalTpReached ? `TP${zone.finalTpReached}` : "—";
+function TpChip({ n, zone }: { n: 1 | 2 | 3 | 4; zone: Zone }) {
+  const enabled = zone[`tp${n}Enabled` as keyof Zone] !== false;
+  const hit = Boolean(zone[`tp${n}Hit` as keyof Zone]);
+  const state = tpDisplayState(enabled, hit);
+  if (state === "disabled") {
+    return (
+      <View style={[styles.tpChip, styles.tpChipDisabled]}>
+        <Text style={styles.tpChipTextDisabled}>N/A</Text>
+      </View>
+    );
+  }
+  const isHit = state === "hit";
   return (
-    <View style={styles.row}>
-      <View style={[styles.dirBadge, isBuy ? styles.dirBuy : styles.dirSell]}>
-        <Text style={[styles.dirText, isBuy ? styles.dirTextBuy : styles.dirTextSell]}>
-          {isBuy ? "BUY" : "SELL"}
-        </Text>
+    <View style={[styles.tpChip, isHit ? styles.tpChipHit : styles.tpChipPending]}>
+      {isHit ? (
+        <Feather name="check" size={10} color={C.buy} />
+      ) : (
+        <View style={styles.tpChipCircle} />
+      )}
+      <Text style={[styles.tpChipText, isHit && { color: C.buy }]}>TP{n}</Text>
+    </View>
+  );
+}
+
+function HistoryCard({ zone }: { zone: Zone }) {
+  const isBuy = zone.direction === "buy";
+  const enabled = zone.enabledTpCount ?? 4;
+  const hits = zone.hitEnabledTpCount ?? 0;
+  const pill = tpPillStyle(hits);
+  const closedTs = zone.closedAt ?? zone.createdAt;
+  const duration = formatDuration(closedTs - zone.createdAt);
+  const lot =
+    zone.originalVolume != null && zone.originalVolume > 0
+      ? zone.originalVolume.toFixed(2)
+      : "—";
+
+  return (
+    <View style={styles.card}>
+      <View style={styles.cardTop}>
+        <View style={[styles.dirIcon, isBuy ? styles.dirIconBuy : styles.dirIconSell]}>
+          <Feather
+            name={isBuy ? "arrow-up-right" : "arrow-down-right"}
+            size={16}
+            color={isBuy ? C.buy : C.sell}
+          />
+        </View>
+        <View style={styles.cardTitleWrap}>
+          <Text style={styles.cardTitle}>{isBuy ? "BUY CASCADE" : "SELL CASCADE"}</Text>
+          <Text style={styles.cardDate}>{formatHistoryDate(closedTs)}</Text>
+        </View>
+        <View
+          style={[
+            styles.tpPill,
+            pill === "green" && styles.tpPillGreen,
+            pill === "gold" && styles.tpPillGold,
+            pill === "grey" && styles.tpPillGrey,
+          ]}
+        >
+          <Text
+            style={[
+              styles.tpPillText,
+              pill === "green" && { color: C.buy },
+              pill === "gold" && { color: C.gold },
+              pill === "grey" && { color: C.textMuted },
+            ]}
+          >
+            {enabled > 0 ? `${hits}/${enabled} TPs` : "—"}
+          </Text>
+        </View>
       </View>
-      <View style={styles.rowBody}>
-        <Text style={styles.rowTitle}>Zone {zone.zoneId.slice(0, 8)}…</Text>
-        <Text style={styles.rowMeta}>
-          Entry {zone.anchorPrice.toFixed(2)} · Final {tpLabel}
-        </Text>
-        <Text style={styles.rowTime}>
-          {zone.closedAt ? formatDate(zone.closedAt) : formatDate(zone.createdAt)}
-        </Text>
+
+      <View style={styles.statRow}>
+        <View style={styles.statCell}>
+          <Text style={styles.statLabel}>ENTRY</Text>
+          <Text style={styles.statValue}>{formatPrice(zone.anchorPrice)}</Text>
+        </View>
+        <View style={styles.statDivider} />
+        <View style={styles.statCell}>
+          <Text style={styles.statLabel}>DURATION</Text>
+          <Text style={styles.statValue}>{duration}</Text>
+        </View>
+        <View style={styles.statDivider} />
+        <View style={styles.statCell}>
+          <Text style={styles.statLabel}>LOT</Text>
+          <Text style={styles.statValue}>{lot}</Text>
+        </View>
       </View>
-      <Feather name="check-circle" size={20} color={C.textMuted} />
+
+      <View style={styles.tpChipRow}>
+        {([1, 2, 3, 4] as const).map((n) => (
+          <TpChip key={n} n={n} zone={zone} />
+        ))}
+      </View>
     </View>
   );
 }
 
 export default function HistoryScreen() {
   const insets = useSafeAreaInsets();
-  const { accountId } = useTrading();
+  const { accountId, region, sseConnected } = useTrading();
   const { zones, loading, error, refresh } = useZones(accountId, {
     includeClosed: true,
     pollIntervalMs: 30_000,
+    sseConnected,
   });
-  const [refreshing, setRefreshing] = React.useState(false);
+  const [period, setPeriod] = useState<Period>("today");
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
 
-  const closed = zones
-    .filter((z) => z.status === "CLOSED")
-    .sort((a, b) => (b.closedAt ?? b.createdAt) - (a.closedAt ?? a.createdAt));
+  const periodZones = useMemo(
+    () => filterClosedZonesByPeriod(zones, period),
+    [zones, period],
+  );
+  const sorted = useMemo(
+    () =>
+      [...periodZones].sort(
+        (a, b) => (b.closedAt ?? b.createdAt) - (a.closedAt ?? a.createdAt),
+      ),
+    [periodZones],
+  );
+
+  const { pnl: periodPnl, loading: pnlLoading } = useRealizedPnl(
+    accountId,
+    period,
+    region,
+    refreshKey,
+  );
 
   const onRefresh = async () => {
     setRefreshing(true);
     await refresh();
+    setRefreshKey((k) => k + 1);
     setRefreshing(false);
   };
+
+  const periodLabel = period === "today" ? "Today" : "This week";
 
   return (
     <ScrollView
@@ -77,27 +189,54 @@ export default function HistoryScreen() {
       }
     >
       <Text style={styles.title}>History</Text>
-      <Text style={styles.subtitle}>Closed cascade zones for this account</Text>
+
+      <View style={styles.toolbar}>
+        <PeriodToggle value={period} onChange={setPeriod} />
+        {accountId && (
+          <Text
+            style={[
+              styles.periodPnl,
+              periodPnl != null && periodPnl >= 0 ? { color: C.buy } : periodPnl != null ? { color: C.sell } : null,
+            ]}
+          >
+            {pnlLoading && periodPnl == null
+              ? "…"
+              : periodPnl != null
+                ? `${periodLabel} ${formatMoney(periodPnl, { signed: true })}`
+                : `${periodLabel} —`}
+          </Text>
+        )}
+      </View>
+
+      <View style={styles.summaryBar}>
+        <SummaryCell label="ZONES" value={String(periodZones.length)} />
+        <View style={styles.summaryDivider} />
+        <SummaryCell label="TP1" value={String(countTpHits(periodZones, 1))} color={C.buy} />
+        <View style={styles.summaryDivider} />
+        <SummaryCell label="TP2" value={String(countTpHits(periodZones, 2))} color={C.buy} />
+        <View style={styles.summaryDivider} />
+        <SummaryCell label="TP3" value={String(countTpHits(periodZones, 3))} color={C.gold} />
+      </View>
 
       {!accountId && (
         <Text style={styles.empty}>Connect MT5 in Settings to load history.</Text>
       )}
 
-      {loading && closed.length === 0 && (
+      {loading && sorted.length === 0 && (
         <ActivityIndicator color={C.gold} style={{ marginTop: 24 }} />
       )}
 
       {error && <Text style={styles.error}>{error}</Text>}
 
-      {!loading && accountId && closed.length === 0 && (
+      {!loading && accountId && sorted.length === 0 && (
         <View style={styles.emptyBox}>
           <Feather name="inbox" size={32} color={C.textMuted} />
-          <Text style={styles.empty}>No closed zones yet.</Text>
+          <Text style={styles.empty}>No closed zones for this period.</Text>
         </View>
       )}
 
-      {closed.map((z) => (
-        <HistoryRow key={z.zoneId} zone={z} />
+      {sorted.map((z) => (
+        <HistoryCard key={z.zoneId} zone={z} />
       ))}
     </ScrollView>
   );
@@ -110,52 +249,168 @@ const styles = StyleSheet.create({
     fontSize: 28,
     fontFamily: "Inter_700Bold",
     color: C.text,
-    marginBottom: 4,
+    marginBottom: 12,
   },
-  subtitle: {
-    fontSize: 14,
-    fontFamily: "Inter_400Regular",
-    color: C.textSecondary,
-    marginBottom: 20,
-  },
-  row: {
+  toolbar: {
     flexDirection: "row",
     alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 12,
     gap: 12,
+  },
+  periodPnl: {
+    flex: 1,
+    textAlign: "right",
+    fontSize: 14,
+    fontFamily: "Inter_700Bold",
+    color: C.textSecondary,
+  },
+  summaryBar: {
+    flexDirection: "row",
     backgroundColor: C.card,
     borderRadius: 14,
     borderWidth: 1,
     borderColor: C.border,
-    padding: 14,
-    marginBottom: 10,
+    paddingVertical: 14,
+    marginBottom: 16,
+    alignItems: "center",
   },
-  dirBadge: {
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 6,
-  },
-  dirBuy: { backgroundColor: C.buyDim },
-  dirSell: { backgroundColor: C.sellDim },
-  dirText: { fontSize: 11, fontFamily: "Inter_700Bold" },
-  dirTextBuy: { color: C.buy },
-  dirTextSell: { color: C.sell },
-  rowBody: { flex: 1 },
-  rowTitle: {
-    fontSize: 14,
-    fontFamily: "Inter_600SemiBold",
+  summaryCell: { flex: 1, alignItems: "center" },
+  summaryValue: {
+    fontSize: 22,
+    fontFamily: "Inter_700Bold",
     color: C.text,
-    marginBottom: 2,
   },
-  rowMeta: {
-    fontSize: 12,
-    fontFamily: "Inter_400Regular",
-    color: C.textSecondary,
-  },
-  rowTime: {
-    fontSize: 11,
-    fontFamily: "Inter_400Regular",
+  summaryLabel: {
+    fontSize: 10,
+    fontFamily: "Inter_600SemiBold",
     color: C.textMuted,
     marginTop: 4,
+    letterSpacing: 0.8,
+  },
+  summaryDivider: {
+    width: 1,
+    height: 36,
+    backgroundColor: C.border,
+  },
+  card: {
+    backgroundColor: C.card,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: C.border,
+    padding: 14,
+    marginBottom: 12,
+    gap: 12,
+  },
+  cardTop: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  dirIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  dirIconBuy: { backgroundColor: C.buyDim },
+  dirIconSell: { backgroundColor: C.sellDim },
+  cardTitleWrap: { flex: 1 },
+  cardTitle: {
+    fontSize: 15,
+    fontFamily: "Inter_700Bold",
+    color: C.text,
+  },
+  cardDate: {
+    fontSize: 12,
+    fontFamily: "Inter_400Regular",
+    color: C.textMuted,
+    marginTop: 2,
+  },
+  tpPill: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 20,
+  },
+  tpPillGreen: { backgroundColor: C.buyDim },
+  tpPillGold: { backgroundColor: C.goldLight },
+  tpPillGrey: { backgroundColor: C.surface },
+  tpPillText: {
+    fontSize: 11,
+    fontFamily: "Inter_700Bold",
+  },
+  statRow: {
+    flexDirection: "row",
+    backgroundColor: C.surface,
+    borderRadius: 10,
+    overflow: "hidden",
+  },
+  statCell: {
+    flex: 1,
+    alignItems: "center",
+    paddingVertical: 10,
+    gap: 4,
+  },
+  statDivider: {
+    width: 1,
+    backgroundColor: C.border,
+    marginVertical: 8,
+  },
+  statLabel: {
+    fontSize: 9,
+    fontFamily: "Inter_600SemiBold",
+    color: C.textMuted,
+    letterSpacing: 0.8,
+  },
+  statValue: {
+    fontSize: 14,
+    fontFamily: "Inter_700Bold",
+    color: C.text,
+  },
+  tpChipRow: {
+    flexDirection: "row",
+    gap: 6,
+  },
+  tpChip: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 4,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+  },
+  tpChipHit: {
+    backgroundColor: C.buyDim,
+    borderColor: C.buyBorder,
+  },
+  tpChipPending: {
+    backgroundColor: C.card,
+    borderColor: C.border,
+  },
+  tpChipDisabled: {
+    backgroundColor: C.surface,
+    borderColor: C.border,
+    opacity: 0.6,
+  },
+  tpChipCircle: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    borderWidth: 1.5,
+    borderColor: C.textMuted,
+  },
+  tpChipText: {
+    fontSize: 10,
+    fontFamily: "Inter_600SemiBold",
+    color: C.textMuted,
+  },
+  tpChipTextDisabled: {
+    fontSize: 9,
+    fontFamily: "Inter_600SemiBold",
+    color: C.textMuted,
   },
   emptyBox: {
     alignItems: "center",

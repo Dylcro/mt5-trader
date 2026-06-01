@@ -1,0 +1,13 @@
+.git
+.cursor
+**/.pnpm-store
+**/node_modules
+.pnpm-store
+artifacts/mt5-trader
+artifacts/mockup-sandbox
+artifacts/onboarding-demo
+**/.expo
+**/dist
+terminals
+*.md
+!replit.md
