@@ -28,8 +28,6 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
 
       - uses: actions/setup-node@v4
         with:
@@ -38,6 +36,9 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --config.minimumReleaseAge=0
+
+      - name: Typecheck workspace libs
+        run: pnpm run typecheck:libs
 
       - name: Typecheck api-server
         run: pnpm --filter @workspace/api-server run typecheck
