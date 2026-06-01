@@ -1412,6 +1412,79 @@ export function shouldAutoCloseZoneAfterPositionExit(
   return true;
 }
 
+type HistoryDealRow = {
+  positionId?: string;
+  profit?: number;
+  commission?: number;
+  swap?: number;
+};
+
+/** Sum realized P&L from broker deals for the given MT5 position ids. */
+export function sumDealPnlForPositions(
+  deals: HistoryDealRow[],
+  positionIds: Set<string>,
+): number {
+  let sum = 0;
+  for (const d of deals) {
+    const pid = d.positionId != null ? String(d.positionId) : "";
+    if (!pid || !positionIds.has(pid)) continue;
+    sum += Number(d.profit ?? 0) + Number(d.commission ?? 0) + Number(d.swap ?? 0);
+  }
+  return Math.round(sum * 100) / 100;
+}
+
+async function fetchAccountHistoryDeals(
+  token: string,
+  region: string,
+  accountId: string,
+  startMs: number,
+  endMs: number,
+): Promise<HistoryDealRow[]> {
+  const startTime = new Date(startMs).toISOString();
+  const endTime = new Date(endMs).toISOString();
+  const res = await fetch(
+    `${clientBase(region)}/users/current/accounts/${accountId}/history-deals/time/${encodeURIComponent(startTime)}/${encodeURIComponent(endTime)}`,
+    { headers: authHeaders(token) },
+  );
+  if (!res.ok) return [];
+  const deals = await res.json() as HistoryDealRow[];
+  return Array.isArray(deals) ? deals : [];
+}
+
+/** After a zone closes, persist broker realized P&L for win-rate (incl. manual MT5 exits). */
+async function settleZoneClosedPnl(accountId: string, zoneId: string): Promise<void> {
+  try {
+    const [zone] = await db.select().from(cascadeZonesTable)
+      .where(and(eq(cascadeZonesTable.zoneId, zoneId), eq(cascadeZonesTable.accountId, accountId)))
+      .limit(1);
+    if (!zone || zone.status !== "CLOSED" || zone.closedAt == null) return;
+    if (zone.closedPnl != null) return;
+
+    const posRows = await db.select({ positionId: zonePositionsTable.positionId })
+      .from(zonePositionsTable)
+      .where(eq(zonePositionsTable.zoneId, zoneId));
+    const positionIds = new Set(posRows.map((r) => r.positionId));
+    if (positionIds.size === 0) return;
+
+    const token = getToken();
+    const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
+    const deals = await fetchAccountHistoryDeals(
+      token,
+      region,
+      accountId,
+      Number(zone.createdAt),
+      Number(zone.closedAt) + 120_000,
+    );
+    const pnl = sumDealPnlForPositions(deals, positionIds);
+    await db.update(cascadeZonesTable)
+      .set({ closedPnl: pnl })
+      .where(eq(cascadeZonesTable.zoneId, zoneId));
+    console.log(`[zone ${zoneId}] closedPnl=${pnl} (${positionIds.size} position(s))`);
+  } catch (e) {
+    console.warn(`[zone ${zoneId}] settleZoneClosedPnl failed:`, (e as Error).message);
+  }
+}
+
 /** Deterministic magic number derived from zoneId for broker-side tagging. */
 export function zoneMagicNumber(zoneId: string): number {
   let h = 47182;
@@ -1958,11 +2031,13 @@ async function markZonePositionClosed(accountId: string, positionId: string): Pr
         console.log(`[markClosed] zone ${zoneId} pre-TP2 with ${pendingLeft ? "live" : "no"} pending limits — skip auto-close`);
         return;
       }
+      const closedAt = Date.now();
       await withDbRetry(`markClosed.zoneClose zone=${zoneId}`, () => db.update(cascadeZonesTable)
-        .set({ status: "CLOSED", closedAt: Date.now() })
+        .set({ status: "CLOSED", closedAt })
         .where(eq(cascadeZonesTable.zoneId, zoneId))
       );
       if (st) st.status = "CLOSED";
+      void settleZoneClosedPnl(accountId, zoneId);
       logEvent("zone.close", { accountId, zoneId, trigger: "position.closed" });
       // Cancel any outstanding cascade limit orders — when the user manually
       // closes all positions in MT5 the limits are NOT auto-cancelled by the
@@ -2325,12 +2400,14 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
           console.log(`[zone ${zoneId}] reconcile: pre-TP2 pending limits remain — skip zone close`);
           return;
         }
+        const closedAt = Date.now();
         await withDbRetry(`evalZone.reconcileZoneClose zone=${zoneId}`,
           () => db.update(cascadeZonesTable)
-            .set({ status: "CLOSED", closedAt: Date.now() })
+            .set({ status: "CLOSED", closedAt })
             .where(eq(cascadeZonesTable.zoneId, zoneId))
         ).catch(() => {/* logged inside withDbRetry */});
         st.status = "CLOSED";
+        void settleZoneClosedPnl(st.accountId, zoneId);
         logEvent("zone.close", { accountId: st.accountId, zoneId, trigger: "reconciliation" });
         // Cancel any outstanding cascade limit orders so they don't orphan on
         // MT5 and flash as individual pending cards on the client. Broadcast
@@ -3040,6 +3117,9 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
     const out = [];
     for (const z of zones) {
       if (!includeClosed && z.status === "CLOSED") continue;
+      if (z.status === "CLOSED" && z.closedPnl == null) {
+        void settleZoneClosedPnl(accountId, z.zoneId);
+      }
       const openPositions = await db.select().from(zonePositionsTable)
         .where(and(eq(zonePositionsTable.zoneId, z.zoneId), eq(zonePositionsTable.status, "OPEN")));
       const finalTpReached = computeFinalTpReached({
@@ -3111,6 +3191,7 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         status: z.status,
         createdAt: Number(z.createdAt),
         closedAt: z.closedAt != null ? Number(z.closedAt) : null,
+        closedPnl: z.closedPnl != null ? Number(z.closedPnl) : null,
         finalTpReached,
         positionCount: openPositions.length,
         originalVolume: z.originalVolume != null ? Number(z.originalVolume) : 0,
@@ -3273,10 +3354,12 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
     }
 
     // All closes succeeded → flip the zone to CLOSED and clear in-memory state.
+    const closedAt = Date.now();
     await db.update(cascadeZonesTable)
-      .set({ status: "CLOSED", closedAt: Date.now() })
+      .set({ status: "CLOSED", closedAt })
       .where(eq(cascadeZonesTable.zoneId, zoneId));
     if (st) st.status = "CLOSED";
+    void settleZoneClosedPnl(accountId, zoneId);
     broadcastZoneUpdate(zoneId);
     logEvent("zone.close", { accountId, zoneId, closedCount: live.length, trigger: "user" });
     res.json({ ok: true, closedCount: live.length });

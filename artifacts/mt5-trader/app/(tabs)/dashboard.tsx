@@ -173,7 +173,7 @@ export default function DashboardScreen() {
       </View>
 
       <View style={styles.periodRow}>
-        <Text style={styles.periodHint}>Win rate & closed P&L</Text>
+        <Text style={styles.periodHint}>Profitable zones & closed P&L</Text>
         <PeriodToggle value={period} onChange={setPeriod} />
       </View>
 

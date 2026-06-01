@@ -33,6 +33,8 @@ export interface Zone {
   status: "OPEN" | "RISK_FREE" | "CLOSED";
   createdAt: number;
   closedAt?: number | null;
+  /** Broker realized P&L for the zone (profit+commission+swap). Set when zone closes. */
+  closedPnl?: number | null;
   finalTpReached?: 0 | 1 | 2 | 3 | 4;
   positionCount: number;
   originalVolume?: number;

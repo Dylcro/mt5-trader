@@ -26,9 +26,15 @@ export function countTpHits(zones: Zone[], level: 1 | 2 | 3): number {
   return zones.filter((z) => Boolean(z[key])).length;
 }
 
+/** Win = closed zone with positive realized P&L; falls back to TP1 hit for legacy rows. */
+export function isZoneWin(z: Zone): boolean {
+  if (typeof z.closedPnl === "number") return z.closedPnl > 0;
+  return Boolean(z.tp1Hit);
+}
+
 export function winRatePct(zones: Zone[]): number | null {
   if (zones.length === 0) return null;
-  const wins = zones.filter((z) => z.tp1Hit).length;
+  const wins = zones.filter(isZoneWin).length;
   return Math.round((wins / zones.length) * 100);
 }
 

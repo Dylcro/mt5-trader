@@ -14,6 +14,7 @@ import {
   tpDisplayState,
   shouldCancelCascadeLimitsAtTpStage,
   shouldAutoCloseZoneAfterPositionExit,
+  sumDealPnlForPositions,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
@@ -565,5 +566,18 @@ describe("cascade limit cancel timing", () => {
       false,
       false,
     )).toBe(true);
+  });
+});
+
+describe("sumDealPnlForPositions (zone closed P&L)", () => {
+  it("sums profit+commission+swap only for linked position ids", () => {
+    const ids = new Set(["p1", "p2"]);
+    const deals = [
+      { positionId: "p1", profit: 10, commission: -0.5, swap: 0 },
+      { positionId: "p2", profit: 5, commission: 0, swap: -0.2 },
+      { positionId: "other", profit: 100, commission: 0, swap: 0 },
+      { positionId: "p1", profit: 2.5, commission: 0, swap: 0 },
+    ];
+    expect(sumDealPnlForPositions(deals, ids)).toBe(16.8);
   });
 });
