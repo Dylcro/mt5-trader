@@ -1,6 +1,7 @@
 import app from "./app";
 import { pool } from "@workspace/db";
 import { loadCascadeConfig, startAutoConnect, startConnectionWatchdog, loadZoneState, startZoneTpMonitor, loadNotificationPrefs } from "./routes/mt5";
+import { loadPlatformFlags } from "./lib/platformFlags";
 
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err);
@@ -126,6 +127,32 @@ async function ensureTables(): Promise<void> {
     );
     CREATE INDEX IF NOT EXISTS zone_orders_zone ON zone_orders (zone_id);
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS admin_settings (
+      id SERIAL PRIMARY KEY,
+      membership_cap INTEGER NOT NULL DEFAULT 20,
+      invite_only BOOLEAN NOT NULL DEFAULT FALSE,
+      invite_code TEXT,
+      signups_open BOOLEAN NOT NULL DEFAULT TRUE,
+      trading_paused BOOLEAN NOT NULL DEFAULT FALSE,
+      trading_pause_message TEXT NOT NULL DEFAULT 'Trading is temporarily paused — we''ll be back shortly.'
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS waitlist (
+      id SERIAL PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at BIGINT NOT NULL
+    );
+  `);
+  await pool.query(`
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS locked BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS locked_reason TEXT;
+    ALTER TABLE support_tickets
+      ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'unread';
+  `);
 }
 
 async function main() {
@@ -148,6 +175,7 @@ async function main() {
   // Load persisted cascade config from the database before accepting requests
   // so that GET /cascade-config never returns stale defaults on a fresh start.
   await loadCascadeConfig();
+  await loadPlatformFlags();
 
   app.listen(port, () => {
     console.log(`Server listening on port ${port}`);
