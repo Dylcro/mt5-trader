@@ -1,8 +1,25 @@
+# Single-service deploy: API server only. Do not set Root Directory to artifacts/api-server
+# (shared lib/* and workspace root files are required). Delete extra Railway services
+# created by monorepo auto-detect (mt5-trader, mockup-sandbox, etc.).
 [build]
 builder = "dockerfile"
 dockerfilePath = "Dockerfile"
+watchPatterns = [
+  "artifacts/api-server/**",
+  "lib/**",
+  "Dockerfile",
+  "railway.toml",
+  "package.json",
+  "pnpm-lock.yaml",
+  "pnpm-workspace.yaml",
+  ".npmrc",
+  "tsconfig.base.json",
+  "tsconfig.json",
+]
 
 [deploy]
 healthcheckPath = "/healthz"
 healthcheckTimeout = 120
 restartPolicyType = "on_failure"
+# Used when builder is Nixpacks/Railpack (fallback). Dockerfile CMD takes precedence for Docker builds.
+startCommand = "pnpm --filter @workspace/api-server exec tsx ./src/index.ts"
