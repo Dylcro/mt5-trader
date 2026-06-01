@@ -95,6 +95,24 @@ export function NotificationSettingsProvider({ children }: { children: React.Rea
   >("unknown");
   const lastTokenSent = useRef<string | null>(null);
 
+  const syncPushTokenIfNeeded = useCallback(async (enabled: NotificationPrefs) => {
+    if (!API_BASE) return;
+    if (!enabled.nearEnabled && !enabled.hitEnabled) return;
+    const reg = await registerForPushTokenAsync();
+    setPermissionStatus(reg.status);
+    if (!reg.token) return;
+    if (lastTokenSent.current === reg.token) return;
+    lastTokenSent.current = reg.token;
+    try {
+      await authFetch(`${API_BASE}/mt5/notifications/prefs`, {
+        method: "PUT",
+        body: JSON.stringify({ expoPushToken: reg.token }),
+      });
+    } catch {
+      // ignored — toggles still persist via updatePrefs
+    }
+  }, []);
+
   // Initial load — fetch server prefs (auth-gated). Silently no-ops when
   // unauthenticated; settings screen re-loads after sign-in.
   useEffect(() => {
@@ -105,7 +123,9 @@ export function NotificationSettingsProvider({ children }: { children: React.Rea
         const res = await authFetch(`${API_BASE}/mt5/notifications/prefs`);
         if (res.ok) {
           const data = (await res.json()) as NotificationPrefs;
-          if (!cancelled) setPrefs({ ...DEFAULTS, ...data });
+          const merged = { ...DEFAULTS, ...data };
+          if (!cancelled) setPrefs(merged);
+          if (!cancelled) await syncPushTokenIfNeeded(merged);
         }
       } catch {
         // ignored — defaults stay
@@ -114,7 +134,7 @@ export function NotificationSettingsProvider({ children }: { children: React.Rea
       }
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [syncPushTokenIfNeeded]);
 
   const updatePrefs = useCallback<NotificationSettingsContextValue["updatePrefs"]>(async (next) => {
     if (!API_BASE) return { ok: false, message: "API not configured" };
@@ -122,22 +142,18 @@ export function NotificationSettingsProvider({ children }: { children: React.Rea
     // Compute the optimistic next state up-front so the UI feels instant.
     const merged: NotificationPrefs = { ...prefs, ...next };
 
-    // If the user is opting in to either alert type and we don't have a token
-    // yet, request permissions + fetch an Expo push token. A denied permission
-    // forces the toggle back off so the UI doesn't lie about being enabled.
+    // Opting in requires a fresh Expo push token on the device (re-installs
+    // and iOS permission resets left hasToken true with a stale server token).
     let pushToken: string | null | undefined;
     const wantsAlerts = merged.nearEnabled || merged.hitEnabled;
-    if (wantsAlerts && !prefs.hasToken) {
+    if (wantsAlerts) {
       const reg = await registerForPushTokenAsync();
       setPermissionStatus(reg.status);
       if (!reg.token) {
         return { ok: false, message: "Notification permission was not granted." };
       }
-      // Only resend the token if it's new — avoids hammering the server.
-      if (lastTokenSent.current !== reg.token) {
-        pushToken = reg.token;
-        lastTokenSent.current = reg.token;
-      }
+      pushToken = reg.token;
+      lastTokenSent.current = reg.token;
     }
 
     try {
