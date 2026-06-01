@@ -2451,16 +2451,18 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     // the absolute TP prices on `st` (the cascade refactor moved away from pip
     // distances), and skips silently if the next TP price isn't set yet.
     {
-      const nextTpIdx: 0 | 1 | 2 | 3 =
+      const nextTpIdx: 0 | 1 | 2 | 3 | 4 =
         st.tp1Enabled && !st.tp1Hit ? 1 :
         st.tp2Enabled && !st.tp2Hit ? 2 :
-        st.tp3Enabled && !st.tp3Hit ? 3 : 0;
+        st.tp3Enabled && !st.tp3Hit ? 3 :
+        st.tp4Enabled && !st.tp4Hit && st.tp4Price != null ? 4 : 0;
       const nextTpPrice =
         nextTpIdx === 1 ? st.tp1Price :
         nextTpIdx === 2 ? st.tp2Price :
-        nextTpIdx === 3 ? st.tp3Price : null;
+        nextTpIdx === 3 ? st.tp3Price :
+        nextTpIdx === 4 ? st.tp4Price : null;
       if (nextTpIdx > 0 && nextTpPrice != null) {
-        const userId = zoneIdToUserId.get(zoneId);
+        const userId = resolveZoneNotifyUserId(zoneId, st.accountId);
         const prefs = userId ? notificationPrefs.get(userId) : undefined;
         const threshold = prefs?.thresholdPips ?? 0;
         const sign = st.direction === "buy" ? 1 : -1;
@@ -2478,7 +2480,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
           (zoneNearNotifiedTp.get(zoneId) ?? 0) !== nextTpIdx
         ) {
           zoneNearNotifiedTp.set(zoneId, nextTpIdx);
-          notifyZoneEvent(zoneId, "near", nextTpIdx as 1 | 2 | 3, remaining, st.direction);
+          notifyZoneEvent(zoneId, "near", nextTpIdx as 1 | 2 | 3 | 4, remaining, st.direction);
         }
       }
     }
@@ -2660,6 +2662,8 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         if (!st.tp4Hit) {
           await db.update(cascadeZonesTable).set({ tp4Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
           st.tp4Hit = true;
+          zoneNearNotifiedTp.set(zoneId, 0);
+          notifyZoneEvent(zoneId, "hit", 4, 0, st.direction);
         }
         broadcastZoneUpdate(zoneId);
         console.log(`[zone ${zoneId}] TP4 complete — final exit (${ids.length} position(s))`);
@@ -2845,6 +2849,11 @@ export async function loadZoneState(): Promise<void> {
       .where(inArray(cascadeZonesTable.status, ["OPEN", "RISK_FREE"]));
     for (const z of zones) {
       zoneStates.set(z.zoneId, rowToZoneState(z));
+      if (z.userId) zoneIdToUserId.set(z.zoneId, z.userId);
+      else {
+        const known = knownAccounts.get(z.accountId);
+        if (known?.userId) zoneIdToUserId.set(z.zoneId, known.userId);
+      }
     }
     // Hydrate the in-memory tracked-positions cache from the open
     // zone_positions rows so we have a working fallback the moment the
@@ -2943,23 +2952,50 @@ async function sendExpoPush(
         sound: "default", priority: "high", channelId: "tp-alerts",
       }),
     });
+    const payload = await res.json().catch(() => ({})) as {
+      data?: Array<{ status?: string; message?: string; details?: { error?: string } }>;
+    };
     if (!res.ok) {
-      console.warn(`[notif] push HTTP ${res.status}: ${await res.text().catch(() => "")}`);
+      console.warn(`[notif] push HTTP ${res.status}: ${JSON.stringify(payload)}`);
+      return;
+    }
+    const ticket = payload.data?.[0];
+    if (ticket?.status === "error") {
+      console.warn(`[notif] push ticket error: ${ticket.message ?? ""} ${ticket.details?.error ?? ""}`);
     }
   } catch (e) {
     console.warn(`[notif] push error: ${(e as Error).message}`);
   }
 }
 
+function resolveZoneNotifyUserId(zoneId: string, accountId?: string): string | undefined {
+  const cached = zoneIdToUserId.get(zoneId);
+  if (cached) return cached;
+  const st = zoneStates.get(zoneId);
+  const acct = accountId ?? st?.accountId;
+  if (acct) {
+    const known = knownAccounts.get(acct);
+    if (known?.userId) {
+      zoneIdToUserId.set(zoneId, known.userId);
+      return known.userId;
+    }
+  }
+  return undefined;
+}
+
 function notifyZoneEvent(
   zoneId: string,
   kind: "near" | "hit",
-  tp: 1 | 2 | 3,
+  tp: 1 | 2 | 3 | 4,
   pipsToNextTp: number | null,
   direction: "buy" | "sell",
 ): void {
-  const userId = zoneIdToUserId.get(zoneId);
-  if (!userId) return;
+  const st = zoneStates.get(zoneId);
+  const userId = resolveZoneNotifyUserId(zoneId, st?.accountId);
+  if (!userId) {
+    console.warn(`[notif] no userId for zone ${zoneId} — skipping ${kind} TP${tp}`);
+    return;
+  }
   const prefs = notificationPrefs.get(userId);
   if (!prefs?.expoPushToken) return;
   if (kind === "near" && !prefs.nearEnabled) return;
