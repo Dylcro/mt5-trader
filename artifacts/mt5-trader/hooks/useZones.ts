@@ -35,6 +35,7 @@ export interface Zone {
   closedAt?: number | null;
   finalTpReached?: 0 | 1 | 2 | 3 | 4;
   positionCount: number;
+  originalVolume?: number;
   currentPrice?: number | null;
   nextTp?: 0 | 1 | 2 | 3 | 4;
   nextTpPrice?: number | null;

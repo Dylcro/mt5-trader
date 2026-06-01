@@ -1,6 +1,7 @@
 import { Feather } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
-import React, { useCallback, useState } from "react";
+import { useFocusEffect } from "expo-router";
+import React, { useCallback, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -12,237 +13,126 @@ import {
   Text,
   View,
 } from "react-native";
-import { useFocusEffect } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import Colors from "@/constants/colors";
-import { useTrading, type PendingOrder, type Position } from "@/context/TradingContext";
-import { useCascadeSettings } from "@/hooks/useCascadeSettings";
+import { useTrading, type Position } from "@/context/TradingContext";
 import { useZones } from "@/hooks/useZones";
-import ZoneCard from "@/components/ZoneCard";
+import { formatMoney, formatPrice, pipsFromEntry } from "@/lib/formatters";
+import { isPositionRiskFree } from "@/lib/zoneStats";
+import { parseCascadeLeg } from "@/lib/zoneComments";
 
 const C = Colors.dark;
 
-function formatPrice(n: number) {
-  return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
-function ProfitBadge({ profit }: { profit: number }) {
-  const positive = profit >= 0;
-  return (
-    <View style={[styles.profitBadge, positive ? styles.profitPositive : styles.profitNegative]}>
-      <Feather
-        name={positive ? "arrow-up-right" : "arrow-down-right"}
-        size={12}
-        color={positive ? C.buy : C.sell}
-      />
-      <Text style={[styles.profitText, { color: positive ? C.buy : C.sell }]}>
-        {positive ? "+" : ""}${profit.toFixed(2)}
-      </Text>
-    </View>
-  );
-}
-
-// Groups one direction's worth of orphan positions (positions that aren't
-// tracked by any zone — typically a cascade whose zone wasn't created, or a
-// legacy trade) into a single zone-style card. The user explicitly does not
-// want per-position cards: every open trade is shown as a roll-up so the
-// Positions tab always looks like "N zones / N groups", never a flat list.
-function StandaloneGroupCard({
-  positions,
-  symbol,
-  direction,
-  onCloseAll,
+function PositionCard({
+  position,
+  cascadeLabel,
+  riskFree,
+  onPress,
 }: {
-  positions: Position[];
-  symbol: string;
-  direction: "buy" | "sell";
-  onCloseAll: (positions: Position[]) => void;
+  position: Position;
+  cascadeLabel: string;
+  riskFree: boolean;
+  onPress: () => void;
 }) {
-  const isBuy = direction === "buy";
-  const [closing, setClosing] = useState(false);
-  const totalVolume = positions.reduce((s, p) => s + p.volume, 0);
-  const totalProfit = positions.reduce((s, p) => s + p.profit, 0);
-  // Volume-weighted average entry — the right number to show for a cascade
-  // where each leg has the same lot size but lands at different prices.
-  const avgEntry = totalVolume > 0
-    ? positions.reduce((s, p) => s + p.openPrice * p.volume, 0) / totalVolume
-    : 0;
-  const currentPrice = positions[0]?.currentPrice ?? 0;
-  // Show a single SL value only if every position shares it (the cascade
-  // case). Mixed SLs would be misleading rolled into one number.
-  const slValues = positions.map((p) => p.stopLoss).filter((sl): sl is number => sl != null);
-  const sharedSl = slValues.length === positions.length && slValues.length > 0
-    && slValues.every((sl) => Math.abs(sl - slValues[0]!) < 0.005)
-    ? slValues[0]!
-    : null;
-
-  const handleClose = async () => {
-    if (closing) return;
-    setClosing(true);
-    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    onCloseAll(positions);
-    setClosing(false);
-  };
+  const isBuy = position.type === "POSITION_TYPE_BUY";
+  const dir: "buy" | "sell" = isBuy ? "buy" : "sell";
+  const pips = pipsFromEntry(dir, position.openPrice, position.currentPrice);
+  const positive = position.profit >= 0;
 
   return (
-    <View style={styles.posCard}>
-      <View style={styles.posTop}>
-        <View style={styles.posLeft}>
-          <View style={[styles.dirPill, isBuy ? styles.dirPillBuy : styles.dirPillSell]}>
-            <Feather
-              name={isBuy ? "trending-up" : "trending-down"}
-              size={12}
-              color={isBuy ? "#000" : "#fff"}
-            />
-            <Text style={[styles.dirPillText, { color: isBuy ? "#000" : "#fff" }]}>
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => [styles.card, pressed && { opacity: 0.92 }]}
+    >
+      <View style={styles.cardTop}>
+        <View style={[styles.dirIcon, isBuy ? styles.dirIconBuy : styles.dirIconSell]}>
+          <Feather
+            name={isBuy ? "arrow-up-right" : "arrow-down-right"}
+            size={14}
+            color={isBuy ? C.buy : C.sell}
+          />
+        </View>
+        <View style={styles.cardTitleWrap}>
+          <Text style={styles.cardTitle}>
+            <Text style={{ color: isBuy ? C.buy : C.sell, fontFamily: "Inter_700Bold" }}>
               {isBuy ? "BUY" : "SELL"}
             </Text>
+            <Text style={styles.cardTitleMuted}> · {position.volume.toFixed(2)} lot</Text>
+          </Text>
+          <Text style={styles.cascadeLabel}>{cascadeLabel}</Text>
+        </View>
+        {riskFree ? (
+          <View style={styles.badgeRiskFree}>
+            <Feather name="shield" size={10} color={C.buy} />
+            <Text style={styles.badgeRiskFreeText}>RISK FREE</Text>
           </View>
-          <Text style={styles.posSymbol}>{symbol}</Text>
-          <Text style={styles.posVol}>
-            {positions.length} {positions.length === 1 ? "position" : "positions"}  ·  {totalVolume.toFixed(2)} lots
+        ) : (
+          <View style={styles.badgeOpen}>
+            <View style={styles.openDot} />
+            <Text style={styles.badgeOpenText}>OPEN</Text>
+          </View>
+        )}
+      </View>
+
+      <View style={styles.statRow}>
+        <View style={styles.statCell}>
+          <Text style={styles.statLabel}>Entry</Text>
+          <Text style={styles.statValue}>{formatPrice(position.openPrice)}</Text>
+        </View>
+        <View style={styles.statDivider} />
+        <View style={styles.statCell}>
+          <Text style={styles.statLabel}>SL</Text>
+          <Text style={[styles.statValue, { color: C.sell }]}>
+            {position.stopLoss != null ? formatPrice(position.stopLoss) : "—"}
           </Text>
         </View>
-        <ProfitBadge profit={totalProfit} />
-      </View>
-
-      <View style={styles.posPriceRow}>
-        <View style={styles.posPriceItem}>
-          <Text style={styles.posPriceLabel}>AVG ENTRY</Text>
-          <Text style={styles.posPriceVal}>{formatPrice(avgEntry)}</Text>
-        </View>
-        <View style={styles.posPriceDivider} />
-        <View style={styles.posPriceItem}>
-          <Text style={styles.posPriceLabel}>CURRENT</Text>
-          <Text style={[styles.posPriceVal, { color: totalProfit >= 0 ? C.buy : C.sell }]}>
-            {formatPrice(currentPrice)}
-          </Text>
-        </View>
-        {sharedSl != null && (
-          <>
-            <View style={styles.posPriceDivider} />
-            <View style={styles.posPriceItem}>
-              <Text style={styles.posPriceLabel}>STOP LOSS</Text>
-              <Text style={[styles.posPriceVal, { color: C.sell }]}>{formatPrice(sharedSl)}</Text>
-            </View>
-          </>
-        )}
-      </View>
-
-      <Pressable
-        style={({ pressed }) => [
-          styles.closeBtn,
-          pressed && { opacity: 0.7 },
-          closing && { opacity: 0.5 },
-        ]}
-        onPress={handleClose}
-        disabled={closing}
-      >
-        {closing ? (
-          <ActivityIndicator size="small" color={C.text} />
-        ) : (
-          <>
-            <Feather name="x-circle" size={14} color={C.textSecondary} />
-            <Text style={styles.closeBtnText}>
-              Close {positions.length === 1 ? "Position" : `All (${positions.length})`}
-            </Text>
-          </>
-        )}
-      </Pressable>
-    </View>
-  );
-}
-
-function PendingOrderCard({ order, onCancel }: { order: PendingOrder; onCancel: () => void }) {
-  const isBuyLimit = order.type.includes("BUY");
-  const [cancelling, setCancelling] = useState(false);
-
-  const typeLabel = order.type === "ORDER_TYPE_BUY_LIMIT" ? "BUY LIMIT"
-    : order.type === "ORDER_TYPE_SELL_LIMIT" ? "SELL LIMIT"
-    : order.type === "ORDER_TYPE_BUY_STOP" ? "BUY STOP"
-    : order.type === "ORDER_TYPE_SELL_STOP" ? "SELL STOP"
-    : order.type.replace("ORDER_TYPE_", "").replace(/_/g, " ");
-
-  const handleCancel = async () => {
-    setCancelling(true);
-    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    onCancel();
-    setCancelling(false);
-  };
-
-  return (
-    <View style={[styles.posCard, styles.pendingCard]}>
-      <View style={styles.posTop}>
-        <View style={styles.posLeft}>
-          <View style={[styles.dirPill, isBuyLimit ? styles.dirPillBuy : styles.dirPillSell]}>
-            <Feather name={isBuyLimit ? "trending-up" : "trending-down"} size={12} color={isBuyLimit ? "#000" : "#fff"} />
-            <Text style={[styles.dirPillText, { color: isBuyLimit ? "#000" : "#fff" }]}>{typeLabel}</Text>
-          </View>
-          <Text style={styles.posSymbol}>{order.symbol}</Text>
-          <Text style={styles.posVol}>{order.volume} lots</Text>
-        </View>
-        <View style={styles.pendingBadge}>
-          <Text style={styles.pendingBadgeText}>PENDING</Text>
+        <View style={styles.statDivider} />
+        <View style={styles.statCell}>
+          <Text style={styles.statLabel}>Now</Text>
+          <Text style={styles.statValue}>{formatPrice(position.currentPrice)}</Text>
         </View>
       </View>
 
-      <View style={styles.posPriceRow}>
-        <View style={styles.posPriceItem}>
-          <Text style={styles.posPriceLabel}>LIMIT PRICE</Text>
-          <Text style={[styles.posPriceVal, { color: isBuyLimit ? C.buy : C.sell }]}>{formatPrice(order.openPrice)}</Text>
-        </View>
-        {order.stopLoss != null && (
-          <>
-            <View style={styles.posPriceDivider} />
-            <View style={styles.posPriceItem}>
-              <Text style={styles.posPriceLabel}>STOP LOSS</Text>
-              <Text style={[styles.posPriceVal, { color: C.sell }]}>{formatPrice(order.stopLoss)}</Text>
-            </View>
-          </>
-        )}
-        {order.comment != null && order.comment !== "" && (
-          <>
-            <View style={styles.posPriceDivider} />
-            <View style={[styles.posPriceItem, { flex: 2 }]}>
-              <Text style={styles.posPriceLabel}>NOTE</Text>
-              <Text style={[styles.posPriceVal, { fontSize: 11 }]} numberOfLines={1}>{order.comment}</Text>
-            </View>
-          </>
-        )}
+      <View style={styles.cardFooter}>
+        <Text style={styles.pipsText}>{pips.toFixed(1)} pips</Text>
+        <Text style={[styles.plText, { color: positive ? C.buy : C.sell }]}>
+          {formatMoney(position.profit, { signed: true })}
+        </Text>
       </View>
-
-      <Pressable
-        style={({ pressed }) => [styles.closeBtn, pressed && { opacity: 0.7 }, cancelling && { opacity: 0.5 }]}
-        onPress={handleCancel}
-        disabled={cancelling}
-      >
-        {cancelling ? (
-          <ActivityIndicator size="small" color={C.text} />
-        ) : (
-          <>
-            <Feather name="x-circle" size={14} color={C.textSecondary} />
-            <Text style={styles.closeBtnText}>Cancel Order</Text>
-          </>
-        )}
-      </Pressable>
-    </View>
+    </Pressable>
   );
 }
 
 export default function PositionsScreen() {
   const insets = useSafeAreaInsets();
-  const { positions, pendingOrders, status, refreshPositions, refreshPendingOrders, closePosition, cancelOrder, accountInfo, accountId, sseConnected } = useTrading();
-  const { zones, riskFree, closeZone, cancelZoneOrders } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000, sseConnected });
-  const { settings: cs } = useCascadeSettings();
-  const activeZones = zones.filter((z) => z.status !== "CLOSED");
-  const pastZones = zones
-    .filter((z) => z.status === "CLOSED")
-    .sort((a, b) => (b.closedAt ?? b.createdAt) - (a.closedAt ?? a.createdAt))
-    .slice(0, 25);
-  const [pastExpanded, setPastExpanded] = useState(false);
+  const {
+    positions,
+    pendingOrders,
+    status,
+    refreshPositions,
+    refreshPendingOrders,
+    closePosition,
+    cancelOrder,
+    accountId,
+    sseConnected,
+  } = useTrading();
+  const { zones } = useZones(accountId, {
+    includeClosed: true,
+    pollIntervalMs: 10_000,
+    sseConnected,
+  });
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+
+  const zoneById = useMemo(() => {
+    const map = new Map<string, (typeof zones)[number]>();
+    for (const z of zones) map.set(z.zoneId, z);
+    return map;
+  }, [zones]);
+
+  const totalPL = positions.reduce((sum, p) => sum + p.profit, 0);
+  const webTopPad = Platform.OS === "web" ? 67 : 0;
 
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -250,7 +140,6 @@ export default function PositionsScreen() {
     setRefreshing(false);
   }, [refreshPositions, refreshPendingOrders]);
 
-  // Poll while focused so MT5-side closes/cancels appear without manual refresh.
   useFocusEffect(
     useCallback(() => {
       if (status !== "connected" || !accountId) return;
@@ -261,19 +150,20 @@ export default function PositionsScreen() {
     }, [status, accountId, refreshPositions, refreshPendingOrders]),
   );
 
-  const handleCancelOrder = useCallback(
-    async (order: PendingOrder) => {
+  const handleClosePosition = useCallback(
+    (position: Position) => {
+      const dir = position.type === "POSITION_TYPE_BUY" ? "BUY" : "SELL";
       Alert.alert(
-        "Cancel Order",
-        `Cancel ${order.type.includes("BUY") ? "BUY" : "SELL"} LIMIT @ ${formatPrice(order.openPrice)} (${order.volume} lots)?`,
+        "Close Position",
+        `Close ${dir} ${position.volume.toFixed(2)} lots?\n\nP&L: ${formatMoney(position.profit, { signed: true })}`,
         [
-          { text: "Keep", style: "cancel" },
+          { text: "Cancel", style: "cancel" },
           {
-            text: "Cancel Order",
+            text: "Close",
             style: "destructive",
             onPress: async () => {
-              setBusyId(order.id);
-              const result = await cancelOrder(order.id);
+              setBusyId(position.id);
+              const result = await closePosition(position.id);
               setBusyId(null);
               if (!result.success) {
                 Alert.alert("Error", result.message);
@@ -282,124 +172,56 @@ export default function PositionsScreen() {
               }
             },
           },
-        ]
+        ],
       );
     },
-    [cancelOrder]
+    [closePosition],
   );
 
-  // Close every position in a standalone group in parallel — fires all the
-  // POSITION_CLOSE_ID calls together rather than serially, matching the same
-  // pattern used by the zone Close button server-side.
-  const handleCloseGroup = useCallback(
-    async (group: Position[]) => {
-      if (group.length === 0) return;
-      const totalLots = group.reduce((s, p) => s + p.volume, 0);
-      const totalProfit = group.reduce((s, p) => s + p.profit, 0);
-      const dir = group[0]!.type === "POSITION_TYPE_BUY" ? "BUY" : "SELL";
-      Alert.alert(
-        group.length === 1 ? "Close Position" : `Close ${group.length} Positions`,
-        `Close ${dir} ${totalLots.toFixed(2)} lots${group.length > 1 ? ` across ${group.length} positions` : ""}?\n\nP&L: ${totalProfit >= 0 ? "+" : ""}${totalProfit.toFixed(2)}`,
-        [
-          { text: "Cancel", style: "cancel" },
-          {
-            text: "Close",
-            style: "destructive",
-            onPress: async () => {
-              const results = await Promise.all(group.map((p) => closePosition(p.id)));
-              const failed = results.filter((r) => !r.success);
-              if (failed.length === 0) {
-                await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-              } else {
-                Alert.alert(
-                  "Some Positions Failed",
-                  `${results.length - failed.length}/${results.length} closed. ${failed[0]!.message}`,
-                );
-              }
-            },
-          },
-        ]
-      );
-    },
-    [closePosition]
-  );
+  const resolveCascade = (position: Position) => {
+    const parsed = parseCascadeLeg(position.comment);
+    if (parsed) return `Cascade ${parsed.leg}/${parsed.total}`;
+    return "Cascade —";
+  };
 
-  const [cancellingAll, setCancellingAll] = useState(false);
-
-  const handleCancelAllLimits = useCallback(async () => {
-    if (cancellingAll || pendingOrders.length === 0) return;
-    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-    setCancellingAll(true);
-    await Promise.all(pendingOrders.map((o) => cancelOrder(o.id)));
-    await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    setCancellingAll(false);
-  }, [cancellingAll, pendingOrders, cancelOrder]);
-
-  const totalPL = positions.reduce((sum, p) => sum + p.profit, 0);
-  const webTopPad = Platform.OS === "web" ? 67 : 0;
-  // When zones are active, positions/limits in those zones are already shown
-  // inside each ZoneCard — hide the redundant flat OPEN/PENDING lists to cut
-  // visual noise. Only surface standalone positions when no zone is active
-  // (e.g. a manual non-cascade trade with nothing else going on).
-  const showStandalone = activeZones.length === 0 && positions.length > 0;
-  const hasAnything = activeZones.length > 0 || showStandalone || pendingOrders.length > 0;
+  const resolveRiskFree = (position: Position) => {
+    const parsed = parseCascadeLeg(position.comment);
+    const zone = parsed ? zoneById.get(parsed.zoneId) : undefined;
+    const dir = position.type === "POSITION_TYPE_BUY" ? "buy" : "sell";
+    return isPositionRiskFree(dir, position.openPrice, position.stopLoss, zone?.status);
+  };
 
   return (
     <View style={[styles.container, { paddingTop: insets.top + webTopPad }]}>
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>Positions</Text>
-        {positions.length > 0 && (
-          <Text style={[styles.totalPL, { color: totalPL >= 0 ? C.buy : C.sell }]}>
-            {totalPL >= 0 ? "+" : ""}{totalPL.toFixed(2)}
-          </Text>
-        )}
+        <Text style={styles.title}>Positions</Text>
+        <Text style={styles.openCount}>{positions.length} open</Text>
       </View>
 
-      {accountInfo && (
-        <View style={styles.accountBar}>
-          <View style={styles.accountItem}>
-            <Text style={styles.accountLabel}>BALANCE</Text>
-            <Text style={styles.accountVal}>{formatPrice(accountInfo.balance)}</Text>
-          </View>
-          <View style={styles.accountDivider} />
-          <View style={styles.accountItem}>
-            <Text style={styles.accountLabel}>EQUITY</Text>
-            <Text style={[styles.accountVal, { color: accountInfo.equity >= accountInfo.balance ? C.buy : C.sell }]}>
-              {formatPrice(accountInfo.equity)}
+      {positions.length > 0 && (
+        <View
+          style={[
+            styles.plBanner,
+            totalPL >= 0 ? styles.plBannerPositive : styles.plBannerNegative,
+          ]}
+        >
+          <View>
+            <Text style={styles.plBannerLabel}>TOTAL FLOATING P&L</Text>
+            <Text style={styles.plBannerSub}>
+              {positions.length} position{positions.length === 1 ? "" : "s"} open
             </Text>
           </View>
-          <View style={styles.accountDivider} />
-          <View style={styles.accountItem}>
-            <Text style={styles.accountLabel}>FREE MARGIN</Text>
-            <Text style={styles.accountVal}>{formatPrice(accountInfo.freeMargin)}</Text>
-          </View>
+          <Text style={[styles.plBannerValue, { color: totalPL >= 0 ? C.buy : C.sell }]}>
+            {formatMoney(totalPL, { signed: true })}
+          </Text>
         </View>
       )}
-
-      <Pressable
-        style={({ pressed }) => [styles.refreshRow, pressed && { opacity: 0.6 }]}
-        onPress={handleRefresh}
-        disabled={refreshing}
-      >
-        {refreshing ? (
-          <ActivityIndicator size={12} color={C.textMuted} />
-        ) : (
-          <Feather name="refresh-cw" size={12} color={C.textMuted} />
-        )}
-        <Text style={styles.refreshRowText}>
-          {refreshing ? "Refreshing…" : sseConnected ? "Live sync" : "Polling · refresh"}
-        </Text>
-      </Pressable>
 
       <ScrollView
         contentContainerStyle={[styles.scroll, { paddingBottom: insets.bottom + 100 }]}
         showsVerticalScrollIndicator={false}
         refreshControl={
-          <RefreshControl
-            refreshing={refreshing}
-            onRefresh={handleRefresh}
-            tintColor={C.gold}
-          />
+          <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} tintColor={C.gold} />
         }
       >
         {status !== "connected" ? (
@@ -408,121 +230,84 @@ export default function PositionsScreen() {
             <Text style={styles.emptyTitle}>Not Connected</Text>
             <Text style={styles.emptyText}>Connect your MT5 account in Settings to see positions</Text>
           </View>
-        ) : !hasAnything ? (
+        ) : positions.length === 0 ? (
           <View style={styles.emptyState}>
             <Feather name="inbox" size={40} color={C.textMuted} />
             <Text style={styles.emptyTitle}>No Open Positions</Text>
             <Text style={styles.emptyText}>Head to the Trade tab to place your first XAUUSD trade</Text>
           </View>
         ) : (
-          <>
-            {activeZones.length > 0 && (
-              <>
-                <Text style={styles.sectionLabel}>ACTIVE ZONES  ·  {activeZones.length}</Text>
-                <View style={{ gap: 10, marginBottom: showStandalone || pendingOrders.length > 0 ? 20 : 0 }}>
-                  {activeZones.map((z) => (
-                    <ZoneCard
-                      key={z.zoneId}
-                      zone={z}
-                      onRiskFree={riskFree}
-                      onCloseZone={closeZone}
-                      onCancelOrders={cancelZoneOrders}
-                      riskFreePips={cs.riskFreePips}
-                    />
-                  ))}
-                </View>
-              </>
-            )}
-            {showStandalone && (() => {
-              // Group standalone (non-zone) positions by symbol + direction so
-              // a cascade that wasn't successfully registered as a zone still
-              // shows as ONE roll-up card per side instead of N separate cards.
-              const groups = new Map<string, Position[]>();
-              for (const p of positions) {
-                const dir = p.type === "POSITION_TYPE_BUY" ? "buy" : "sell";
-                const key = `${p.symbol}|${dir}`;
-                const arr = groups.get(key) ?? [];
-                arr.push(p);
-                groups.set(key, arr);
-              }
-              const groupList = Array.from(groups.entries());
-              return (
-                <>
-                  <Text style={styles.sectionLabel}>
-                    OPEN  ·  {positions.length}
-                  </Text>
-                  <View style={{ gap: 10 }}>
-                    {groupList.map(([key, group]) => {
-                      const [symbol, dir] = key.split("|") as [string, "buy" | "sell"];
-                      return (
-                        <StandaloneGroupCard
-                          key={key}
-                          positions={group}
-                          symbol={symbol}
-                          direction={dir}
-                          onCloseAll={handleCloseGroup}
-                        />
-                      );
-                    })}
-                  </View>
-                </>
-              );
-            })()}
-            {activeZones.length === 0 && pendingOrders.length > 0 && (
-              <>
-                <View style={[styles.sectionRow, { marginTop: positions.length > 0 ? 20 : 0 }]}>
-                  <Text style={styles.sectionLabel}>PENDING  ·  {pendingOrders.length}</Text>
-                  <Pressable
-                    style={({ pressed }) => [styles.cancelAllBtn, (pressed || cancellingAll) && { opacity: 0.6 }]}
-                    onPress={handleCancelAllLimits}
-                    disabled={cancellingAll}
-                  >
-                    {cancellingAll ? (
-                      <ActivityIndicator size="small" color={C.sell} />
-                    ) : (
-                      <>
-                        <Feather name="x" size={12} color={C.sell} />
-                        <Text style={styles.cancelAllText}>Cancel All Limits</Text>
-                      </>
-                    )}
-                  </Pressable>
-                </View>
-                {pendingOrders.map((order) => (
-                  <PendingOrderCard
-                    key={order.id}
-                    order={order}
-                    onCancel={() => handleCancelOrder(order)}
-                  />
-                ))}
-              </>
-            )}
-          </>
+          <View style={{ gap: 12 }}>
+            {positions.map((p) => (
+              <View key={p.id} style={busyId === p.id ? { opacity: 0.5 } : undefined}>
+                <PositionCard
+                  position={p}
+                  cascadeLabel={resolveCascade(p)}
+                  riskFree={resolveRiskFree(p)}
+                  onPress={() => handleClosePosition(p)}
+                />
+              </View>
+            ))}
+          </View>
         )}
 
-        {status === "connected" && pastZones.length > 0 && (
-          <View style={{ marginTop: hasAnything ? 20 : 0 }}>
-            <Pressable
-              onPress={() => setPastExpanded((v) => !v)}
-              style={({ pressed }) => [styles.pastHeader, pressed && { opacity: 0.7 }]}
-              hitSlop={8}
-            >
-              <Text style={styles.sectionLabel}>
-                PAST ZONES  ·  {pastZones.length}
-              </Text>
-              <Feather
-                name={pastExpanded ? "chevron-up" : "chevron-down"}
-                size={16}
-                color={C.textSecondary}
-              />
-            </Pressable>
-            {pastExpanded && (
-              <View style={{ gap: 10, marginTop: 6 }}>
-                {pastZones.map((z) => (
-                  <ZoneCard key={z.zoneId} zone={z} historical />
-                ))}
-              </View>
-            )}
+        {status === "connected" && pendingOrders.length > 0 && (
+          <View style={{ gap: 10, marginTop: positions.length > 0 ? 16 : 0 }}>
+            <Text style={styles.pendingLabel}>PENDING · {pendingOrders.length}</Text>
+            {pendingOrders.map((order) => {
+              const isBuy = order.type.includes("BUY");
+              return (
+                <View key={order.id} style={[styles.card, styles.pendingCard]}>
+                  <Text style={styles.cardTitle}>
+                    <Text style={{ color: isBuy ? C.buy : C.sell, fontFamily: "Inter_700Bold" }}>
+                      {isBuy ? "BUY" : "SELL"} LIMIT
+                    </Text>
+                    <Text style={styles.cardTitleMuted}> · {order.volume.toFixed(2)} lot</Text>
+                  </Text>
+                  <Text style={styles.cascadeLabel}>@ {formatPrice(order.openPrice)}</Text>
+                  <Pressable
+                    style={({ pressed }) => [styles.cancelBtn, pressed && { opacity: 0.7 }]}
+                    onPress={() => {
+                      Alert.alert(
+                        "Cancel Order",
+                        `Cancel limit @ ${formatPrice(order.openPrice)}?`,
+                        [
+                          { text: "Keep", style: "cancel" },
+                          {
+                            text: "Cancel",
+                            style: "destructive",
+                            onPress: async () => {
+                              const result = await cancelOrder(order.id);
+                              if (!result.success) Alert.alert("Error", result.message);
+                            },
+                          },
+                        ],
+                      );
+                    }}
+                  >
+                    <Text style={styles.cancelBtnText}>Cancel Order</Text>
+                  </Pressable>
+                </View>
+              );
+            })}
           </View>
+        )}
+
+        {status === "connected" && (
+          <Pressable
+            style={({ pressed }) => [styles.syncRow, pressed && { opacity: 0.6 }]}
+            onPress={handleRefresh}
+            disabled={refreshing}
+          >
+            {refreshing ? (
+              <ActivityIndicator size={12} color={C.textMuted} />
+            ) : (
+              <Feather name="refresh-cw" size={12} color={C.textMuted} />
+            )}
+            <Text style={styles.syncText}>
+              {refreshing ? "Refreshing…" : sseConnected ? "Live sync" : "Polling · refresh"}
+            </Text>
+          </Pressable>
         )}
       </ScrollView>
     </View>
@@ -536,70 +321,192 @@ const styles = StyleSheet.create({
   },
   header: {
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "baseline",
     justifyContent: "space-between",
-    paddingHorizontal: 20,
-    paddingVertical: 14,
-    borderBottomWidth: 1,
-    borderBottomColor: C.border,
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 8,
   },
-  headerTitle: {
-    fontSize: 22,
+  title: {
+    fontSize: 28,
     fontFamily: "Inter_700Bold",
     color: C.text,
   },
-  totalPL: {
-    fontSize: 18,
-    fontFamily: "Inter_700Bold",
+  openCount: {
+    fontSize: 14,
+    fontFamily: "Inter_500Medium",
+    color: C.textMuted,
   },
-  accountBar: {
+  plBanner: {
     flexDirection: "row",
-    backgroundColor: C.card,
-    borderBottomWidth: 1,
-    borderBottomColor: C.border,
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-  },
-  accountItem: {
-    flex: 1,
     alignItems: "center",
-    gap: 3,
+    justifyContent: "space-between",
+    marginHorizontal: 16,
+    marginBottom: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    borderRadius: 14,
   },
-  accountLabel: {
+  plBannerPositive: {
+    backgroundColor: C.buyDim,
+    borderWidth: 1,
+    borderColor: C.buyBorder,
+  },
+  plBannerNegative: {
+    backgroundColor: C.sellDim,
+    borderWidth: 1,
+    borderColor: C.sellBorder,
+  },
+  plBannerLabel: {
     fontSize: 9,
-    fontFamily: "Inter_600SemiBold",
+    fontFamily: "Inter_700Bold",
     color: C.textSecondary,
     letterSpacing: 0.8,
   },
-  accountVal: {
+  plBannerSub: {
+    fontSize: 11,
+    fontFamily: "Inter_400Regular",
+    color: C.textMuted,
+    marginTop: 2,
+  },
+  plBannerValue: {
+    fontSize: 24,
+    fontFamily: "Inter_700Bold",
+  },
+  scroll: {
+    paddingHorizontal: 16,
+    paddingTop: 4,
+  },
+  card: {
+    backgroundColor: C.card,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: C.border,
+    padding: 14,
+    gap: 12,
+  },
+  cardTop: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  dirIcon: {
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  dirIconBuy: { backgroundColor: C.buyDim },
+  dirIconSell: { backgroundColor: C.sellDim },
+  cardTitleWrap: { flex: 1 },
+  cardTitle: {
+    fontSize: 14,
+    fontFamily: "Inter_600SemiBold",
+    color: C.text,
+  },
+  cardTitleMuted: {
+    color: C.textSecondary,
+    fontFamily: "Inter_400Regular",
+  },
+  cascadeLabel: {
+    fontSize: 11,
+    fontFamily: "Inter_400Regular",
+    color: C.textMuted,
+    marginTop: 2,
+  },
+  badgeRiskFree: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 20,
+    backgroundColor: C.buyDim,
+    borderWidth: 1,
+    borderColor: C.buyBorder,
+  },
+  badgeRiskFreeText: {
+    fontSize: 9,
+    fontFamily: "Inter_700Bold",
+    color: C.buy,
+    letterSpacing: 0.5,
+  },
+  badgeOpen: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 20,
+    backgroundColor: C.goldLight,
+    borderWidth: 1,
+    borderColor: C.goldBorder,
+  },
+  openDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: C.gold,
+  },
+  badgeOpenText: {
+    fontSize: 9,
+    fontFamily: "Inter_700Bold",
+    color: C.gold,
+    letterSpacing: 0.5,
+  },
+  statRow: {
+    flexDirection: "row",
+    backgroundColor: C.surface,
+    borderRadius: 10,
+    overflow: "hidden",
+  },
+  statCell: {
+    flex: 1,
+    alignItems: "center",
+    paddingVertical: 10,
+    gap: 4,
+  },
+  statDivider: {
+    width: 1,
+    backgroundColor: C.border,
+    marginVertical: 8,
+  },
+  statLabel: {
+    fontSize: 9,
+    fontFamily: "Inter_600SemiBold",
+    color: C.textMuted,
+  },
+  statValue: {
     fontSize: 13,
     fontFamily: "Inter_700Bold",
     color: C.text,
   },
-  accountDivider: {
-    width: 1,
-    backgroundColor: C.border,
-    marginVertical: 2,
+  cardFooter: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
   },
-  refreshRow: {
+  pipsText: {
+    fontSize: 12,
+    fontFamily: "Inter_400Regular",
+    color: C.textMuted,
+  },
+  plText: {
+    fontSize: 18,
+    fontFamily: "Inter_700Bold",
+  },
+  syncRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
     gap: 5,
-    paddingVertical: 7,
-    backgroundColor: C.card,
-    borderBottomWidth: 1,
-    borderBottomColor: C.border,
+    paddingVertical: 16,
   },
-  refreshRowText: {
+  syncText: {
     fontSize: 11,
     fontFamily: "Inter_400Regular",
     color: C.textMuted,
-    letterSpacing: 0.3,
-  },
-  scroll: {
-    padding: 16,
-    gap: 12,
   },
   emptyState: {
     alignItems: "center",
@@ -619,166 +526,28 @@ const styles = StyleSheet.create({
     textAlign: "center",
     lineHeight: 20,
   },
-  posCard: {
-    backgroundColor: C.card,
-    borderRadius: 16,
-    padding: 16,
-    borderWidth: 1,
-    borderColor: C.border,
-    gap: 14,
-  },
-  posTop: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-  },
-  posLeft: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-  },
-  dirPill: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 4,
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 20,
-  },
-  dirPillBuy: {
-    backgroundColor: C.buy,
-  },
-  dirPillSell: {
-    backgroundColor: C.sell,
-  },
-  dirPillText: {
-    fontSize: 11,
-    fontFamily: "Inter_700Bold",
-    letterSpacing: 0.5,
-  },
-  posSymbol: {
-    fontSize: 15,
-    fontFamily: "Inter_700Bold",
-    color: C.text,
-  },
-  posVol: {
-    fontSize: 12,
-    fontFamily: "Inter_400Regular",
-    color: C.textSecondary,
-  },
-  profitBadge: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 3,
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 20,
-  },
-  profitPositive: {
-    backgroundColor: C.buyDim,
-  },
-  profitNegative: {
-    backgroundColor: C.sellDim,
-  },
-  profitText: {
-    fontSize: 14,
-    fontFamily: "Inter_700Bold",
-  },
-  posPriceRow: {
-    flexDirection: "row",
-    backgroundColor: C.surface,
-    borderRadius: 12,
-    overflow: "hidden",
-  },
-  posPriceItem: {
-    flex: 1,
-    alignItems: "center",
-    paddingVertical: 10,
-    gap: 3,
-  },
-  posPriceDivider: {
-    width: 1,
-    backgroundColor: C.border,
-    marginVertical: 8,
-  },
-  posPriceLabel: {
-    fontSize: 9,
-    fontFamily: "Inter_600SemiBold",
-    color: C.textSecondary,
-    letterSpacing: 0.8,
-  },
-  posPriceVal: {
-    fontSize: 13,
-    fontFamily: "Inter_700Bold",
-    color: C.text,
-  },
-  closeBtn: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 8,
-    paddingVertical: 12,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: C.border,
-    backgroundColor: C.surface,
-  },
-  closeBtnText: {
-    fontSize: 13,
-    fontFamily: "Inter_600SemiBold",
-    color: C.textSecondary,
-  },
-  sectionRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 4,
-  },
-  pastHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingVertical: 4,
-  },
-  sectionLabel: {
+  pendingLabel: {
     fontSize: 10,
     fontFamily: "Inter_700Bold",
     color: C.textMuted,
     letterSpacing: 1.2,
   },
-  cancelAllBtn: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 5,
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: "rgba(246,70,93,0.35)",
-    backgroundColor: "rgba(246,70,93,0.1)",
-  },
-  cancelAllText: {
-    fontSize: 11,
-    fontFamily: "Inter_600SemiBold",
-    color: C.sell,
-  },
   pendingCard: {
     borderStyle: "dashed",
     borderColor: C.gold,
-    opacity: 0.9,
   },
-  pendingBadge: {
-    backgroundColor: "rgba(201,168,76,0.15)",
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 8,
+  cancelBtn: {
+    marginTop: 8,
+    paddingVertical: 10,
+    borderRadius: 10,
     borderWidth: 1,
-    borderColor: "rgba(201,168,76,0.4)",
+    borderColor: C.border,
+    alignItems: "center",
+    backgroundColor: C.surface,
   },
-  pendingBadgeText: {
-    fontSize: 9,
-    fontFamily: "Inter_700Bold",
-    color: C.gold,
-    letterSpacing: 1,
+  cancelBtnText: {
+    fontSize: 12,
+    fontFamily: "Inter_600SemiBold",
+    color: C.textSecondary,
   },
 });

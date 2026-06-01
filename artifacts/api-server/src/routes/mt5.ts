@@ -3019,6 +3019,7 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         closedAt: z.closedAt != null ? Number(z.closedAt) : null,
         finalTpReached,
         positionCount: openPositions.length,
+        originalVolume: z.originalVolume != null ? Number(z.originalVolume) : 0,
         currentPrice,
         nextTp,
         nextTpPrice,
@@ -3795,6 +3796,35 @@ router.post("/mt5/account/:accountId/disconnect", checkOwner, async (req: Reques
     return res.json({ success: true });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Disconnect failed" });
+  }
+});
+
+// GET /api/mt5/account/:accountId/realized-pnl?since=<ms>&region=london
+// Sums profit+commission+swap from MetaAPI history deals since `since` (ms epoch).
+router.get("/mt5/account/:accountId/realized-pnl", checkOwner, async (req: Request, res: Response) => {
+  try {
+    const token = getToken();
+    const { accountId } = req.params as { accountId: string };
+    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
+    const sinceMs = parseInt(qstr(req.query.since) ?? "0", 10) || 0;
+    const startTime = new Date(sinceMs).toISOString();
+    const endTime = new Date().toISOString();
+    const res2 = await fetch(
+      `${clientBase(region)}/users/current/accounts/${accountId}/history-deals/time/${encodeURIComponent(startTime)}/${encodeURIComponent(endTime)}`,
+      { headers: authHeaders(token) },
+    );
+    if (!res2.ok) {
+      const err = await res2.json().catch(() => ({})) as { message?: string };
+      return res.status(res2.status).json({ error: err.message ?? `History deals failed: ${res2.status}` });
+    }
+    const deals = await res2.json() as Array<{ profit?: number; commission?: number; swap?: number }>;
+    const pnl = (Array.isArray(deals) ? deals : []).reduce(
+      (sum, d) => sum + Number(d.profit ?? 0) + Number(d.commission ?? 0) + Number(d.swap ?? 0),
+      0,
+    );
+    return res.json({ pnl: Math.round(pnl * 100) / 100 });
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
   }
 });
 
