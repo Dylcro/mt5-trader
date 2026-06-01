@@ -279,7 +279,13 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, connectionWarm, sseConnected, syncSession } = useTrading();
+  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, connectionWarm, sseConnected, syncSession } = useTrading();
+
+  const syncReady =
+    status === "connected" &&
+    connectionWarm &&
+    price != null &&
+    !priceError;
   const { formatMoney } = useDisplayCurrency();
   const { settings: cascadeSettings } = useCascadeSettings();
   const cascadeSettingsRef = useRef(cascadeSettings);
@@ -706,8 +712,26 @@ export default function TradeScreen() {
             </View>
           </Pressable>
         </View>
-        <Pressable onPress={refreshPrice} hitSlop={12}>
-          <Feather name="refresh-cw" size={18} color={C.textSecondary} />
+        <Pressable
+          onPress={() => {
+            if (status === "disconnected") void connect();
+            else if (status === "connected") void syncSession(true);
+          }}
+          hitSlop={8}
+          accessibilityLabel={syncReady ? "Connection ready, tap to refresh" : "Tap to sync MT5 connection"}
+          style={({ pressed }) => [
+            styles.headerSyncBtn,
+            syncReady ? styles.headerSyncBtnReady : styles.headerSyncBtnRefresh,
+            pressed && { opacity: 0.8, transform: [{ scale: 0.96 }] },
+          ]}
+        >
+          {status === "connected" && !connectionWarm ? (
+            <ActivityIndicator size="small" color={C.sell} />
+          ) : syncReady ? (
+            <Feather name="check" size={22} color={C.buy} />
+          ) : (
+            <Feather name="refresh-cw" size={20} color={C.sell} />
+          )}
         </Pressable>
       </View>
 
@@ -729,8 +753,8 @@ export default function TradeScreen() {
               {priceError && (
                 <View style={styles.priceErrorBanner}>
                   <Feather name="wifi-off" size={12} color={C.sell} />
-                  <Text style={styles.priceErrorText}>Price feed interrupted — tap{" "}
-                    <Text style={{ color: C.textSecondary }} onPress={refreshPrice}>↻</Text> to retry
+                  <Text style={styles.priceErrorText}>
+                    Price feed interrupted — tap the red sync button (top right) to retry
                   </Text>
                 </View>
               )}
@@ -740,7 +764,7 @@ export default function TradeScreen() {
               <MaterialCommunityIcons name="chart-line" size={28} color={C.textMuted} />
               <Text style={styles.noPriceText}>
                 {priceError
-                  ? "Price feed failed — tap ↻ to retry"
+                  ? "Price feed failed — tap sync (top right)"
                   : status === "connecting"
                     ? "Fetching price..."
                     : "Connect account to see live price"}
@@ -748,31 +772,6 @@ export default function TradeScreen() {
             </View>
           )}
         </View>
-
-        {/* Wake broker connection before trading */}
-        {status === "connected" && (
-          <Pressable
-            style={({ pressed }) => [
-              styles.wakeBtn,
-              connectionWarm ? styles.wakeBtnReady : styles.wakeBtnPending,
-              pressed && { opacity: 0.85 },
-            ]}
-            onPress={() => void syncSession(true)}
-          >
-            {!connectionWarm ? (
-              <ActivityIndicator size="small" color={C.gold} />
-            ) : (
-              <Feather name="zap" size={16} color={C.buy} />
-            )}
-            <Text style={[styles.wakeBtnText, connectionWarm && { color: C.buy }]}>
-              {!connectionWarm
-                ? "Waking MT5 connection…"
-                : sseConnected
-                  ? "Connection ready · tap to refresh"
-                  : "Connected · tap to sync before trade"}
-            </Text>
-          </Pressable>
-        )}
 
         {/* BUY / SELL — always visible, above mode toggle */}
         {(() => {
@@ -860,7 +859,12 @@ export default function TradeScreen() {
         )}
         {status === "connected" && price && !connectionWarm && (
           <Text style={styles.cascadeStatusHint}>
-            Warming broker link — tap Sync above if you want; buy/sell still available
+            Warming broker link — red sync (top right) turns green ✓ when ready
+          </Text>
+        )}
+        {status === "connected" && syncReady && (
+          <Text style={styles.cascadeStatusHint}>
+            Green ✓ top right — good to trade (tap to refresh anytime)
           </Text>
         )}
         {status !== "connected" && status !== "connecting" && (
@@ -1139,6 +1143,22 @@ const styles = StyleSheet.create({
   },
   dot: { width: 6, height: 6, borderRadius: 3, backgroundColor: C.buy },
   liveLabel: { fontSize: 10, fontFamily: "Inter_600SemiBold", color: C.buy, letterSpacing: 0.5 },
+  headerSyncBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  headerSyncBtnReady: {
+    backgroundColor: C.buyDim,
+    borderColor: C.buy,
+  },
+  headerSyncBtnRefresh: {
+    backgroundColor: C.sellDim,
+    borderColor: C.sell,
+  },
   scroll: { padding: 16, gap: 12 },
   stickyFooter: {
     paddingHorizontal: 16,
@@ -1426,30 +1446,6 @@ const styles = StyleSheet.create({
   cascadeExecBtnSell: { backgroundColor: C.sell },
   cascadeExecLabel: { fontSize: 18, fontFamily: "Inter_700Bold", letterSpacing: 1.5 },
   cascadeExecPrice: { fontSize: 12, fontFamily: "Inter_400Regular", opacity: 0.75 },
-  wakeBtn: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 10,
-    paddingVertical: 12,
-    paddingHorizontal: 14,
-    borderRadius: 12,
-    borderWidth: 1,
-    marginBottom: 10,
-  },
-  wakeBtnPending: {
-    backgroundColor: C.goldLight,
-    borderColor: C.gold,
-  },
-  wakeBtnReady: {
-    backgroundColor: C.buyDim,
-    borderColor: C.buyBorder,
-  },
-  wakeBtnText: {
-    fontSize: 13,
-    fontFamily: "Inter_600SemiBold",
-    color: C.gold,
-  },
   cascadeStatusHint: {
     textAlign: "center",
     fontSize: 12,
