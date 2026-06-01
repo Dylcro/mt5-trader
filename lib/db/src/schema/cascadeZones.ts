@@ -51,6 +51,8 @@ export const cascadeZonesTable = pgTable("cascade_zones", {
   status:      text("status").notNull().default("OPEN"),
   createdAt:   bigint("created_at", { mode: "number" }).notNull(),
   closedAt:    bigint("closed_at", { mode: "number" }),
+  // Realized P&L for the whole zone (profit+commission+swap on all linked positions).
+  closedPnl:   doublePrecision("closed_pnl"),
 });
 
 export type CascadeZoneRow = typeof cascadeZonesTable.$inferSelect;
