@@ -38,10 +38,12 @@ export function winRatePct(zones: Zone[]): number | null {
   return Math.round((wins / zones.length) * 100);
 }
 
-export function tp2HitRatePct(zones: Zone[]): number | null {
-  if (zones.length === 0) return null;
-  const hits = zones.filter((z) => z.tp2Hit).length;
-  return Math.round((hits / zones.length) * 100);
+/** Average realized P&L per closed zone in the set (zones with closedPnl only). */
+export function avgClosedZonePnl(zones: Zone[]): number | null {
+  const withPnl = zones.filter((z) => typeof z.closedPnl === "number");
+  if (withPnl.length === 0) return null;
+  const sum = withPnl.reduce((s, z) => s + (z.closedPnl as number), 0);
+  return Math.round((sum / withPnl.length) * 100) / 100;
 }
 
 export function tpPillStyle(hits: number): "green" | "gold" | "grey" {

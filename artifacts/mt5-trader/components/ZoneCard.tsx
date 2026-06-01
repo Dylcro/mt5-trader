@@ -234,7 +234,7 @@ export default function ZoneCard({
         )}
       </View>
 
-      {!historical && zone.tp2Hit && zone.tp2SlIsBestEffort && zone.status !== "CLOSED" && (
+      {!historical && zone.tp2SlIsBestEffort && zone.status !== "CLOSED" && (
         <View style={styles.warnRow}>
           <Feather name="alert-triangle" size={11} color="#E6A23C" />
           <Text style={styles.warnText}>

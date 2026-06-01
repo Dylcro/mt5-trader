@@ -1603,6 +1603,8 @@ interface ZoneState {
   // true BE on every tick while this is true; clears it once SL = openPrice
   // is accepted.
   tp2SlIsBestEffort: boolean;
+  /** Auto SL→BE after this TP partial (1, 2, or 3). Baked in at zone creation. */
+  autoBeAtTp: 1 | 2 | 3;
   status: "OPEN" | "RISK_FREE" | "CLOSED";
   busy: boolean; // debounce: prevent overlapping monitor ticks for this zone
   // In-memory mirror of zone_positions(status=OPEN) for this zone, used as a
@@ -1623,6 +1625,40 @@ export const ZONE_RISK_FREE_PIPS   = -10;
 const ZONE_RISK_FREE_PIPS_MIN = -30;
 const ZONE_RISK_FREE_PIPS_MAX =  30;
 const ZONE_RISK_FREE_PIPS_STEP = 5;
+export const ZONE_AUTO_BE_AT_TP_DEFAULT = 2;
+
+export function sanitizeAutoBeAtTp(raw: unknown): 1 | 2 | 3 {
+  const n = typeof raw === "number" ? raw : parseInt(String(raw ?? ""), 10);
+  if (n === 1 || n === 2 || n === 3) return n;
+  return ZONE_AUTO_BE_AT_TP_DEFAULT;
+}
+
+/** If the chosen TP is disabled, use the next enabled level (prefer later TPs). */
+export function resolveAutoBeAtTp(
+  requested: 1 | 2 | 3,
+  enabled: { tp1: boolean; tp2: boolean; tp3: boolean },
+): 1 | 2 | 3 {
+  const candidates: (1 | 2 | 3)[] = [requested, 1, 2, 3].filter(
+    (v, i, a) => a.indexOf(v) === i,
+  ) as (1 | 2 | 3)[];
+  for (const level of candidates) {
+    if (level === 1 && enabled.tp1) return 1;
+    if (level === 2 && enabled.tp2) return 2;
+    if (level === 3 && enabled.tp3) return 3;
+  }
+  return ZONE_AUTO_BE_AT_TP_DEFAULT;
+}
+
+export function isAutoBeTriggerSatisfied(st: {
+  autoBeAtTp: 1 | 2 | 3;
+  tp1Hit: boolean;
+  tp2Hit: boolean;
+  tp3Hit: boolean;
+}): boolean {
+  if (st.autoBeAtTp === 1) return st.tp1Hit;
+  if (st.autoBeAtTp === 2) return st.tp2Hit;
+  return st.tp3Hit;
+}
 const ZONE_CASHOUT_PIPS_DEFAULT = 5;   // anchor + 5p covers spread
 const ZONE_MIN_LOT_PER_ENTRY    = 0.01; // broker minimum; lots ≥ 0.04 get 25% partials, smaller lots get a full close at TP1
 // How close (in pips) price must come to a TP target before the engine fires
@@ -1809,7 +1845,11 @@ function newZoneId(): string {
 // trade endpoint validator; TP4 is optional (null = left manual).
 function prepareZoneForCascade(
   accountId: string, direction: "buy" | "sell", userId: string | undefined,
-  tps: { tp1Price: number; tp2Price: number; tp3Price: number; tp4Price: number | null; tp1Pct: number; tp2Pct: number; tp3Pct: number; tp4Pct: number },
+  tps: {
+    tp1Price: number; tp2Price: number; tp3Price: number; tp4Price: number | null;
+    tp1Pct: number; tp2Pct: number; tp3Pct: number; tp4Pct: number;
+    autoBeAtTp?: unknown;
+  },
   originalVolume: number,
   explicitZoneId?: string,
 ): ZoneState {
@@ -1830,6 +1870,9 @@ function prepareZoneForCascade(
     // Disabled TPs stay false — they are not "hit", they are skipped by the engine.
     tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
     tp2SlMoved: false, tp2BeAttempts: 0, tp2SlIsBestEffort: false,
+    autoBeAtTp: resolveAutoBeAtTp(sanitizeAutoBeAtTp(tps.autoBeAtTp), {
+      tp1: tp1Enabled, tp2: tp2Enabled, tp3: tp3Enabled,
+    }),
     status: "OPEN", busy: false,
     trackedPositions: new Map(),
   };
@@ -1891,6 +1934,7 @@ async function persistPreparedZone(
     originalVolume: state.originalVolume,
     cashoutPips: state.cashoutPips, cashoutDone: false,
     tp1Hit: state.tp1Hit, tp2Hit: state.tp2Hit, tp3Hit: state.tp3Hit, tp4Hit: state.tp4Hit,
+    autoBeAtTp: state.autoBeAtTp,
     status: "OPEN", createdAt: now,
   }).onConflictDoNothing();
   await db.insert(zonePositionsTable).values({
@@ -2706,7 +2750,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     // apply the safest possible protective SL and flag the zone as
     // "best effort" so the app can warn the user — and keep trying to
     // upgrade to true BE on later ticks without consuming the retry budget.
-    if (st.tp2Hit && live.length > 0 && (!st.tp2SlMoved || st.tp2SlIsBestEffort)) {
+    if (isAutoBeTriggerSatisfied(st) && live.length > 0 && (!st.tp2SlMoved || st.tp2SlIsBestEffort)) {
       const price = await fetchSymbolPrice(token, region, st.accountId, live[0]!.symbol || "XAUUSD");
       if (price) {
         // Compute per-position safe SL (openPrice differs across cascade
@@ -2730,7 +2774,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
               () => db.update(cascadeZonesTable).set({ tp2SlIsBestEffort: false } as Record<string, unknown>).where(eq(cascadeZonesTable.zoneId, zoneId))
             ).catch(() => {/* logged inside withDbRetry */});
           }
-          console.log(`[zone ${zoneId}] TP2 SL→BE complete on ${live.length} entr${live.length === 1 ? "y" : "ies"}${wasBestEffort ? " (upgraded from best-effort)" : ""}`);
+          console.log(`[zone ${zoneId}] TP${st.autoBeAtTp} SL→BE complete on ${live.length} entr${live.length === 1 ? "y" : "ies"}${wasBestEffort ? " (upgraded from best-effort)" : ""}`);
         } else if (allOk) {
           // Best-effort SL accepted on every entry but at least one isn't
           // at true BE yet (price hasn't moved far enough). Mark the zone
@@ -2809,6 +2853,7 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
     // flag IS persisted so the app warning chip survives a restart.
     tp2SlMoved: false, tp2BeAttempts: 0,
     tp2SlIsBestEffort: (z as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
+    autoBeAtTp: sanitizeAutoBeAtTp((z as { autoBeAtTp?: number }).autoBeAtTp),
     status: z.status === "CLOSED" ? "CLOSED" : z.status === "RISK_FREE" ? "RISK_FREE" : "OPEN",
     busy: false,
     trackedPositions: new Map(),
@@ -4419,7 +4464,11 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
               // arrives immediately after will find a zoneId to attach to.
               const zoneState = prepareZoneForCascade(
                 accountId, direction, uId,
-                { tp1Price: tp1Price!, tp2Price: tp2Price!, tp3Price: tp3Price!, tp4Price, tp1Pct, tp2Pct, tp3Pct, tp4Pct },
+                {
+                  tp1Price: tp1Price!, tp2Price: tp2Price!, tp3Price: tp3Price!, tp4Price,
+                  tp1Pct, tp2Pct, tp3Pct, tp4Pct,
+                  autoBeAtTp: rawBody.autoBeAtTp,
+                },
                 volume,
                 clientZoneId || parseZoneIdFromComment(comment) || undefined,
               );

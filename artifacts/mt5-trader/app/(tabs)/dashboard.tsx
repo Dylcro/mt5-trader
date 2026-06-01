@@ -21,7 +21,7 @@ import { normalizeDisplayCurrency } from "@/lib/displayCurrency";
 import { formatMoney as formatMoneyRaw, formatPrice } from "@/lib/formatters";
 import {
   filterClosedZonesByPeriod,
-  tp2HitRatePct,
+  avgClosedZonePnl,
   winRatePct,
   type Period,
 } from "@/lib/zoneStats";
@@ -91,7 +91,7 @@ export default function DashboardScreen() {
   const riskFreeCount = openZones.filter((z) => z.status === "RISK_FREE").length;
 
   const winRate = winRatePct(periodClosed);
-  const tp2Rate = tp2HitRatePct(closedAll);
+  const avgZonePnl = useMemo(() => avgClosedZonePnl(periodClosed), [periodClosed]);
   const floatingPnl =
     accountInfo != null ? accountInfo.equity - accountInfo.balance : null;
 
@@ -216,12 +216,14 @@ export default function DashboardScreen() {
           label={period === "today" ? "Realized P&L Today" : "Realized P&L Week"}
         />
         <DashStatCard
-          icon={<MaterialCommunityIcons name="target" size={16} color={C.buy} />}
+          icon={<Feather name="trending-up" size={16} color={C.buy} />}
           iconColor={C.buy}
-          note="all time"
-          value={tp2Rate != null ? `${tp2Rate}%` : "—"}
-          valueColor={C.buy}
-          label="TP2 Hit Rate"
+          note={`${periodClosed.length} closed`}
+          value={avgZonePnl != null ? formatMoney(avgZonePnl, { signed: true }) : "—"}
+          valueColor={
+            avgZonePnl != null ? (avgZonePnl >= 0 ? C.buy : C.sell) : C.text
+          }
+          label={period === "today" ? "Avg P&L / Zone" : "Avg P&L / Zone"}
         />
       </View>
 

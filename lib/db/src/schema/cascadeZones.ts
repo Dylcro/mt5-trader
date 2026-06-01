@@ -48,6 +48,8 @@ export const cascadeZonesTable = pgTable("cascade_zones", {
   // moves favorably enough that true BE becomes valid, the engine upgrades
   // the SL and clears the flag.
   tp2SlIsBestEffort: boolean("tp2_sl_is_best_effort").notNull().default(false),
+  // Auto SL→BE fires after this TP level's partial close (1, 2, or 3). Default 2.
+  autoBeAtTp:  doublePrecision("auto_be_at_tp").notNull().default(2),
   status:      text("status").notNull().default("OPEN"),
   createdAt:   bigint("created_at", { mode: "number" }).notNull(),
   closedAt:    bigint("closed_at", { mode: "number" }),
