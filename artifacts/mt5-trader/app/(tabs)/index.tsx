@@ -279,7 +279,7 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, connectionWarm, sseConnected } = useTrading();
+  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, refreshPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, connectionWarm, sseConnected, syncSession } = useTrading();
   const { formatMoney } = useDisplayCurrency();
   const { settings: cascadeSettings } = useCascadeSettings();
   const cascadeSettingsRef = useRef(cascadeSettings);
@@ -379,6 +379,12 @@ export default function TradeScreen() {
   }, []);
   useEffect(loadLotSizes, [loadLotSizes]);
   useFocusEffect(loadLotSizes);
+
+  useFocusEffect(
+    useCallback(() => {
+      if (status === "connected") void syncSession();
+    }, [status, syncSession]),
+  );
 
   const tpWatchersRef = useRef<WatcherEntry[]>([]); // take-profit queue
 
@@ -621,6 +627,7 @@ export default function TradeScreen() {
         tp2Pct: cs.tp2Enabled ? cs.tp2Pct : 0,
         tp3Pct: cs.tp3Enabled ? cs.tp3Pct : 0,
         tp4Pct: cs.tp4Enabled ? cs.tp4Pct : 0,
+        autoBeAtTp: cs.autoBeAtTp,
       });
       console.log("[cascade] done placed=" + String(result.placed) + " failed=" + String(result.failed) + " success=" + String(result.success) + " msg=" + result.message);
       if (result.success) {
@@ -671,7 +678,8 @@ export default function TradeScreen() {
           <Text style={styles.symbol}>XAUUSD</Text>
           <Pressable
             onPress={() => {
-              if (status === "disconnected") connect();
+              if (status === "disconnected") void connect();
+              else if (status === "connected") void syncSession(true);
             }}
             hitSlop={12}
           >
@@ -679,11 +687,15 @@ export default function TradeScreen() {
               <Animated.View style={[styles.dot, { opacity: status === "connected" ? blinkAnim : 0.2, backgroundColor: status === "connected" ? C.buy : status === "connecting" ? C.gold : C.sell }]} />
               <Text style={[styles.liveLabel, status === "disconnected" && { color: C.sell }]}>
                 {status === "connected"
-                  ? connectionWarm
-                    ? sseConnected
-                      ? "LIVE"
-                      : "SYNCING"
-                    : "CONNECTING…"
+                  ? !price
+                    ? "FETCHING PRICE…"
+                    : !connectionWarm
+                      ? "SYNCING…"
+                      : sseConnected
+                        ? "LIVE"
+                        : "CONNECTED"
+                  : status === "connecting"
+                    ? "CONNECTING MT5…"
                   : status === "disconnected"
                     ? "TAP TO RECONNECT"
                     : status.toUpperCase()}
@@ -736,14 +748,14 @@ export default function TradeScreen() {
 
         {/* BUY / SELL — always visible, above mode toggle */}
         {(() => {
-          const tradeReady = status === "connected" && !!price && connectionWarm;
+          const tradeBlocked = status !== "connected" || !price;
           return (
             <View style={styles.cascadeExecRow}>
               <Pressable
                 style={({ pressed }) => [
                   styles.cascadeExecBtn,
                   styles.cascadeExecBtnBuy,
-                  !tradeReady && !isPlacing && { opacity: 0.5 },
+                  tradeBlocked && !isPlacing && { opacity: 0.5 },
                   pressed && { opacity: 0.8, transform: [{ scale: 0.97 }] },
                   isPlacing && { opacity: 0.6 },
                 ]}
@@ -776,7 +788,7 @@ export default function TradeScreen() {
                 style={({ pressed }) => [
                   styles.cascadeExecBtn,
                   styles.cascadeExecBtnSell,
-                  !tradeReady && !isPlacing && { opacity: 0.5 },
+                  tradeBlocked && !isPlacing && { opacity: 0.5 },
                   pressed && { opacity: 0.8, transform: [{ scale: 0.97 }] },
                   isPlacing && { opacity: 0.6 },
                 ]}
@@ -808,7 +820,22 @@ export default function TradeScreen() {
           );
         })()}
 
-        {status !== "connected" && (
+        {status === "connecting" && (
+          <Text style={styles.cascadeStatusHint}>
+            Connecting to MT5… buy/sell unlock when price appears
+          </Text>
+        )}
+        {status === "connected" && !price && (
+          <Text style={styles.cascadeStatusHint}>
+            Fetching live price…
+          </Text>
+        )}
+        {status === "connected" && price && !connectionWarm && (
+          <Text style={styles.cascadeStatusHint}>
+            Syncing with broker… you can still trade
+          </Text>
+        )}
+        {status !== "connected" && status !== "connecting" && (
           <Text style={styles.cascadeStatusHint}>
             Connect your MT5 account in Settings to trade
           </Text>

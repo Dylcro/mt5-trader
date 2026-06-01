@@ -7,7 +7,7 @@ function localReply(userText: string, ctx: { status: string; zonesHint: string }
   if (q.includes("cascade") || q.includes("tp")) {
     return (
       "Cascade trades layer limit orders with shared stop loss and up to four take-profit levels. " +
-      "TP2 moves your stop to break-even when hit. Set TP4 to 0 pips in Settings to leave the final 25% open manually."
+      "Settings → Auto break-even chooses when SL moves to BE (TP1, TP2, or TP3). Set TP4 to 0 pips to leave the final slice open manually."
     );
   }
   if (q.includes("connect") || q.includes("mt5") || q.includes("link")) {

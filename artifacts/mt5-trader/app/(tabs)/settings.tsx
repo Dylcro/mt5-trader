@@ -920,6 +920,34 @@ export default function SettingsScreen() {
             </Pressable>
           </View>
 
+          {/* Auto SL→break-even — which TP triggers the engine move (new zones only). */}
+          <View style={styles.cascadeCard}>
+            <View style={styles.cascadeCardHeader}>
+              <Feather name="lock" size={16} color={C.gold} />
+              <Text style={styles.cascadeCardTitle}>Auto break-even</Text>
+              <View style={styles.sourceBadge}>
+                <Text style={styles.sourceBadgeText}>IN-APP</Text>
+              </View>
+            </View>
+            <Text style={styles.cascadeCardDesc}>
+              After this take-profit partial closes, the app moves stop loss to break-even on remaining entries. Applies to new cascades you place after saving.
+            </Text>
+            <View style={styles.cascadeDivider} />
+            <PillSelector
+              label="Move SL to BE after"
+              hint={
+                cs.autoBeAtTp === 1 ? "Earlier protection — right after TP1"
+                : cs.autoBeAtTp === 3 ? "Later — after TP3 partial"
+                : "Default — after TP2 partial"
+              }
+              options={[1, 2, 3]}
+              value={cs.autoBeAtTp}
+              onChange={(v) => updateSettings({ autoBeAtTp: v as 1 | 2 | 3 })}
+              suffix=""
+              labels={{ 1: "TP1", 2: "TP2", 3: "TP3" }}
+            />
+          </View>
+
           {/* Risk Free SL placement — signed pip offset from the surviving entry. */}
           <View style={styles.cascadeCard}>
             <View style={styles.cascadeCardHeader}>

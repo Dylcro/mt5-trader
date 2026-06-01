@@ -121,8 +121,10 @@ interface TradingContextValue {
   refreshPrice: () => Promise<void>;
   refreshAccountInfo: () => Promise<void>;
   sseConnected: boolean;
-  /** False briefly after foreground wake — trade buttons stay disabled until warm. */
+  /** False while session sync runs after connect / foreground / trade-tab focus. */
   connectionWarm: boolean;
+  /** Refresh broker session (price, positions, account). Safe to call when already warm. */
+  syncSession: (force?: boolean) => Promise<void>;
 }
 
 export interface PlaceTradeParams {
@@ -147,6 +149,8 @@ export interface PlaceTradeParams {
   tp2Pct?: number;
   tp3Pct?: number;
   tp4Pct?: number;
+  /** Auto SL→BE after TP1, TP2, or TP3 (default 2). */
+  autoBeAtTp?: number;
   /** Pre-generated zone id for cascade legs — ties all orders to one zone. */
   zoneId?: string;
 }
@@ -171,6 +175,7 @@ export interface CascadeOrderParams {
   tp2Pct?: number;
   tp3Pct?: number;
   tp4Pct?: number;
+  autoBeAtTp?: number;
   /** Optional — generated automatically when omitted. */
   zoneId?: string;
 }
@@ -251,6 +256,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const priceFailCountRef = useRef(0);
   const startPollingRef = useRef<((accId: string, accRegion: string) => void) | null>(null);
   const reconnectInProgressRef = useRef(false);
+  const connectionWarmRef = useRef(connectionWarm);
+  const priceRef = useRef(price);
+  const prevStatusRef = useRef<ConnectionStatus>(status);
+  useEffect(() => { connectionWarmRef.current = connectionWarm; }, [connectionWarm]);
+  useEffect(() => { priceRef.current = price; }, [price]);
 
   // Keeps current region readable from the SSE closure without adding region
   // to the SSE effect's dependency array (which would reconnect on region change).
@@ -555,15 +565,20 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     if (heartbeatIntervalRef.current) clearInterval(heartbeatIntervalRef.current);
   }, []);
 
-  const wakeConnection = useCallback(async () => {
+  const wakeConnection = useCallback(async (force = false) => {
     if (!accountId || status !== "connected") return;
+    if (!force && connectionWarmRef.current && priceRef.current) return;
     setConnectionWarm(false);
     const r = regionRef.current;
     try {
       await authFetch(`${API_BASE}/healthz`);
       await authFetch(`${API_BASE}/mt5/account/${accountId}/status?region=${r}`);
       await Promise.all([
-        fetchPriceData(accountId, r).then(setPrice).catch(() => {}),
+        fetchPriceData(accountId, r).then((p) => {
+          setPrice(p);
+          priceFailCountRef.current = 0;
+          setPriceError(false);
+        }).catch(() => {}),
         fetchPositionsData(accountId, r).then(setPositions).catch(() => {}),
         fetchPendingOrdersData(accountId, r).then(setPendingOrders).catch(() => {}),
         fetchAccountInfoData(accountId, r).then(setAccountInfo).catch(() => {}),
@@ -577,6 +592,15 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
   const wakeConnectionRef = useRef<() => void>(() => {});
   wakeConnectionRef.current = () => { void wakeConnection(); };
+
+  // Auto-sync when MT5 reaches CONNECTED (fixes buttons stuck "cloudy" until manual tap).
+  useEffect(() => {
+    const prev = prevStatusRef.current;
+    prevStatusRef.current = status;
+    if (status === "connected" && accountId && prev !== "connected") {
+      void wakeConnection(true);
+    }
+  }, [status, accountId, wakeConnection]);
 
   // Foreground wake + session heartbeat — keeps backend/MetaAPI warm after idle.
   useEffect(() => {
@@ -744,6 +768,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
                         setPrice({ bid, ask, spread: Math.round((ask - bid) * 10), time: new Date().toISOString() });
                         priceFailCountRef.current = 0;
                         setPriceError(false);
+                        setConnectionWarm(true);
                       }
                     } else if (curEvent === "deal") {
                       sseHandlersRef.current.onDeal();
@@ -1050,6 +1075,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       if (params.tp2Pct != null) body.tp2Pct = params.tp2Pct;
       if (params.tp3Pct != null) body.tp3Pct = params.tp3Pct;
       if (params.tp4Pct != null) body.tp4Pct = params.tp4Pct;
+      if (params.autoBeAtTp != null) body.autoBeAtTp = params.autoBeAtTp;
       if (params.zoneId) body.zoneId = params.zoneId;
 
       const isTransient = (msg?: string) => {
@@ -1194,6 +1220,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
               tp2Pct: params.tp2Pct,
               tp3Pct: params.tp3Pct,
               tp4Pct: params.tp4Pct,
+              autoBeAtTp: params.autoBeAtTp,
             }),
             ...params.limitEntries.map((limitPrice, i) =>
               submitOrderRaw({
@@ -1322,6 +1349,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         refreshAccountInfo,
         sseConnected,
         connectionWarm,
+        syncSession: wakeConnection,
       }}
     >
       {children}
