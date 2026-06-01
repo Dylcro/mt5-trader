@@ -382,7 +382,10 @@ export default function TradeScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      if (status === "connected") void syncSession();
+      if (status !== "connected") return;
+      void syncSession();
+      const id = setInterval(() => void syncSession(), 10_000);
+      return () => clearInterval(id);
     }, [status, syncSession]),
   );
 
@@ -746,6 +749,31 @@ export default function TradeScreen() {
           )}
         </View>
 
+        {/* Wake broker connection before trading */}
+        {status === "connected" && (
+          <Pressable
+            style={({ pressed }) => [
+              styles.wakeBtn,
+              connectionWarm ? styles.wakeBtnReady : styles.wakeBtnPending,
+              pressed && { opacity: 0.85 },
+            ]}
+            onPress={() => void syncSession(true)}
+          >
+            {!connectionWarm ? (
+              <ActivityIndicator size="small" color={C.gold} />
+            ) : (
+              <Feather name="zap" size={16} color={C.buy} />
+            )}
+            <Text style={[styles.wakeBtnText, connectionWarm && { color: C.buy }]}>
+              {!connectionWarm
+                ? "Waking MT5 connection…"
+                : sseConnected
+                  ? "Connection ready · tap to refresh"
+                  : "Connected · tap to sync before trade"}
+            </Text>
+          </Pressable>
+        )}
+
         {/* BUY / SELL — always visible, above mode toggle */}
         {(() => {
           const tradeBlocked = status !== "connected" || !price;
@@ -832,7 +860,7 @@ export default function TradeScreen() {
         )}
         {status === "connected" && price && !connectionWarm && (
           <Text style={styles.cascadeStatusHint}>
-            Syncing with broker… you can still trade
+            Warming broker link — tap Sync above if you want; buy/sell still available
           </Text>
         )}
         {status !== "connected" && status !== "connecting" && (
@@ -1398,6 +1426,30 @@ const styles = StyleSheet.create({
   cascadeExecBtnSell: { backgroundColor: C.sell },
   cascadeExecLabel: { fontSize: 18, fontFamily: "Inter_700Bold", letterSpacing: 1.5 },
   cascadeExecPrice: { fontSize: 12, fontFamily: "Inter_400Regular", opacity: 0.75 },
+  wakeBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    marginBottom: 10,
+  },
+  wakeBtnPending: {
+    backgroundColor: C.goldLight,
+    borderColor: C.gold,
+  },
+  wakeBtnReady: {
+    backgroundColor: C.buyDim,
+    borderColor: C.buyBorder,
+  },
+  wakeBtnText: {
+    fontSize: 13,
+    fontFamily: "Inter_600SemiBold",
+    color: C.gold,
+  },
   cascadeStatusHint: {
     textAlign: "center",
     fontSize: 12,
