@@ -2,8 +2,8 @@ import { useAuth } from "@/context/AuthContext";
 import { Feather } from "@expo/vector-icons";
 import Slider from "@react-native-community/slider";
 import * as Haptics from "expo-haptics";
-import { useRouter } from "expo-router";
-import React, { useEffect, useState } from "react";
+import { useFocusEffect, useRouter } from "expo-router";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
   Keyboard,
@@ -215,7 +215,7 @@ export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
   const { signOut } = useAuth();
-  const { credentials, status, errorMsg, accountInfo, connect, disconnect } = useTrading();
+  const { credentials, status, errorMsg, accountInfo, connect, disconnect, accountId, syncSession } = useTrading();
   const { currency: displayCurrency, brokerCurrency, setCurrency, formatMoney } = useDisplayCurrency();
   const { settings: cs, updateSettings, saveToServer } = useCascadeSettings();
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
@@ -232,6 +232,15 @@ export default function SettingsScreen() {
   const [rfDraft, setRfDraft] = useState<number>(cs.riskFreePips);
   const [rfSaveState, setRfSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   useEffect(() => { setRfDraft(cs.riskFreePips); }, [cs.riskFreePips]);
+
+  useFocusEffect(
+    useCallback(() => {
+      if (status !== "connected" || !accountId) return;
+      void syncSession();
+      const id = setInterval(() => void syncSession(), 10_000);
+      return () => clearInterval(id);
+    }, [status, accountId, syncSession]),
+  );
   const rfDirty = rfDraft !== cs.riskFreePips;
   useEffect(() => {
     setTpDraft({

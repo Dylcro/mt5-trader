@@ -8,6 +8,7 @@ import {
   buildCascadeComment,
   parseZoneIdFromComment,
   commentBelongsToZone,
+  zoneHasTpTargets,
   computeFinalTpReached,
   dealIndicatesStopLoss,
   resolveCloseOutcome,
@@ -116,6 +117,19 @@ const BASE_CONFIG = {
   tp1Pips: 20,
   tp2Pips: 50,
   tp3Pips: 90,
+  tp4Pips: 0,
+  tp1Pct: 25,
+  tp2Pct: 25,
+  tp3Pct: 25,
+  tp4Pct: 25,
+  tp1Enabled: true,
+  tp2Enabled: true,
+  tp3Enabled: true,
+  tp4Enabled: true,
+  riskFreePips: -10,
+  autoBeAtTp: 2,
+  takeProfitEnabled: false,
+  takeProfitPips: 30,
 };
 
 describe("buildCascadeConfigUpdate (PUT /cascade-config TP ordering)", () => {
@@ -343,11 +357,25 @@ describe("rowToZoneState (restart-hydration path)", () => {
     expect(st.tp2SlIsBestEffort).toBe(true);
   });
 
-  it("handles anchorPrice=0 gracefully (zone created before fill price arrived)", () => {
-    const st = rowToZoneState(makeRow({ anchorPrice: "0" }));
+  it("handles anchorPrice=0 gracefully when absolute TP prices are set", () => {
+    const st = rowToZoneState(makeRow({
+      anchorPrice: "0",
+      tp1Price: "3130.00",
+      tp2Price: "3145.00",
+      tp3Price: "3160.00",
+    }));
     expect(st.anchorPrice).toBe(0);
-    // evaluateZone guards on anchorPrice > 0, so a zero anchor pauses TP
-    // checks without crashing — this row is safe to load on restart.
+    expect(zoneHasTpTargets(st)).toBe(true);
+  });
+
+  it("zoneHasTpTargets is false when anchor and TP prices are all unset", () => {
+    expect(zoneHasTpTargets({
+      anchorPrice: 0,
+      tp1Price: null,
+      tp2Price: null,
+      tp3Price: null,
+      tp4Price: null,
+    })).toBe(false);
   });
 });
 

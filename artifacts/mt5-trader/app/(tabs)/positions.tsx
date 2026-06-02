@@ -240,7 +240,7 @@ function PendingOrderCard({ order, onCancel }: { order: PendingOrder; onCancel: 
 export default function PositionsScreen() {
   const insets = useSafeAreaInsets();
   const { formatMoney } = useDisplayCurrency();
-  const { positions, pendingOrders, status, refreshPositions, refreshPendingOrders, closePosition, cancelOrder, accountId, sseConnected, price } = useTrading();
+  const { positions, pendingOrders, status, refreshPositions, refreshPendingOrders, closePosition, cancelOrder, accountId, sseConnected, price, syncSession } = useTrading();
   const { zones, refresh: refreshZones, riskFree, closeZone, cancelZoneOrders } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000, sseConnected });
   const { settings: cs } = useCascadeSettings();
   const displayActiveZones = useMemo(
@@ -277,11 +277,17 @@ export default function PositionsScreen() {
   useFocusEffect(
     useCallback(() => {
       if (status !== "connected" || !accountId) return;
-      const sync = () => void Promise.all([refreshZones(), refreshPositions(), refreshPendingOrders()]);
+      void syncSession();
+      const sync = () => void Promise.all([
+        syncSession(),
+        refreshZones(),
+        refreshPositions(),
+        refreshPendingOrders(),
+      ]);
       sync();
       const id = setInterval(sync, 4_000);
       return () => clearInterval(id);
-    }, [status, accountId, refreshZones, refreshPositions, refreshPendingOrders]),
+    }, [status, accountId, syncSession, refreshZones, refreshPositions, refreshPendingOrders]),
   );
 
   const handleCancelOrder = useCallback(
