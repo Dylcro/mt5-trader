@@ -50,7 +50,7 @@ export default function OnboardingModal({
   const [scrolledToBottom, setScrolledToBottom] = useState(false);
   const [agreed, setAgreed] = useState(false);
 
-  const { status: platformStatus } = usePlatformStatus();
+  const { status: platformStatus, refresh: refreshPlatformStatus } = usePlatformStatus();
   const [authMode, setAuthMode] = useState<"create" | "signin">("create");
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
@@ -86,14 +86,7 @@ export default function OnboardingModal({
         setAuthError("Enter your full name (at least 2 characters).");
         return;
       }
-      if (!platformStatus.signups_open) {
-        setAuthError("New sign-ups are closed right now. Try again later or contact support.");
-        return;
-      }
-      if (platformStatus.invite_only && !inviteCode.trim()) {
-        setAuthError("Enter the invite code you were given.");
-        return;
-      }
+      // Do not block on cached /system/status — server enforces signups, invite, and cap.
     }
     if (!email.trim() || !password) {
       setAuthError("Enter your email and a password.");
@@ -105,6 +98,7 @@ export default function OnboardingModal({
     }
     setAuthBusy(true);
     try {
+      if (authMode === "create") void refreshPlatformStatus();
       if (authMode === "create") {
         await onCreateAccount?.(
           fullName.trim(),

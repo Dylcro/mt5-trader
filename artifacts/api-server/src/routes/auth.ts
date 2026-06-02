@@ -7,6 +7,7 @@ import {
   addWaitlistEmail,
   countRealUsers,
   getPlatformFlags,
+  loadPlatformFlags,
 } from "../lib/platformFlags";
 
 const router = Router();
@@ -20,6 +21,9 @@ function makeToken(userId: number, email: string): string {
 
 router.post("/register", async (req: Request, res: Response): Promise<void> => {
   const { email, password, fullName, inviteCode } = req.body ?? {};
+
+  // Always read fresh flags from DB (Replit can run multiple instances; in-memory cache can lag).
+  await loadPlatformFlags();
 
   if (!fullName || typeof fullName !== "string" || fullName.trim().length < 2) {
     res.status(400).json({ error: "Please enter your full name." });

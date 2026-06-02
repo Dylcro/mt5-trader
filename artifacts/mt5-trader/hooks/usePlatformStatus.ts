@@ -8,6 +8,8 @@ export type PlatformStatus = {
   signups_open: boolean;
   invite_only: boolean;
   membership_cap: number;
+  users_count?: number;
+  spots_remaining?: number;
 };
 
 const DEFAULT_STATUS: PlatformStatus = {
@@ -16,6 +18,8 @@ const DEFAULT_STATUS: PlatformStatus = {
   signups_open: true,
   invite_only: false,
   membership_cap: 20,
+  users_count: 0,
+  spots_remaining: 20,
 };
 
 export function usePlatformStatus(pollMs = 30_000) {

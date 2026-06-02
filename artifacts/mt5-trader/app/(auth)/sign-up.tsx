@@ -1,4 +1,4 @@
-import { Link, useRouter } from "expo-router";
+import { Link, useLocalSearchParams, useRouter } from "expo-router";
 import React, { useEffect, useState } from "react";
 import {
   ActivityIndicator,
@@ -27,13 +27,17 @@ const RED = "#FF4757";
 export default function SignUpScreen() {
   const { isSignedIn, signUp } = useAuth();
   const { status: platformStatus } = usePlatformStatus();
+  const params = useLocalSearchParams<{ inviteCode?: string; code?: string }>();
   const router = useRouter();
   const insets = useSafeAreaInsets();
 
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [inviteCode, setInviteCode] = useState("");
+  const initialInvite =
+    (typeof params.inviteCode === "string" ? params.inviteCode : "") ||
+    (typeof params.code === "string" ? params.code : "");
+  const [inviteCode, setInviteCode] = useState(initialInvite);
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -46,15 +50,6 @@ export default function SignUpScreen() {
     if (!fullName.trim() || fullName.trim().length < 2) { setError("Please enter your full name."); return; }
     if (!email.trim()) { setError("Please enter your email address."); return; }
     if (!password || password.length < 8) { setError("Password must be at least 8 characters."); return; }
-    if (platformStatus.invite_only && !inviteCode.trim()) {
-      setError("Enter the invite code you were given.");
-      return;
-    }
-    if (!platformStatus.signups_open) {
-      setError("New sign-ups are closed right now. Contact support.");
-      return;
-    }
-
     setLoading(true);
     setError("");
     const result = await signUp(fullName.trim(), email.trim(), password, inviteCode.trim() || undefined);
@@ -106,20 +101,18 @@ export default function SignUpScreen() {
             returnKeyType="next"
           />
 
-          {platformStatus.invite_only ? (
-            <>
-              <Text style={styles.label}>Invite code</Text>
-              <TextInput
-                style={styles.input}
-                value={inviteCode}
-                onChangeText={setInviteCode}
-                placeholder="Required"
-                placeholderTextColor={MUTED}
-                autoCapitalize="none"
-                autoCorrect={false}
-              />
-            </>
-          ) : null}
+          <Text style={styles.label}>
+            {platformStatus.invite_only ? "Invite code (required)" : "Invite code (if you were sent one)"}
+          </Text>
+          <TextInput
+            style={styles.input}
+            value={inviteCode}
+            onChangeText={setInviteCode}
+            placeholder={platformStatus.invite_only ? "Paste code from your invite" : "Optional"}
+            placeholderTextColor={MUTED}
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
 
           <Text style={styles.label}>Password</Text>
           <View style={styles.pwWrap}>
