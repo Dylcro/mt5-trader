@@ -1733,6 +1733,43 @@ export function computeFinalTpReached(z: {
   return last;
 }
 
+export type ZonePrimaryOutcome = "SL" | "MANUAL" | "TP4" | "TP3" | "TP2" | "TP1" | "NONE";
+
+/** One history bucket per closed zone (not per position leg). */
+export function zonePrimaryOutcome(row: {
+  status: string;
+  slHit?: boolean;
+  manualClose?: boolean;
+  finalTpReached?: 0 | 1 | 2 | 3 | 4;
+  tp1Enabled?: boolean;
+  tp2Enabled?: boolean;
+  tp3Enabled?: boolean;
+  tp4Enabled?: boolean;
+  tp1Hit?: boolean;
+  tp2Hit?: boolean;
+  tp3Hit?: boolean;
+  tp4Hit?: boolean;
+}): ZonePrimaryOutcome {
+  if (row.status !== "CLOSED") return "NONE";
+  if (row.slHit) return "SL";
+  if (row.manualClose) return "MANUAL";
+  const final = row.finalTpReached ?? computeFinalTpReached({
+    tp1Enabled: row.tp1Enabled ?? true,
+    tp2Enabled: row.tp2Enabled ?? true,
+    tp3Enabled: row.tp3Enabled ?? true,
+    tp4Enabled: row.tp4Enabled ?? true,
+    tp1Hit: Boolean(row.tp1Hit),
+    tp2Hit: Boolean(row.tp2Hit),
+    tp3Hit: Boolean(row.tp3Hit),
+    tp4Hit: Boolean(row.tp4Hit),
+  });
+  if (final >= 4 && row.tp4Enabled !== false) return "TP4";
+  if (final >= 3 && row.tp3Enabled !== false) return "TP3";
+  if (final >= 2 && row.tp2Enabled !== false) return "TP2";
+  if (final >= 1 && row.tp1Enabled !== false) return "TP1";
+  return "MANUAL";
+}
+
 /** True when a broker deal indicates the position exited via stop loss. */
 export function dealIndicatesStopLoss(deal: unknown): boolean {
   if (!deal || typeof deal !== "object") return false;
@@ -3753,6 +3790,14 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         closedAt: row.closedAt != null ? Number(row.closedAt) : null,
         closedPnl: row.closedPnl != null ? Number(row.closedPnl) : null,
         finalTpReached,
+        primaryOutcome: zonePrimaryOutcome({
+          status: row.status,
+          slHit: row.slHit,
+          manualClose: row.manualClose,
+          finalTpReached,
+          tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+          tp1Hit: row.tp1Hit, tp2Hit: row.tp2Hit, tp3Hit: row.tp3Hit, tp4Hit: row.tp4Hit ?? false,
+        }),
         ...resolveCloseOutcome(row),
         positionCount: openPositions.length,
         originalVolume: row.originalVolume != null ? Number(row.originalVolume) : 0,

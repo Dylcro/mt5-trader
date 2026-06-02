@@ -22,17 +22,63 @@ export function filterClosedZonesByPeriod(zones: Zone[], period: Period): Zone[]
   });
 }
 
+/** How a closed zone ended — one bucket per zone (not per ladder entry/leg). */
+export type ZonePrimaryOutcome = "SL" | "MANUAL" | "TP4" | "TP3" | "TP2" | "TP1" | "NONE";
+
+/** Classify a closed zone into a single exit bucket for history summaries. */
+export function zonePrimaryOutcome(z: Zone): ZonePrimaryOutcome {
+  if (z.primaryOutcome) return z.primaryOutcome;
+  if (z.status !== "CLOSED") return "NONE";
+  if (z.slHit) return "SL";
+  if (z.manualClose) return "MANUAL";
+  const final = z.finalTpReached ?? 0;
+  if (final >= 4 && z.tp4Enabled !== false) return "TP4";
+  if (final >= 3 && z.tp3Enabled !== false) return "TP3";
+  if (final >= 2 && z.tp2Enabled !== false) return "TP2";
+  if (final >= 1 && z.tp1Enabled !== false) return "TP1";
+  return "MANUAL";
+}
+
+export function countZonesByPrimaryOutcome(
+  zones: Zone[],
+  outcome: ZonePrimaryOutcome,
+): number {
+  return zones.filter((z) => zonePrimaryOutcome(z) === outcome).length;
+}
+
+/** @deprecated Use countZonesByPrimaryOutcome — old helper counted any zone that touched a TP level. */
 export function countTpHits(zones: Zone[], level: 1 | 2 | 3 | 4): number {
-  const key = `tp${level}Hit` as const;
-  return zones.filter((z) => Boolean(z[key])).length;
+  const map: Record<1 | 2 | 3 | 4, ZonePrimaryOutcome> = {
+    1: "TP1",
+    2: "TP2",
+    3: "TP3",
+    4: "TP4",
+  };
+  return countZonesByPrimaryOutcome(zones, map[level]);
 }
 
 export function countManualCloses(zones: Zone[]): number {
-  return zones.filter((z) => Boolean(z.manualClose)).length;
+  return countZonesByPrimaryOutcome(zones, "MANUAL");
 }
 
 export function countSlHits(zones: Zone[]): number {
-  return zones.filter((z) => Boolean(z.slHit)).length;
+  return countZonesByPrimaryOutcome(zones, "SL");
+}
+
+export function primaryOutcomeLabel(outcome: ZonePrimaryOutcome): string {
+  if (outcome === "NONE") return "—";
+  return outcome;
+}
+
+export function primaryOutcomePillStyle(
+  outcome: ZonePrimaryOutcome,
+): "green" | "gold" | "grey" | "red" {
+  if (outcome === "SL") return "red";
+  if (outcome === "MANUAL") return "gold";
+  if (outcome === "TP4" || outcome === "TP3") return "green";
+  if (outcome === "TP2") return "gold";
+  if (outcome === "TP1") return "grey";
+  return "grey";
 }
 
 /** Win = closed zone with positive realized P&L; falls back to TP hits when P&L not settled yet. */

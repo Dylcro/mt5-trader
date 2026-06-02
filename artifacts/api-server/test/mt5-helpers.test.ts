@@ -18,6 +18,7 @@ import {
   exitPriceBeyondTp3,
   exitPriceBeforeTp1,
   isManualTp4Zone,
+  zonePrimaryOutcome,
   countEnabledTps,
   countHitEnabledTps,
   tpDisplayState,
@@ -613,6 +614,26 @@ describe("disabled TP history", () => {
     expect(inferCloseOutcomeFromExitPrice(zone, 2660)).toEqual({ tp4Hit: true, manualClose: false });
     expect(inferCloseOutcomeFromExitPrice(zone, 2590)).toEqual({ tp4Hit: false, manualClose: true });
     expect(inferCloseOutcomeFromExitPrice(zone, 2630)).toEqual({ tp4Hit: false, manualClose: false });
+  });
+
+  it("zonePrimaryOutcome: one bucket per closed zone", () => {
+    const base = {
+      status: "CLOSED",
+      tp1Enabled: true,
+      tp2Enabled: true,
+      tp3Enabled: true,
+      tp4Enabled: true,
+      tp1Hit: true,
+      tp2Hit: true,
+      tp3Hit: true,
+      tp4Hit: false,
+      slHit: false,
+      manualClose: false,
+    };
+    expect(zonePrimaryOutcome({ ...base, finalTpReached: 3 })).toBe("TP3");
+    expect(zonePrimaryOutcome({ ...base, manualClose: true, finalTpReached: 3 })).toBe("MANUAL");
+    expect(zonePrimaryOutcome({ ...base, tp4Hit: true, finalTpReached: 4 })).toBe("TP4");
+    expect(zonePrimaryOutcome({ ...base, slHit: true })).toBe("SL");
   });
 
   it("inferCloseOutcomeFromExitPrice: sell zone mirrors buy", () => {

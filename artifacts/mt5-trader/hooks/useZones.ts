@@ -36,6 +36,8 @@ export interface Zone {
   /** Broker realized P&L for the zone (profit+commission+swap). Set when zone closes. */
   closedPnl?: number | null;
   finalTpReached?: 0 | 1 | 2 | 3 | 4;
+  /** Single exit bucket for history stats (SL | MANUAL | TP1–TP4). */
+  primaryOutcome?: "SL" | "MANUAL" | "TP4" | "TP3" | "TP2" | "TP1" | "NONE";
   /** Closed by user/app or MT5 without TP4 automation. */
   manualClose?: boolean;
   /** Closed because broker stop loss was hit. */

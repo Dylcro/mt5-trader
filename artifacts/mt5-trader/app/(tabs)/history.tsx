@@ -20,11 +20,11 @@ import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
 import { formatDuration, formatHistoryDate, formatPrice } from "@/lib/formatters";
 import { tpDisplayState } from "@/lib/zoneComments";
 import {
-  countManualCloses,
-  countSlHits,
-  countTpHits,
+  countZonesByPrimaryOutcome,
   filterClosedZonesByPeriod,
-  tpPillStyle,
+  primaryOutcomeLabel,
+  primaryOutcomePillStyle,
+  zonePrimaryOutcome,
   type Period,
 } from "@/lib/zoneStats";
 
@@ -90,9 +90,9 @@ function ExitChip({
 
 function HistoryCard({ zone }: { zone: Zone }) {
   const isBuy = zone.direction === "buy";
-  const enabled = zone.enabledTpCount ?? 4;
-  const hits = zone.hitEnabledTpCount ?? 0;
-  const pill = tpPillStyle(hits);
+  const exitOutcome = zonePrimaryOutcome(zone);
+  const pill = primaryOutcomePillStyle(exitOutcome);
+  const exitLabel = primaryOutcomeLabel(exitOutcome);
   const closedTs = zone.closedAt ?? zone.createdAt;
   const duration = formatDuration(closedTs - zone.createdAt);
   const lot =
@@ -120,6 +120,7 @@ function HistoryCard({ zone }: { zone: Zone }) {
             pill === "green" && styles.tpPillGreen,
             pill === "gold" && styles.tpPillGold,
             pill === "grey" && styles.tpPillGrey,
+            pill === "red" && styles.tpPillSlHit,
           ]}
         >
           <Text
@@ -128,9 +129,10 @@ function HistoryCard({ zone }: { zone: Zone }) {
               pill === "green" && { color: C.buy },
               pill === "gold" && { color: C.gold },
               pill === "grey" && { color: C.textMuted },
+              pill === "red" && { color: C.sell },
             ]}
           >
-            {enabled > 0 ? `${hits}/${enabled} TPs` : "—"}
+            {exitLabel === "—" ? "—" : `EXIT ${exitLabel}`}
           </Text>
         </View>
       </View>
@@ -249,17 +251,17 @@ export default function HistoryScreen() {
       >
         <SummaryCell label="ZONES" value={String(periodZones.length)} />
         <View style={styles.summaryDivider} />
-        <SummaryCell label="TP1" value={String(countTpHits(periodZones, 1))} color={C.buy} />
+        <SummaryCell label="TP1" value={String(countZonesByPrimaryOutcome(periodZones, "TP1"))} color={C.buy} />
         <View style={styles.summaryDivider} />
-        <SummaryCell label="TP2" value={String(countTpHits(periodZones, 2))} color={C.buy} />
+        <SummaryCell label="TP2" value={String(countZonesByPrimaryOutcome(periodZones, "TP2"))} color={C.buy} />
         <View style={styles.summaryDivider} />
-        <SummaryCell label="TP3" value={String(countTpHits(periodZones, 3))} color={C.gold} />
+        <SummaryCell label="TP3" value={String(countZonesByPrimaryOutcome(periodZones, "TP3"))} color={C.gold} />
         <View style={styles.summaryDivider} />
-        <SummaryCell label="TP4" value={String(countTpHits(periodZones, 4))} color={C.gold} />
+        <SummaryCell label="TP4" value={String(countZonesByPrimaryOutcome(periodZones, "TP4"))} color={C.gold} />
         <View style={styles.summaryDivider} />
-        <SummaryCell label="MANUAL" value={String(countManualCloses(periodZones))} color={C.gold} />
+        <SummaryCell label="MANUAL" value={String(countZonesByPrimaryOutcome(periodZones, "MANUAL"))} color={C.gold} />
         <View style={styles.summaryDivider} />
-        <SummaryCell label="SL" value={String(countSlHits(periodZones))} color={C.sell} />
+        <SummaryCell label="SL" value={String(countZonesByPrimaryOutcome(periodZones, "SL"))} color={C.sell} />
       </ScrollView>
 
       {!accountId && (
@@ -388,6 +390,7 @@ const styles = StyleSheet.create({
   tpPillGreen: { backgroundColor: C.buyDim },
   tpPillGold: { backgroundColor: C.goldLight },
   tpPillGrey: { backgroundColor: C.surface },
+  tpPillSlHit: { backgroundColor: C.sellDim },
   tpPillText: {
     fontSize: 11,
     fontFamily: "Inter_700Bold",
