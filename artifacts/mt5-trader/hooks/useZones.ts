@@ -192,10 +192,15 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
       );
       const data = await res.json().catch(() => ({})) as {
-        ok?: boolean; message?: string; error?: string; cancelledCount?: number;
+        ok?: boolean; message?: string; error?: string; cancelledCount?: number; zoneClosed?: boolean;
       };
-      void refresh();
-      if (res.ok && data.ok) return { ok: true, cancelledCount: data.cancelledCount };
+      await refresh();
+      if (res.ok && data.ok) {
+        if (data.zoneClosed) {
+          setZones((prev) => prev.filter((z) => z.zoneId !== zoneId));
+        }
+        return { ok: true, cancelledCount: data.cancelledCount };
+      }
       return { ok: false, message: data.message ?? data.error ?? `HTTP ${res.status}` };
     } catch (e) {
       return { ok: false, message: (e as Error).message };

@@ -1,6 +1,6 @@
 import { Feather } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -21,6 +21,7 @@ import { useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useZones } from "@/hooks/useZones";
 import ZoneCard from "@/components/ZoneCard";
 import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
+import { subscribeAccountEvents } from "@/lib/accountEventBus";
 import {
   buildDisplayActiveZones,
   pendingWithoutZone,
@@ -267,11 +268,37 @@ export default function PositionsScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
 
+  const handleCancelZoneOrders = useCallback(
+    async (zoneId: string) => {
+      const result = await cancelZoneOrders(zoneId);
+      await refreshPendingOrders();
+      return result;
+    },
+    [cancelZoneOrders, refreshPendingOrders],
+  );
+
+  const handleCloseZone = useCallback(
+    async (zoneId: string) => {
+      const result = await closeZone(zoneId);
+      await Promise.all([refreshPendingOrders(), refreshZones()]);
+      return result;
+    },
+    [closeZone, refreshPendingOrders, refreshZones],
+  );
+
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
     await Promise.all([refreshZones(), refreshPositions(), refreshPendingOrders()]);
     setRefreshing(false);
   }, [refreshZones, refreshPositions, refreshPendingOrders]);
+
+  useEffect(() => {
+    if (!accountId) return;
+    return subscribeAccountEvents(accountId, (type) => {
+      if (type === "pending_order") void refreshPendingOrders();
+      if (type === "zone_update") void refreshZones();
+    });
+  }, [accountId, refreshPendingOrders, refreshZones]);
 
   // Poll while focused so MT5-side closes/cancels appear without manual refresh.
   useFocusEffect(
@@ -406,8 +433,8 @@ export default function PositionsScreen() {
                       key={z.zoneId}
                       zone={z}
                       onRiskFree={riskFree}
-                      onCloseZone={closeZone}
-                      onCancelOrders={cancelZoneOrders}
+                      onCloseZone={handleCloseZone}
+                      onCancelOrders={handleCancelZoneOrders}
                       riskFreePips={cs.riskFreePips}
                     />
                   ))}

@@ -547,6 +547,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     onPendingOrder: () => {
       const r = regionRef.current;
       const a = accountId;
+      emitAccountEvent(a, "pending_order", {});
       void fetchPendingOrdersData(a, r).then(setPendingOrders).catch(() => {});
     },
     onZoneUpdate: (data: unknown) => {

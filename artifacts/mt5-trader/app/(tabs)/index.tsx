@@ -627,74 +627,58 @@ export default function TradeScreen() {
       return;
     }
     const levels = buildCascadeLevels(trigger, dir, cs);
-    const total = cs.numPositions;
-    const dirLabel = dir.toUpperCase();
-    Alert.alert(
-      `Arm ${dirLabel} cascade`,
-      `${dirLabel} @ ${formatPrice(trigger)} when price reaches level.\n${total} pending orders (Settings cascade).`,
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "OK",
-          onPress: () => {
-            void (async () => {
-              isPlacingRef.current = true;
-              setIsPlacing(true);
-              void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-              try {
-                const PIP = 0.10;
-                const sign = dir === "buy" ? 1 : -1;
-                const round2 = (v: number) => parseFloat(v.toFixed(2));
-                const tp1Price = round2(trigger + sign * tp1Pips * PIP);
-                const tp2Price = round2(trigger + sign * tp2Pips * PIP);
-                const tp3Price = round2(trigger + sign * tp3Pips * PIP);
-                const tp4Price = tp4Pips > 0 ? round2(trigger + sign * tp4Pips * PIP) : undefined;
-                const result = await placeArmedCascadeAtPrice({
-                  direction: dir,
-                  volume: cascadeLotSize,
-                  anchorPrice: trigger,
-                  limitEntries: levels.limitEntries,
-                  stopLoss: levels.stopLoss,
-                  tp1Price, tp2Price, tp3Price, tp4Price,
-                  tp1Pct: cs.tp1Enabled ? cs.tp1Pct : 0,
-                  tp2Pct: cs.tp2Enabled ? cs.tp2Pct : 0,
-                  tp3Pct: cs.tp3Enabled ? cs.tp3Pct : 0,
-                  tp4Pct: cs.tp4Enabled ? cs.tp4Pct : 0,
-                  autoBeAtTp: cs.autoBeAtTp,
-                });
-                if (result.success) {
-                  await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-                  showToast(result.message, "success", true);
-                  if (cs.takeProfitEnabled && cs.takeProfitPips > 0) {
-                    const cascadeId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-                    const readyAt = Date.now() + 3000;
-                    const tpTrigger = dir === "buy" ? trigger + cs.takeProfitPips * 0.10 : trigger - cs.takeProfitPips * 0.10;
-                    tpWatchersRef.current.push({
-                      id: cascadeId,
-                      entryPrice: trigger,
-                      direction: dir,
-                      pipsTarget: cs.takeProfitPips,
-                      readyAt,
-                      limitOrderIds: result.limitOrderIds,
-                      limitPrices: [trigger, ...levels.limitEntries],
-                    });
-                    setArmedWatchers((prev) => [...prev, { id: cascadeId, trigger: tpTrigger, dir, pips: cs.takeProfitPips }]);
-                  }
-                } else {
-                  await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-                  showToast(result.message, "error");
-                }
-              } catch (err) {
-                showToast(err instanceof Error ? err.message : "Arm failed", "error");
-              } finally {
-                isPlacingRef.current = false;
-                setIsPlacing(false);
-              }
-            })();
-          },
-        },
-      ],
-    );
+    isPlacingRef.current = true;
+    setIsPlacing(true);
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    try {
+      const PIP = 0.10;
+      const sign = dir === "buy" ? 1 : -1;
+      const round2 = (v: number) => parseFloat(v.toFixed(2));
+      const tp1Price = round2(trigger + sign * tp1Pips * PIP);
+      const tp2Price = round2(trigger + sign * tp2Pips * PIP);
+      const tp3Price = round2(trigger + sign * tp3Pips * PIP);
+      const tp4Price = tp4Pips > 0 ? round2(trigger + sign * tp4Pips * PIP) : undefined;
+      const result = await placeArmedCascadeAtPrice({
+        direction: dir,
+        volume: cascadeLotSize,
+        anchorPrice: trigger,
+        limitEntries: levels.limitEntries,
+        stopLoss: levels.stopLoss,
+        tp1Price, tp2Price, tp3Price, tp4Price,
+        tp1Pct: cs.tp1Enabled ? cs.tp1Pct : 0,
+        tp2Pct: cs.tp2Enabled ? cs.tp2Pct : 0,
+        tp3Pct: cs.tp3Enabled ? cs.tp3Pct : 0,
+        tp4Pct: cs.tp4Enabled ? cs.tp4Pct : 0,
+        autoBeAtTp: cs.autoBeAtTp,
+      });
+      if (result.success) {
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        showToast(result.message, "success", true);
+        if (cs.takeProfitEnabled && cs.takeProfitPips > 0) {
+          const cascadeId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+          const readyAt = Date.now() + 3000;
+          const tpTrigger = dir === "buy" ? trigger + cs.takeProfitPips * 0.10 : trigger - cs.takeProfitPips * 0.10;
+          tpWatchersRef.current.push({
+            id: cascadeId,
+            entryPrice: trigger,
+            direction: dir,
+            pipsTarget: cs.takeProfitPips,
+            readyAt,
+            limitOrderIds: result.limitOrderIds,
+            limitPrices: [trigger, ...levels.limitEntries],
+          });
+          setArmedWatchers((prev) => [...prev, { id: cascadeId, trigger: tpTrigger, dir, pips: cs.takeProfitPips }]);
+        }
+      } else {
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+        showToast(result.message, "error");
+      }
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "Arm failed", "error");
+    } finally {
+      isPlacingRef.current = false;
+      setIsPlacing(false);
+    }
   }, [triggerPriceText, cascadeLotSize, placeArmedCascadeAtPrice, showToast]);
 
   const handleCascadeTrade = useCallback(async (dir: Direction) => {

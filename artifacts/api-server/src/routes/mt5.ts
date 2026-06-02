@@ -2364,6 +2364,28 @@ async function persistArmedZone(state: ZoneState, userId: string | undefined): P
   logEvent("zone.arm", { accountId: state.accountId, zoneId: state.zoneId, direction: state.direction, anchorPrice: state.anchorPrice });
 }
 
+/** After delete-orders on an @-price zone with no fills, remove it from the app. */
+async function closeArmedZoneIfDisarmed(
+  accountId: string, zoneId: string, token: string, region: string,
+): Promise<void> {
+  const st = await loadZone(zoneId);
+  if (!st || st.accountId !== accountId || st.status !== "ARMED") return;
+  const openRows = await db.select().from(zonePositionsTable)
+    .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
+  if (openRows.length > 0) return;
+  const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, accountId, zoneId);
+  if (pendingLeft) return;
+  const closedAt = Date.now();
+  await db.update(cascadeZonesTable)
+    .set({ status: "CLOSED", closedAt, manualClose: true })
+    .where(eq(cascadeZonesTable.zoneId, zoneId));
+  st.status = "CLOSED";
+  await finalizeZoneClose(accountId, zoneId, {
+    exitPrice: exitPriceForZoneClose(accountId, st.direction),
+  });
+  console.log(`[zone ${zoneId}] ARMED disarmed — no pending orders or positions, zone closed`);
+}
+
 async function activateArmedZone(zoneId: string): Promise<void> {
   const [row] = await db.select({ status: cascadeZonesTable.status })
     .from(cascadeZonesTable).where(eq(cascadeZonesTable.zoneId, zoneId)).limit(1);
@@ -4129,8 +4151,11 @@ router.post("/mt5/account/:accountId/zones/:zoneId/cancel-pending", checkOwner, 
       if (zid === zoneId) pendingAfter++;
     }
     const cancelledCount = Math.max(0, pendingBefore - pendingAfter);
+    await closeArmedZoneIfDisarmed(accountId, zoneId, token, region);
+    broadcastToAccount(accountId, "pending_order", {});
+    broadcastZoneUpdate(zoneId);
     console.log(`[zone ${zoneId}] cancel-pending: user-initiated, cancelled=${cancelledCount}/${pendingBefore}`);
-    res.json({ ok: true, cancelledCount });
+    res.json({ ok: true, cancelledCount, zoneClosed: (await loadZone(zoneId))?.status === "CLOSED" });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }
