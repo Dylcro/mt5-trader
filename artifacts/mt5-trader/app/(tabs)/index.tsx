@@ -216,17 +216,22 @@ function CascadeLadder({
   stopLoss,
   direction,
   lotSize,
+  numPositions,
 }: {
   marketPrice: number;
   limitEntries: number[];
   stopLoss: number;
   direction: Direction;
   lotSize: number;
+  numPositions: number;
 }) {
   const color = direction === "buy" ? C.buy : C.sell;
-  const allPrices = [marketPrice, ...limitEntries];
-  const totalRisk = allPrices.reduce((sum, entry) => {
-    return sum + Math.abs(entry - stopLoss) * lotSize * 100;
+  // Exactly numPositions legs: 1 market + (numPositions - 1) limits.
+  const legEntries = [marketPrice, ...limitEntries].slice(0, numPositions);
+  const totalRisk = legEntries.reduce((sum, entry) => {
+    if (entry <= 0) return sum;
+    const slPipsAtLeg = Math.round(Math.abs(entry - stopLoss) / PIP_SIZE);
+    return sum + computeRiskDollars("points", direction, entry, slPipsAtLeg, 0, 0, lotSize, 0);
   }, 0);
 
   return (
@@ -275,7 +280,7 @@ function CascadeLadder({
             <Text style={[styles.ladderEntryLabel, { color: C.sell }]}>STOP LOSS · ALL</Text>
             <Text style={[styles.ladderEntryPrice, { color: C.sell }]}>{formatPrice(stopLoss)}</Text>
           </View>
-          <Text style={styles.ladderLot}>{allPrices.length} orders</Text>
+          <Text style={styles.ladderLot}>{legEntries.length} orders</Text>
         </View>
       </View>
     </View>
@@ -1053,6 +1058,7 @@ export default function TradeScreen() {
                 stopLoss={cascadeLevels.stopLoss}
                 direction={cascadeDirection}
                 lotSize={cascadeLotSize}
+                numPositions={cascadeSettings.numPositions}
               />
             ) : (
               <View style={styles.cascadeHint}>

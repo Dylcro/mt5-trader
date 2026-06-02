@@ -165,6 +165,19 @@ interface CascadeConfig {
   tp1Pips: number;
   tp2Pips: number;
   tp3Pips: number;
+  tp4Pips: number;
+  tp1Pct: number;
+  tp2Pct: number;
+  tp3Pct: number;
+  tp4Pct: number;
+  tp1Enabled: boolean;
+  tp2Enabled: boolean;
+  tp3Enabled: boolean;
+  tp4Enabled: boolean;
+  riskFreePips: number;
+  autoBeAtTp: number;
+  takeProfitEnabled: boolean;
+  takeProfitPips: number;
 }
 
 const CASCADE_DEFAULTS: CascadeConfig = {
@@ -175,6 +188,19 @@ const CASCADE_DEFAULTS: CascadeConfig = {
   tp1Pips: 20,
   tp2Pips: 50,
   tp3Pips: 90,
+  tp4Pips: 0,
+  tp1Pct: 25,
+  tp2Pct: 25,
+  tp3Pct: 25,
+  tp4Pct: 25,
+  tp1Enabled: true,
+  tp2Enabled: true,
+  tp3Enabled: true,
+  tp4Enabled: true,
+  riskFreePips: -10,
+  autoBeAtTp: 2,
+  takeProfitEnabled: false,
+  takeProfitPips: 30,
 };
 
 // In-memory cache: accountId (or "" for global) → config.
@@ -199,6 +225,12 @@ async function attemptLoadCascadeConfig(): Promise<void> {
     }
     for (const row of rows) {
       const key = row.accountId ?? "";
+      const r = row as typeof row & {
+        tp4Pips?: number; tp1Pct?: number; tp2Pct?: number; tp3Pct?: number; tp4Pct?: number;
+        tp1Enabled?: boolean; tp2Enabled?: boolean; tp3Enabled?: boolean; tp4Enabled?: boolean;
+        riskFreePips?: number; autoBeAtTp?: number;
+        takeProfitEnabled?: boolean; takeProfitPips?: number;
+      };
       const cfg: CascadeConfig = {
         enabled:           row.enabled,
         numPositions:      row.numPositions,
@@ -207,6 +239,19 @@ async function attemptLoadCascadeConfig(): Promise<void> {
         tp1Pips:           row.tp1Pips,
         tp2Pips:           row.tp2Pips,
         tp3Pips:           row.tp3Pips,
+        tp4Pips:           r.tp4Pips ?? CASCADE_DEFAULTS.tp4Pips,
+        tp1Pct:            r.tp1Pct ?? CASCADE_DEFAULTS.tp1Pct,
+        tp2Pct:            r.tp2Pct ?? CASCADE_DEFAULTS.tp2Pct,
+        tp3Pct:            r.tp3Pct ?? CASCADE_DEFAULTS.tp3Pct,
+        tp4Pct:            r.tp4Pct ?? CASCADE_DEFAULTS.tp4Pct,
+        tp1Enabled:        r.tp1Enabled ?? CASCADE_DEFAULTS.tp1Enabled,
+        tp2Enabled:        r.tp2Enabled ?? CASCADE_DEFAULTS.tp2Enabled,
+        tp3Enabled:        r.tp3Enabled ?? CASCADE_DEFAULTS.tp3Enabled,
+        tp4Enabled:        r.tp4Enabled ?? CASCADE_DEFAULTS.tp4Enabled,
+        riskFreePips:      r.riskFreePips ?? CASCADE_DEFAULTS.riskFreePips,
+        autoBeAtTp:        r.autoBeAtTp ?? CASCADE_DEFAULTS.autoBeAtTp,
+        takeProfitEnabled: r.takeProfitEnabled ?? CASCADE_DEFAULTS.takeProfitEnabled,
+        takeProfitPips:    r.takeProfitPips ?? CASCADE_DEFAULTS.takeProfitPips,
       };
       cascadeConfigs.set(key, cfg);
       // Also cache under the MetaAPI accountId so the auto-cascade background
@@ -282,14 +327,37 @@ export function buildCascadeConfigUpdate(
   current: CascadeConfig,
 ): CascadeConfigUpdateResult {
   const b = body ?? {};
+  const pickBool = (v: unknown, cur: boolean) => typeof v === "boolean" ? v : cur;
+  const pickNum = (v: unknown, cur: number) => typeof v === "number" && Number.isFinite(v) ? v : cur;
+  const pickPct = (v: unknown, cur: number) => {
+    if (typeof v !== "number" || !Number.isFinite(v)) return cur;
+    return Math.min(100, Math.max(0, Math.round(v)));
+  };
   const nextConfig: CascadeConfig = {
-    enabled:      typeof b.enabled      === "boolean" ? b.enabled      : current.enabled,
-    numPositions: typeof b.numPositions === "number"  ? b.numPositions : current.numPositions,
-    pipsBetween:  typeof b.pipsBetween  === "number"  ? b.pipsBetween  : current.pipsBetween,
-    slPips:       typeof b.slPips       === "number"  ? b.slPips       : current.slPips,
-    tp1Pips:      typeof b.tp1Pips      === "number" && b.tp1Pips > 0 ? Math.round(b.tp1Pips) : current.tp1Pips,
-    tp2Pips:      typeof b.tp2Pips      === "number" && b.tp2Pips > 0 ? Math.round(b.tp2Pips) : current.tp2Pips,
-    tp3Pips:      typeof b.tp3Pips      === "number" && b.tp3Pips > 0 ? Math.round(b.tp3Pips) : current.tp3Pips,
+    enabled:      pickBool(b.enabled, current.enabled),
+    numPositions: pickNum(b.numPositions, current.numPositions),
+    pipsBetween:  pickNum(b.pipsBetween, current.pipsBetween),
+    slPips:       pickNum(b.slPips, current.slPips),
+    tp1Pips:      typeof b.tp1Pips === "number" && b.tp1Pips > 0 ? Math.round(b.tp1Pips) : current.tp1Pips,
+    tp2Pips:      typeof b.tp2Pips === "number" && b.tp2Pips > 0 ? Math.round(b.tp2Pips) : current.tp2Pips,
+    tp3Pips:      typeof b.tp3Pips === "number" && b.tp3Pips > 0 ? Math.round(b.tp3Pips) : current.tp3Pips,
+    tp4Pips:      typeof b.tp4Pips === "number" && b.tp4Pips >= 0 ? Math.round(b.tp4Pips) : current.tp4Pips,
+    tp1Pct:       pickPct(b.tp1Pct, current.tp1Pct),
+    tp2Pct:       pickPct(b.tp2Pct, current.tp2Pct),
+    tp3Pct:       pickPct(b.tp3Pct, current.tp3Pct),
+    tp4Pct:       pickPct(b.tp4Pct, current.tp4Pct),
+    tp1Enabled:   pickBool(b.tp1Enabled, current.tp1Enabled),
+    tp2Enabled:   pickBool(b.tp2Enabled, current.tp2Enabled),
+    tp3Enabled:   pickBool(b.tp3Enabled, current.tp3Enabled),
+    tp4Enabled:   pickBool(b.tp4Enabled, current.tp4Enabled),
+    riskFreePips: sanitizeRiskFreePips(b.riskFreePips ?? current.riskFreePips),
+    autoBeAtTp:   (() => {
+      const n = typeof b.autoBeAtTp === "number" ? b.autoBeAtTp : current.autoBeAtTp;
+      return n === 1 || n === 2 || n === 3 ? n : current.autoBeAtTp;
+    })(),
+    takeProfitEnabled: pickBool(b.takeProfitEnabled, current.takeProfitEnabled),
+    takeProfitPips:    typeof b.takeProfitPips === "number" && b.takeProfitPips > 0
+      ? Math.round(b.takeProfitPips) : current.takeProfitPips,
   };
   // Enforce strict ordering: TP1 < TP2 < TP3 (zone TP stages must fire in sequence).
   if (!(nextConfig.tp1Pips < nextConfig.tp2Pips && nextConfig.tp2Pips < nextConfig.tp3Pips)) {
@@ -298,6 +366,18 @@ export function buildCascadeConfigUpdate(
       status: 400,
       body: {
         error: "Take Profit levels must be strictly increasing (TP1 < TP2 < TP3)",
+        tp1Pips: nextConfig.tp1Pips,
+        tp2Pips: nextConfig.tp2Pips,
+        tp3Pips: nextConfig.tp3Pips,
+      },
+    };
+  }
+  if (nextConfig.tp4Pips > 0 && !(nextConfig.tp4Pips > nextConfig.tp3Pips)) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: "TP4 must be 0 (manual) or strictly greater than TP3",
         tp1Pips: nextConfig.tp1Pips,
         tp2Pips: nextConfig.tp2Pips,
         tp3Pips: nextConfig.tp3Pips,
@@ -323,6 +403,19 @@ async function saveCascadeConfig(config: CascadeConfig, accountId: string): Prom
           tp1Pips:           config.tp1Pips,
           tp2Pips:           config.tp2Pips,
           tp3Pips:           config.tp3Pips,
+          tp4Pips:           config.tp4Pips,
+          tp1Pct:            config.tp1Pct,
+          tp2Pct:            config.tp2Pct,
+          tp3Pct:            config.tp3Pct,
+          tp4Pct:            config.tp4Pct,
+          tp1Enabled:        config.tp1Enabled,
+          tp2Enabled:        config.tp2Enabled,
+          tp3Enabled:        config.tp3Enabled,
+          tp4Enabled:        config.tp4Enabled,
+          riskFreePips:      config.riskFreePips,
+          autoBeAtTp:        config.autoBeAtTp,
+          takeProfitEnabled: config.takeProfitEnabled,
+          takeProfitPips:    config.takeProfitPips,
         },
       });
     return true;
@@ -725,24 +818,10 @@ function makeDealListener(accountId: string) {
       if (deal.orderId) markOrderCompleted(accountId, String(deal.orderId));
       if (deal.orderId && cascadePlacedOrderIds.has(String(deal.orderId))) {
         let zoneId = zoneLimitOrders.get(String(deal.orderId));
-        // Backstop: if the orderId is known as a cascade limit but somehow has
-        // no zone mapping (orphan-drain race lost, server restart between
-        // POST and fill, etc.), first try recovering the mapping from the DB
-        // (zone_orders table persists it at order-placement time). Only fall
-        // back to the "most recent active zone" heuristic when the DB also
-        // has no record — that heuristic can misattribute fills to the wrong
-        // zone when multiple zones are open simultaneously.
-        if (!zoneId && deal.positionId) {
-          const commentZone = parseZoneIdFromComment(String(deal.comment ?? ""));
-          if (commentZone) {
-            zoneId = commentZone;
-            zoneLimitOrders.set(String(deal.orderId), zoneId);
-            console.log(`[zone ${zoneId}] backstop-recovered from deal comment orderId=${deal.orderId}`);
-          }
-        }
-        // Step 1: DB lookup — the order was persisted to zone_orders when it
-        // was placed, so a restart between placement and fill won't lose the
-        // association.
+        // Backstop when in-memory mapping is missing: (1) DB by orderId,
+        // (2) deal comment Cascade|zoneId|leg/total, (3) pendingZoneAssoc
+        // with matching direction within ZONE_ASSOC_WINDOW_MS. No "oldest zone"
+        // heuristic — that steals fills across parallel zones.
         if (!zoneId && deal.positionId) {
           try {
             const dbRow = await db.select({ zoneId: zoneOrdersTable.zoneId })
@@ -758,31 +837,27 @@ function makeDealListener(accountId: string) {
             console.warn(`[stream ${accountId}] backstop DB lookup failed for orderId=${deal.orderId}:`, (e as Error).message);
           }
         }
-        // Step 2: heuristic fallback — only if DB also had no record.
+        if (!zoneId && deal.positionId) {
+          const commentZone = parseZoneIdFromComment(String(deal.comment ?? ""));
+          if (commentZone) {
+            zoneId = commentZone;
+            zoneLimitOrders.set(String(deal.orderId), zoneId);
+            console.log(`[zone ${zoneId}] backstop-recovered from deal comment orderId=${deal.orderId}`);
+          }
+        }
         if (!zoneId && deal.positionId) {
           const direction: "buy" | "sell" | null =
             deal.type === "DEAL_TYPE_BUY" ? "buy" :
             deal.type === "DEAL_TYPE_SELL" ? "sell" : null;
-          if (direction) {
-            let best: ZoneState | null = null;
-            for (const st of zoneStates.values()) {
-              if (st.accountId !== accountId) continue;
-              if (st.direction !== direction) continue;
-              if (st.status !== "OPEN" && st.status !== "RISK_FREE") continue;
-              // Prefer the OLDEST active zone — orphaned fills are more likely
-              // from an older zone whose limit hasn't filled yet than from a
-              // newly created one.
-              if (!best || st.zoneId < best.zoneId) best = st;
-            }
-            if (best) {
-              zoneId = best.zoneId;
-              zoneLimitOrders.set(String(deal.orderId), zoneId);
-              void db.insert(zoneOrdersTable)
-                .values({ zoneId, orderId: String(deal.orderId), createdAt: Date.now() })
-                .onConflictDoNothing()
-                .catch((e: Error) => console.warn(`[zone ${zoneId}] backstop persist orderId=${deal.orderId} failed:`, e.message));
-              console.warn(`[zone ${zoneId}] backstop-heuristic attached orphan cascade fill orderId=${deal.orderId} posId=${deal.positionId} (no DB record, used oldest active zone)`);
-            }
+          const pending = resolvePendingZoneAssoc(accountId, direction);
+          if (pending) {
+            zoneId = pending.zoneId;
+            zoneLimitOrders.set(String(deal.orderId), zoneId);
+            void db.insert(zoneOrdersTable)
+              .values({ zoneId, orderId: String(deal.orderId), createdAt: Date.now() })
+              .onConflictDoNothing()
+              .catch((e: Error) => console.warn(`[zone ${zoneId}] pending-assoc persist orderId=${deal.orderId} failed:`, e.message));
+            console.log(`[zone ${zoneId}] backstop-recovered from pending assoc orderId=${deal.orderId} posId=${deal.positionId} dir=${direction}`);
           }
         }
         if (zoneId && deal.positionId) {
@@ -1470,6 +1545,19 @@ export function commentBelongsToZone(comment: string | undefined | null, zoneId:
   return parsed != null && parsed === zoneId;
 }
 
+/** True when evaluateZone can run TP/BE logic (anchor or absolute TP prices set). */
+export function zoneHasTpTargets(st: {
+  anchorPrice: number;
+  tp1Price: number | null;
+  tp2Price: number | null;
+  tp3Price: number | null;
+  tp4Price: number | null;
+}): boolean {
+  if (st.anchorPrice > 0) return true;
+  return [st.tp1Price, st.tp2Price, st.tp3Price, st.tp4Price]
+    .some((p) => p != null && p > 0);
+}
+
 /** Cascade limits are cancelled only on the first successful TP2, never on TP1. */
 export function shouldCancelCascadeLimitsAtTpStage(
   tpStage: 1 | 2 | 3 | 4,
@@ -1983,6 +2071,28 @@ const pendingZoneByZone = new Map<string, Map<string, { zoneId: string; directio
 // unrelated cascades.
 const orphanedCascadeLimits = new Map<string, { orderId: string; expiresAt: number; bufferedAt: number }[]>();
 
+function resolvePendingZoneAssoc(
+  accountId: string,
+  direction: "buy" | "sell" | null,
+): { zoneId: string; direction: "buy" | "sell" } | null {
+  const now = Date.now();
+  if (direction) {
+    const byZone = pendingZoneByZone.get(accountId);
+    if (byZone) {
+      for (const entry of byZone.values()) {
+        if (entry.expiresAt >= now && entry.direction === direction) return entry;
+      }
+    }
+  }
+  const pending = pendingZoneAssoc.get(accountId);
+  if (!pending || pending.expiresAt < now) {
+    if (pending) pendingZoneAssoc.delete(accountId);
+    return null;
+  }
+  if (direction && pending.direction !== direction) return null;
+  return pending;
+}
+
 function newZoneId(): string {
   return `z_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -2002,6 +2112,7 @@ function prepareZoneForCascade(
   },
   originalVolume: number,
   explicitZoneId?: string,
+  anchorPriceHint = 0,
 ): ZoneState {
   void userId;
   const zoneId = explicitZoneId && /^z_[a-z0-9_]+$/i.test(explicitZoneId) ? explicitZoneId : newZoneId();
@@ -2010,7 +2121,7 @@ function prepareZoneForCascade(
   const tp3Enabled = tps.tp3Pct > 0;
   const tp4Enabled = tps.tp4Pct > 0;
   const state: ZoneState = {
-    zoneId, accountId, direction, anchorPrice: 0,
+    zoneId, accountId, direction, anchorPrice: anchorPriceHint > 0 ? anchorPriceHint : 0,
     tp1Price: tps.tp1Price, tp2Price: tps.tp2Price, tp3Price: tps.tp3Price, tp4Price: tps.tp4Price,
     tp1Pct: tps.tp1Pct, tp2Pct: tps.tp2Pct, tp3Pct: tps.tp3Pct, tp4Pct: tps.tp4Pct,
     tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
@@ -2098,7 +2209,12 @@ async function persistPreparedZone(
   logEvent("zone.create", { accountId: state.accountId, zoneId: state.zoneId, direction: state.direction, anchorPrice: state.anchorPrice, positionId, volume });
 }
 
-async function attachLimitOrderToZone(accountId: string, orderId: string, comment?: string): Promise<void> {
+async function attachLimitOrderToZone(
+  accountId: string,
+  orderId: string,
+  comment?: string,
+  direction?: "buy" | "sell" | null,
+): Promise<void> {
   const zoneFromComment = parseZoneIdFromComment(comment);
   if (zoneFromComment) {
     zoneLimitOrders.set(orderId, zoneFromComment);
@@ -2112,9 +2228,8 @@ async function attachLimitOrderToZone(accountId: string, orderId: string, commen
     console.log(`[zone ${zoneFromComment}] tracking limit orderId=${orderId} (from comment)`);
     return;
   }
-  const pending = pendingZoneAssoc.get(accountId);
-  if (!pending || Date.now() > pending.expiresAt) {
-    if (pending) pendingZoneAssoc.delete(accountId);
+  const pending = resolvePendingZoneAssoc(accountId, direction ?? null);
+  if (!pending) {
     // Race: this cascade limit POST resolved before the companion market POST
     // could call prepareZoneForCascade. Buffer the orderId so the next zone
     // prepared for this account picks it up.
@@ -2649,8 +2764,9 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
 
     const price = await fetchSymbolPrice(token, region, st.accountId, live[0]!.symbol || "XAUUSD");
     if (!price) return;
-    // For BUY closes use bid; for SELL closes use ask. Skip if anchor is invalid.
-    if (!(st.anchorPrice > 0)) return;
+    // For BUY closes use bid; for SELL closes use ask. Allow TP checks when
+    // absolute TP prices are set even if anchor was closed before persisting.
+    if (!zoneHasTpTargets(st)) return;
     const cmpPrice = st.direction === "buy" ? price.bid : price.ask;
 
     // Spread/slippage tolerance: fire TP when price comes within
@@ -2966,11 +3082,29 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
 }
 
 let zoneMonitorTimer: NodeJS.Timeout | null = null;
+let zoneMonitorTick = 0;
 export function startZoneTpMonitor(): void {
   if (zoneMonitorTimer) return;
   zoneMonitorTimer = setInterval(() => {
     const token = (() => { try { return getToken(); } catch { return null; } })();
     if (!token) return;
+    zoneMonitorTick += 1;
+    // Every ~60 s, hydrate any OPEN/RISK_FREE zones missing from memory (e.g.
+    // created while this pod was down or lost from cache after a partial failure).
+    if (zoneMonitorTick % 20 === 0) {
+      void (async () => {
+        try {
+          const rows = await db.select({ zoneId: cascadeZonesTable.zoneId })
+            .from(cascadeZonesTable)
+            .where(inArray(cascadeZonesTable.status, ["OPEN", "RISK_FREE"]));
+          for (const row of rows) {
+            if (!zoneStates.has(row.zoneId)) await loadZone(row.zoneId);
+          }
+        } catch (e) {
+          console.warn("[zone-monitor] periodic DB hydrate failed:", (e as Error).message);
+        }
+      })();
+    }
     for (const [zoneId, st] of zoneStates.entries()) {
       if (st.status !== "CLOSED") void evaluateZone(zoneId, token);
     }
@@ -4612,9 +4746,10 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
         if (actionType.endsWith("_LIMIT") && data.orderId) {
           trackCascadeOrder(accountId, data.orderId);
           console.log(`[trade] tracked cascade limit orderId=${data.orderId}`);
-          // Attach this limit to the most recently created zone for this account
-          // (if any limit-association window is still open).
-          void attachLimitOrderToZone(accountId, data.orderId, comment);
+          const limitDir: "buy" | "sell" | null =
+            actionType.includes("BUY") ? "buy" :
+            actionType.includes("SELL") ? "sell" : null;
+          void attachLimitOrderToZone(accountId, data.orderId, comment, limitDir);
         }
         // Market order placed by the app: mark its positionId immediately so the
         // hasBeenCascaded guard blocks it even if the comment is later stripped.
@@ -4678,11 +4813,15 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
                 },
                 volume,
                 clientZoneId || parseZoneIdFromComment(comment) || undefined,
+                anchorHint,
               );
               // Seed best-known anchor from caller-provided value / cached tick.
               const tick = latestPrice(accountId);
-              if (anchorHint > 0) zoneState.anchorPrice = anchorHint;
-              else if (tick) zoneState.anchorPrice = direction === "buy" ? tick.ask : tick.bid;
+              if (anchorHint > 0 && zoneState.anchorPrice !== anchorHint) {
+                zoneState.anchorPrice = anchorHint;
+              } else if (zoneState.anchorPrice <= 0 && tick) {
+                zoneState.anchorPrice = direction === "buy" ? tick.ask : tick.bid;
+              }
               // DB-FIRST: write the zone row immediately with the best-known
               // anchor so it survives a pod restart. If the server crashes
               // between here and the anchor-refinement below, loadZoneState()

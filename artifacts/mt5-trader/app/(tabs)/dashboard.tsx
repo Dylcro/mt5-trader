@@ -1,5 +1,5 @@
 import { Feather, MaterialCommunityIcons } from "@expo/vector-icons";
-import React, { useMemo, useState } from "react";
+import React, { useCallback, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Pressable,
@@ -10,6 +10,7 @@ import {
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useFocusEffect } from "expo-router";
 
 import PeriodToggle from "@/components/PeriodToggle";
 import Colors from "@/constants/colors";
@@ -71,6 +72,7 @@ export default function DashboardScreen() {
     refreshAccountInfo,
     refreshPrice,
     sseConnected,
+    syncSession,
   } = useTrading();
   const { zones, refresh, loading } = useZones(accountId, {
     includeClosed: true,
@@ -80,6 +82,15 @@ export default function DashboardScreen() {
   const [period, setPeriod] = useState<Period>("today");
   const [refreshing, setRefreshing] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
+
+  useFocusEffect(
+    useCallback(() => {
+      if (status !== "connected" || !accountId) return;
+      void syncSession();
+      const id = setInterval(() => void syncSession(), 10_000);
+      return () => clearInterval(id);
+    }, [status, accountId, syncSession]),
+  );
 
   const openZones = zones.filter((z) => z.status === "OPEN" || z.status === "RISK_FREE");
   const closedAll = zones.filter((z) => z.status === "CLOSED");
