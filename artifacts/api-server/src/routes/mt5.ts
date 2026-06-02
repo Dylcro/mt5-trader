@@ -2623,6 +2623,7 @@ async function zoneHasLiveTrackedPositionsOnBroker(
 // if the REST call fails, then null if neither has data.
 async function fetchSymbolPrice(
   token: string, region: string, accountId: string, symbol: string,
+  opts?: { useTickFallback?: boolean },
 ): Promise<{ bid: number; ask: number } | null> {
   recordApiCall(accountId);
   try {
@@ -2637,6 +2638,7 @@ async function fetchSymbolPrice(
   } catch {
     /* fall through to tick cache */
   }
+  if (opts?.useTickFallback === false) return null;
   const ticks = tickStore.get(accountId);
   if (ticks && ticks.length > 0) {
     const t = ticks[ticks.length - 1]!;
@@ -4536,7 +4538,7 @@ router.get("/mt5/account/:accountId/display-fx", checkOwner, async (req: Request
     const to = qstr(req.query.to) || "USD";
     const { rate, currency } = await usdToTargetRate(
       token, region, accountId, to,
-      (t, r, a, s) => fetchSymbolPrice(t, r, a, s),
+      (t, r, a, s) => fetchSymbolPrice(t, r, a, s, { useTickFallback: false }),
     );
     return res.json({ from: "USD", to: currency, rate });
   } catch (err) {
