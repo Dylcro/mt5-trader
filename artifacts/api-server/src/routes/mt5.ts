@@ -2675,9 +2675,9 @@ async function recordZonePositionFill(
 }
 
 /**
- * Positions to act on for risk-free / close-zone. Prefer OPEN zone_positions rows;
- * if DB is empty but MT5 still has cascade-tagged legs, relink them (UI already
- * shows those legs via comment grouping).
+ * All open MT5 legs for this zone (DB OPEN rows ∪ comment/magic-tagged positions).
+ * Anchor is often missing from OPEN rows while limits are tracked — union prevents
+ * close-zone from closing only the ladder and leaving the market entry running.
  */
 async function resolveLivePositionsForZoneAction(
   token: string,
@@ -2691,12 +2691,15 @@ async function resolveLivePositionsForZoneAction(
     .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
   const trackedIds = new Set(openRows.map((z) => z.positionId));
   const fromDb = allLive.filter((p) => trackedIds.has(p.id));
-  if (fromDb.length > 0) return fromDb;
-
   const tagged = allLive.filter((p) => positionBelongsToZone(p, zoneId));
-  if (tagged.length === 0) return [];
+  const byId = new Map<string, LivePosition>();
+  for (const p of fromDb) byId.set(p.id, p);
+  for (const p of tagged) byId.set(p.id, p);
+  const live = [...byId.values()];
+  if (live.length === 0) return [];
 
-  for (const p of tagged) {
+  let relinked = 0;
+  for (const p of live) {
     const [row] = await db.select({ status: zonePositionsTable.status })
       .from(zonePositionsTable)
       .where(and(
@@ -2711,8 +2714,10 @@ async function resolveLivePositionsForZoneAction(
           eq(zonePositionsTable.zoneId, zoneId),
           eq(zonePositionsTable.positionId, p.id),
         ));
+      relinked++;
     } else if (!row) {
       await recordZonePositionFill(zoneId, p.id, p.openPrice, p.volume);
+      relinked++;
     }
     const cached = st.trackedPositions.get(p.id);
     st.trackedPositions.set(p.id, {
@@ -2724,8 +2729,45 @@ async function resolveLivePositionsForZoneAction(
       tp4Hit: cached?.tp4Hit ?? false,
     });
   }
-  console.log(`[zone ${zoneId}] relinked ${tagged.length} broker leg(s) for zone action (no OPEN DB rows)`);
-  return tagged;
+  if (relinked > 0 || tagged.length > fromDb.length) {
+    console.log(
+      `[zone ${zoneId}] resolved ${live.length} leg(s) for zone action (dbOpen=${fromDb.length} tagged=${tagged.length} relinked=${relinked})`,
+    );
+  }
+  return live;
+}
+
+async function markZonePositionsClosedInDb(zoneId: string, positionIds: string[]): Promise<void> {
+  if (positionIds.length === 0) return;
+  await db.update(zonePositionsTable)
+    .set({ status: "CLOSED" })
+    .where(and(
+      eq(zonePositionsTable.zoneId, zoneId),
+      inArray(zonePositionsTable.positionId, positionIds),
+    ));
+}
+
+async function closeLiveZoneLegs(
+  token: string,
+  region: string,
+  accountId: string,
+  zoneId: string,
+  live: LivePosition[],
+): Promise<{ failed: string[] }> {
+  const closeResults = await Promise.all(
+    live.map(async (p) => {
+      try {
+        return { id: p.id, ok: await closeZonePosition(token, region, accountId, p.id) };
+      } catch (e) {
+        console.warn(`[zone ${zoneId}] close threw for posId=${p.id}:`, (e as Error).message);
+        return { id: p.id, ok: false };
+      }
+    }),
+  );
+  const failed = closeResults.filter((r) => !r.ok).map((r) => r.id);
+  const closedIds = closeResults.filter((r) => r.ok).map((r) => r.id);
+  await markZonePositionsClosedInDb(zoneId, closedIds);
+  return { failed };
 }
 
 // Called on every DEAL_ENTRY_OUT. A partial close ALSO fires this event with
@@ -4256,43 +4298,43 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
     // DB errors bubble up to the surrounding try/catch and return 500.
     const st = await loadZone(zoneId);
     if (!st || st.accountId !== accountId) { res.status(404).json({ error: "Zone not found" }); return; }
-    if (st.status === "CLOSED") {
-      // Zone already closed (reconciliation or a prior close beat us). Still
-      // attempt limit cancellation — if the monitor path ran first it may not
-      // have had the token or may have lost the race with limit fills. This is
-      // a cheap idempotent call that no-ops when nothing remains.
-      await cancelZoneLimits(token, region, accountId, zoneId).catch(() => {});
-      res.json({ ok: true, closedCount: 0, alreadyClosed: true });
-      return;
-    }
 
-    // Cancel pending cascade limits FIRST. If we closed positions first and
-    // then a cancel failed, the user would be left with un-anchored limits
-    // that could open new entries into a "closed" zone. Cancel-first ordering
-    // means the worst case is "limits gone, some positions still open" — much
-    // easier to retry from than the inverse.
     await cancelZoneLimits(token, region, accountId, zoneId);
 
     const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
 
-    // Close every tracked position in parallel — serial closes were a major
-    // source of "Close Zone takes seconds" lag. Each closeZonePosition is an
-    // independent POSITION_CLOSE_ID REST call and the broker handles them
-    // concurrently for distinct positionIds. Per-item try/catch keeps a
-    // single network throw from short-circuiting Promise.all and converting
-    // a partial-success into a generic 500 — callers depend on the 207
-    // `failedPositionIds` shape to know what to retry.
-    const closeResults = await Promise.all(
-      live.map(async (p) => {
-        try {
-          return { id: p.id, ok: await closeZonePosition(token, region, accountId, p.id) };
-        } catch (e) {
-          console.warn(`[zone ${zoneId}] close threw for posId=${p.id}:`, (e as Error).message);
-          return { id: p.id, ok: false };
-        }
-      }),
-    );
-    const failed: string[] = closeResults.filter((r) => !r.ok).map((r) => r.id);
+    // Zone already CLOSED in DB but anchor (or other leg) still open on MT5 — sweep.
+    if (st.status === "CLOSED") {
+      if (live.length === 0) {
+        res.json({ ok: true, closedCount: 0, alreadyClosed: true });
+        return;
+      }
+      const { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, live);
+      for (const id of live.map((p) => p.id)) st.trackedPositions.delete(id);
+      if (failed.length > 0) {
+        res.status(207).json({
+          ok: false,
+          closedCount: live.length - failed.length,
+          failedPositionIds: failed,
+          message: "Some positions failed to close — retry Close Zone to clear the rest.",
+        });
+        return;
+      }
+      void settleZoneClosedPnl(accountId, zoneId);
+      broadcastZoneUpdate(zoneId);
+      broadcastToAccount(accountId, "deal", { type: "position_changed" });
+      logEvent("zone.close", { accountId, zoneId, closedCount: live.length, trigger: "user_cleanup" });
+      res.json({ ok: true, closedCount: live.length, cleanedUp: true });
+      return;
+    }
+
+    if (live.length === 0) {
+      res.status(409).json({ error: "No open positions in this zone" });
+      return;
+    }
+
+    const { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, live);
+    for (const id of live.map((p) => p.id)) st.trackedPositions.delete(id);
 
     if (failed.length > 0) {
       console.warn(`[zone ${zoneId}] close: failedCloses=${failed.length}/${live.length}`);
@@ -4305,13 +4347,12 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
       return;
     }
 
-    // All closes succeeded → flip the zone to CLOSED and clear in-memory state.
     const closedAt = Date.now();
     await db.update(cascadeZonesTable)
       .set({ status: "CLOSED", closedAt })
       .where(eq(cascadeZonesTable.zoneId, zoneId));
-    const wasRiskFree = st?.status === "RISK_FREE";
-    if (st) st.status = "CLOSED";
+    const wasRiskFree = st.status === "RISK_FREE";
+    st.status = "CLOSED";
     await finalizeZoneClose(accountId, zoneId, {
       wasRiskFree,
       exitPrice: exitPriceForZoneClose(accountId, st.direction),
@@ -4319,6 +4360,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
     });
     void settleZoneClosedPnl(accountId, zoneId);
     broadcastZoneUpdate(zoneId);
+    broadcastToAccount(accountId, "deal", { type: "position_changed" });
     logEvent("zone.close", { accountId, zoneId, closedCount: live.length, trigger: "user" });
     res.json({ ok: true, closedCount: live.length });
   } catch (err) {
