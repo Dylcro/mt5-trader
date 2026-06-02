@@ -914,36 +914,41 @@ export default function TradeScreen() {
           )}
         </View>
 
-        {/* BUY / SELL — Cascade mode only */}
-        {tradeMode === "cascade" && (() => {
+        {/* BUY / SELL — always mounted (fixed layout); inactive (black) in At price mode */}
+        {(() => {
+          const cascadeActive = tradeMode === "cascade";
           const tradeBlocked = !syncReady;
+          const labelColor = cascadeActive ? undefined : C.textMuted;
           return (
             <View style={styles.cascadeExecRow}>
               <Pressable
                 style={({ pressed }) => [
                   styles.cascadeExecBtn,
-                  styles.cascadeExecBtnBuy,
-                  tradeBlocked && !isPlacing && { opacity: 0.5 },
-                  pressed && { opacity: 0.8, transform: [{ scale: 0.97 }] },
-                  isPlacing && { opacity: 0.6 },
+                  cascadeActive ? styles.cascadeExecBtnBuy : styles.cascadeExecBtnInactive,
+                  cascadeActive && tradeBlocked && !isPlacing && { opacity: 0.5 },
+                  cascadeActive && pressed && { opacity: 0.8, transform: [{ scale: 0.97 }] },
+                  cascadeActive && isPlacing && { opacity: 0.6 },
                 ]}
                 onPress={() => {
+                  if (!cascadeActive) return;
                   setCascadeDirection("buy");
                   void handleCascadeTrade("buy");
                 }}
-                disabled={isPlacing}
+                disabled={!cascadeActive || isPlacing || tradeBlocked}
               >
-                {isPlacing && cascadeDirection === "buy" ? (
+                {cascadeActive && isPlacing && cascadeDirection === "buy" ? (
                   <ActivityIndicator color="#000" />
                 ) : (
                   <>
-                    <Feather name="trending-up" size={20} color="#000" />
-                    <Text style={[styles.cascadeExecLabel, { color: "#000" }]}>BUY</Text>
-                    {price && (
+                    <Feather name="trending-up" size={20} color={cascadeActive ? "#000" : C.textMuted} />
+                    <Text style={[styles.cascadeExecLabel, labelColor != null && { color: labelColor }]}>
+                      BUY
+                    </Text>
+                    {cascadeActive && price ? (
                       <Text style={[styles.cascadeExecPrice, { color: "#000" }]}>
                         {formatPrice(price.ask)}
                       </Text>
-                    )}
+                    ) : null}
                   </>
                 )}
               </Pressable>
@@ -951,28 +956,31 @@ export default function TradeScreen() {
               <Pressable
                 style={({ pressed }) => [
                   styles.cascadeExecBtn,
-                  styles.cascadeExecBtnSell,
-                  tradeBlocked && !isPlacing && { opacity: 0.5 },
-                  pressed && { opacity: 0.8, transform: [{ scale: 0.97 }] },
-                  isPlacing && { opacity: 0.6 },
+                  cascadeActive ? styles.cascadeExecBtnSell : styles.cascadeExecBtnInactive,
+                  cascadeActive && tradeBlocked && !isPlacing && { opacity: 0.5 },
+                  cascadeActive && pressed && { opacity: 0.8, transform: [{ scale: 0.97 }] },
+                  cascadeActive && isPlacing && { opacity: 0.6 },
                 ]}
                 onPress={() => {
+                  if (!cascadeActive) return;
                   setCascadeDirection("sell");
                   void handleCascadeTrade("sell");
                 }}
-                disabled={isPlacing}
+                disabled={!cascadeActive || isPlacing || tradeBlocked}
               >
-                {isPlacing && cascadeDirection === "sell" ? (
+                {cascadeActive && isPlacing && cascadeDirection === "sell" ? (
                   <ActivityIndicator color="#fff" />
                 ) : (
                   <>
-                    <Feather name="trending-down" size={20} color="#fff" />
-                    <Text style={[styles.cascadeExecLabel, { color: "#fff" }]}>SELL</Text>
-                    {price && (
+                    <Feather name="trending-down" size={20} color={cascadeActive ? "#fff" : C.textMuted} />
+                    <Text style={[styles.cascadeExecLabel, cascadeActive ? { color: "#fff" } : { color: C.textMuted }]}>
+                      SELL
+                    </Text>
+                    {cascadeActive && price ? (
                       <Text style={[styles.cascadeExecPrice, { color: "#fff" }]}>
                         {formatPrice(price.bid)}
                       </Text>
-                    )}
+                    ) : null}
                   </>
                 )}
               </Pressable>
@@ -1602,6 +1610,7 @@ const styles = StyleSheet.create({
   },
   cascadeExecBtnBuy: { backgroundColor: C.buy },
   cascadeExecBtnSell: { backgroundColor: C.sell },
+  cascadeExecBtnInactive: { backgroundColor: C.navy },
   atPriceOkBtn: {
     flexDirection: "row",
     alignItems: "center",
