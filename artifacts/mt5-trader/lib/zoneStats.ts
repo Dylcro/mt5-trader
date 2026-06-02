@@ -22,10 +22,10 @@ export function filterClosedZonesByPeriod(zones: Zone[], period: Period): Zone[]
   });
 }
 
-/** How a closed zone ended — one bucket per zone (not per ladder entry/leg). */
+/** How a closed zone ended (exit reason) — separate from day/week TP reach stats. */
 export type ZonePrimaryOutcome = "SL" | "MANUAL" | "TP4" | "TP3" | "TP2" | "TP1" | "NONE";
 
-/** Classify a closed zone into a single exit bucket for history summaries. */
+/** Classify exit reason for a closed zone (optional card label). */
 export function zonePrimaryOutcome(z: Zone): ZonePrimaryOutcome {
   if (z.primaryOutcome) return z.primaryOutcome;
   if (z.status !== "CLOSED") return "NONE";
@@ -39,30 +39,44 @@ export function zonePrimaryOutcome(z: Zone): ZonePrimaryOutcome {
   return "MANUAL";
 }
 
-export function countZonesByPrimaryOutcome(
-  zones: Zone[],
-  outcome: ZonePrimaryOutcome,
-): number {
-  return zones.filter((z) => zonePrimaryOutcome(z) === outcome).length;
+/**
+ * Day/week stats: count closed zones that reached TP{n} at least once.
+ * One zone that hits TP1+TP2 adds +1 to TP1 and +1 to TP2 (not +1 per ladder entry).
+ */
+export function countZonesReachedTp(zones: Zone[], level: 1 | 2 | 3 | 4): number {
+  const hitKey = `tp${level}Hit` as keyof Zone;
+  const enKey = `tp${level}Enabled` as keyof Zone;
+  return zones.filter((z) => {
+    if (z[enKey] === false) return false;
+    return Boolean(z[hitKey]);
+  }).length;
 }
 
-/** @deprecated Use countZonesByPrimaryOutcome — old helper counted any zone that touched a TP level. */
-export function countTpHits(zones: Zone[], level: 1 | 2 | 3 | 4): number {
-  const map: Record<1 | 2 | 3 | 4, ZonePrimaryOutcome> = {
-    1: "TP1",
-    2: "TP2",
-    3: "TP3",
-    4: "TP4",
-  };
-  return countZonesByPrimaryOutcome(zones, map[level]);
-}
+/** @alias countZonesReachedTp */
+export const countTpHits = countZonesReachedTp;
 
 export function countManualCloses(zones: Zone[]): number {
-  return countZonesByPrimaryOutcome(zones, "MANUAL");
+  return zones.filter((z) => Boolean(z.manualClose)).length;
 }
 
 export function countSlHits(zones: Zone[]): number {
-  return countZonesByPrimaryOutcome(zones, "SL");
+  return zones.filter((z) => Boolean(z.slHit)).length;
+}
+
+/** Enabled TP levels this zone reached (for card pill, e.g. 3/4). */
+export function zoneTpLevelsHit(z: Zone): { hit: number; enabled: number } {
+  const flags = [
+    { en: z.tp1Enabled !== false, hit: z.tp1Hit },
+    { en: z.tp2Enabled !== false, hit: z.tp2Hit },
+    { en: z.tp3Enabled !== false, hit: z.tp3Hit },
+    { en: z.tp4Enabled !== false, hit: z.tp4Hit },
+  ];
+  const enabled = flags.filter((f) => f.en).length;
+  const hit = flags.filter((f) => f.en && f.hit).length;
+  return {
+    hit: z.hitEnabledTpCount ?? hit,
+    enabled: z.enabledTpCount ?? enabled,
+  };
 }
 
 export function primaryOutcomeLabel(outcome: ZonePrimaryOutcome): string {

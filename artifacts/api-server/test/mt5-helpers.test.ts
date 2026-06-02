@@ -616,7 +616,7 @@ describe("disabled TP history", () => {
     expect(inferCloseOutcomeFromExitPrice(zone, 2630)).toEqual({ tp4Hit: false, manualClose: false });
   });
 
-  it("zonePrimaryOutcome: one bucket per closed zone", () => {
+  it("zonePrimaryOutcome: exit reason for a closed zone", () => {
     const base = {
       status: "CLOSED",
       tp1Enabled: true,
