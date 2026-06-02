@@ -15,8 +15,10 @@ import { useFocusEffect } from "expo-router";
 import PeriodToggle from "@/components/PeriodToggle";
 import Colors from "@/constants/colors";
 import { useTrading } from "@/context/TradingContext";
+import { useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useRealizedPnl } from "@/hooks/useRealizedPnl";
 import { useZones } from "@/hooks/useZones";
+import { buildDisplayActiveZones } from "@/lib/zoneDisplay";
 import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
 import { normalizeDisplayCurrency } from "@/lib/displayCurrency";
 import { formatMoney as formatMoneyRaw, formatPrice } from "@/lib/formatters";
@@ -68,12 +70,14 @@ export default function DashboardScreen() {
     accountId,
     region,
     credentials,
+    positions,
     refreshPositions,
     refreshAccountInfo,
     refreshPrice,
     sseConnected,
     syncSession,
   } = useTrading();
+  const { settings: cascadeSettings } = useCascadeSettings();
   const { zones, refresh, loading } = useZones(accountId, {
     includeClosed: true,
     pollIntervalMs: 10_000,
@@ -92,7 +96,11 @@ export default function DashboardScreen() {
     }, [status, accountId, syncSession]),
   );
 
-  const openZones = zones.filter((z) => z.status === "OPEN" || z.status === "RISK_FREE" || z.status === "ARMED");
+  const displayActiveZones = useMemo(
+    () => buildDisplayActiveZones(zones, positions, cascadeSettings, price),
+    [zones, positions, cascadeSettings, price],
+  );
+  const openZones = displayActiveZones;
   const closedAll = zones.filter((z) => z.status === "CLOSED");
   const periodClosed = useMemo(
     () => filterClosedZonesByPeriod(zones, period),

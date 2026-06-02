@@ -59,10 +59,10 @@ function TpChip({ label, state }: { label: string; state: TpChipState }) {
 }
 
 function tpEnabledAtPlacement(zone: Zone, level: 1 | 2 | 3 | 4): boolean {
-  if (level === 1) return zone.tp1Enabled === true;
-  if (level === 2) return zone.tp2Enabled === true;
-  if (level === 3) return zone.tp3Enabled === true;
-  return zone.tp4Enabled === true;
+  if (level === 1) return zone.tp1Enabled !== false;
+  if (level === 2) return zone.tp2Enabled !== false;
+  if (level === 3) return zone.tp3Enabled !== false;
+  return zone.tp4Enabled !== false;
 }
 
 function tpChipState(zone: Zone, level: 1 | 2 | 3 | 4): TpChipState {

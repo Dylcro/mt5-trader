@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { subscribeAccountEvents } from "@/lib/accountEventBus";
+import { enrichZoneDisplayFields } from "@/lib/zoneDisplay";
 import { getAuthToken } from "@/lib/authToken";
 
 const API_BASE = process.env.EXPO_PUBLIC_API_URL ?? "";
@@ -88,7 +89,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
         return;
       }
       const data = (await res.json()) as Zone[];
-      setZones(Array.isArray(data) ? data : []);
+      setZones(Array.isArray(data) ? data.map(enrichZoneDisplayFields) : []);
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -117,19 +118,26 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
       if (type === "zone_update") {
         const update = data as Partial<Zone> & { zoneId?: string };
         if (!update.zoneId) return;
-        setZones(prev =>
+        if (update.status === "CLOSED") {
+          setZones((prev) => {
+            const closedAt = update.closedAt ?? Date.now();
+            const has = prev.some((z) => z.zoneId === update.zoneId);
+            if (!has) return prev;
+            return prev.map((z) =>
+              z.zoneId === update.zoneId
+                ? enrichZoneDisplayFields({ ...z, ...update, status: "CLOSED", closedAt })
+                : z,
+            );
+          });
+          return;
+        }
+        setZones((prev) =>
           prev.map((z) => {
             if (z.zoneId !== update.zoneId) return z;
-            const next: Zone = { ...z, ...update };
-            if (update.status === "CLOSED") {
-              if (next.closedAt == null || next.closedAt <= 0) {
-                next.closedAt = Date.now();
-              }
-            }
-            return next;
+            return enrichZoneDisplayFields({ ...z, ...update });
           }),
         );
-      } else if (type === "deal") {
+      } else if (type === "deal" || type === "pending_order") {
         void refresh();
       }
     });
@@ -197,7 +205,13 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
       await refresh();
       if (res.ok && data.ok) {
         if (data.zoneClosed) {
-          setZones((prev) => prev.filter((z) => z.zoneId !== zoneId));
+          setZones((prev) =>
+            prev.map((z) =>
+              z.zoneId === zoneId
+                ? { ...z, status: "CLOSED" as const, closedAt: z.closedAt ?? Date.now() }
+                : z,
+            ),
+          );
         }
         return { ok: true, cancelledCount: data.cancelledCount };
       }

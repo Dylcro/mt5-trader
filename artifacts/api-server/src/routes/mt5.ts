@@ -541,24 +541,98 @@ function broadcastToAccount(accountId: string, event: string, data: unknown): vo
   }
 }
 
+async function mergeZoneHitsFromPositions(
+  zoneId: string,
+  row: {
+    tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean;
+    tp1Enabled?: boolean; tp2Enabled?: boolean; tp3Enabled?: boolean; tp4Enabled?: boolean;
+  },
+): Promise<{
+  tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean; positionCount: number;
+  tp1Enabled: boolean; tp2Enabled: boolean; tp3Enabled: boolean; tp4Enabled: boolean;
+}> {
+  const tp1Enabled = row.tp1Enabled ?? true;
+  const tp2Enabled = row.tp2Enabled ?? true;
+  const tp3Enabled = row.tp3Enabled ?? true;
+  const tp4Enabled = row.tp4Enabled ?? true;
+  const posRows = await db.select().from(zonePositionsTable)
+    .where(eq(zonePositionsTable.zoneId, zoneId));
+  const open = posRows.filter((r) => r.status === "OPEN");
+  const tp1Hit = Boolean(row.tp1Hit) || posRows.some((r) => r.tp1Hit);
+  const tp2Hit = Boolean(row.tp2Hit) || posRows.some((r) => r.tp2Hit);
+  const tp3Hit = Boolean(row.tp3Hit) || posRows.some((r) => r.tp3Hit);
+  const tp4Hit = Boolean(row.tp4Hit) || posRows.some((r) => r.tp4Hit);
+  if (tp1Hit !== row.tp1Hit || tp2Hit !== row.tp2Hit || tp3Hit !== row.tp3Hit || tp4Hit !== row.tp4Hit) {
+    await db.update(cascadeZonesTable)
+      .set({ tp1Hit, tp2Hit, tp3Hit, tp4Hit })
+      .where(eq(cascadeZonesTable.zoneId, zoneId))
+      .catch((e: Error) => console.warn(`[zone ${zoneId}] hit-flag sync failed:`, e.message));
+    const st = zoneStates.get(zoneId);
+    if (st) {
+      st.tp1Hit = tp1Hit;
+      st.tp2Hit = tp2Hit;
+      st.tp3Hit = tp3Hit;
+      st.tp4Hit = tp4Hit;
+    }
+  }
+  return {
+    tp1Hit, tp2Hit, tp3Hit, tp4Hit, positionCount: open.length,
+    tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+  };
+}
+
 function broadcastZoneUpdate(zoneId: string): void {
-  const st = zoneStates.get(zoneId);
-  if (!st) return;
-  broadcastToAccount(st.accountId, "zone_update", {
-    zoneId,
-    status: st.status,
-    tp1Hit: st.tp1Hit,
-    tp2Hit: st.tp2Hit,
-    tp3Hit: st.tp3Hit,
-    tp4Hit: st.tp4Hit ?? false,
-    tp1Enabled: st.tp1Enabled,
-    tp2Enabled: st.tp2Enabled,
-    tp3Enabled: st.tp3Enabled,
-    tp4Enabled: st.tp4Enabled,
-    tp2SlIsBestEffort: (st as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
-    manualClose: (st as { manualClose?: boolean }).manualClose ?? false,
-    slHit: (st as { slHit?: boolean }).slHit ?? false,
-  });
+  void (async () => {
+    const st = zoneStates.get(zoneId);
+    const [dbRow] = await db.select().from(cascadeZonesTable)
+      .where(eq(cascadeZonesTable.zoneId, zoneId))
+      .limit(1);
+    if (!st && !dbRow) return;
+    const accountId = st?.accountId ?? dbRow!.accountId;
+    const base = dbRow ?? {
+      status: st!.status,
+      tp1Hit: st!.tp1Hit, tp2Hit: st!.tp2Hit, tp3Hit: st!.tp3Hit, tp4Hit: st!.tp4Hit,
+      tp1Enabled: st!.tp1Enabled, tp2Enabled: st!.tp2Enabled, tp3Enabled: st!.tp3Enabled, tp4Enabled: st!.tp4Enabled,
+    };
+    const merged = await mergeZoneHitsFromPositions(zoneId, {
+      tp1Hit: Boolean(base.tp1Hit),
+      tp2Hit: Boolean(base.tp2Hit),
+      tp3Hit: Boolean(base.tp3Hit),
+      tp4Hit: Boolean(base.tp4Hit ?? false),
+      tp1Enabled: (base as { tp1Enabled?: boolean }).tp1Enabled,
+      tp2Enabled: (base as { tp2Enabled?: boolean }).tp2Enabled,
+      tp3Enabled: (base as { tp3Enabled?: boolean }).tp3Enabled,
+      tp4Enabled: (base as { tp4Enabled?: boolean }).tp4Enabled,
+    });
+    const enabledTpCount = countEnabledTps({
+      tp1Enabled: merged.tp1Enabled, tp2Enabled: merged.tp2Enabled,
+      tp3Enabled: merged.tp3Enabled, tp4Enabled: merged.tp4Enabled,
+    });
+    const hitEnabledTpCount = countHitEnabledTps({
+      tp1Enabled: merged.tp1Enabled, tp2Enabled: merged.tp2Enabled,
+      tp3Enabled: merged.tp3Enabled, tp4Enabled: merged.tp4Enabled,
+      tp1Hit: merged.tp1Hit, tp2Hit: merged.tp2Hit, tp3Hit: merged.tp3Hit, tp4Hit: merged.tp4Hit,
+    });
+    broadcastToAccount(accountId, "zone_update", {
+      zoneId,
+      status: st?.status ?? String(dbRow!.status),
+      tp1Hit: merged.tp1Hit,
+      tp2Hit: merged.tp2Hit,
+      tp3Hit: merged.tp3Hit,
+      tp4Hit: merged.tp4Hit,
+      tp1Enabled: merged.tp1Enabled,
+      tp2Enabled: merged.tp2Enabled,
+      tp3Enabled: merged.tp3Enabled,
+      tp4Enabled: merged.tp4Enabled,
+      enabledTpCount,
+      hitEnabledTpCount,
+      positionCount: merged.positionCount,
+      tp2SlIsBestEffort: (dbRow as { tp2SlIsBestEffort?: boolean } | undefined)?.tp2SlIsBestEffort
+        ?? (st as { tp2SlIsBestEffort?: boolean } | undefined)?.tp2SlIsBestEffort ?? false,
+      manualClose: (dbRow as { manualClose?: boolean } | undefined)?.manualClose ?? false,
+      slHit: (dbRow as { slHit?: boolean } | undefined)?.slHit ?? false,
+    });
+  })();
 }
 
 // ── Stream-health tracking ──────────────────────────────────────────────────
@@ -2367,14 +2441,17 @@ async function persistArmedZone(state: ZoneState, userId: string | undefined): P
 /** After delete-orders on an @-price zone with no fills, remove it from the app. */
 async function closeArmedZoneIfDisarmed(
   accountId: string, zoneId: string, token: string, region: string,
+  opts?: { force?: boolean },
 ): Promise<void> {
   const st = await loadZone(zoneId);
   if (!st || st.accountId !== accountId || st.status !== "ARMED") return;
   const openRows = await db.select().from(zonePositionsTable)
     .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
   if (openRows.length > 0) return;
-  const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, accountId, zoneId);
-  if (pendingLeft) return;
+  if (!opts?.force) {
+    const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, accountId, zoneId);
+    if (pendingLeft) return;
+  }
   const closedAt = Date.now();
   await db.update(cascadeZonesTable)
     .set({ status: "CLOSED", closedAt, manualClose: true })
@@ -3776,23 +3853,23 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
       } else if (z.status === "CLOSED" && z.closedPnl == null) {
         void settleZoneClosedPnl(accountId, z.zoneId);
       }
-      const openPositions = await db.select().from(zonePositionsTable)
-        .where(and(eq(zonePositionsTable.zoneId, row.zoneId), eq(zonePositionsTable.status, "OPEN")));
-      const finalTpReached = computeFinalTpReached({
-        tp1Enabled: (row as { tp1Enabled?: boolean }).tp1Enabled ?? (Number(row.tp1Pct ?? 25) > 0),
-        tp2Enabled: (row as { tp2Enabled?: boolean }).tp2Enabled ?? (Number(row.tp2Pct ?? 25) > 0),
-        tp3Enabled: (row as { tp3Enabled?: boolean }).tp3Enabled ?? (Number(row.tp3Pct ?? 25) > 0),
-        tp4Enabled: (row as { tp4Enabled?: boolean }).tp4Enabled ?? (Number(row.tp4Pct ?? 25) > 0),
-        tp1Hit: row.tp1Hit, tp2Hit: row.tp2Hit, tp3Hit: row.tp3Hit, tp4Hit: row.tp4Hit ?? false,
-      });
       const tp1Enabled = (row as { tp1Enabled?: boolean }).tp1Enabled ?? (Number(row.tp1Pct ?? 25) > 0);
       const tp2Enabled = (row as { tp2Enabled?: boolean }).tp2Enabled ?? (Number(row.tp2Pct ?? 25) > 0);
       const tp3Enabled = (row as { tp3Enabled?: boolean }).tp3Enabled ?? (Number(row.tp3Pct ?? 25) > 0);
       const tp4Enabled = (row as { tp4Enabled?: boolean }).tp4Enabled ?? (Number(row.tp4Pct ?? 25) > 0);
+      const mergedHits = await mergeZoneHitsFromPositions(row.zoneId, {
+        tp1Hit: row.tp1Hit, tp2Hit: row.tp2Hit, tp3Hit: row.tp3Hit, tp4Hit: row.tp4Hit ?? false,
+        tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+      });
+      const positionCount = mergedHits.positionCount;
+      const finalTpReached = computeFinalTpReached({
+        tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+        tp1Hit: mergedHits.tp1Hit, tp2Hit: mergedHits.tp2Hit, tp3Hit: mergedHits.tp3Hit, tp4Hit: mergedHits.tp4Hit,
+      });
       const enabledTpCount = countEnabledTps({ tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled });
       const hitEnabledTpCount = countHitEnabledTps({
         tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
-        tp1Hit: row.tp1Hit, tp2Hit: row.tp2Hit, tp3Hit: row.tp3Hit, tp4Hit: row.tp4Hit ?? false,
+        tp1Hit: mergedHits.tp1Hit, tp2Hit: mergedHits.tp2Hit, tp3Hit: mergedHits.tp3Hit, tp4Hit: mergedHits.tp4Hit,
       });
 
       const dir = row.direction === "sell" ? "sell" : "buy";
@@ -3805,10 +3882,10 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
       const tp4Price = row.tp4Price != null ? Number(row.tp4Price) : null;
 
       let nextTp: 0 | 1 | 2 | 3 | 4 = 0;
-      if (tp1Enabled && !row.tp1Hit) nextTp = 1;
-      else if (tp2Enabled && !row.tp2Hit) nextTp = 2;
-      else if (tp3Enabled && !row.tp3Hit) nextTp = 3;
-      else if (tp4Enabled && !row.tp4Hit && tp4Price != null) nextTp = 4;
+      if (tp1Enabled && !mergedHits.tp1Hit) nextTp = 1;
+      else if (tp2Enabled && !mergedHits.tp2Hit) nextTp = 2;
+      else if (tp3Enabled && !mergedHits.tp3Hit) nextTp = 3;
+      else if (tp4Enabled && !mergedHits.tp4Hit && tp4Price != null) nextTp = 4;
 
       let currentPrice: number | null = null;
       let nextTpPrice: number | null = null;
@@ -3839,7 +3916,7 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         direction: row.direction,
         anchorPrice: anchor,
         tp1Price, tp2Price, tp3Price, tp4Price,
-        tp1Hit: row.tp1Hit, tp2Hit: row.tp2Hit, tp3Hit: row.tp3Hit, tp4Hit: row.tp4Hit ?? false,
+        tp1Hit: mergedHits.tp1Hit, tp2Hit: mergedHits.tp2Hit, tp3Hit: mergedHits.tp3Hit, tp4Hit: mergedHits.tp4Hit,
         tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
         enabledTpCount, hitEnabledTpCount,
         tp2SlIsBestEffort: (row as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
@@ -3855,10 +3932,10 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
           manualClose: row.manualClose,
           finalTpReached,
           tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
-          tp1Hit: row.tp1Hit, tp2Hit: row.tp2Hit, tp3Hit: row.tp3Hit, tp4Hit: row.tp4Hit ?? false,
+          tp1Hit: mergedHits.tp1Hit, tp2Hit: mergedHits.tp2Hit, tp3Hit: mergedHits.tp3Hit, tp4Hit: mergedHits.tp4Hit,
         }),
         ...resolveCloseOutcome(row),
-        positionCount: openPositions.length,
+        positionCount,
         originalVolume: row.originalVolume != null ? Number(row.originalVolume) : 0,
         currentPrice,
         nextTp,
@@ -3944,9 +4021,21 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       });
       return;
     }
+    for (const r of closeResults) {
+      if (!r.ok) continue;
+      await db.update(zonePositionsTable)
+        .set({ status: "CLOSED" })
+        .where(and(
+          eq(zonePositionsTable.zoneId, zoneId),
+          eq(zonePositionsTable.positionId, r.id),
+        ))
+        .catch((e: Error) => console.warn(`[zone ${zoneId}] risk-free mark closed ${r.id}:`, e.message));
+      st.trackedPositions.delete(r.id);
+    }
     await db.update(cascadeZonesTable).set({ status: "RISK_FREE" }).where(eq(cascadeZonesTable.zoneId, zoneId));
     st.status = "RISK_FREE";
     broadcastZoneUpdate(zoneId);
+    broadcastToAccount(accountId, "deal", { type: "position_changed" });
     console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl} (pips=${pips})`);
     res.json({ ok: true, bestPositionId: best.id, sl, pips, closedCount: others.length });
   } catch (err) {
@@ -4151,11 +4240,13 @@ router.post("/mt5/account/:accountId/zones/:zoneId/cancel-pending", checkOwner, 
       if (zid === zoneId) pendingAfter++;
     }
     const cancelledCount = Math.max(0, pendingBefore - pendingAfter);
-    await closeArmedZoneIfDisarmed(accountId, zoneId, token, region);
+    await closeArmedZoneIfDisarmed(accountId, zoneId, token, region, { force: true });
     broadcastToAccount(accountId, "pending_order", {});
     broadcastZoneUpdate(zoneId);
+    const closed = (await db.select({ status: cascadeZonesTable.status }).from(cascadeZonesTable)
+      .where(eq(cascadeZonesTable.zoneId, zoneId)).limit(1))[0];
     console.log(`[zone ${zoneId}] cancel-pending: user-initiated, cancelled=${cancelledCount}/${pendingBefore}`);
-    res.json({ ok: true, cancelledCount, zoneClosed: (await loadZone(zoneId))?.status === "CLOSED" });
+    res.json({ ok: true, cancelledCount, zoneClosed: closed?.status === "CLOSED" });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }

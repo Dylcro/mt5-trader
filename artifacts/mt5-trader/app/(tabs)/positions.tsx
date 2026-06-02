@@ -241,7 +241,11 @@ function PendingOrderCard({ order, onCancel }: { order: PendingOrder; onCancel: 
 export default function PositionsScreen() {
   const insets = useSafeAreaInsets();
   const { formatMoney } = useDisplayCurrency();
-  const { positions, pendingOrders, status, refreshPositions, refreshPendingOrders, closePosition, cancelOrder, accountId, sseConnected, price, syncSession } = useTrading();
+  const {
+    positions, pendingOrders, status, accountInfo,
+    refreshPositions, refreshPendingOrders, refreshAccountInfo,
+    closePosition, cancelOrder, accountId, sseConnected, price, syncSession,
+  } = useTrading();
   const { zones, refresh: refreshZones, riskFree, closeZone, cancelZoneOrders } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000, sseConnected });
   const { settings: cs } = useCascadeSettings();
   const displayActiveZones = useMemo(
@@ -288,9 +292,11 @@ export default function PositionsScreen() {
 
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
-    await Promise.all([refreshZones(), refreshPositions(), refreshPendingOrders()]);
+    await Promise.all([
+      refreshZones(), refreshPositions(), refreshPendingOrders(), refreshAccountInfo(),
+    ]);
     setRefreshing(false);
-  }, [refreshZones, refreshPositions, refreshPendingOrders]);
+  }, [refreshZones, refreshPositions, refreshPendingOrders, refreshAccountInfo]);
 
   useEffect(() => {
     if (!accountId) return;
@@ -310,11 +316,12 @@ export default function PositionsScreen() {
         refreshZones(),
         refreshPositions(),
         refreshPendingOrders(),
+        refreshAccountInfo(),
       ]);
       sync();
       const id = setInterval(sync, 4_000);
       return () => clearInterval(id);
-    }, [status, accountId, syncSession, refreshZones, refreshPositions, refreshPendingOrders]),
+    }, [status, accountId, syncSession, refreshZones, refreshPositions, refreshPendingOrders, refreshAccountInfo]),
   );
 
   const handleCancelOrder = useCallback(
@@ -364,7 +371,10 @@ export default function PositionsScreen() {
     setCancellingAll(false);
   }, [cancellingAll, orphanPendingOrders, cancelOrder]);
 
-  const totalPL = positions.reduce((sum, p) => sum + p.profit, 0);
+  const totalPL =
+    accountInfo != null
+      ? accountInfo.equity - accountInfo.balance
+      : positions.reduce((sum, p) => sum + p.profit, 0);
   const webTopPad = Platform.OS === "web" ? 67 : 0;
   const showStandalone = standalonePositions.length > 0;
   const hasAnything =
@@ -387,7 +397,7 @@ export default function PositionsScreen() {
           <View>
             <Text style={styles.plBannerLabel}>TOTAL FLOATING P&L</Text>
             <Text style={styles.plBannerSub}>
-              {positions.length} position{positions.length === 1 ? "" : "s"} open
+              {accountInfo != null ? "Account floating" : `${positions.length} position${positions.length === 1 ? "" : "s"} open`}
               {displayActiveZones.length > 0
                 ? ` · ${displayActiveZones.length} zone${displayActiveZones.length === 1 ? "" : "s"}`
                 : ""}

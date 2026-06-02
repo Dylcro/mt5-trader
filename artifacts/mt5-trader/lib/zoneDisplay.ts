@@ -34,6 +34,25 @@ function buildTpPricesFromSettings(
   };
 }
 
+/** Recompute TP tally from per-level hit flags (SSE payloads may omit counts). */
+export function enrichZoneDisplayFields(zone: Zone): Zone {
+  const tp1Enabled = zone.tp1Enabled !== false;
+  const tp2Enabled = zone.tp2Enabled !== false;
+  const tp3Enabled = zone.tp3Enabled !== false;
+  const tp4Enabled = zone.tp4Enabled !== false;
+  const enabledTpCount = [tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled].filter(Boolean).length;
+  let hit = 0;
+  if (tp1Enabled && zone.tp1Hit) hit++;
+  if (tp2Enabled && zone.tp2Hit) hit++;
+  if (tp3Enabled && zone.tp3Hit) hit++;
+  if (tp4Enabled && zone.tp4Hit) hit++;
+  return {
+    ...zone,
+    enabledTpCount: zone.enabledTpCount ?? enabledTpCount,
+    hitEnabledTpCount: zone.hitEnabledTpCount ?? hit,
+  };
+}
+
 /** Client-side progress when the zones API omits live fields. */
 export function enrichZoneLiveFields(zone: Zone, price: Price | null): Zone {
   if (zone.status === "CLOSED" || zone.status === "ARMED" || !price || zone.anchorPrice <= 0) return zone;
@@ -124,6 +143,9 @@ export function buildDisplayActiveZones(
   cs: CascadeSettings,
   price: Price | null,
 ): Zone[] {
+  const closedIds = new Set(
+    apiZones.filter((z) => z.status === "CLOSED").map((z) => z.zoneId),
+  );
   const active = apiZones.filter((z) => z.status === "OPEN" || z.status === "RISK_FREE" || z.status === "ARMED");
   const byComment = groupPositionsByZoneId(positions);
   const seen = new Set<string>();
@@ -132,17 +154,17 @@ export function buildDisplayActiveZones(
   for (const z of active) {
     seen.add(z.zoneId);
     const linked = byComment.get(z.zoneId) ?? [];
-    const merged: Zone = {
+    const merged: Zone = enrichZoneDisplayFields({
       ...z,
-      positionCount: Math.max(z.positionCount, linked.length),
-    };
+      positionCount: linked.length > 0 ? linked.length : z.positionCount,
+    });
     out.push(enrichZoneLiveFields(merged, price));
   }
 
   for (const [zoneId, linked] of byComment) {
-    if (seen.has(zoneId)) continue;
+    if (seen.has(zoneId) || closedIds.has(zoneId)) continue;
     const syn = syntheticZoneFromPositions(zoneId, linked, cs);
-    if (syn) out.push(enrichZoneLiveFields(syn, price));
+    if (syn) out.push(enrichZoneLiveFields(enrichZoneDisplayFields(syn), price));
   }
 
   return out;
