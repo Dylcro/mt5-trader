@@ -107,6 +107,8 @@ interface TradingContextValue {
   pendingOrders: PendingOrder[];
   price: Price | null;
   priceError: boolean;
+  /** True when bid/ask have not updated recently (session asleep / SSE dropped). */
+  priceStale: boolean;
   cascadeNotification: CascadeNotification | null;
   clearCascadeNotification: () => void;
   connect: (creds?: Mt5Credentials) => Promise<void>;
@@ -242,8 +244,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const [pendingOrders, setPendingOrders] = useState<PendingOrder[]>([]);
   const [price, setPrice] = useState<Price | null>(null);
   const [priceError, setPriceError] = useState(false);
+  const [priceStale, setPriceStale] = useState(true);
   const [sseConnected, setSseConnected] = useState(false);
-  const [connectionWarm, setConnectionWarm] = useState(true);
+  const [connectionWarm, setConnectionWarm] = useState(false);
+
+  /** No price tick for this long → show Tap to sync (not Ready to trade). */
+  const PRICE_STALE_MS = 12_000;
+  const lastPriceAtRef = useRef(0);
 
   const [cascadeNotification, setCascadeNotification] = useState<CascadeNotification | null>(null);
 
@@ -261,6 +268,31 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const prevStatusRef = useRef<ConnectionStatus>(status);
   useEffect(() => { connectionWarmRef.current = connectionWarm; }, [connectionWarm]);
   useEffect(() => { priceRef.current = price; }, [price]);
+
+  const applyLivePrice = useCallback((p: Price) => {
+    lastPriceAtRef.current = Date.now();
+    setPriceStale(false);
+    priceRef.current = p;
+    setPrice(p);
+  }, []);
+
+  // Mark quotes stale when ticks stop (app backgrounded, SSE dropped, MetaAPI idle).
+  useEffect(() => {
+    if (status !== "connected") {
+      setPriceStale(false);
+      return;
+    }
+    const id = setInterval(() => {
+      if (!priceRef.current || lastPriceAtRef.current === 0) {
+        setPriceStale(true);
+        return;
+      }
+      const stale = Date.now() - lastPriceAtRef.current > PRICE_STALE_MS;
+      setPriceStale(stale);
+      if (stale) setConnectionWarm(false);
+    }, 2_000);
+    return () => clearInterval(id);
+  }, [status]);
 
   // Keeps current region readable from the SSE closure without adding region
   // to the SSE effect's dependency array (which would reconnect on region change).
@@ -512,7 +544,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
       const pollPrice = () =>
         fetchPriceData(accId, accRegion)
-          .then((p) => { priceFailCountRef.current = 0; setPriceError(false); setPrice(p); })
+          .then((p) => { priceFailCountRef.current = 0; setPriceError(false); applyLivePrice(p); })
           .catch(() => {
             priceFailCountRef.current += 1;
             if (priceFailCountRef.current >= 3) setPriceError(true);
@@ -552,7 +584,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       positionsIntervalRef.current = null;
       eventsIntervalRef.current = setInterval(pollEvents, 5000);
     },
-    [fetchPriceData, fetchPositionsData, fetchPendingOrdersData, fetchAccountInfoData]
+    [fetchPriceData, fetchPositionsData, fetchPendingOrdersData, fetchAccountInfoData, applyLivePrice]
   );
 
   // Keep the ref in sync so pollUntilConnected (declared before startPolling) can access it
@@ -575,7 +607,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       await authFetch(`${API_BASE}/mt5/account/${accountId}/status?region=${r}`);
       await Promise.all([
         fetchPriceData(accountId, r).then((p) => {
-          setPrice(p);
+          applyLivePrice(p);
           priceFailCountRef.current = 0;
           setPriceError(false);
         }).catch(() => {}),
@@ -586,9 +618,14 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     } catch {
       // Trade path will auto-retry if still stale.
     } finally {
-      setConnectionWarm(true);
+      const fresh =
+        priceRef.current != null &&
+        lastPriceAtRef.current > 0 &&
+        Date.now() - lastPriceAtRef.current <= PRICE_STALE_MS;
+      setConnectionWarm(fresh);
+      if (!fresh) setPriceStale(true);
     }
-  }, [accountId, status, fetchPriceData, fetchPositionsData, fetchPendingOrdersData, fetchAccountInfoData]);
+  }, [accountId, status, fetchPriceData, fetchPositionsData, fetchPendingOrdersData, fetchAccountInfoData, applyLivePrice]);
 
   const wakeConnectionRef = useRef<() => void>(() => {});
   wakeConnectionRef.current = () => { void wakeConnection(); };
@@ -652,7 +689,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         wakeConnectionRef.current();
         startHeartbeat();
       }
-      if (next.match(/inactive|background/)) stopHeartbeat();
+      if (next.match(/inactive|background/)) {
+        stopHeartbeat();
+        setConnectionWarm(false);
+        setPriceStale(true);
+      }
     };
     const sub = AppState.addEventListener("change", onChange);
     if (AppState.currentState === "active") startHeartbeat();
@@ -689,7 +730,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       const a = accountId;
       priceIntervalRef.current = setInterval(() => {
         fetchPriceData(a, r)
-          .then(p => { priceFailCountRef.current = 0; setPriceError(false); setPrice(p); })
+          .then(p => { priceFailCountRef.current = 0; setPriceError(false); applyLivePrice(p); })
           .catch(() => { priceFailCountRef.current += 1; if (priceFailCountRef.current >= 3) setPriceError(true); });
       }, 4_000);
       positionsIntervalRef.current = setInterval(() => {
@@ -765,7 +806,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
                       const bid = Number(data.bid ?? 0);
                       const ask = Number(data.ask ?? 0);
                       if (bid > 0 && ask > 0) {
-                        setPrice({ bid, ask, spread: Math.round((ask - bid) * 10), time: new Date().toISOString() });
+                        applyLivePrice({ bid, ask, spread: Math.round((ask - bid) * 10), time: new Date().toISOString() });
                         priceFailCountRef.current = 0;
                         setPriceError(false);
                         setConnectionWarm(true);
@@ -796,6 +837,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
         // SSE dropped — update connection state and arm the 12 s grace timer.
         setSseConnected(false);
+        setConnectionWarm(false);
         if (sseDroppedAt === null) sseDroppedAt = Date.now();
         if (Date.now() - sseDroppedAt >= 12_000) startFallbackPolling();
 
@@ -929,6 +971,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     setPositions([]);
     setPendingOrders([]);
     setPrice(null);
+    lastPriceAtRef.current = 0;
+    setPriceStale(true);
+    setConnectionWarm(false);
     setErrorMsg("");
   }, [accountId, stopPolling]);
 
@@ -973,11 +1018,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const refreshPrice = useCallback(async () => {
     if (status !== "connected" || !accountId) return;
     try {
-      setPrice(await fetchPriceData(accountId, region));
+      applyLivePrice(await fetchPriceData(accountId, region));
       priceFailCountRef.current = 0;
       setPriceError(false);
     } catch {}
-  }, [status, accountId, region, fetchPriceData]);
+  }, [status, accountId, region, fetchPriceData, applyLivePrice]);
 
   const refreshPositions = useCallback(async () => {
     if (status !== "connected" || !accountId) return;
@@ -1334,6 +1379,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         pendingOrders,
         price,
         priceError,
+        priceStale,
         cascadeNotification,
         clearCascadeNotification,
         connect,

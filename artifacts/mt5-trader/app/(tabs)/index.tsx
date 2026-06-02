@@ -39,6 +39,7 @@ function resolveSyncUi(
   connectionWarm: boolean,
   hasPrice: boolean,
   priceError: boolean,
+  priceStale: boolean,
 ): { variant: SyncUiVariant; actionLabel: string; statusLabel: string } {
   if (status === "disconnected") {
     return { variant: "connect", actionLabel: "Connect MT5", statusLabel: "OFFLINE" };
@@ -52,7 +53,7 @@ function resolveSyncUi(
   if (status === "connected" && !hasPrice) {
     return { variant: "wait", actionLabel: "Syncing…", statusLabel: "FETCHING" };
   }
-  if (priceError) {
+  if (priceError || priceStale) {
     return { variant: "sync", actionLabel: "Tap to sync", statusLabel: "STALE" };
   }
   if (syncReady) {
@@ -316,15 +317,16 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { status, price, priceError, accountInfo, placeTrade, placeCascadeOrders, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, connectionWarm, syncSession } = useTrading();
+  const { status, price, priceError, priceStale, accountInfo, placeTrade, placeCascadeOrders, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, connectionWarm, syncSession } = useTrading();
 
   const syncReady =
     status === "connected" &&
     connectionWarm &&
     price != null &&
-    !priceError;
+    !priceError &&
+    !priceStale;
 
-  const syncUi = resolveSyncUi(status, syncReady, connectionWarm, price != null, priceError);
+  const syncUi = resolveSyncUi(status, syncReady, connectionWarm, price != null, priceError, priceStale);
 
   const handleHeaderSync = useCallback(() => {
     if (status === "disconnected") void connect();
@@ -436,8 +438,8 @@ export default function TradeScreen() {
   useFocusEffect(
     useCallback(() => {
       if (status !== "connected") return;
-      void syncSession();
-      const id = setInterval(() => void syncSession(), 10_000);
+      void syncSession(true);
+      const id = setInterval(() => void syncSession(true), 10_000);
       return () => clearInterval(id);
     }, [status, syncSession]),
   );
@@ -860,7 +862,7 @@ export default function TradeScreen() {
 
         {/* BUY / SELL — always visible, above mode toggle */}
         {(() => {
-          const tradeBlocked = status !== "connected" || !price;
+          const tradeBlocked = !syncReady;
           return (
             <View style={styles.cascadeExecRow}>
               <Pressable
@@ -944,7 +946,7 @@ export default function TradeScreen() {
         )}
         {status === "connected" && !syncReady && (
           <Text style={styles.cascadeStatusHint}>
-            After a break, use Tap to sync (top right) — turns green when Ready to trade
+            Live quotes paused — tap Sync (top right) or wait a few seconds for prices to move
           </Text>
         )}
         {status !== "connected" && status !== "connecting" && (
