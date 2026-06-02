@@ -1,6 +1,31 @@
-import type { DisplayCurrency } from "@/lib/displayCurrency";
+import { currencySymbol, type DisplayCurrency } from "@/lib/displayCurrency";
 
 const PIP = 0.1;
+const MONEY_LOCALE = "en-GB";
+
+function safeCurrencyFormat(
+  n: number,
+  currency: DisplayCurrency,
+  decimals: number,
+): string {
+  const abs = Math.abs(n);
+  if (!Number.isFinite(abs)) return "—";
+  try {
+    return new Intl.NumberFormat(MONEY_LOCALE, {
+      style: "currency",
+      currency,
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals,
+    }).format(abs);
+  } catch {
+    const sym = currencySymbol(currency);
+    const text = abs.toLocaleString(MONEY_LOCALE, {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals,
+    });
+    return `${sym}${text}`;
+  }
+}
 
 export function formatPrice(n: number): string {
   return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -12,13 +37,8 @@ export function formatMoney(
 ): string {
   const currency = opts?.currency ?? "USD";
   const decimals = opts?.decimals ?? 2;
-  const formatter = new Intl.NumberFormat(undefined, {
-    style: "currency",
-    currency,
-    minimumFractionDigits: decimals,
-    maximumFractionDigits: decimals,
-  });
-  const formatted = formatter.format(Math.abs(n));
+  if (!Number.isFinite(n)) return "—";
+  const formatted = safeCurrencyFormat(n, currency, decimals);
   if (opts?.signed) {
     if (n >= 0) return `+${formatted}`;
     return `-${formatted}`;
@@ -28,21 +48,27 @@ export function formatMoney(
 }
 
 export function formatCompactMoney(n: number, currency: DisplayCurrency = "USD"): string {
+  if (!Number.isFinite(n)) return "—";
   const abs = Math.abs(n);
   const sign = n >= 0 ? "+" : "-";
   if (abs >= 1000) {
     const k = abs / 1000;
-    const parts = new Intl.NumberFormat(undefined, {
-      style: "currency",
-      currency,
-      maximumFractionDigits: 1,
-    }).formatToParts(k);
-    const compact = parts
-      .map((p) => (p.type === "integer" || p.type === "decimal" || p.type === "fraction"
-        ? `${p.value}k`
-        : p.value))
-      .join("");
-    return `${sign}${compact}`;
+    try {
+      const parts = new Intl.NumberFormat(MONEY_LOCALE, {
+        style: "currency",
+        currency,
+        maximumFractionDigits: 1,
+      }).formatToParts(k);
+      const compact = parts
+        .map((p) => (p.type === "integer" || p.type === "decimal" || p.type === "fraction"
+          ? `${p.value}k`
+          : p.value))
+        .join("");
+      return `${sign}${compact}`;
+    } catch {
+      const sym = currencySymbol(currency);
+      return `${sign}${sym}${(k).toLocaleString(MONEY_LOCALE, { maximumFractionDigits: 1 })}k`;
+    }
   }
   return formatMoney(n, { signed: true, decimals: abs >= 100 ? 0 : 2, currency });
 }
