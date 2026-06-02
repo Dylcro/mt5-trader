@@ -14,6 +14,10 @@ import {
   computeFinalTpReached,
   dealIndicatesStopLoss,
   resolveCloseOutcome,
+  inferCloseOutcomeFromExitPrice,
+  exitPriceBeyondTp3,
+  exitPriceBeforeTp1,
+  isManualTp4Zone,
   countEnabledTps,
   countHitEnabledTps,
   tpDisplayState,
@@ -571,12 +575,12 @@ describe("disabled TP history", () => {
     expect(dealIndicatesStopLoss({ reason: "CLIENT" })).toBe(false);
   });
 
-  it("resolveCloseOutcome backfills manual close when TP4 not done", () => {
+  it("resolveCloseOutcome respects persisted flags", () => {
     expect(resolveCloseOutcome({
       status: "CLOSED",
       tp4Enabled: true,
       tp4Hit: false,
-      manualClose: false,
+      manualClose: true,
       slHit: false,
     })).toEqual({ manualClose: true, slHit: false });
     expect(resolveCloseOutcome({
@@ -593,6 +597,35 @@ describe("disabled TP history", () => {
       manualClose: false,
       slHit: true,
     })).toEqual({ manualClose: false, slHit: true });
+  });
+
+  it("inferCloseOutcomeFromExitPrice: manual TP4 close above TP3 is tp4Hit not manual", () => {
+    const zone = {
+      direction: "buy" as const,
+      tp1Price: 2600,
+      tp3Price: 2650,
+      tp4Price: null,
+      tp4Enabled: true,
+      tp4Hit: false,
+    };
+    expect(isManualTp4Zone(zone.tp4Price, zone.tp4Enabled)).toBe(true);
+    expect(exitPriceBeyondTp3("buy", 2660, 2650)).toBe(true);
+    expect(inferCloseOutcomeFromExitPrice(zone, 2660)).toEqual({ tp4Hit: true, manualClose: false });
+    expect(inferCloseOutcomeFromExitPrice(zone, 2590)).toEqual({ tp4Hit: false, manualClose: true });
+    expect(inferCloseOutcomeFromExitPrice(zone, 2630)).toEqual({ tp4Hit: false, manualClose: false });
+  });
+
+  it("inferCloseOutcomeFromExitPrice: sell zone mirrors buy", () => {
+    const zone = {
+      direction: "sell" as const,
+      tp1Price: 2700,
+      tp3Price: 2650,
+      tp4Price: null,
+      tp4Enabled: true,
+    };
+    expect(exitPriceBeforeTp1("sell", 2710, 2700)).toBe(true);
+    expect(inferCloseOutcomeFromExitPrice(zone, 2640)).toEqual({ tp4Hit: true, manualClose: false });
+    expect(inferCloseOutcomeFromExitPrice(zone, 2710)).toEqual({ tp4Hit: false, manualClose: true });
   });
 
   it("hit/enabled counts use only enabled TPs as denominator", () => {

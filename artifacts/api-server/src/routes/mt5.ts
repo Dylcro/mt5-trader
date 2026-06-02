@@ -1745,7 +1745,67 @@ export function dealIndicatesStopLoss(deal: unknown): boolean {
   return comment.includes("STOP LOSS") || comment.includes("[SL");
 }
 
-type CloseFinalizeOpts = { userInitiated?: boolean; stopLossExit?: boolean };
+type CloseFinalizeOpts = { userInitiated?: boolean; stopLossExit?: boolean; exitPrice?: number };
+
+export function exitPriceFromDeal(deal: unknown): number | null {
+  if (!deal || typeof deal !== "object") return null;
+  const d = deal as Record<string, unknown>;
+  const p = Number(d.price ?? d.openPrice ?? 0);
+  return Number.isFinite(p) && p > 0 ? p : null;
+}
+
+/** TP4 left manual in MT5 (tp4 pips = 0 → no tp4Price on the zone). */
+export function isManualTp4Zone(tp4Price: number | null | undefined, tp4Enabled: boolean): boolean {
+  return Boolean(tp4Enabled) && (tp4Price == null || !(tp4Price > 0));
+}
+
+/** Exit at/above TP3 region (manual TP4 leg) for buy; at/below for sell. */
+export function exitPriceBeyondTp3(
+  direction: "buy" | "sell",
+  exitPrice: number,
+  tp3Price: number | null,
+): boolean {
+  if (tp3Price == null || !(tp3Price > 0) || !(exitPrice > 0)) return false;
+  return direction === "buy" ? exitPrice >= tp3Price : exitPrice <= tp3Price;
+}
+
+/** Early bailout in MT5 before TP1. */
+export function exitPriceBeforeTp1(
+  direction: "buy" | "sell",
+  exitPrice: number,
+  tp1Price: number | null,
+): boolean {
+  if (tp1Price == null || !(tp1Price > 0) || !(exitPrice > 0)) return false;
+  return direction === "buy" ? exitPrice < tp1Price : exitPrice > tp1Price;
+}
+
+/** Classify MT5/app full close from exit price (XAUUSD only). */
+export function inferCloseOutcomeFromExitPrice(
+  zone: {
+    direction: "buy" | "sell";
+    tp1Price: number | null;
+    tp3Price: number | null;
+    tp4Price: number | null;
+    tp4Enabled: boolean;
+    tp4Hit?: boolean;
+  },
+  exitPrice: number | null | undefined,
+): { tp4Hit: boolean; manualClose: boolean } {
+  if (exitPrice == null || !(exitPrice > 0)) {
+    const tp4Done = Boolean(zone.tp4Enabled) && Boolean(zone.tp4Hit);
+    return { tp4Hit: tp4Done, manualClose: !tp4Done };
+  }
+  if (exitPriceBeforeTp1(zone.direction, exitPrice, zone.tp1Price)) {
+    return { tp4Hit: false, manualClose: true };
+  }
+  if (isManualTp4Zone(zone.tp4Price, zone.tp4Enabled) && exitPriceBeyondTp3(zone.direction, exitPrice, zone.tp3Price)) {
+    return { tp4Hit: true, manualClose: false };
+  }
+  if (zone.tp4Price != null && zone.tp4Price > 0 && exitPriceBeyondTp3(zone.direction, exitPrice, zone.tp4Price)) {
+    return { tp4Hit: true, manualClose: false };
+  }
+  return { tp4Hit: Boolean(zone.tp4Hit), manualClose: false };
+}
 
 /** Resolve close outcome for API/history (backfills legacy CLOSED rows missing flags). */
 export function resolveCloseOutcome(row: {
@@ -1755,10 +1815,11 @@ export function resolveCloseOutcome(row: {
   manualClose?: boolean;
   slHit?: boolean;
 }): { manualClose: boolean; slHit: boolean } {
-  if (row.manualClose || row.slHit) {
-    return { manualClose: Boolean(row.manualClose), slHit: Boolean(row.slHit) };
-  }
+  if (row.slHit) return { manualClose: false, slHit: true };
   if (row.status !== "CLOSED") return { manualClose: false, slHit: false };
+  if (row.manualClose != null) {
+    return { manualClose: Boolean(row.manualClose), slHit: false };
+  }
   const tp4Done = Boolean(row.tp4Enabled) && Boolean(row.tp4Hit);
   return { manualClose: !tp4Done, slHit: false };
 }
@@ -1776,31 +1837,56 @@ async function finalizeZoneClose(
     if (!row || row.status !== "CLOSED") return;
 
     let slHit = Boolean(opts.stopLossExit);
-    let manualClose = Boolean(opts.userInitiated);
-    const tp4Done = Boolean(row.tp4Enabled) && Boolean(row.tp4Hit);
+    let tp4Hit = Boolean(row.tp4Hit);
+    let manualClose = false;
 
-    if (!slHit && !manualClose) {
-      if (tp4Done) {
-        manualClose = false;
-      } else {
-        // Closed without TP4 automation — treat as manual exit (app or MT5).
-        manualClose = true;
-      }
+    if (slHit) {
+      manualClose = false;
+    } else if (opts.exitPrice != null && opts.exitPrice > 0) {
+      const inferred = inferCloseOutcomeFromExitPrice(
+        {
+          direction: row.direction as "buy" | "sell",
+          tp1Price: row.tp1Price,
+          tp3Price: row.tp3Price,
+          tp4Price: row.tp4Price,
+          tp4Enabled: Boolean(row.tp4Enabled),
+          tp4Hit,
+        },
+        opts.exitPrice,
+      );
+      tp4Hit = inferred.tp4Hit || tp4Hit;
+      manualClose = inferred.manualClose;
+    } else if (opts.userInitiated) {
+      manualClose = true;
+    } else {
+      const tp4Done = Boolean(row.tp4Enabled) && tp4Hit;
+      manualClose = !tp4Done;
     }
-    if (slHit) manualClose = false;
 
     await db.update(cascadeZonesTable)
-      .set({ slHit, manualClose })
+      .set({ slHit, manualClose, tp4Hit })
       .where(eq(cascadeZonesTable.zoneId, zoneId));
     const st = zoneStates.get(zoneId);
     if (st) {
+      st.tp4Hit = tp4Hit;
       (st as ZoneState & { slHit?: boolean; manualClose?: boolean }).slHit = slHit;
       (st as ZoneState & { manualClose?: boolean }).manualClose = manualClose;
     }
-    console.log(`[zone ${zoneId}] close outcome sl=${slHit} manual=${manualClose}`);
+    console.log(`[zone ${zoneId}] close outcome sl=${slHit} manual=${manualClose} tp4Hit=${tp4Hit} exit=${opts.exitPrice ?? "n/a"}`);
   } catch (e) {
     console.warn(`[zone ${zoneId}] finalizeZoneClose failed:`, (e as Error).message);
   }
+}
+
+function exitPriceForZoneClose(
+  accountId: string,
+  direction: "buy" | "sell",
+  explicit?: number,
+): number | undefined {
+  if (explicit != null && explicit > 0) return explicit;
+  const px = latestPrice(accountId);
+  if (!px) return undefined;
+  return direction === "buy" ? px.bid : px.ask;
 }
 
 // ── Zone TP Engine ───────────────────────────────────────────────────────────
@@ -2382,8 +2468,11 @@ async function markZonePositionClosed(
         .where(eq(cascadeZonesTable.zoneId, zoneId))
       );
       if (st) st.status = "CLOSED";
+      const exitPx = exitPriceFromDeal(exitDeal);
+      const dir = (st?.direction ?? "buy") as "buy" | "sell";
       await finalizeZoneClose(accountId, zoneId, {
         stopLossExit: dealIndicatesStopLoss(exitDeal),
+        exitPrice: exitPx ?? exitPriceForZoneClose(accountId, dir),
       });
       void settleZoneClosedPnl(accountId, zoneId);
       logEvent("zone.close", { accountId, zoneId, trigger: "position.closed" });
@@ -2736,7 +2825,9 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
             .where(eq(cascadeZonesTable.zoneId, zoneId)),
         ).catch(() => {/* logged inside withDbRetry */});
         st.status = "CLOSED";
-        await finalizeZoneClose(st.accountId, zoneId, {});
+        await finalizeZoneClose(st.accountId, zoneId, {
+          exitPrice: exitPriceForZoneClose(st.accountId, st.direction),
+        });
         void settleZoneClosedPnl(st.accountId, zoneId);
         logEvent("zone.close", { accountId: st.accountId, zoneId, trigger: "empty_reconcile" });
         try {
@@ -2803,7 +2894,9 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
             .where(eq(cascadeZonesTable.zoneId, zoneId))
         ).catch(() => {/* logged inside withDbRetry */});
         st.status = "CLOSED";
-        await finalizeZoneClose(st.accountId, zoneId, {});
+        await finalizeZoneClose(st.accountId, zoneId, {
+          exitPrice: exitPriceForZoneClose(st.accountId, st.direction),
+        });
         void settleZoneClosedPnl(st.accountId, zoneId);
         logEvent("zone.close", { accountId: st.accountId, zoneId, trigger: "reconciliation" });
         // Cancel any outstanding cascade limit orders so they don't orphan on
@@ -3830,7 +3923,9 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
       .set({ status: "CLOSED", closedAt })
       .where(eq(cascadeZonesTable.zoneId, zoneId));
     if (st) st.status = "CLOSED";
-    await finalizeZoneClose(accountId, zoneId, { userInitiated: true });
+    await finalizeZoneClose(accountId, zoneId, {
+      exitPrice: exitPriceForZoneClose(accountId, st.direction),
+    });
     void settleZoneClosedPnl(accountId, zoneId);
     broadcastZoneUpdate(zoneId);
     logEvent("zone.close", { accountId, zoneId, closedCount: live.length, trigger: "user" });
