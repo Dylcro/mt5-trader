@@ -652,6 +652,7 @@ export default function TradeScreen() {
         autoBeAtTp: cs.autoBeAtTp,
       });
       if (result.success) {
+        setTriggerPriceText("");
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         showToast(result.message, "success", true);
         if (cs.takeProfitEnabled && cs.takeProfitPips > 0) {
@@ -1191,6 +1192,26 @@ export default function TradeScreen() {
                 <Text style={styles.sectionHint}>From Settings cascade</Text>
               </View>
               <StepInput value={cascadeLotSize} onChange={setCascadeLotSize} step={0.01} min={0.01} max={100} decimals={2} />
+              <Pressable
+                style={({ pressed }) => [
+                  styles.atPriceOkBtn,
+                  { marginTop: 14 },
+                  (!syncReady || !inferredAtPriceDir) && !isPlacing && { opacity: 0.5 },
+                  pressed && { opacity: 0.85 },
+                  isPlacing && { opacity: 0.6 },
+                ]}
+                onPress={() => void handleAtPriceArm()}
+                disabled={isPlacing || !syncReady || !inferredAtPriceDir}
+              >
+                {isPlacing ? (
+                  <ActivityIndicator color="#000" />
+                ) : (
+                  <>
+                    <Feather name="check" size={20} color="#000" />
+                    <Text style={styles.atPriceOkLabel}>OK — arm cascade</Text>
+                  </>
+                )}
+              </Pressable>
             </View>
 
             {atPriceLevels && inferredAtPriceDir && triggerPrice > 0 ? (
@@ -1212,26 +1233,6 @@ export default function TradeScreen() {
                 </Text>
               </View>
             )}
-
-            <Pressable
-              style={({ pressed }) => [
-                styles.atPriceOkBtn,
-                (!syncReady || !inferredAtPriceDir) && !isPlacing && { opacity: 0.5 },
-                pressed && { opacity: 0.85 },
-                isPlacing && { opacity: 0.6 },
-              ]}
-              onPress={() => void handleAtPriceArm()}
-              disabled={isPlacing || !syncReady || !inferredAtPriceDir}
-            >
-              {isPlacing ? (
-                <ActivityIndicator color="#000" />
-              ) : (
-                <>
-                  <Feather name="check" size={20} color="#000" />
-                  <Text style={styles.atPriceOkLabel}>OK — arm cascade</Text>
-                </>
-              )}
-            </Pressable>
 
             <Text style={styles.cascadeStatusHint}>
               Zone appears as ORDER NOT ACTIVE until the first order fills, then ACTIVE (same buttons as cascade).
@@ -1609,7 +1610,6 @@ const styles = StyleSheet.create({
     backgroundColor: C.gold,
     borderRadius: 14,
     paddingVertical: 16,
-    marginTop: 12,
   },
   atPriceOkLabel: { fontSize: 17, fontFamily: "Inter_700Bold", color: "#000", letterSpacing: 0.5 },
   cascadeExecLabel: { fontSize: 18, fontFamily: "Inter_700Bold", letterSpacing: 1.5 },
