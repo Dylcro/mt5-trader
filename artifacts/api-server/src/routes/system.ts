@@ -13,6 +13,7 @@ router.get("/status", (_req: Request, res: Response) => {
     trading_enabled: trading.trading_enabled,
     message: trading.message,
     signups_open: flags.signupsOpen,
+    invite_only: flags.inviteOnly,
     membership_cap: flags.membershipCap,
   });
 });

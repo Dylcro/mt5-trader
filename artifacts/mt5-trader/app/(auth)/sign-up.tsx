@@ -14,6 +14,7 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { useAuth } from "@/context/AuthContext";
+import { usePlatformStatus } from "@/hooks/usePlatformStatus";
 
 const GOLD = "#C9A84C";
 const BG = "#0A0A0F";
@@ -25,12 +26,14 @@ const RED = "#FF4757";
 
 export default function SignUpScreen() {
   const { isSignedIn, signUp } = useAuth();
+  const { status: platformStatus } = usePlatformStatus();
   const router = useRouter();
   const insets = useSafeAreaInsets();
 
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [inviteCode, setInviteCode] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -43,10 +46,18 @@ export default function SignUpScreen() {
     if (!fullName.trim() || fullName.trim().length < 2) { setError("Please enter your full name."); return; }
     if (!email.trim()) { setError("Please enter your email address."); return; }
     if (!password || password.length < 8) { setError("Password must be at least 8 characters."); return; }
+    if (platformStatus.invite_only && !inviteCode.trim()) {
+      setError("Enter the invite code you were given.");
+      return;
+    }
+    if (!platformStatus.signups_open) {
+      setError("New sign-ups are closed right now. Contact support.");
+      return;
+    }
 
     setLoading(true);
     setError("");
-    const result = await signUp(fullName.trim(), email.trim(), password);
+    const result = await signUp(fullName.trim(), email.trim(), password, inviteCode.trim() || undefined);
     setLoading(false);
 
     if (result.error) {
@@ -94,6 +105,21 @@ export default function SignUpScreen() {
             autoCorrect={false}
             returnKeyType="next"
           />
+
+          {platformStatus.invite_only ? (
+            <>
+              <Text style={styles.label}>Invite code</Text>
+              <TextInput
+                style={styles.input}
+                value={inviteCode}
+                onChangeText={setInviteCode}
+                placeholder="Required"
+                placeholderTextColor={MUTED}
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+            </>
+          ) : null}
 
           <Text style={styles.label}>Password</Text>
           <View style={styles.pwWrap}>

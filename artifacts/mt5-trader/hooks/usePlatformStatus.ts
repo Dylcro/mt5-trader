@@ -6,6 +6,7 @@ export type PlatformStatus = {
   trading_enabled: boolean;
   message: string;
   signups_open: boolean;
+  invite_only: boolean;
   membership_cap: number;
 };
 
@@ -13,6 +14,7 @@ const DEFAULT_STATUS: PlatformStatus = {
   trading_enabled: true,
   message: "",
   signups_open: true,
+  invite_only: false,
   membership_cap: 20,
 };
 

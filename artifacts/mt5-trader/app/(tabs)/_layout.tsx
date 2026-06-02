@@ -48,9 +48,8 @@ function TabChrome({
     if (res.error) throw new Error(res.error);
   }, [signIn]);
 
-  const onCreateAccount = useCallback(async (email: string, password: string) => {
-    const name = email.split("@")[0]?.trim() || "Trader";
-    const res = await signUp(name, email, password);
+  const onCreateAccount = useCallback(async (fullName: string, email: string, password: string, inviteCode?: string) => {
+    const res = await signUp(fullName, email, password, inviteCode);
     if (res.error) throw new Error(res.error);
   }, [signUp]);
 
@@ -262,9 +261,8 @@ function OnboardingOnly({ onComplete }: { onComplete: () => void }) {
     if (res.error) throw new Error(res.error);
   }, [signIn]);
 
-  const onCreateAccount = useCallback(async (email: string, password: string) => {
-    const name = email.split("@")[0]?.trim() || "Trader";
-    const res = await signUp(name, email, password);
+  const onCreateAccount = useCallback(async (fullName: string, email: string, password: string, inviteCode?: string) => {
+    const res = await signUp(fullName, email, password, inviteCode);
     if (res.error) throw new Error(res.error);
   }, [signUp]);
 

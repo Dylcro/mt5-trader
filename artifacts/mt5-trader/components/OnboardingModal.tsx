@@ -15,6 +15,7 @@ import {
   NativeScrollEvent,
 } from "react-native";
 import Colors from "../constants/colors";
+import { usePlatformStatus } from "../hooks/usePlatformStatus";
 
 const colors = Colors.dark;
 
@@ -27,7 +28,7 @@ type Props = {
     server: string;
   }) => Promise<void>;
   onSignIn?: (email: string, password: string) => Promise<void>;
-  onCreateAccount?: (email: string, password: string) => Promise<void>;
+  onCreateAccount?: (fullName: string, email: string, password: string, inviteCode?: string) => Promise<void>;
   termsUrl?: string;
 };
 
@@ -46,9 +47,12 @@ export default function OnboardingModal({
   const [scrolledToBottom, setScrolledToBottom] = useState(false);
   const [agreed, setAgreed] = useState(false);
 
+  const { status: platformStatus } = usePlatformStatus();
   const [authMode, setAuthMode] = useState<"create" | "signin">("create");
+  const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [inviteCode, setInviteCode] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
 
@@ -70,22 +74,47 @@ export default function OnboardingModal({
 
   const doAuth = async () => {
     setAuthError(null);
+    if (authMode === "create") {
+      if (!fullName.trim() || fullName.trim().length < 2) {
+        setAuthError("Enter your full name (at least 2 characters).");
+        return;
+      }
+      if (!platformStatus.signups_open) {
+        setAuthError("New sign-ups are closed right now. Try again later or contact support.");
+        return;
+      }
+      if (platformStatus.invite_only && !inviteCode.trim()) {
+        setAuthError("Enter the invite code you were given.");
+        return;
+      }
+    }
     if (!email.trim() || !password) {
       setAuthError("Enter your email and a password.");
+      return;
+    }
+    if (authMode === "create" && password.length < 8) {
+      setAuthError("Password must be at least 8 characters.");
       return;
     }
     setAuthBusy(true);
     try {
       if (authMode === "create") {
-        await onCreateAccount?.(email.trim(), password);
+        await onCreateAccount?.(
+          fullName.trim(),
+          email.trim(),
+          password,
+          inviteCode.trim() || undefined,
+        );
       } else {
         await onSignIn?.(email.trim(), password);
       }
       next();
     } catch (err: unknown) {
-      setAuthError(
-        humanError(err) ?? "Could not sign you in. Check your details and try again."
-      );
+      const fallback =
+        authMode === "create"
+          ? "Could not create your account. Check your details and try again."
+          : "Could not sign you in. Check your email and password.";
+      setAuthError(humanError(err) ?? fallback);
     } finally {
       setAuthBusy(false);
     }
@@ -187,9 +216,18 @@ export default function OnboardingModal({
               <SegBtn label="Create account" active={authMode === "create"} onPress={() => setAuthMode("create")} />
               <SegBtn label="Sign in" active={authMode === "signin"} onPress={() => setAuthMode("signin")} />
             </View>
+            {authMode === "create" && (
+              <Field label="Full name" value={fullName} onChangeText={setFullName} placeholder="Your name"
+                autoCapitalize="words" />
+            )}
             <Field label="Email" value={email} onChangeText={setEmail} placeholder="you@example.com"
               keyboardType="email-address" autoCapitalize="none" />
-            <Field label="Password" value={password} onChangeText={setPassword} placeholder="••••••••" secureTextEntry />
+            <Field label="Password" value={password} onChangeText={setPassword}
+              placeholder={authMode === "create" ? "At least 8 characters" : "••••••••"} secureTextEntry />
+            {authMode === "create" && platformStatus.invite_only && (
+              <Field label="Invite code" value={inviteCode} onChangeText={setInviteCode} placeholder="Required"
+                autoCapitalize="none" />
+            )}
             {authError && <Text style={s.error}>{authError}</Text>}
             <Pressable style={[s.primaryBtn, authBusy && s.btnBusy]} onPress={doAuth} disabled={authBusy}>
               {authBusy ? <ActivityIndicator color={colors.onDark} /> :
@@ -337,13 +375,18 @@ function SegBtn({ label, active, onPress }: { label: string; active: boolean; on
 }
 
 function humanError(err: unknown): string | null {
-  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
-  if (!msg) return null;
+  const raw = err instanceof Error ? err.message.trim() : String(err).trim();
+  if (!raw) return null;
+  const msg = raw.toLowerCase();
   if (msg.includes("invalid") && msg.includes("password")) return "That password wasn't accepted.";
-  if (msg.includes("server")) return "Couldn't reach that server — check the server name.";
+  if (msg.includes("server") && !msg.includes("invite")) return "Couldn't reach that server — check the server name.";
   if (msg.includes("network") || msg.includes("timeout")) return "Network problem — check your connection and retry.";
-  if (msg.includes("exists")) return "An account with that email already exists — try signing in.";
-  return null;
+  if (msg.includes("already exists")) return "An account with that email already exists — switch to Sign in.";
+  if (msg.includes("invite code")) return raw;
+  if (msg.includes("waitlist") || msg.includes("registration is closed") || msg.includes("we're full")) return raw;
+  if (msg.includes("full name") || msg.includes("password must") || msg.includes("valid email")) return raw;
+  // Show the API message (registration failed, locked, etc.) instead of a generic sign-in line.
+  return raw;
 }
 
 const TERMS_TEXT = `XAUUSD Trader — Terms & Conditions
