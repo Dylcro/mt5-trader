@@ -6,6 +6,7 @@ import { and, eq, inArray, isNotNull } from "drizzle-orm";
 import { JWT_SECRET } from "./auth";
 import { getTradingStatus } from "../lib/platformFlags";
 import { logEvent } from "../logger";
+import { usdToTargetRate } from "../lib/usdFx.js";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
 // In dev (tsx/ESM) import.meta.url is the real file URL.
 // In production (esbuild CJS) build.ts injects a __importMetaUrl banner and
@@ -1545,6 +1546,17 @@ export function commentBelongsToZone(comment: string | undefined | null, zoneId:
   return parsed != null && parsed === zoneId;
 }
 
+/** True when a live MT5 position belongs to this cascade zone (magic or comment tag). */
+export function positionBelongsToZone(
+  p: { magic?: number; comment?: string },
+  zoneId: string,
+): boolean {
+  const expectedMagic = zoneMagicNumber(zoneId);
+  const magic = Number(p.magic);
+  if (Number.isFinite(magic) && magic === expectedMagic) return true;
+  return commentBelongsToZone(p.comment, zoneId);
+}
+
 /** True when evaluateZone can run TP/BE logic (anchor or absolute TP prices set). */
 export function zoneHasTpTargets(st: {
   anchorPrice: number;
@@ -2534,6 +2546,7 @@ async function cancelZoneLimits(
 
 interface LivePosition {
   id: string; openPrice: number; volume: number; type: string; symbol: string;
+  magic?: number; comment?: string;
 }
 
 async function fetchOpenPositions(token: string, region: string, accountId: string): Promise<LivePosition[]> {
@@ -2549,22 +2562,44 @@ async function fetchOpenPositions(token: string, region: string, accountId: stri
     volume: Number(p.volume ?? 0),
     type: String(p.type ?? ""),
     symbol: String(p.symbol ?? ""),
+    magic: p.magic != null ? Number(p.magic) : undefined,
+    comment: p.comment != null ? String(p.comment) : undefined,
   })).filter(p => p.id);
 }
 
 async function fetchLivePendingOrders(
   token: string, region: string, accountId: string,
-): Promise<Array<{ id: string; comment?: string }>> {
+): Promise<Array<{ id: string; comment?: string; magic?: number }>> {
   try {
     const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`, {
       headers: authHeaders(token),
     });
     if (!r.ok) return [];
-    const raw = await r.json() as Array<{ id?: string; _id?: string; comment?: string }>;
-    return raw.map(o => ({ id: String(o.id ?? o._id ?? ""), comment: o.comment })).filter(o => o.id);
+    const raw = await r.json() as Array<{ id?: string; _id?: string; comment?: string; magic?: number }>;
+    return raw.map(o => ({
+      id: String(o.id ?? o._id ?? ""),
+      comment: o.comment,
+      magic: o.magic != null ? Number(o.magic) : undefined,
+    })).filter(o => o.id);
   } catch {
     return [];
   }
+}
+
+/** Any open position or pending cascade order on the broker tagged for this zone. */
+export async function brokerHasOpenLegsForZone(
+  token: string, region: string, accountId: string, zoneId: string,
+): Promise<boolean> {
+  const [live, orders] = await Promise.all([
+    fetchOpenPositions(token, region, accountId),
+    fetchLivePendingOrders(token, region, accountId),
+  ]);
+  if (live.some((p) => positionBelongsToZone(p, zoneId))) return true;
+  return orders.some((o) => {
+    if (zoneLimitOrders.get(o.id) === zoneId) return true;
+    if (o.magic != null && o.magic === zoneMagicNumber(zoneId)) return true;
+    return commentBelongsToZone(o.comment, zoneId);
+  });
 }
 
 async function zoneHasLivePendingCascadeLimits(
@@ -2580,13 +2615,7 @@ async function zoneHasLivePendingCascadeLimits(
 async function zoneHasLiveTrackedPositionsOnBroker(
   token: string, region: string, accountId: string, zoneId: string,
 ): Promise<boolean> {
-  const openRows = await db.select({ positionId: zonePositionsTable.positionId })
-    .from(zonePositionsTable)
-    .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
-  if (openRows.length === 0) return false;
-  const live = await fetchOpenPositions(token, region, accountId);
-  const liveIds = new Set(live.map(p => p.id));
-  return openRows.some(r => liveIds.has(r.positionId));
+  return brokerHasOpenLegsForZone(token, region, accountId, zoneId);
 }
 
 // Live bid/ask straight from MetaAPI — independent of tickStore (which only
@@ -2689,7 +2718,36 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       trackedIds = new Set(zps.map(z => z.positionId));
       console.warn(`[zone ${zoneId}] tracked-positions DB query failed, using in-memory cache (${trackedIds.size} ids): ${(e as Error).message}`);
     }
-    if (zps.length === 0) return;
+    if (zps.length === 0) {
+      if (!syncReady.has(st.accountId)) return;
+      const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, st.accountId, zoneId);
+      const brokerLegs = await brokerHasOpenLegsForZone(token, region, st.accountId, zoneId);
+      if (!brokerLegs && !pendingLeft) {
+        if (!shouldAutoCloseZoneAfterPositionExit(st, false, false)) {
+          console.log(`[zone ${zoneId}] empty tracked rows but defer zone close (pre-TP2 policy)`);
+          return;
+        }
+        const closedAt = Date.now();
+        await withDbRetry(`evalZone.emptyClose zone=${zoneId}`,
+          () => db.update(cascadeZonesTable)
+            .set({ status: "CLOSED", closedAt })
+            .where(eq(cascadeZonesTable.zoneId, zoneId)),
+        ).catch(() => {/* logged inside withDbRetry */});
+        st.status = "CLOSED";
+        await finalizeZoneClose(st.accountId, zoneId, {});
+        void settleZoneClosedPnl(st.accountId, zoneId);
+        logEvent("zone.close", { accountId: st.accountId, zoneId, trigger: "empty_reconcile" });
+        try {
+          const tkn = getToken();
+          cancelZoneLimits(tkn, region, st.accountId, zoneId)
+            .catch((e: Error) => console.warn(`[zone ${zoneId}] empty reconcile cancelZoneLimits:`, e.message))
+            .finally(() => broadcastZoneUpdate(zoneId));
+        } catch {
+          broadcastZoneUpdate(zoneId);
+        }
+      }
+      return;
+    }
     const allLive = await fetchOpenPositions(token, region, st.accountId);
     const live = allLive.filter(p => trackedIds.has(p.id));
     // Skip the destructive reconciliation path (which permanently marks
@@ -4465,6 +4523,24 @@ router.get("/mt5/account/:accountId/price", checkOwner, async (req: Request, res
     return res.json(priceData);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
+  }
+});
+
+// GET /api/mt5/account/:accountId/display-fx?to=GBP&region=london
+// Returns FX rate: display amount = usdAmount * rate (XAUUSD risk is quoted in USD).
+router.get("/mt5/account/:accountId/display-fx", checkOwner, async (req: Request, res: Response) => {
+  try {
+    const token = getToken();
+    const region = qstr(req.query.region) || DEFAULT_REGION;
+    const accountId = String(req.params.accountId);
+    const to = qstr(req.query.to) || "USD";
+    const { rate, currency } = await usdToTargetRate(
+      token, region, accountId, to,
+      (t, r, a, s) => fetchSymbolPrice(t, r, a, s),
+    );
+    return res.json({ from: "USD", to: currency, rate });
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : "FX rate failed" });
   }
 });
 

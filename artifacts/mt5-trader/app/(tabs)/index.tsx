@@ -218,6 +218,7 @@ function CascadeLadder({
   direction,
   lotSize,
   numPositions,
+  formatUsdMoney,
 }: {
   marketPrice: number;
   limitEntries: number[];
@@ -225,6 +226,7 @@ function CascadeLadder({
   direction: Direction;
   lotSize: number;
   numPositions: number;
+  formatUsdMoney: (usd: number) => string;
 }) {
   const color = direction === "buy" ? C.buy : C.sell;
   // Exactly numPositions legs: 1 market + (numPositions - 1) limits.
@@ -240,7 +242,7 @@ function CascadeLadder({
       <View style={styles.ladderHeader}>
         <Text style={styles.ladderTitle}>ORDER LADDER</Text>
         <Text style={[styles.ladderRisk, { color: C.sell }]}>
-          Total Risk ~{totalRisk.toFixed(2)}
+          Total Risk ~{formatUsdMoney(totalRisk)}
         </Text>
       </View>
 
@@ -332,7 +334,7 @@ export default function TradeScreen() {
     if (status === "disconnected") void connect();
     else void syncSession(true);
   }, [status, connect, syncSession]);
-  const { formatMoney } = useDisplayCurrency();
+  const { formatMoney, formatUsdMoney } = useDisplayCurrency();
   const { status: platformStatus } = usePlatformStatus();
   const platformRef = useRef(platformStatus);
   useEffect(() => { platformRef.current = platformStatus; }, [platformStatus]);
@@ -1061,6 +1063,7 @@ export default function TradeScreen() {
                 direction={cascadeDirection}
                 lotSize={cascadeLotSize}
                 numPositions={cascadeSettings.numPositions}
+                formatUsdMoney={formatUsdMoney}
               />
             ) : (
               <View style={styles.cascadeHint}>
@@ -1139,7 +1142,7 @@ export default function TradeScreen() {
                   <StepInput value={slPercent} onChange={setSlPercent} step={0.1} min={0.1} max={20} decimals={1} />
                   <Text style={styles.slNote}>
                     {marketEntry > 0 && sl != null
-                      ? `Risk ${formatMoney(riskDollars)} → SL ${formatPrice(sl)}`
+                      ? `Risk ${formatUsdMoney(riskDollars)} → SL ${formatPrice(sl)}`
                       : "Connect to calculate"}
                   </Text>
                 </View>
@@ -1183,7 +1186,7 @@ export default function TradeScreen() {
                 </View>
                 <View style={styles.riskRow}>
                   <Text style={styles.riskLabel}>Est. Risk</Text>
-                  <Text style={[styles.riskValue, { color: C.gold }]}>{formatMoney(riskDollars)}</Text>
+                  <Text style={[styles.riskValue, { color: C.gold }]}>{formatUsdMoney(riskDollars)}</Text>
                 </View>
                 {accountInfo && (
                   <View style={styles.riskRow}>
