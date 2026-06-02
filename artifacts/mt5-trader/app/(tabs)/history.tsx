@@ -24,7 +24,7 @@ import {
   countSlHits,
   countZonesReachedTp,
   filterClosedZonesByPeriod,
-  isAutomatedTp4Level,
+  isTp4LevelEnabled,
   tpPillStyle,
   zoneReachedTpLevel,
   zoneTpLevelsHit,
@@ -52,7 +52,7 @@ function SummaryCell({
 
 function TpChip({ n, zone }: { n: 1 | 2 | 3 | 4; zone: Zone }) {
   const enabled = n === 4
-    ? isAutomatedTp4Level(zone)
+    ? isTp4LevelEnabled(zone)
     : zone[`tp${n}Enabled` as keyof Zone] !== false;
   const hit = zoneReachedTpLevel(zone, n);
   const state = tpDisplayState(enabled, hit);

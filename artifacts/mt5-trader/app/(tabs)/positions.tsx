@@ -249,8 +249,8 @@ export default function PositionsScreen() {
   const { zones, refresh: refreshZones, riskFree, closeZone, cancelZoneOrders } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000, sseConnected });
   const { settings: cs } = useCascadeSettings();
   const displayActiveZones = useMemo(
-    () => buildDisplayActiveZones(zones, positions, cs, price),
-    [zones, positions, cs, price],
+    () => buildDisplayActiveZones(zones, positions, cs, price, pendingOrders),
+    [zones, positions, cs, price, pendingOrders],
   );
   const displayZoneIds = useMemo(
     () => new Set(displayActiveZones.map((z) => z.zoneId)),

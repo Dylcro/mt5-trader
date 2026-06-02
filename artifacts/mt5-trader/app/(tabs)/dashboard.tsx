@@ -71,7 +71,9 @@ export default function DashboardScreen() {
     region,
     credentials,
     positions,
+    pendingOrders,
     refreshPositions,
+    refreshPendingOrders,
     refreshAccountInfo,
     refreshPrice,
     sseConnected,
@@ -90,15 +92,21 @@ export default function DashboardScreen() {
   useFocusEffect(
     useCallback(() => {
       if (status !== "connected" || !accountId) return;
-      void syncSession();
-      const id = setInterval(() => void syncSession(), 10_000);
+      const sync = () => void Promise.all([
+        syncSession(),
+        refresh(),
+        refreshPositions(),
+        refreshPendingOrders(),
+      ]);
+      sync();
+      const id = setInterval(sync, 10_000);
       return () => clearInterval(id);
-    }, [status, accountId, syncSession]),
+    }, [status, accountId, syncSession, refresh, refreshPositions, refreshPendingOrders]),
   );
 
   const displayActiveZones = useMemo(
-    () => buildDisplayActiveZones(zones, positions, cascadeSettings, price),
-    [zones, positions, cascadeSettings, price],
+    () => buildDisplayActiveZones(zones, positions, cascadeSettings, price, pendingOrders),
+    [zones, positions, cascadeSettings, price, pendingOrders],
   );
   const openZones = displayActiveZones;
   const closedAll = zones.filter((z) => z.status === "CLOSED");
@@ -126,7 +134,9 @@ export default function DashboardScreen() {
 
   const onRefresh = async () => {
     setRefreshing(true);
-    await Promise.all([refresh(), refreshPositions(), refreshAccountInfo(), refreshPrice()]);
+    await Promise.all([
+      refresh(), refreshPositions(), refreshPendingOrders(), refreshAccountInfo(), refreshPrice(),
+    ]);
     setRefreshKey((k) => k + 1);
     setRefreshing(false);
   };

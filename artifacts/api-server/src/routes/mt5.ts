@@ -558,16 +558,13 @@ async function mergeZoneHitsFromPositions(
   const [zoneMeta] = await db.select({ tp4Price: cascadeZonesTable.tp4Price })
     .from(cascadeZonesTable).where(eq(cascadeZonesTable.zoneId, zoneId)).limit(1);
   const tp4Price = zoneMeta?.tp4Price != null ? Number(zoneMeta.tp4Price) : null;
-  const manualTp4 = isManualTp4Zone(tp4Price, tp4Enabled);
   const posRows = await db.select().from(zonePositionsTable)
     .where(eq(zonePositionsTable.zoneId, zoneId));
   const open = posRows.filter((r) => r.status === "OPEN");
   let tp1Hit = Boolean(row.tp1Hit) || posRows.some((r) => r.tp1Hit);
   let tp2Hit = Boolean(row.tp2Hit) || posRows.some((r) => r.tp2Hit);
   let tp3Hit = Boolean(row.tp3Hit) || posRows.some((r) => r.tp3Hit);
-  let tp4Hit = manualTp4
-    ? false
-    : Boolean(row.tp4Hit) || posRows.some((r) => r.tp4Hit);
+  let tp4Hit = Boolean(row.tp4Hit) || posRows.some((r) => r.tp4Hit);
   const sanitized = sanitizeZoneTpLadder({
     tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
     tp1Hit, tp2Hit, tp3Hit, tp4Hit, tp4Price,
@@ -1802,8 +1799,7 @@ export function countEnabledTps(flags: {
   tp1Enabled: boolean; tp2Enabled: boolean; tp3Enabled: boolean; tp4Enabled: boolean;
   tp4Price?: number | null;
 }): number {
-  const tp4Ladder = flags.tp4Enabled && !isManualTp4Zone(flags.tp4Price, flags.tp4Enabled);
-  return [flags.tp1Enabled, flags.tp2Enabled, flags.tp3Enabled, tp4Ladder].filter(Boolean).length;
+  return [flags.tp1Enabled, flags.tp2Enabled, flags.tp3Enabled, flags.tp4Enabled].filter(Boolean).length;
 }
 
 export function countHitEnabledTps(z: {
@@ -1815,7 +1811,7 @@ export function countHitEnabledTps(z: {
   if (z.tp1Enabled && z.tp1Hit) n++;
   if (z.tp2Enabled && z.tp2Hit) n++;
   if (z.tp3Enabled && z.tp3Hit) n++;
-  if (z.tp4Enabled && z.tp4Hit && !isManualTp4Zone(z.tp4Price, z.tp4Enabled)) n++;
+  if (z.tp4Enabled && z.tp4Hit) n++;
   return n;
 }
 
@@ -1828,7 +1824,7 @@ export function computeFinalTpReached(z: {
   if (z.tp1Enabled && z.tp1Hit) last = 1;
   if (z.tp2Enabled && z.tp2Hit) last = 2;
   if (z.tp3Enabled && z.tp3Hit) last = 3;
-  if (z.tp4Enabled && z.tp4Hit && !isManualTp4Zone(z.tp4Price, z.tp4Enabled)) last = 4;
+  if (z.tp4Enabled && z.tp4Hit) last = 4;
   return last;
 }
 
@@ -1852,6 +1848,7 @@ export function zonePrimaryOutcome(row: {
 }): ZonePrimaryOutcome {
   if (row.status !== "CLOSED") return "NONE";
   if (row.slHit) return "SL";
+  if (Boolean(row.tp4Hit) && row.tp4Enabled !== false) return "TP4";
   if (row.manualClose) return "MANUAL";
   const final = row.finalTpReached ?? computeFinalTpReached({
     tp1Enabled: row.tp1Enabled ?? true,
@@ -1864,9 +1861,6 @@ export function zonePrimaryOutcome(row: {
     tp4Hit: Boolean(row.tp4Hit),
     tp4Price: row.tp4Price,
   });
-  if (final >= 4 && row.tp4Enabled !== false && !isManualTp4Zone(row.tp4Price, row.tp4Enabled ?? true)) {
-    return "TP4";
-  }
   if (final >= 3 && row.tp3Enabled !== false) return "TP3";
   if (final >= 2 && row.tp2Enabled !== false) return "TP2";
   if (final >= 1 && row.tp1Enabled !== false) return "TP1";
@@ -1918,7 +1912,10 @@ export function sanitizeZoneTpLadder<T extends {
   const tp1Hit = tp1Enabled && Boolean(z.tp1Hit);
   const tp2Hit = tp2Enabled && tp1Hit && Boolean(z.tp2Hit);
   const tp3Hit = tp3Enabled && tp2Hit && Boolean(z.tp3Hit);
-  const tp4Hit = tp4Enabled && !isManualTp4Zone(z.tp4Price, tp4Enabled) && tp3Hit && Boolean(z.tp4Hit);
+  const manualTp4 = isManualTp4Zone(z.tp4Price, tp4Enabled);
+  const tp4Hit = tp4Enabled && Boolean(z.tp4Hit) && (
+    manualTp4 ? true : tp3Hit
+  );
   return { ...z, tp1Hit, tp2Hit, tp3Hit, tp4Hit };
 }
 
@@ -1943,32 +1940,53 @@ export function exitPriceBeforeTp1(
 }
 
 /**
- * Classify manual vs automated exit from a broker deal price only.
- * Never promotes tp4Hit from price — ladder hits come only from the TP engine.
+ * Classify MT5/app zone close from broker fill price.
+ * - manualClose: early exit before TP1 was ever reached (History MANUAL column).
+ * - tp4Hit: manual TP4 slice closed at/above TP3, or automated TP4 price reached.
+ * - TP1 already hit then closed below TP1: keeps tp1Hit, not manualClose.
  */
-export function inferManualCloseFromExitPrice(
+export function inferCloseOutcomeFromExitPrice(
   zone: {
     direction: "buy" | "sell";
     tp1Price: number | null;
+    tp3Price: number | null;
     tp4Price: number | null;
     tp4Enabled: boolean;
+    tp1Hit?: boolean;
     tp4Hit?: boolean;
   },
   exitPrice: number | null | undefined,
-): boolean {
-  if (exitPrice == null || !(exitPrice > 0)) return true;
-  if (exitPriceBeforeTp1(zone.direction, exitPrice, zone.tp1Price)) return true;
-  if (Boolean(zone.tp4Hit) && !isManualTp4Zone(zone.tp4Price, zone.tp4Enabled)) return false;
-  return true;
+): { tp4Hit: boolean; manualClose: boolean } {
+  const tp1Hit = Boolean(zone.tp1Hit);
+  const priorTp4 = Boolean(zone.tp4Hit);
+
+  if (exitPrice == null || !(exitPrice > 0)) {
+    return { tp4Hit: priorTp4, manualClose: !tp1Hit && !priorTp4 };
+  }
+
+  if (exitPriceBeforeTp1(zone.direction, exitPrice, zone.tp1Price)) {
+    if (tp1Hit) return { tp4Hit: false, manualClose: false };
+    return { tp4Hit: false, manualClose: true };
+  }
+
+  if (isManualTp4Zone(zone.tp4Price, zone.tp4Enabled)
+    && exitPriceBeyondTp3(zone.direction, exitPrice, zone.tp3Price)) {
+    return { tp4Hit: true, manualClose: false };
+  }
+
+  if (zone.tp4Price != null && zone.tp4Price > 0
+    && exitPriceBeyondTp3(zone.direction, exitPrice, zone.tp4Price)) {
+    return { tp4Hit: true, manualClose: false };
+  }
+
+  return { tp4Hit: priorTp4, manualClose: false };
 }
 
-/** @deprecated Use inferManualCloseFromExitPrice — kept for tests migrating off tp4Hit inference. */
-export function inferCloseOutcomeFromExitPrice(
-  zone: Parameters<typeof inferManualCloseFromExitPrice>[0] & { tp3Price?: number | null },
+export function inferManualCloseFromExitPrice(
+  zone: Parameters<typeof inferCloseOutcomeFromExitPrice>[0],
   exitPrice: number | null | undefined,
-): { tp4Hit: boolean; manualClose: boolean } {
-  const manualClose = inferManualCloseFromExitPrice(zone, exitPrice);
-  return { tp4Hit: false, manualClose };
+): boolean {
+  return inferCloseOutcomeFromExitPrice(zone, exitPrice).manualClose;
 }
 
 /** Resolve close outcome for API/history (backfills legacy CLOSED rows missing flags). */
@@ -1985,9 +2003,7 @@ export function resolveCloseOutcome(row: {
   if (row.manualClose != null) {
     return { manualClose: Boolean(row.manualClose), slHit: false };
   }
-  const tp4Done = Boolean(row.tp4Enabled) && Boolean(row.tp4Hit)
-    && !isManualTp4Zone(row.tp4Price, row.tp4Enabled);
-  return { manualClose: !tp4Done, slHit: false };
+  return { manualClose: Boolean(row.manualClose), slHit: false };
 }
 
 /** Persist how a closed zone ended (manual app/MT5 exit vs SL vs TP ladder). */
@@ -2003,58 +2019,68 @@ async function finalizeZoneClose(
     if (!row || row.status !== "CLOSED") return;
 
     let slHit = Boolean(opts.stopLossExit);
-    const ladder = sanitizeZoneTpLadder({
+    const baseFlags = {
       tp1Enabled: Boolean(row.tp1Enabled),
       tp2Enabled: Boolean(row.tp2Enabled),
       tp3Enabled: Boolean(row.tp3Enabled),
       tp4Enabled: Boolean(row.tp4Enabled),
+      tp4Price: row.tp4Price,
+    };
+    let sanitized = sanitizeZoneTpLadder({
+      ...baseFlags,
       tp1Hit: Boolean(row.tp1Hit),
       tp2Hit: Boolean(row.tp2Hit),
       tp3Hit: Boolean(row.tp3Hit),
       tp4Hit: Boolean(row.tp4Hit),
-      tp4Price: row.tp4Price,
     });
     let manualClose = false;
 
     if (slHit) {
       manualClose = false;
-    } else if (opts.userInitiated) {
-      manualClose = true;
     } else if (opts.exitPriceFromDeal && opts.exitPrice != null && opts.exitPrice > 0) {
-      manualClose = inferManualCloseFromExitPrice(
+      const inferred = inferCloseOutcomeFromExitPrice(
         {
           direction: row.direction as "buy" | "sell",
           tp1Price: row.tp1Price,
+          tp3Price: row.tp3Price,
           tp4Price: row.tp4Price,
-          tp4Enabled: Boolean(row.tp4Enabled),
-          tp4Hit: ladder.tp4Hit,
+          tp4Enabled: baseFlags.tp4Enabled,
+          tp1Hit: sanitized.tp1Hit,
+          tp4Hit: sanitized.tp4Hit,
         },
         opts.exitPrice,
       );
+      manualClose = inferred.manualClose;
+      sanitized = sanitizeZoneTpLadder({
+        ...baseFlags,
+        ...sanitized,
+        tp4Hit: inferred.tp4Hit || sanitized.tp4Hit,
+      });
+    } else if (opts.userInitiated) {
+      manualClose = !sanitized.tp1Hit && !sanitized.tp4Hit;
     } else {
-      // Live bid/ask at reconcile time is not the fill price — do not infer TP hits from it.
-      manualClose = true;
+      manualClose = !sanitized.tp1Hit && !sanitized.tp4Hit;
     }
 
     await db.update(cascadeZonesTable)
       .set({
         slHit, manualClose,
-        tp1Hit: ladder.tp1Hit,
-        tp2Hit: ladder.tp2Hit,
-        tp3Hit: ladder.tp3Hit,
-        tp4Hit: ladder.tp4Hit,
+        tp1Hit: sanitized.tp1Hit,
+        tp2Hit: sanitized.tp2Hit,
+        tp3Hit: sanitized.tp3Hit,
+        tp4Hit: sanitized.tp4Hit,
       })
       .where(eq(cascadeZonesTable.zoneId, zoneId));
     const st = zoneStates.get(zoneId);
     if (st) {
-      st.tp1Hit = ladder.tp1Hit;
-      st.tp2Hit = ladder.tp2Hit;
-      st.tp3Hit = ladder.tp3Hit;
-      st.tp4Hit = ladder.tp4Hit;
+      st.tp1Hit = sanitized.tp1Hit;
+      st.tp2Hit = sanitized.tp2Hit;
+      st.tp3Hit = sanitized.tp3Hit;
+      st.tp4Hit = sanitized.tp4Hit;
       (st as ZoneState & { slHit?: boolean; manualClose?: boolean }).slHit = slHit;
       (st as ZoneState & { manualClose?: boolean }).manualClose = manualClose;
     }
-    console.log(`[zone ${zoneId}] close outcome sl=${slHit} manual=${manualClose} tp4Hit=${ladder.tp4Hit} exit=${opts.exitPrice ?? "n/a"} deal=${opts.exitPriceFromDeal ?? false}`);
+    console.log(`[zone ${zoneId}] close outcome sl=${slHit} manual=${manualClose} tp4Hit=${sanitized.tp4Hit} exit=${opts.exitPrice ?? "n/a"} deal=${opts.exitPriceFromDeal ?? false}`);
   } catch (e) {
     console.warn(`[zone ${zoneId}] finalizeZoneClose failed:`, (e as Error).message);
   }

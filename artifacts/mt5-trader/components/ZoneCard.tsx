@@ -5,7 +5,6 @@ import { ActivityIndicator, Alert, Platform, Pressable, StyleSheet, Text, View }
 
 import Colors from "@/constants/colors";
 import type { Zone } from "@/hooks/useZones";
-import { isAutomatedTp4Level } from "@/lib/zoneStats";
 
 const C = Colors.dark;
 
@@ -60,10 +59,10 @@ function TpChip({ label, state }: { label: string; state: TpChipState }) {
 }
 
 function tpEnabledAtPlacement(zone: Zone, level: 1 | 2 | 3 | 4): boolean {
-  if (level === 4) return isAutomatedTp4Level(zone);
   if (level === 1) return zone.tp1Enabled !== false;
   if (level === 2) return zone.tp2Enabled !== false;
-  return zone.tp3Enabled !== false;
+  if (level === 3) return zone.tp3Enabled !== false;
+  return zone.tp4Enabled !== false;
 }
 
 function tpChipState(zone: Zone, level: 1 | 2 | 3 | 4): TpChipState {
