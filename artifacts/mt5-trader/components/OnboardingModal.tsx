@@ -1,6 +1,6 @@
 // XAUUSD Trader — 6-step onboarding wizard (light theme)
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   Modal,
   View,
