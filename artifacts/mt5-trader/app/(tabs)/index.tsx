@@ -280,7 +280,7 @@ function CascadeLadder({
             <Text style={[styles.ladderEntryLabel, { color: C.sell }]}>STOP LOSS · ALL</Text>
             <Text style={[styles.ladderEntryPrice, { color: C.sell }]}>{formatPrice(stopLoss)}</Text>
           </View>
-          <Text style={[styles.ladderLot}>{legEntries.length} orders</Text>
+          <Text style={styles.ladderLot}>{legEntries.length} orders</Text>
         </View>
       </View>
     </View>
