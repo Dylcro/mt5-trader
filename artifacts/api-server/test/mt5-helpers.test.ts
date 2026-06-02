@@ -591,21 +591,29 @@ describe("disabled TP history", () => {
       tp4Hit: false,
       manualClose: true,
       slHit: false,
-    })).toEqual({ manualClose: true, slHit: false });
+    })).toEqual({ manualClose: true, slHit: false, riskFreeSlExit: false });
     expect(resolveCloseOutcome({
       status: "CLOSED",
       tp4Enabled: true,
       tp4Hit: true,
       manualClose: false,
       slHit: false,
-    })).toEqual({ manualClose: false, slHit: false });
+    })).toEqual({ manualClose: false, slHit: false, riskFreeSlExit: false });
     expect(resolveCloseOutcome({
       status: "CLOSED",
       tp4Enabled: true,
       tp4Hit: false,
       manualClose: false,
       slHit: true,
-    })).toEqual({ manualClose: false, slHit: true });
+    })).toEqual({ manualClose: false, slHit: true, riskFreeSlExit: false });
+    expect(resolveCloseOutcome({
+      status: "CLOSED",
+      tp4Enabled: true,
+      tp4Hit: false,
+      manualClose: false,
+      slHit: false,
+      riskFreeSlExit: true,
+    })).toEqual({ manualClose: false, slHit: false, riskFreeSlExit: true });
   });
 
   it("inferCloseOutcomeFromExitPrice: manual TP4 slice rules", () => {
@@ -655,6 +663,8 @@ describe("disabled TP history", () => {
     expect(zonePrimaryOutcome({ ...base, manualClose: true, finalTpReached: 3 })).toBe("MANUAL");
     expect(zonePrimaryOutcome({ ...base, tp4Hit: true, finalTpReached: 4 })).toBe("TP4");
     expect(zonePrimaryOutcome({ ...base, slHit: true })).toBe("SL");
+    expect(zonePrimaryOutcome({ ...base, riskFreeSlExit: true })).toBe("RF");
+    expect(zonePrimaryOutcome({ ...base, riskFreeSlExit: true, slHit: true })).toBe("RF");
   });
 
   it("inferCloseOutcomeFromExitPrice: sell zone mirrors buy", () => {

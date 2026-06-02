@@ -647,6 +647,7 @@ function broadcastZoneUpdate(zoneId: string): void {
         ?? (st as { tp2SlIsBestEffort?: boolean } | undefined)?.tp2SlIsBestEffort ?? false,
       manualClose: (dbRow as { manualClose?: boolean } | undefined)?.manualClose ?? false,
       slHit: (dbRow as { slHit?: boolean } | undefined)?.slHit ?? false,
+      riskFreeSlExit: (dbRow as { riskFreeSlExit?: boolean } | undefined)?.riskFreeSlExit ?? false,
     });
   })();
 }
@@ -1828,11 +1829,12 @@ export function computeFinalTpReached(z: {
   return last;
 }
 
-export type ZonePrimaryOutcome = "SL" | "MANUAL" | "TP4" | "TP3" | "TP2" | "TP1" | "NONE";
+export type ZonePrimaryOutcome = "RF" | "SL" | "MANUAL" | "TP4" | "TP3" | "TP2" | "TP1" | "NONE";
 
 /** One history bucket per closed zone (not per position leg). */
 export function zonePrimaryOutcome(row: {
   status: string;
+  riskFreeSlExit?: boolean;
   slHit?: boolean;
   manualClose?: boolean;
   finalTpReached?: 0 | 1 | 2 | 3 | 4;
@@ -1847,6 +1849,7 @@ export function zonePrimaryOutcome(row: {
   tp4Price?: number | null;
 }): ZonePrimaryOutcome {
   if (row.status !== "CLOSED") return "NONE";
+  if (row.riskFreeSlExit) return "RF";
   if (row.slHit) return "SL";
   if (Boolean(row.tp4Hit) && row.tp4Enabled !== false) return "TP4";
   if (row.manualClose) return "MANUAL";
@@ -1882,6 +1885,8 @@ export function dealIndicatesStopLoss(deal: unknown): boolean {
 type CloseFinalizeOpts = {
   userInitiated?: boolean;
   stopLossExit?: boolean;
+  /** Zone was RISK_FREE when the last leg closed (or wentRiskFree persisted). */
+  wasRiskFree?: boolean;
   exitPrice?: number;
   /** True when exitPrice is the broker fill from a deal, not live bid/ask. */
   exitPriceFromDeal?: boolean;
@@ -1997,13 +2002,15 @@ export function resolveCloseOutcome(row: {
   tp4Price?: number | null;
   manualClose?: boolean;
   slHit?: boolean;
-}): { manualClose: boolean; slHit: boolean } {
-  if (row.slHit) return { manualClose: false, slHit: true };
-  if (row.status !== "CLOSED") return { manualClose: false, slHit: false };
+  riskFreeSlExit?: boolean;
+}): { manualClose: boolean; slHit: boolean; riskFreeSlExit: boolean } {
+  if (row.riskFreeSlExit) return { manualClose: false, slHit: false, riskFreeSlExit: true };
+  if (row.slHit) return { manualClose: false, slHit: true, riskFreeSlExit: false };
+  if (row.status !== "CLOSED") return { manualClose: false, slHit: false, riskFreeSlExit: false };
   if (row.manualClose != null) {
-    return { manualClose: Boolean(row.manualClose), slHit: false };
+    return { manualClose: Boolean(row.manualClose), slHit: false, riskFreeSlExit: false };
   }
-  return { manualClose: Boolean(row.manualClose), slHit: false };
+  return { manualClose: Boolean(row.manualClose), slHit: false, riskFreeSlExit: false };
 }
 
 /** Persist how a closed zone ended (manual app/MT5 exit vs SL vs TP ladder). */
@@ -2019,6 +2026,11 @@ async function finalizeZoneClose(
     if (!row || row.status !== "CLOSED") return;
 
     let slHit = Boolean(opts.stopLossExit);
+    let riskFreeSlExit = false;
+    if (slHit && (opts.wasRiskFree || Boolean(row.wentRiskFree))) {
+      riskFreeSlExit = true;
+      slHit = false;
+    }
     const baseFlags = {
       tp1Enabled: Boolean(row.tp1Enabled),
       tp2Enabled: Boolean(row.tp2Enabled),
@@ -2064,7 +2076,7 @@ async function finalizeZoneClose(
 
     await db.update(cascadeZonesTable)
       .set({
-        slHit, manualClose,
+        slHit, manualClose, riskFreeSlExit,
         tp1Hit: sanitized.tp1Hit,
         tp2Hit: sanitized.tp2Hit,
         tp3Hit: sanitized.tp3Hit,
@@ -2077,10 +2089,11 @@ async function finalizeZoneClose(
       st.tp2Hit = sanitized.tp2Hit;
       st.tp3Hit = sanitized.tp3Hit;
       st.tp4Hit = sanitized.tp4Hit;
-      (st as ZoneState & { slHit?: boolean; manualClose?: boolean }).slHit = slHit;
+      (st as ZoneState & { slHit?: boolean; manualClose?: boolean; riskFreeSlExit?: boolean }).slHit = slHit;
       (st as ZoneState & { manualClose?: boolean }).manualClose = manualClose;
+      (st as ZoneState & { riskFreeSlExit?: boolean }).riskFreeSlExit = riskFreeSlExit;
     }
-    console.log(`[zone ${zoneId}] close outcome sl=${slHit} manual=${manualClose} tp4Hit=${sanitized.tp4Hit} exit=${opts.exitPrice ?? "n/a"} deal=${opts.exitPriceFromDeal ?? false}`);
+    console.log(`[zone ${zoneId}] close outcome rfSl=${riskFreeSlExit} sl=${slHit} manual=${manualClose} tp4Hit=${sanitized.tp4Hit} exit=${opts.exitPrice ?? "n/a"} deal=${opts.exitPriceFromDeal ?? false}`);
   } catch (e) {
     console.warn(`[zone ${zoneId}] finalizeZoneClose failed:`, (e as Error).message);
   }
@@ -2737,6 +2750,7 @@ async function markZonePositionClosed(
       const dir = (st?.direction ?? "buy") as "buy" | "sell";
       await finalizeZoneClose(accountId, zoneId, {
         stopLossExit: dealIndicatesStopLoss(exitDeal),
+        wasRiskFree: zoneStatus === "RISK_FREE",
         exitPrice: exitPx ?? exitPriceForZoneClose(accountId, dir),
         exitPriceFromDeal: exitPx != null && exitPx > 0,
       });
@@ -3092,8 +3106,10 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
             .set({ status: "CLOSED", closedAt })
             .where(eq(cascadeZonesTable.zoneId, zoneId)),
         ).catch(() => {/* logged inside withDbRetry */});
+        const wasRiskFree = st.status === "RISK_FREE";
         st.status = "CLOSED";
         await finalizeZoneClose(st.accountId, zoneId, {
+          wasRiskFree,
           exitPrice: exitPriceForZoneClose(st.accountId, st.direction),
         });
         void settleZoneClosedPnl(st.accountId, zoneId);
@@ -3161,8 +3177,10 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
             .set({ status: "CLOSED", closedAt })
             .where(eq(cascadeZonesTable.zoneId, zoneId))
         ).catch(() => {/* logged inside withDbRetry */});
+        const wasRiskFree = st.status === "RISK_FREE";
         st.status = "CLOSED";
         await finalizeZoneClose(st.accountId, zoneId, {
+          wasRiskFree,
           exitPrice: exitPriceForZoneClose(st.accountId, st.direction),
         });
         void settleZoneClosedPnl(st.accountId, zoneId);
@@ -4025,16 +4043,21 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         closedAt: row.closedAt != null ? Number(row.closedAt) : null,
         closedPnl: row.closedPnl != null ? Number(row.closedPnl) : null,
         finalTpReached,
-        primaryOutcome: zonePrimaryOutcome({
-          status: row.status,
-          slHit: row.slHit,
-          manualClose: row.manualClose,
-          finalTpReached,
-          tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
-          tp1Hit: mergedHits.tp1Hit, tp2Hit: mergedHits.tp2Hit, tp3Hit: mergedHits.tp3Hit, tp4Hit: mergedHits.tp4Hit,
-          tp4Price,
-        }),
-        ...resolveCloseOutcome(row),
+        ...(() => {
+          const closeFlags = resolveCloseOutcome(row);
+          return {
+            ...closeFlags,
+            primaryOutcome: zonePrimaryOutcome({
+              status: row.status,
+              ...closeFlags,
+              manualClose: row.manualClose,
+              finalTpReached,
+              tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+              tp1Hit: mergedHits.tp1Hit, tp2Hit: mergedHits.tp2Hit, tp3Hit: mergedHits.tp3Hit, tp4Hit: mergedHits.tp4Hit,
+              tp4Price,
+            }),
+          };
+        })(),
         positionCount,
         originalVolume: row.originalVolume != null ? Number(row.originalVolume) : 0,
         currentPrice,
@@ -4132,7 +4155,9 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
         .catch((e: Error) => console.warn(`[zone ${zoneId}] risk-free mark closed ${r.id}:`, e.message));
       st.trackedPositions.delete(r.id);
     }
-    await db.update(cascadeZonesTable).set({ status: "RISK_FREE" }).where(eq(cascadeZonesTable.zoneId, zoneId));
+    await db.update(cascadeZonesTable)
+      .set({ status: "RISK_FREE", wentRiskFree: true })
+      .where(eq(cascadeZonesTable.zoneId, zoneId));
     st.status = "RISK_FREE";
     broadcastZoneUpdate(zoneId);
     broadcastToAccount(accountId, "deal", { type: "position_changed" });
@@ -4219,9 +4244,12 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
     await db.update(cascadeZonesTable)
       .set({ status: "CLOSED", closedAt })
       .where(eq(cascadeZonesTable.zoneId, zoneId));
+    const wasRiskFree = st?.status === "RISK_FREE";
     if (st) st.status = "CLOSED";
     await finalizeZoneClose(accountId, zoneId, {
+      wasRiskFree,
       exitPrice: exitPriceForZoneClose(accountId, st.direction),
+      userInitiated: true,
     });
     void settleZoneClosedPnl(accountId, zoneId);
     broadcastZoneUpdate(zoneId);

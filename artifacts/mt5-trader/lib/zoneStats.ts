@@ -39,12 +39,13 @@ export function isTp4LevelEnabled(z: Pick<Zone, "tp4Enabled">): boolean {
 }
 
 /** How a closed zone ended (exit reason) — separate from day/week TP reach stats. */
-export type ZonePrimaryOutcome = "SL" | "MANUAL" | "TP4" | "TP3" | "TP2" | "TP1" | "NONE";
+export type ZonePrimaryOutcome = "RF" | "SL" | "MANUAL" | "TP4" | "TP3" | "TP2" | "TP1" | "NONE";
 
 /** Classify exit reason for a closed zone (optional card label). */
 export function zonePrimaryOutcome(z: Zone): ZonePrimaryOutcome {
   if (z.primaryOutcome) return z.primaryOutcome;
   if (z.status !== "CLOSED") return "NONE";
+  if (z.riskFreeSlExit) return "RF";
   if (z.slHit) return "SL";
   if (z.tp4Hit && isTp4LevelEnabled(z)) return "TP4";
   if (z.manualClose) return "MANUAL";
@@ -80,7 +81,11 @@ export function countManualCloses(zones: Zone[]): number {
 }
 
 export function countSlHits(zones: Zone[]): number {
-  return zones.filter((z) => Boolean(z.slHit)).length;
+  return zones.filter((z) => Boolean(z.slHit) && !z.riskFreeSlExit).length;
+}
+
+export function countRiskFreeSlExits(zones: Zone[]): number {
+  return zones.filter((z) => Boolean(z.riskFreeSlExit)).length;
 }
 
 /** Enabled TP levels this zone reached (for card pill, e.g. 3/4). */
@@ -98,12 +103,14 @@ export function zoneTpLevelsHit(z: Zone): { hit: number; enabled: number } {
 
 export function primaryOutcomeLabel(outcome: ZonePrimaryOutcome): string {
   if (outcome === "NONE") return "—";
+  if (outcome === "RF") return "Risk free";
   return outcome;
 }
 
 export function primaryOutcomePillStyle(
   outcome: ZonePrimaryOutcome,
 ): "green" | "gold" | "grey" | "red" {
+  if (outcome === "RF") return "gold";
   if (outcome === "SL") return "red";
   if (outcome === "MANUAL") return "gold";
   if (outcome === "TP4" || outcome === "TP3") return "green";
@@ -112,8 +119,15 @@ export function primaryOutcomePillStyle(
   return "grey";
 }
 
-/** Win/loss only from settled broker P&L (blue = win, red = loss). Manual closes included. */
+/**
+ * Win rate bucket for a closed zone.
+ * - TP1+ reached → win (normal or risk-free), even if it later closed on SL/RF SL.
+ * - Risk-free SL without TP1 → excluded (null), not in win-rate %.
+ * - Otherwise → win/loss from settled closedPnl.
+ */
 export function isZoneWin(z: Zone): boolean | null {
+  if (zoneReachedTpLevel(z, 1)) return true;
+  if (z.riskFreeSlExit) return null;
   if (typeof z.closedPnl !== "number" || !Number.isFinite(z.closedPnl)) return null;
   return z.closedPnl > 0;
 }

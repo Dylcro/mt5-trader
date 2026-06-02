@@ -21,6 +21,7 @@ import { formatDuration, formatHistoryDate, formatPrice } from "@/lib/formatters
 import { tpDisplayState } from "@/lib/zoneComments";
 import {
   countManualCloses,
+  countRiskFreeSlExits,
   countSlHits,
   countZonesReachedTp,
   filterClosedZonesByPeriod,
@@ -77,9 +78,12 @@ function ExitChip({
 }: {
   label: string;
   hit: boolean;
-  variant: "manual" | "sl";
+  variant: "manual" | "sl" | "rf";
 }) {
-  const hitStyle = variant === "sl" ? styles.tpChipSlHit : styles.tpChipManualHit;
+  const hitStyle =
+    variant === "sl" ? styles.tpChipSlHit
+      : variant === "rf" ? styles.tpChipRfHit
+        : styles.tpChipManualHit;
   const hitColor = variant === "sl" ? C.sell : C.gold;
   return (
     <View style={[styles.tpChip, hit ? hitStyle : styles.tpChipPending]}>
@@ -161,7 +165,8 @@ function HistoryCard({ zone }: { zone: Zone }) {
           <TpChip key={n} n={n} zone={zone} />
         ))}
         <ExitChip label="MANUAL" hit={Boolean(zone.manualClose)} variant="manual" />
-        <ExitChip label="SL" hit={Boolean(zone.slHit)} variant="sl" />
+        <ExitChip label="RF" hit={Boolean(zone.riskFreeSlExit)} variant="rf" />
+        <ExitChip label="SL" hit={Boolean(zone.slHit) && !zone.riskFreeSlExit} variant="sl" />
       </View>
     </View>
   );
@@ -262,6 +267,8 @@ export default function HistoryScreen() {
         <SummaryCell label="TP4" value={String(countZonesReachedTp(periodZones, 4))} color={C.gold} />
         <View style={styles.summaryDivider} />
         <SummaryCell label="MANUAL" value={String(countManualCloses(periodZones))} color={C.gold} />
+        <View style={styles.summaryDivider} />
+        <SummaryCell label="RF" value={String(countRiskFreeSlExits(periodZones))} color={C.gold} />
         <View style={styles.summaryDivider} />
         <SummaryCell label="SL" value={String(countSlHits(periodZones))} color={C.sell} />
       </ScrollView>
@@ -444,6 +451,10 @@ const styles = StyleSheet.create({
     borderColor: C.buyBorder,
   },
   tpChipManualHit: {
+    backgroundColor: C.goldLight,
+    borderColor: C.gold,
+  },
+  tpChipRfHit: {
     backgroundColor: C.goldLight,
     borderColor: C.gold,
   },
