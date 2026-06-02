@@ -64,13 +64,20 @@ async function authFetch(url: string, options: RequestInit = {}): Promise<Respon
 interface UseZonesOptions {
   includeClosed?: boolean;
   pollIntervalMs?: number;
+  /** MetaAPI region for zone trade routes (must match connected account). */
+  region?: string;
   /** When true, SSE is live and zone_update events patch state directly.
    *  The poll interval is stretched to 60 s (safety net only). */
   sseConnected?: boolean;
 }
 
+function zoneTradeQuery(region?: string): string {
+  const r = (region?.trim() || "london");
+  return `?region=${encodeURIComponent(r)}`;
+}
+
 export function useZones(accountId: string, options: UseZonesOptions = {}) {
-  const { includeClosed = false, pollIntervalMs = 5_000, sseConnected = false } = options;
+  const { includeClosed = false, pollIntervalMs = 5_000, sseConnected = false, region } = options;
   // SSE zone_update events are the primary source of zone changes.
   // When connected: 60 s safety net (SSE handles all real-time updates).
   // When disconnected: 15 s fallback cadence (aligned with SSE fallback contract).
@@ -154,7 +161,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
       const body: Record<string, unknown> = {};
       if (opts.riskFreePips !== undefined) body.riskFreePips = opts.riskFreePips;
       const res = await authFetch(
-        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/risk-free`,
+        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/risk-free${zoneTradeQuery(region)}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -168,7 +175,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     } catch (e) {
       return { ok: false, message: (e as Error).message };
     }
-  }, [accountId, refresh]);
+  }, [accountId, region, refresh]);
 
   const closeZone = useCallback(async (
     zoneId: string,
@@ -176,7 +183,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     if (!API_BASE || !accountId) return { ok: false, message: "No account" };
     try {
       const res = await authFetch(
-        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/close`,
+        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/close${zoneTradeQuery(region)}`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
       );
       const data = await res.json().catch(() => ({})) as {
@@ -188,7 +195,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     } catch (e) {
       return { ok: false, message: (e as Error).message };
     }
-  }, [accountId, refresh]);
+  }, [accountId, region, refresh]);
 
   // Cancel pending cascade limit orders for the zone without touching open
   // positions. Powers the "Delete Orders" button on each zone card.
@@ -198,7 +205,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     if (!API_BASE || !accountId) return { ok: false, message: "No account" };
     try {
       const res = await authFetch(
-        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/cancel-pending`,
+        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/cancel-pending${zoneTradeQuery(region)}`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
       );
       const data = await res.json().catch(() => ({})) as {
@@ -221,7 +228,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     } catch (e) {
       return { ok: false, message: (e as Error).message };
     }
-  }, [accountId, refresh]);
+  }, [accountId, region, refresh]);
 
   return { zones, loading, error, refresh, riskFree, closeZone, cancelZoneOrders };
 }

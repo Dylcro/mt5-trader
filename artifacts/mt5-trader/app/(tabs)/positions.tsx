@@ -244,9 +244,11 @@ export default function PositionsScreen() {
   const {
     positions, pendingOrders, status, accountInfo,
     refreshPositions, refreshPendingOrders, refreshAccountInfo,
-    closePosition, cancelOrder, accountId, sseConnected, price, syncSession,
+    closePosition, cancelOrder, accountId, region, sseConnected, price, syncSession,
   } = useTrading();
-  const { zones, refresh: refreshZones, riskFree, closeZone, cancelZoneOrders } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000, sseConnected });
+  const { zones, refresh: refreshZones, riskFree, closeZone, cancelZoneOrders } = useZones(accountId, {
+    includeClosed: true, pollIntervalMs: 10_000, sseConnected, region,
+  });
   const { settings: cs } = useCascadeSettings();
   const displayActiveZones = useMemo(
     () => buildDisplayActiveZones(zones, positions, cs, price, pendingOrders),

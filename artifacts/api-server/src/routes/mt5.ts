@@ -1,7 +1,7 @@
 import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { createRequire } from "module";
-import { db, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable, cascadeZonesTable, zonePositionsTable, zoneOrdersTable, notificationPrefsTable, usersTable } from "@workspace/db";
+import { db, pool, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable, cascadeZonesTable, zonePositionsTable, zoneOrdersTable, notificationPrefsTable, usersTable } from "@workspace/db";
 import { and, eq, inArray, isNotNull } from "drizzle-orm";
 import { JWT_SECRET } from "./auth";
 import { getTradingStatus } from "../lib/platformFlags";
@@ -119,6 +119,22 @@ const activeRegions = new Map<string, string>();  // accountId → region (used 
 interface KnownAccount { accountId: string; userId?: string; region: string; }
 const knownAccounts = new Map<string, KnownAccount>(); // accountId → KnownAccount
 let sdkInstance: InstanceType<typeof MetaApi> | null = null;
+
+/** Idempotent — safe when drizzle push was skipped (RF history columns). */
+let cascadeRfColumnsReady: Promise<void> | null = null;
+export async function ensureCascadeZoneRfColumns(): Promise<void> {
+  if (!cascadeRfColumnsReady) {
+    cascadeRfColumnsReady = pool.query(`
+      ALTER TABLE cascade_zones
+        ADD COLUMN IF NOT EXISTS went_risk_free BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS risk_free_sl_exit BOOLEAN NOT NULL DEFAULT FALSE;
+    `).then(() => undefined).catch((e) => {
+      cascadeRfColumnsReady = null;
+      throw e;
+    });
+  }
+  await cascadeRfColumnsReady;
+}
 
 async function upsertStoredAccount(params: {
   accountId: string;
@@ -3602,6 +3618,7 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
 export async function loadZone(zoneId: string): Promise<ZoneState | null> {
   const cached = zoneStates.get(zoneId);
   if (cached) return cached;
+  await ensureCascadeZoneRfColumns();
   // Intentionally no try/catch — DB errors bubble up to the route handler
   // which wraps everything in try/catch and returns 500.
   const [z] = await db.select().from(cascadeZonesTable)
@@ -3642,6 +3659,7 @@ export const _zoneStatesForTest = zoneStates;
 // watching zones placed in previous server sessions.
 export async function loadZoneState(): Promise<void> {
   try {
+    await ensureCascadeZoneRfColumns();
     // Load both OPEN and RISK_FREE zones — the monitor evaluates both
     // (RISK_FREE zones still need TP progression on the surviving entry).
     const zones = await db.select().from(cascadeZonesTable)
@@ -3942,6 +3960,7 @@ router.get("/mt5/account/:accountId/stream", checkOwner, (req: Request, res: Res
 // GET /api/mt5/account/:accountId/zones — list active + risk-free zones with live position count.
 router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res: Response) => {
   try {
+    await ensureCascadeZoneRfColumns();
     const { accountId } = req.params as { accountId: string };
     const includeClosed = qstr(req.query.includeClosed) === "true";
     const zones = await db.select().from(cascadeZonesTable)
@@ -4081,6 +4100,7 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
 router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async (req: Request, res: Response) => {
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
+    await ensureCascadeZoneRfColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     // DB-first read: loadZone checks cache first, then hydrates from DB on miss.
