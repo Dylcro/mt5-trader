@@ -29,6 +29,7 @@ export type AdminDashboardData = {
   smokePurgeCount: number;
   testToggleHref: string;
   testToggleLabel: string;
+  publicAppUrl: string;
 };
 
 export function renderAdminDashboard(d: AdminDashboardData): string {
@@ -113,7 +114,14 @@ export function renderAdminDashboard(d: AdminDashboardData): string {
           <input type="checkbox" id="inviteOnly" ${d.flags.inviteOnly ? "checked" : ""}> Invite-only signups
         </label>
         <div class="field"><div class="field-label">Invite code</div>
-          <input class="input" id="inviteCode" value="${escapeAttr(d.flags.inviteCode ?? "")}" placeholder="Required when invite-only"></div>
+          <input class="input" id="inviteCode" value="${escapeAttr(d.flags.inviteCode ?? "")}" placeholder="e.g. DEMO2026"></div>
+        <div class="field" style="margin-top:10px"><div class="field-label">Invite link (send to testers)</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <input class="input" id="inviteLink" readonly style="flex:1;min-width:200px" value="${escapeAttr(inviteLinkFor(d.publicAppUrl, d.flags.inviteCode))}">
+            <button type="button" class="btn" id="copyInviteLinkBtn">Copy link</button>
+          </div>
+        </div>
+        <p class="section-hint" id="inviteShareHint" style="margin-top:8px;font-size:12px">Testers open the link on their phone (or paste the code in the app under <strong>Create account → Invite code</strong>). Save membership after changing the code.</p>
         <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:12px">
           <input type="checkbox" id="signupsOpen" ${d.flags.signupsOpen ? "checked" : ""}> Signups open
         </label>
@@ -251,6 +259,20 @@ export function renderAdminDashboard(d: AdminDashboardData): string {
     }) }).then(function() { location.reload(); });
   };
 
+  function updateInviteLink() {
+    var code = (document.getElementById('inviteCode').value || '').trim();
+    var base = ${JSON.stringify(d.publicAppUrl)};
+    var link = code ? (base + '/join?code=' + encodeURIComponent(code)) : (base + '/join');
+    document.getElementById('inviteLink').value = link;
+  }
+  document.getElementById('inviteCode').addEventListener('input', updateInviteLink);
+  document.getElementById('copyInviteLinkBtn').onclick = function() {
+    var el = document.getElementById('inviteLink');
+    el.select();
+    el.setSelectionRange(0, 99999);
+    navigator.clipboard.writeText(el.value).then(function() { alert('Invite link copied'); }).catch(function() { alert(el.value); });
+  };
+
   document.getElementById('saveMembershipBtn').onclick = function() {
     api('/settings/membership', { method: 'POST', body: JSON.stringify({
       membershipCap: Number(document.getElementById('membershipCap').value),
@@ -299,4 +321,10 @@ export function renderAdminDashboard(d: AdminDashboardData): string {
 
 function escapeAttr(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+}
+
+function inviteLinkFor(baseUrl: string, code: string | null): string {
+  const base = baseUrl.replace(/\/$/, "");
+  const c = (code ?? "").trim();
+  return c ? `${base}/join?code=${encodeURIComponent(c)}` : `${base}/join`;
 }

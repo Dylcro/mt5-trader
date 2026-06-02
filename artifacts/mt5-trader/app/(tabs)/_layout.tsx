@@ -4,7 +4,7 @@ import { Redirect, Tabs } from "expo-router";
 import { NativeTabs } from "expo-router/unstable-native-tabs";
 import { MaterialCommunityIcons, Feather } from "@expo/vector-icons";
 import { SymbolView } from "expo-symbols";
-import React, { useCallback, useEffect, useRef } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Platform, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -17,6 +17,7 @@ import { useAuth } from "@/context/AuthContext";
 import { useTrading } from "@/context/TradingContext";
 import { useOnboardingGate } from "@/hooks/useOnboardingGate";
 import { setAuthTokenGetter } from "@/lib/authToken";
+import { clearPendingInviteCode, loadPendingInviteCode } from "@/lib/inviteStorage";
 
 const C = Colors.dark;
 
@@ -35,6 +36,7 @@ function TabChrome({
 }) {
   const { signIn, signUp } = useAuth();
   const { connect, status, errorMsg } = useTrading();
+  const [pendingInviteCode, setPendingInviteCode] = useState("");
   const statusRef = useRef(status);
   const errorRef = useRef(errorMsg);
 
@@ -42,6 +44,12 @@ function TabChrome({
     statusRef.current = status;
     errorRef.current = errorMsg;
   }, [status, errorMsg]);
+
+  useEffect(() => {
+    void loadPendingInviteCode().then((code) => {
+      if (code) setPendingInviteCode(code);
+    });
+  }, []);
 
   const onSignIn = useCallback(async (email: string, password: string) => {
     const res = await signIn(email, password);
@@ -51,6 +59,8 @@ function TabChrome({
   const onCreateAccount = useCallback(async (fullName: string, email: string, password: string, inviteCode?: string) => {
     const res = await signUp(fullName, email, password, inviteCode);
     if (res.error) throw new Error(res.error);
+    await clearPendingInviteCode();
+    setPendingInviteCode("");
   }, [signUp]);
 
   const onConnectMT5 = useCallback(
@@ -82,6 +92,7 @@ function TabChrome({
         onSignIn={onSignIn}
         onCreateAccount={onCreateAccount}
         onConnectMT5={onConnectMT5}
+        initialInviteCode={pendingInviteCode}
       />
     </View>
   );
@@ -248,6 +259,7 @@ export default function TabLayout() {
 function OnboardingOnly({ onComplete }: { onComplete: () => void }) {
   const { signIn, signUp } = useAuth();
   const { connect, status, errorMsg } = useTrading();
+  const [pendingInviteCode, setPendingInviteCode] = useState("");
   const statusRef = useRef(status);
   const errorRef = useRef(errorMsg);
 
@@ -255,6 +267,12 @@ function OnboardingOnly({ onComplete }: { onComplete: () => void }) {
     statusRef.current = status;
     errorRef.current = errorMsg;
   }, [status, errorMsg]);
+
+  useEffect(() => {
+    void loadPendingInviteCode().then((code) => {
+      if (code) setPendingInviteCode(code);
+    });
+  }, []);
 
   const onSignIn = useCallback(async (email: string, password: string) => {
     const res = await signIn(email, password);
@@ -264,6 +282,8 @@ function OnboardingOnly({ onComplete }: { onComplete: () => void }) {
   const onCreateAccount = useCallback(async (fullName: string, email: string, password: string, inviteCode?: string) => {
     const res = await signUp(fullName, email, password, inviteCode);
     if (res.error) throw new Error(res.error);
+    await clearPendingInviteCode();
+    setPendingInviteCode("");
   }, [signUp]);
 
   const onConnectMT5 = useCallback(
@@ -291,6 +311,7 @@ function OnboardingOnly({ onComplete }: { onComplete: () => void }) {
         onSignIn={onSignIn}
         onCreateAccount={onCreateAccount}
         onConnectMT5={onConnectMT5}
+        initialInviteCode={pendingInviteCode}
       />
     </View>
   );

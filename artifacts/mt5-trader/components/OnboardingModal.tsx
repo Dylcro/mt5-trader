@@ -29,6 +29,8 @@ type Props = {
   }) => Promise<void>;
   onSignIn?: (email: string, password: string) => Promise<void>;
   onCreateAccount?: (fullName: string, email: string, password: string, inviteCode?: string) => Promise<void>;
+  /** Pre-filled from /join?code= or admin invite link */
+  initialInviteCode?: string;
   termsUrl?: string;
 };
 
@@ -40,6 +42,7 @@ export default function OnboardingModal({
   onConnectMT5,
   onSignIn,
   onCreateAccount,
+  initialInviteCode = "",
   termsUrl = "https://meta-trader-link.replit.app/terms",
 }: Props) {
   const [step, setStep] = useState(0);
@@ -52,7 +55,11 @@ export default function OnboardingModal({
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [inviteCode, setInviteCode] = useState("");
+  const [inviteCode, setInviteCode] = useState(initialInviteCode.trim());
+
+  useEffect(() => {
+    if (initialInviteCode.trim()) setInviteCode(initialInviteCode.trim());
+  }, [initialInviteCode]);
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
 
@@ -224,9 +231,14 @@ export default function OnboardingModal({
               keyboardType="email-address" autoCapitalize="none" />
             <Field label="Password" value={password} onChangeText={setPassword}
               placeholder={authMode === "create" ? "At least 8 characters" : "••••••••"} secureTextEntry />
-            {authMode === "create" && platformStatus.invite_only && (
-              <Field label="Invite code" value={inviteCode} onChangeText={setInviteCode} placeholder="Required"
-                autoCapitalize="none" />
+            {authMode === "create" && (
+              <Field
+                label={platformStatus.invite_only ? "Invite code (required)" : "Invite code (if you were sent one)"}
+                value={inviteCode}
+                onChangeText={setInviteCode}
+                placeholder={platformStatus.invite_only ? "Paste code from your invite" : "Optional"}
+                autoCapitalize="none"
+              />
             )}
             {authError && <Text style={s.error}>{authError}</Text>}
             <Pressable style={[s.primaryBtn, authBusy && s.btnBusy]} onPress={doAuth} disabled={authBusy}>

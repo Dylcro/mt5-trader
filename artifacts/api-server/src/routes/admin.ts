@@ -218,6 +218,7 @@ router.get("/", async (req: Request, res: Response) => {
       smokePurgeCount: smokeUsers.length,
       testToggleHref,
       testToggleLabel: hideTest ? "Show smoke-test users" : "Hide smoke-test users",
+      publicAppUrl: process.env.PUBLIC_APP_URL?.trim() || "https://meta-trader-link.replit.app",
     }));
   } catch (err) {
     console.error("[admin] error:", (err as Error).message);

@@ -49,6 +49,33 @@ app.use("/api/system", systemRouter);
 app.use("/api/auth", authLimiter, authRouter);
 app.use("/api", apiLimiter);
 
+/** Invite link landing — opens app sign-up with ?code= pre-filled when possible. */
+app.get("/join", (req: Request, res: Response) => {
+  const code = typeof req.query.code === "string" ? req.query.code.trim() : "";
+  const appScheme = code
+    ? `mt5trader://join?code=${encodeURIComponent(code)}`
+    : "mt5trader://join";
+  const safeCode = code.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Join XAUUSD Trader</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 420px; margin: 40px auto; padding: 0 20px; color: #1a1a1a; line-height: 1.6; }
+  h1 { color: #b8860b; font-size: 22px; }
+  .code { font-size: 20px; font-weight: 700; letter-spacing: 1px; padding: 12px; background: #f5f5f0; border-radius: 8px; text-align: center; }
+  a.btn { display: block; text-align: center; background: #C9A84C; color: #000; font-weight: 700; padding: 14px; border-radius: 10px; text-decoration: none; margin: 16px 0; }
+  .muted { color: #666; font-size: 14px; }
+</style></head><body>
+<h1>Join XAUUSD Trader</h1>
+${code ? `<p>Your invite code:</p><p class="code">${safeCode}</p>` : "<p>Get the app and create an account.</p>"}
+<p><a class="btn" href="${appScheme}">Open in app</a></p>
+<p class="muted">If the app does not open: install from TestFlight, then on <strong>Create account</strong> paste the invite code above.</p>
+<p class="muted">Or open the app and go to Create account → Invite code.</p>
+</body></html>`);
+});
+
 // Public privacy policy page — required by App Store and Google Play for financial apps
 app.get("/privacy", (_req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
