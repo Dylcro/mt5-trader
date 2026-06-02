@@ -2,6 +2,7 @@ import type { Position, PendingOrder, Price } from "@/context/TradingContext";
 import type { CascadeSettings } from "@/hooks/useCascadeSettings";
 import type { Zone } from "@/hooks/useZones";
 import { parseZoneIdFromComment } from "@/lib/zoneComments";
+import { isAutomatedTp4Level, zoneReachedTpLevel } from "@/lib/zoneStats";
 
 const PIP = 0.1;
 
@@ -39,13 +40,9 @@ export function enrichZoneDisplayFields(zone: Zone): Zone {
   const tp1Enabled = zone.tp1Enabled !== false;
   const tp2Enabled = zone.tp2Enabled !== false;
   const tp3Enabled = zone.tp3Enabled !== false;
-  const tp4Enabled = zone.tp4Enabled !== false;
-  const enabledTpCount = [tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled].filter(Boolean).length;
-  let hit = 0;
-  if (tp1Enabled && zone.tp1Hit) hit++;
-  if (tp2Enabled && zone.tp2Hit) hit++;
-  if (tp3Enabled && zone.tp3Hit) hit++;
-  if (tp4Enabled && zone.tp4Hit) hit++;
+  const tp4Ladder = isAutomatedTp4Level(zone);
+  const enabledTpCount = [tp1Enabled, tp2Enabled, tp3Enabled, tp4Ladder].filter(Boolean).length;
+  const hit = ([1, 2, 3, 4] as const).filter((n) => zoneReachedTpLevel(zone, n)).length;
   return {
     ...zone,
     enabledTpCount: zone.enabledTpCount ?? enabledTpCount,

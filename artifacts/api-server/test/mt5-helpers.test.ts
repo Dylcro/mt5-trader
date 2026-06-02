@@ -15,6 +15,8 @@ import {
   dealIndicatesStopLoss,
   resolveCloseOutcome,
   inferCloseOutcomeFromExitPrice,
+  inferManualCloseFromExitPrice,
+  sanitizeZoneTpLadder,
   exitPriceBeyondTp3,
   exitPriceBeforeTp1,
   isManualTp4Zone,
@@ -606,20 +608,29 @@ describe("disabled TP history", () => {
     })).toEqual({ manualClose: false, slHit: true });
   });
 
-  it("inferCloseOutcomeFromExitPrice: manual TP4 close above TP3 is tp4Hit not manual", () => {
+  it("inferManualCloseFromExitPrice: never promotes tp4Hit from spot/deal price", () => {
     const zone = {
       direction: "buy" as const,
       tp1Price: 2600,
-      tp3Price: 2650,
       tp4Price: null,
       tp4Enabled: true,
       tp4Hit: false,
     };
     expect(isManualTp4Zone(zone.tp4Price, zone.tp4Enabled)).toBe(true);
-    expect(exitPriceBeyondTp3("buy", 2660, 2650)).toBe(true);
-    expect(inferCloseOutcomeFromExitPrice(zone, 2660)).toEqual({ tp4Hit: true, manualClose: false });
-    expect(inferCloseOutcomeFromExitPrice(zone, 2590)).toEqual({ tp4Hit: false, manualClose: true });
-    expect(inferCloseOutcomeFromExitPrice(zone, 2630)).toEqual({ tp4Hit: false, manualClose: false });
+    expect(inferManualCloseFromExitPrice(zone, 2660)).toBe(true);
+    expect(inferManualCloseFromExitPrice(zone, 2590)).toBe(true);
+    expect(inferManualCloseFromExitPrice(zone, 2630)).toBe(true);
+    expect(inferManualCloseFromExitPrice({
+      direction: "buy", tp1Price: 2600, tp4Price: 2700, tp4Enabled: true, tp4Hit: true,
+    }, 2660)).toBe(false);
+  });
+
+  it("sanitizeZoneTpLadder: cannot have TP4 without TP3", () => {
+    expect(sanitizeZoneTpLadder({
+      tp1Enabled: true, tp2Enabled: true, tp3Enabled: true, tp4Enabled: true,
+      tp1Hit: true, tp2Hit: true, tp3Hit: false, tp4Hit: true,
+      tp4Price: 2700,
+    }).tp4Hit).toBe(false);
   });
 
   it("zonePrimaryOutcome: exit reason for a closed zone", () => {
@@ -651,8 +662,8 @@ describe("disabled TP history", () => {
       tp4Enabled: true,
     };
     expect(exitPriceBeforeTp1("sell", 2710, 2700)).toBe(true);
-    expect(inferCloseOutcomeFromExitPrice(zone, 2640)).toEqual({ tp4Hit: true, manualClose: false });
-    expect(inferCloseOutcomeFromExitPrice(zone, 2710)).toEqual({ tp4Hit: false, manualClose: true });
+    expect(inferManualCloseFromExitPrice(zone, 2640)).toBe(true);
+    expect(inferManualCloseFromExitPrice(zone, 2710)).toBe(true);
   });
 
   it("hit/enabled counts use only enabled TPs as denominator", () => {
@@ -662,6 +673,19 @@ describe("disabled TP history", () => {
       ...flags,
       tp1Hit: true, tp2Hit: true, tp3Hit: true, tp4Hit: false,
     })).toBe(2);
+  });
+
+  it("manual TP4 slice does not count as ladder TP4 hit", () => {
+    const manual = { tp1Enabled: true, tp2Enabled: true, tp3Enabled: true, tp4Enabled: true, tp4Price: null };
+    expect(countEnabledTps(manual)).toBe(3);
+    expect(countHitEnabledTps({
+      ...manual,
+      tp1Hit: true, tp2Hit: true, tp3Hit: true, tp4Hit: true,
+    })).toBe(3);
+    expect(computeFinalTpReached({
+      ...manual,
+      tp1Hit: true, tp2Hit: true, tp3Hit: true, tp4Hit: true,
+    })).toBe(3);
   });
 
   it("rowToZoneState does not pre-mark disabled TPs as hit", () => {

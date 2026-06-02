@@ -22,6 +22,14 @@ export function filterClosedZonesByPeriod(zones: Zone[], period: Period): Zone[]
   });
 }
 
+/** TP4 with 0 pips / no price — final slice is manual in MT5, not an automated ladder level. */
+export function isAutomatedTp4Level(
+  z: Pick<Zone, "tp4Enabled" | "tp4Price">,
+): boolean {
+  if (z.tp4Enabled === false) return false;
+  return z.tp4Price != null && z.tp4Price > 0;
+}
+
 /** How a closed zone ended (exit reason) — separate from day/week TP reach stats. */
 export type ZonePrimaryOutcome = "SL" | "MANUAL" | "TP4" | "TP3" | "TP2" | "TP1" | "NONE";
 
@@ -32,11 +40,19 @@ export function zonePrimaryOutcome(z: Zone): ZonePrimaryOutcome {
   if (z.slHit) return "SL";
   if (z.manualClose) return "MANUAL";
   const final = z.finalTpReached ?? 0;
-  if (final >= 4 && z.tp4Enabled !== false) return "TP4";
+  if (final >= 4 && isAutomatedTp4Level(z)) return "TP4";
   if (final >= 3 && z.tp3Enabled !== false) return "TP3";
   if (final >= 2 && z.tp2Enabled !== false) return "TP2";
   if (final >= 1 && z.tp1Enabled !== false) return "TP1";
   return "MANUAL";
+}
+
+/** True only when this TP level was enabled and all prior ladder levels were hit. */
+export function zoneReachedTpLevel(z: Zone, level: 1 | 2 | 3 | 4): boolean {
+  if (level === 1) return z.tp1Enabled !== false && Boolean(z.tp1Hit);
+  if (level === 2) return zoneReachedTpLevel(z, 1) && z.tp2Enabled !== false && Boolean(z.tp2Hit);
+  if (level === 3) return zoneReachedTpLevel(z, 2) && z.tp3Enabled !== false && Boolean(z.tp3Hit);
+  return zoneReachedTpLevel(z, 3) && isAutomatedTp4Level(z) && Boolean(z.tp4Hit);
 }
 
 /**
@@ -44,12 +60,7 @@ export function zonePrimaryOutcome(z: Zone): ZonePrimaryOutcome {
  * One zone that hits TP1+TP2 adds +1 to TP1 and +1 to TP2 (not +1 per ladder entry).
  */
 export function countZonesReachedTp(zones: Zone[], level: 1 | 2 | 3 | 4): number {
-  const hitKey = `tp${level}Hit` as keyof Zone;
-  const enKey = `tp${level}Enabled` as keyof Zone;
-  return zones.filter((z) => {
-    if (z[enKey] === false) return false;
-    return Boolean(z[hitKey]);
-  }).length;
+  return zones.filter((z) => zoneReachedTpLevel(z, level)).length;
 }
 
 /** @alias countZonesReachedTp */
@@ -65,14 +76,11 @@ export function countSlHits(zones: Zone[]): number {
 
 /** Enabled TP levels this zone reached (for card pill, e.g. 3/4). */
 export function zoneTpLevelsHit(z: Zone): { hit: number; enabled: number } {
-  const flags = [
-    { en: z.tp1Enabled !== false, hit: z.tp1Hit },
-    { en: z.tp2Enabled !== false, hit: z.tp2Hit },
-    { en: z.tp3Enabled !== false, hit: z.tp3Hit },
-    { en: z.tp4Enabled !== false, hit: z.tp4Hit },
-  ];
-  const enabled = flags.filter((f) => f.en).length;
-  const hit = flags.filter((f) => f.en && f.hit).length;
+  const levels = [1, 2, 3, 4] as const;
+  const enabled = levels.filter((n) =>
+    n === 4 ? isAutomatedTp4Level(z) : z[`tp${n}Enabled` as keyof Zone] !== false,
+  ).length;
+  const hit = levels.filter((n) => zoneReachedTpLevel(z, n)).length;
   return {
     hit: z.hitEnabledTpCount ?? hit,
     enabled: z.enabledTpCount ?? enabled,

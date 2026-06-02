@@ -555,13 +555,23 @@ async function mergeZoneHitsFromPositions(
   const tp2Enabled = row.tp2Enabled ?? true;
   const tp3Enabled = row.tp3Enabled ?? true;
   const tp4Enabled = row.tp4Enabled ?? true;
+  const [zoneMeta] = await db.select({ tp4Price: cascadeZonesTable.tp4Price })
+    .from(cascadeZonesTable).where(eq(cascadeZonesTable.zoneId, zoneId)).limit(1);
+  const tp4Price = zoneMeta?.tp4Price != null ? Number(zoneMeta.tp4Price) : null;
+  const manualTp4 = isManualTp4Zone(tp4Price, tp4Enabled);
   const posRows = await db.select().from(zonePositionsTable)
     .where(eq(zonePositionsTable.zoneId, zoneId));
   const open = posRows.filter((r) => r.status === "OPEN");
   const tp1Hit = Boolean(row.tp1Hit) || posRows.some((r) => r.tp1Hit);
   const tp2Hit = Boolean(row.tp2Hit) || posRows.some((r) => r.tp2Hit);
   const tp3Hit = Boolean(row.tp3Hit) || posRows.some((r) => r.tp3Hit);
-  const tp4Hit = Boolean(row.tp4Hit) || posRows.some((r) => r.tp4Hit);
+  let tp4Hit = manualTp4
+    ? false
+    : Boolean(row.tp4Hit) || posRows.some((r) => r.tp4Hit);
+  ({ tp1Hit, tp2Hit, tp3Hit, tp4Hit } = sanitizeZoneTpLadder({
+    tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+    tp1Hit, tp2Hit, tp3Hit, tp4Hit, tp4Price,
+  }));
   if (tp1Hit !== row.tp1Hit || tp2Hit !== row.tp2Hit || tp3Hit !== row.tp3Hit || tp4Hit !== row.tp4Hit) {
     await db.update(cascadeZonesTable)
       .set({ tp1Hit, tp2Hit, tp3Hit, tp4Hit })
@@ -604,14 +614,19 @@ function broadcastZoneUpdate(zoneId: string): void {
       tp3Enabled: (base as { tp3Enabled?: boolean }).tp3Enabled,
       tp4Enabled: (base as { tp4Enabled?: boolean }).tp4Enabled,
     });
+    const tp4Price = (dbRow as { tp4Price?: number | null } | undefined)?.tp4Price != null
+      ? Number((dbRow as { tp4Price: number }).tp4Price)
+      : st?.tp4Price ?? null;
     const enabledTpCount = countEnabledTps({
       tp1Enabled: merged.tp1Enabled, tp2Enabled: merged.tp2Enabled,
       tp3Enabled: merged.tp3Enabled, tp4Enabled: merged.tp4Enabled,
+      tp4Price,
     });
     const hitEnabledTpCount = countHitEnabledTps({
       tp1Enabled: merged.tp1Enabled, tp2Enabled: merged.tp2Enabled,
       tp3Enabled: merged.tp3Enabled, tp4Enabled: merged.tp4Enabled,
       tp1Hit: merged.tp1Hit, tp2Hit: merged.tp2Hit, tp3Hit: merged.tp3Hit, tp4Hit: merged.tp4Hit,
+      tp4Price,
     });
     broadcastToAccount(accountId, "zone_update", {
       zoneId,
@@ -1779,31 +1794,37 @@ export function tpDisplayState(
   return "pending";
 }
 
-export function countEnabledTps(flags: { tp1Enabled: boolean; tp2Enabled: boolean; tp3Enabled: boolean; tp4Enabled: boolean }): number {
-  return [flags.tp1Enabled, flags.tp2Enabled, flags.tp3Enabled, flags.tp4Enabled].filter(Boolean).length;
+export function countEnabledTps(flags: {
+  tp1Enabled: boolean; tp2Enabled: boolean; tp3Enabled: boolean; tp4Enabled: boolean;
+  tp4Price?: number | null;
+}): number {
+  const tp4Ladder = flags.tp4Enabled && !isManualTp4Zone(flags.tp4Price, flags.tp4Enabled);
+  return [flags.tp1Enabled, flags.tp2Enabled, flags.tp3Enabled, tp4Ladder].filter(Boolean).length;
 }
 
 export function countHitEnabledTps(z: {
   tp1Enabled: boolean; tp2Enabled: boolean; tp3Enabled: boolean; tp4Enabled: boolean;
   tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean;
+  tp4Price?: number | null;
 }): number {
   let n = 0;
   if (z.tp1Enabled && z.tp1Hit) n++;
   if (z.tp2Enabled && z.tp2Hit) n++;
   if (z.tp3Enabled && z.tp3Hit) n++;
-  if (z.tp4Enabled && z.tp4Hit) n++;
+  if (z.tp4Enabled && z.tp4Hit && !isManualTp4Zone(z.tp4Price, z.tp4Enabled)) n++;
   return n;
 }
 
 export function computeFinalTpReached(z: {
   tp1Enabled: boolean; tp2Enabled: boolean; tp3Enabled: boolean; tp4Enabled: boolean;
   tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean;
+  tp4Price?: number | null;
 }): 0 | 1 | 2 | 3 | 4 {
   let last: 0 | 1 | 2 | 3 | 4 = 0;
   if (z.tp1Enabled && z.tp1Hit) last = 1;
   if (z.tp2Enabled && z.tp2Hit) last = 2;
   if (z.tp3Enabled && z.tp3Hit) last = 3;
-  if (z.tp4Enabled && z.tp4Hit) last = 4;
+  if (z.tp4Enabled && z.tp4Hit && !isManualTp4Zone(z.tp4Price, z.tp4Enabled)) last = 4;
   return last;
 }
 
@@ -1823,6 +1844,7 @@ export function zonePrimaryOutcome(row: {
   tp2Hit?: boolean;
   tp3Hit?: boolean;
   tp4Hit?: boolean;
+  tp4Price?: number | null;
 }): ZonePrimaryOutcome {
   if (row.status !== "CLOSED") return "NONE";
   if (row.slHit) return "SL";
@@ -1836,8 +1858,11 @@ export function zonePrimaryOutcome(row: {
     tp2Hit: Boolean(row.tp2Hit),
     tp3Hit: Boolean(row.tp3Hit),
     tp4Hit: Boolean(row.tp4Hit),
+    tp4Price: row.tp4Price,
   });
-  if (final >= 4 && row.tp4Enabled !== false) return "TP4";
+  if (final >= 4 && row.tp4Enabled !== false && !isManualTp4Zone(row.tp4Price, row.tp4Enabled ?? true)) {
+    return "TP4";
+  }
   if (final >= 3 && row.tp3Enabled !== false) return "TP3";
   if (final >= 2 && row.tp2Enabled !== false) return "TP2";
   if (final >= 1 && row.tp1Enabled !== false) return "TP1";
@@ -1856,7 +1881,13 @@ export function dealIndicatesStopLoss(deal: unknown): boolean {
   return comment.includes("STOP LOSS") || comment.includes("[SL");
 }
 
-type CloseFinalizeOpts = { userInitiated?: boolean; stopLossExit?: boolean; exitPrice?: number };
+type CloseFinalizeOpts = {
+  userInitiated?: boolean;
+  stopLossExit?: boolean;
+  exitPrice?: number;
+  /** True when exitPrice is the broker fill from a deal, not live bid/ask. */
+  exitPriceFromDeal?: boolean;
+};
 
 export function exitPriceFromDeal(deal: unknown): number | null {
   if (!deal || typeof deal !== "object") return null;
@@ -1868,6 +1899,23 @@ export function exitPriceFromDeal(deal: unknown): number | null {
 /** TP4 left manual in MT5 (tp4 pips = 0 → no tp4Price on the zone). */
 export function isManualTp4Zone(tp4Price: number | null | undefined, tp4Enabled: boolean): boolean {
   return Boolean(tp4Enabled) && (tp4Price == null || !(tp4Price > 0));
+}
+
+/** Enforce ladder order — TP4 cannot be hit without TP3, etc. Strips manual-TP4 false positives. */
+export function sanitizeZoneTpLadder<T extends {
+  tp1Enabled?: boolean; tp2Enabled?: boolean; tp3Enabled?: boolean; tp4Enabled?: boolean;
+  tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean;
+  tp4Price?: number | null;
+}>(z: T): T {
+  const tp1Enabled = z.tp1Enabled ?? true;
+  const tp2Enabled = z.tp2Enabled ?? true;
+  const tp3Enabled = z.tp3Enabled ?? true;
+  const tp4Enabled = z.tp4Enabled ?? true;
+  const tp1Hit = tp1Enabled && Boolean(z.tp1Hit);
+  const tp2Hit = tp2Enabled && tp1Hit && Boolean(z.tp2Hit);
+  const tp3Hit = tp3Enabled && tp2Hit && Boolean(z.tp3Hit);
+  const tp4Hit = tp4Enabled && !isManualTp4Zone(z.tp4Price, tp4Enabled) && tp3Hit && Boolean(z.tp4Hit);
+  return { ...z, tp1Hit, tp2Hit, tp3Hit, tp4Hit };
 }
 
 /** Exit at/above TP3 region (manual TP4 leg) for buy; at/below for sell. */
@@ -1890,32 +1938,33 @@ export function exitPriceBeforeTp1(
   return direction === "buy" ? exitPrice < tp1Price : exitPrice > tp1Price;
 }
 
-/** Classify MT5/app full close from exit price (XAUUSD only). */
-export function inferCloseOutcomeFromExitPrice(
+/**
+ * Classify manual vs automated exit from a broker deal price only.
+ * Never promotes tp4Hit from price — ladder hits come only from the TP engine.
+ */
+export function inferManualCloseFromExitPrice(
   zone: {
     direction: "buy" | "sell";
     tp1Price: number | null;
-    tp3Price: number | null;
     tp4Price: number | null;
     tp4Enabled: boolean;
     tp4Hit?: boolean;
   },
   exitPrice: number | null | undefined,
+): boolean {
+  if (exitPrice == null || !(exitPrice > 0)) return true;
+  if (exitPriceBeforeTp1(zone.direction, exitPrice, zone.tp1Price)) return true;
+  if (Boolean(zone.tp4Hit) && !isManualTp4Zone(zone.tp4Price, zone.tp4Enabled)) return false;
+  return true;
+}
+
+/** @deprecated Use inferManualCloseFromExitPrice — kept for tests migrating off tp4Hit inference. */
+export function inferCloseOutcomeFromExitPrice(
+  zone: Parameters<typeof inferManualCloseFromExitPrice>[0] & { tp3Price?: number | null },
+  exitPrice: number | null | undefined,
 ): { tp4Hit: boolean; manualClose: boolean } {
-  if (exitPrice == null || !(exitPrice > 0)) {
-    const tp4Done = Boolean(zone.tp4Enabled) && Boolean(zone.tp4Hit);
-    return { tp4Hit: tp4Done, manualClose: !tp4Done };
-  }
-  if (exitPriceBeforeTp1(zone.direction, exitPrice, zone.tp1Price)) {
-    return { tp4Hit: false, manualClose: true };
-  }
-  if (isManualTp4Zone(zone.tp4Price, zone.tp4Enabled) && exitPriceBeyondTp3(zone.direction, exitPrice, zone.tp3Price)) {
-    return { tp4Hit: true, manualClose: false };
-  }
-  if (zone.tp4Price != null && zone.tp4Price > 0 && exitPriceBeyondTp3(zone.direction, exitPrice, zone.tp4Price)) {
-    return { tp4Hit: true, manualClose: false };
-  }
-  return { tp4Hit: Boolean(zone.tp4Hit), manualClose: false };
+  const manualClose = inferManualCloseFromExitPrice(zone, exitPrice);
+  return { tp4Hit: false, manualClose };
 }
 
 /** Resolve close outcome for API/history (backfills legacy CLOSED rows missing flags). */
@@ -1923,6 +1972,7 @@ export function resolveCloseOutcome(row: {
   status: string;
   tp4Enabled: boolean;
   tp4Hit: boolean;
+  tp4Price?: number | null;
   manualClose?: boolean;
   slHit?: boolean;
 }): { manualClose: boolean; slHit: boolean } {
@@ -1931,7 +1981,8 @@ export function resolveCloseOutcome(row: {
   if (row.manualClose != null) {
     return { manualClose: Boolean(row.manualClose), slHit: false };
   }
-  const tp4Done = Boolean(row.tp4Enabled) && Boolean(row.tp4Hit);
+  const tp4Done = Boolean(row.tp4Enabled) && Boolean(row.tp4Hit)
+    && !isManualTp4Zone(row.tp4Price, row.tp4Enabled);
   return { manualClose: !tp4Done, slHit: false };
 }
 
@@ -1948,42 +1999,58 @@ async function finalizeZoneClose(
     if (!row || row.status !== "CLOSED") return;
 
     let slHit = Boolean(opts.stopLossExit);
-    let tp4Hit = Boolean(row.tp4Hit);
+    const ladder = sanitizeZoneTpLadder({
+      tp1Enabled: Boolean(row.tp1Enabled),
+      tp2Enabled: Boolean(row.tp2Enabled),
+      tp3Enabled: Boolean(row.tp3Enabled),
+      tp4Enabled: Boolean(row.tp4Enabled),
+      tp1Hit: Boolean(row.tp1Hit),
+      tp2Hit: Boolean(row.tp2Hit),
+      tp3Hit: Boolean(row.tp3Hit),
+      tp4Hit: Boolean(row.tp4Hit),
+      tp4Price: row.tp4Price,
+    });
     let manualClose = false;
 
     if (slHit) {
       manualClose = false;
-    } else if (opts.exitPrice != null && opts.exitPrice > 0) {
-      const inferred = inferCloseOutcomeFromExitPrice(
+    } else if (opts.userInitiated) {
+      manualClose = true;
+    } else if (opts.exitPriceFromDeal && opts.exitPrice != null && opts.exitPrice > 0) {
+      manualClose = inferManualCloseFromExitPrice(
         {
           direction: row.direction as "buy" | "sell",
           tp1Price: row.tp1Price,
-          tp3Price: row.tp3Price,
           tp4Price: row.tp4Price,
           tp4Enabled: Boolean(row.tp4Enabled),
-          tp4Hit,
+          tp4Hit: ladder.tp4Hit,
         },
         opts.exitPrice,
       );
-      tp4Hit = inferred.tp4Hit || tp4Hit;
-      manualClose = inferred.manualClose;
-    } else if (opts.userInitiated) {
-      manualClose = true;
     } else {
-      const tp4Done = Boolean(row.tp4Enabled) && tp4Hit;
-      manualClose = !tp4Done;
+      // Live bid/ask at reconcile time is not the fill price — do not infer TP hits from it.
+      manualClose = true;
     }
 
     await db.update(cascadeZonesTable)
-      .set({ slHit, manualClose, tp4Hit })
+      .set({
+        slHit, manualClose,
+        tp1Hit: ladder.tp1Hit,
+        tp2Hit: ladder.tp2Hit,
+        tp3Hit: ladder.tp3Hit,
+        tp4Hit: ladder.tp4Hit,
+      })
       .where(eq(cascadeZonesTable.zoneId, zoneId));
     const st = zoneStates.get(zoneId);
     if (st) {
-      st.tp4Hit = tp4Hit;
+      st.tp1Hit = ladder.tp1Hit;
+      st.tp2Hit = ladder.tp2Hit;
+      st.tp3Hit = ladder.tp3Hit;
+      st.tp4Hit = ladder.tp4Hit;
       (st as ZoneState & { slHit?: boolean; manualClose?: boolean }).slHit = slHit;
       (st as ZoneState & { manualClose?: boolean }).manualClose = manualClose;
     }
-    console.log(`[zone ${zoneId}] close outcome sl=${slHit} manual=${manualClose} tp4Hit=${tp4Hit} exit=${opts.exitPrice ?? "n/a"}`);
+    console.log(`[zone ${zoneId}] close outcome sl=${slHit} manual=${manualClose} tp4Hit=${ladder.tp4Hit} exit=${opts.exitPrice ?? "n/a"} deal=${opts.exitPriceFromDeal ?? false}`);
   } catch (e) {
     console.warn(`[zone ${zoneId}] finalizeZoneClose failed:`, (e as Error).message);
   }
@@ -2641,6 +2708,7 @@ async function markZonePositionClosed(
       await finalizeZoneClose(accountId, zoneId, {
         stopLossExit: dealIndicatesStopLoss(exitDeal),
         exitPrice: exitPx ?? exitPriceForZoneClose(accountId, dir),
+        exitPriceFromDeal: exitPx != null && exitPx > 0,
       });
       void settleZoneClosedPnl(accountId, zoneId);
       logEvent("zone.close", { accountId, zoneId, trigger: "position.closed" });
@@ -3508,9 +3576,9 @@ export async function loadZone(zoneId: string): Promise<ZoneState | null> {
         st.trackedPositions.set(zp.positionId, {
           volume: Number(zp.volume), entryPrice: Number(zp.entryPrice),
           tp1Hit: Boolean(zp.tp1Hit) || st.tp1Hit,
-          tp2Hit: Boolean(zp.tp2Hit) || st.tp2Hit,
-          tp3Hit: Boolean(zp.tp3Hit) || st.tp3Hit,
-          tp4Hit: Boolean(zp.tp4Hit) || (st.tp4Hit ?? false),
+          tp2Hit: Boolean(zp.tp2Hit),
+          tp3Hit: Boolean(zp.tp3Hit),
+          tp4Hit: Boolean(zp.tp4Hit),
         });
       }
     } catch { /* non-fatal — evaluateZone will re-read from DB */ }
@@ -3549,11 +3617,10 @@ export async function loadZoneState(): Promise<void> {
         const st = zoneStates.get(zp.zoneId);
         if (st) st.trackedPositions.set(zp.positionId, {
           volume: Number(zp.volume), entryPrice: Number(zp.entryPrice),
-          // Migration safety: same zone-level floor logic as loadZone.
           tp1Hit: Boolean(zp.tp1Hit) || st.tp1Hit,
-          tp2Hit: Boolean(zp.tp2Hit) || st.tp2Hit,
-          tp3Hit: Boolean(zp.tp3Hit) || st.tp3Hit,
-          tp4Hit: Boolean(zp.tp4Hit) || (st.tp4Hit ?? false),
+          tp2Hit: Boolean(zp.tp2Hit),
+          tp3Hit: Boolean(zp.tp3Hit),
+          tp4Hit: Boolean(zp.tp4Hit),
         });
       }
     } catch (e) {
@@ -3857,21 +3924,10 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
       const tp2Enabled = (row as { tp2Enabled?: boolean }).tp2Enabled ?? (Number(row.tp2Pct ?? 25) > 0);
       const tp3Enabled = (row as { tp3Enabled?: boolean }).tp3Enabled ?? (Number(row.tp3Pct ?? 25) > 0);
       const tp4Enabled = (row as { tp4Enabled?: boolean }).tp4Enabled ?? (Number(row.tp4Pct ?? 25) > 0);
-      const mergedHits = await mergeZoneHitsFromPositions(row.zoneId, {
+      let mergedHits = await mergeZoneHitsFromPositions(row.zoneId, {
         tp1Hit: row.tp1Hit, tp2Hit: row.tp2Hit, tp3Hit: row.tp3Hit, tp4Hit: row.tp4Hit ?? false,
         tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
       });
-      const positionCount = mergedHits.positionCount;
-      const finalTpReached = computeFinalTpReached({
-        tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
-        tp1Hit: mergedHits.tp1Hit, tp2Hit: mergedHits.tp2Hit, tp3Hit: mergedHits.tp3Hit, tp4Hit: mergedHits.tp4Hit,
-      });
-      const enabledTpCount = countEnabledTps({ tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled });
-      const hitEnabledTpCount = countHitEnabledTps({
-        tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
-        tp1Hit: mergedHits.tp1Hit, tp2Hit: mergedHits.tp2Hit, tp3Hit: mergedHits.tp3Hit, tp4Hit: mergedHits.tp4Hit,
-      });
-
       const dir = row.direction === "sell" ? "sell" : "buy";
       const anchor = Number(row.anchorPrice);
       // Resolve absolute TP prices, falling back to anchor + legacy pip distance.
@@ -3880,6 +3936,19 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
       const tp2Price = row.tp2Price != null ? Number(row.tp2Price) : (row.tp2Pips ? fromPips(Number(row.tp2Pips)) : null);
       const tp3Price = row.tp3Price != null ? Number(row.tp3Price) : (row.tp3Pips ? fromPips(Number(row.tp3Pips)) : null);
       const tp4Price = row.tp4Price != null ? Number(row.tp4Price) : null;
+      mergedHits = sanitizeZoneTpLadder({ ...mergedHits, tp4Price });
+      const positionCount = mergedHits.positionCount;
+      const finalTpReached = computeFinalTpReached({
+        tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+        tp1Hit: mergedHits.tp1Hit, tp2Hit: mergedHits.tp2Hit, tp3Hit: mergedHits.tp3Hit, tp4Hit: mergedHits.tp4Hit,
+        tp4Price,
+      });
+      const enabledTpCount = countEnabledTps({ tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled, tp4Price });
+      const hitEnabledTpCount = countHitEnabledTps({
+        tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+        tp1Hit: mergedHits.tp1Hit, tp2Hit: mergedHits.tp2Hit, tp3Hit: mergedHits.tp3Hit, tp4Hit: mergedHits.tp4Hit,
+        tp4Price,
+      });
 
       let nextTp: 0 | 1 | 2 | 3 | 4 = 0;
       if (tp1Enabled && !mergedHits.tp1Hit) nextTp = 1;
@@ -3933,6 +4002,7 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
           finalTpReached,
           tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
           tp1Hit: mergedHits.tp1Hit, tp2Hit: mergedHits.tp2Hit, tp3Hit: mergedHits.tp3Hit, tp4Hit: mergedHits.tp4Hit,
+          tp4Price,
         }),
         ...resolveCloseOutcome(row),
         positionCount,
