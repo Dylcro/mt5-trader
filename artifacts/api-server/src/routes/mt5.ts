@@ -2674,6 +2674,60 @@ async function recordZonePositionFill(
   console.error(`[zone ${zoneId}] fill persist FAILED after retries for posId=${positionId} @${entryPrice}:`, (lastErr as Error)?.message);
 }
 
+/**
+ * Positions to act on for risk-free / close-zone. Prefer OPEN zone_positions rows;
+ * if DB is empty but MT5 still has cascade-tagged legs, relink them (UI already
+ * shows those legs via comment grouping).
+ */
+async function resolveLivePositionsForZoneAction(
+  token: string,
+  region: string,
+  accountId: string,
+  zoneId: string,
+  st: ZoneState,
+): Promise<LivePosition[]> {
+  const allLive = await fetchOpenPositions(token, region, accountId);
+  const openRows = await db.select().from(zonePositionsTable)
+    .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
+  const trackedIds = new Set(openRows.map((z) => z.positionId));
+  const fromDb = allLive.filter((p) => trackedIds.has(p.id));
+  if (fromDb.length > 0) return fromDb;
+
+  const tagged = allLive.filter((p) => positionBelongsToZone(p, zoneId));
+  if (tagged.length === 0) return [];
+
+  for (const p of tagged) {
+    const [row] = await db.select({ status: zonePositionsTable.status })
+      .from(zonePositionsTable)
+      .where(and(
+        eq(zonePositionsTable.zoneId, zoneId),
+        eq(zonePositionsTable.positionId, p.id),
+      ))
+      .limit(1);
+    if (row?.status === "CLOSED") {
+      await db.update(zonePositionsTable)
+        .set({ status: "OPEN" })
+        .where(and(
+          eq(zonePositionsTable.zoneId, zoneId),
+          eq(zonePositionsTable.positionId, p.id),
+        ));
+    } else if (!row) {
+      await recordZonePositionFill(zoneId, p.id, p.openPrice, p.volume);
+    }
+    const cached = st.trackedPositions.get(p.id);
+    st.trackedPositions.set(p.id, {
+      volume: p.volume,
+      entryPrice: p.openPrice,
+      tp1Hit: cached?.tp1Hit ?? false,
+      tp2Hit: cached?.tp2Hit ?? false,
+      tp3Hit: cached?.tp3Hit ?? false,
+      tp4Hit: cached?.tp4Hit ?? false,
+    });
+  }
+  console.log(`[zone ${zoneId}] relinked ${tagged.length} broker leg(s) for zone action (no OPEN DB rows)`);
+  return tagged;
+}
+
 // Called on every DEAL_ENTRY_OUT. A partial close ALSO fires this event with
 // the closed slice as `volume` — the position stays open with its remaining
 // volume. To avoid marking a still-open position CLOSED, verify the position
@@ -4111,10 +4165,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       res.status(409).json({ error: "Zone not active yet — wait for the first order to fill" });
       return;
     }
-    const zps = await db.select().from(zonePositionsTable)
-      .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
-    const trackedIds = new Set(zps.map(z => z.positionId));
-    const live = (await fetchOpenPositions(token, region, accountId)).filter(p => trackedIds.has(p.id));
+    const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
     if (live.length === 0) {
       res.status(409).json({ error: "No open positions in this zone" }); return;
     }
@@ -4222,12 +4273,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
     // easier to retry from than the inverse.
     await cancelZoneLimits(token, region, accountId, zoneId);
 
-    // Collect tracked open positions from DB (source of truth for zone
-    // membership) and intersect with what the broker actually has open.
-    const zps = await db.select().from(zonePositionsTable)
-      .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
-    const trackedIds = new Set(zps.map(z => z.positionId));
-    const live = (await fetchOpenPositions(token, region, accountId)).filter(p => trackedIds.has(p.id));
+    const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
 
     // Close every tracked position in parallel — serial closes were a major
     // source of "Close Zone takes seconds" lag. Each closeZonePosition is an
