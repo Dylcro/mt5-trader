@@ -562,16 +562,20 @@ async function mergeZoneHitsFromPositions(
   const posRows = await db.select().from(zonePositionsTable)
     .where(eq(zonePositionsTable.zoneId, zoneId));
   const open = posRows.filter((r) => r.status === "OPEN");
-  const tp1Hit = Boolean(row.tp1Hit) || posRows.some((r) => r.tp1Hit);
-  const tp2Hit = Boolean(row.tp2Hit) || posRows.some((r) => r.tp2Hit);
-  const tp3Hit = Boolean(row.tp3Hit) || posRows.some((r) => r.tp3Hit);
+  let tp1Hit = Boolean(row.tp1Hit) || posRows.some((r) => r.tp1Hit);
+  let tp2Hit = Boolean(row.tp2Hit) || posRows.some((r) => r.tp2Hit);
+  let tp3Hit = Boolean(row.tp3Hit) || posRows.some((r) => r.tp3Hit);
   let tp4Hit = manualTp4
     ? false
     : Boolean(row.tp4Hit) || posRows.some((r) => r.tp4Hit);
-  ({ tp1Hit, tp2Hit, tp3Hit, tp4Hit } = sanitizeZoneTpLadder({
+  const sanitized = sanitizeZoneTpLadder({
     tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
     tp1Hit, tp2Hit, tp3Hit, tp4Hit, tp4Price,
-  }));
+  });
+  tp1Hit = sanitized.tp1Hit;
+  tp2Hit = sanitized.tp2Hit;
+  tp3Hit = sanitized.tp3Hit;
+  tp4Hit = sanitized.tp4Hit;
   if (tp1Hit !== row.tp1Hit || tp2Hit !== row.tp2Hit || tp3Hit !== row.tp3Hit || tp4Hit !== row.tp4Hit) {
     await db.update(cascadeZonesTable)
       .set({ tp1Hit, tp2Hit, tp3Hit, tp4Hit })

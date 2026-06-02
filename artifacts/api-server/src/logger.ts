@@ -6,6 +6,7 @@ export type EventName =
   | "trade.ok"
   | "trade.fail"
   | "zone.create"
+  | "zone.arm"
   | "zone.close"
   | "rate.hit";
 
@@ -17,6 +18,7 @@ const OUTCOME: Record<EventName, string> = {
   "trade.ok":          "ok",
   "trade.fail":        "fail",
   "zone.create":       "created",
+  "zone.arm":          "armed",
   "zone.close":        "closed",
   "rate.hit":          "hit",
 };
