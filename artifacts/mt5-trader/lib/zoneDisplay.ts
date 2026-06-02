@@ -36,7 +36,7 @@ function buildTpPricesFromSettings(
 
 /** Client-side progress when the zones API omits live fields. */
 export function enrichZoneLiveFields(zone: Zone, price: Price | null): Zone {
-  if (zone.status === "CLOSED" || !price || zone.anchorPrice <= 0) return zone;
+  if (zone.status === "CLOSED" || zone.status === "ARMED" || !price || zone.anchorPrice <= 0) return zone;
   if (zone.nextTp && zone.nextTp > 0 && zone.pipsToNextTp != null) return zone;
 
   const dir = zone.direction;
@@ -124,7 +124,7 @@ export function buildDisplayActiveZones(
   cs: CascadeSettings,
   price: Price | null,
 ): Zone[] {
-  const active = apiZones.filter((z) => z.status === "OPEN" || z.status === "RISK_FREE");
+  const active = apiZones.filter((z) => z.status === "OPEN" || z.status === "RISK_FREE" || z.status === "ARMED");
   const byComment = groupPositionsByZoneId(positions);
   const seen = new Set<string>();
   const out: Zone[] = [];

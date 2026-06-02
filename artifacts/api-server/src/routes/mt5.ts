@@ -1978,7 +1978,7 @@ interface ZoneState {
   tp2SlIsBestEffort: boolean;
   /** Auto SL→BE after this TP partial (1, 2, or 3). Baked in at zone creation. */
   autoBeAtTp: 1 | 2 | 3;
-  status: "OPEN" | "RISK_FREE" | "CLOSED";
+  status: "OPEN" | "RISK_FREE" | "CLOSED" | "ARMED";
   busy: boolean; // debounce: prevent overlapping monitor ticks for this zone
   // In-memory mirror of zone_positions(status=OPEN) for this zone, used as a
   // fallback when the DB query inside evaluateZone fails — prevents transient
@@ -2344,6 +2344,37 @@ async function persistPreparedZone(
   logEvent("zone.create", { accountId: state.accountId, zoneId: state.zoneId, direction: state.direction, anchorPrice: state.anchorPrice, positionId, volume });
 }
 
+/** Armed @-price cascade: zone row only — no positions until first limit fills. */
+async function persistArmedZone(state: ZoneState, userId: string | undefined): Promise<void> {
+  const now = Date.now();
+  await db.insert(cascadeZonesTable).values({
+    zoneId: state.zoneId, accountId: state.accountId, userId: userId ?? null,
+    direction: state.direction, anchorPrice: state.anchorPrice,
+    tp1Price: state.tp1Price, tp2Price: state.tp2Price,
+    tp3Price: state.tp3Price, tp4Price: state.tp4Price,
+    tp1Pct: state.tp1Pct, tp2Pct: state.tp2Pct, tp3Pct: state.tp3Pct, tp4Pct: state.tp4Pct,
+    tp1Enabled: state.tp1Enabled, tp2Enabled: state.tp2Enabled, tp3Enabled: state.tp3Enabled, tp4Enabled: state.tp4Enabled,
+    originalVolume: state.originalVolume,
+    cashoutPips: state.cashoutPips, cashoutDone: false,
+    tp1Hit: state.tp1Hit, tp2Hit: state.tp2Hit, tp3Hit: state.tp3Hit, tp4Hit: state.tp4Hit,
+    autoBeAtTp: state.autoBeAtTp,
+    status: "ARMED", createdAt: now,
+  }).onConflictDoNothing();
+  if (userId) zoneIdToUserId.set(state.zoneId, userId);
+  logEvent("zone.arm", { accountId: state.accountId, zoneId: state.zoneId, direction: state.direction, anchorPrice: state.anchorPrice });
+}
+
+async function activateArmedZone(zoneId: string): Promise<void> {
+  const [row] = await db.select({ status: cascadeZonesTable.status })
+    .from(cascadeZonesTable).where(eq(cascadeZonesTable.zoneId, zoneId)).limit(1);
+  if (!row || row.status !== "ARMED") return;
+  await db.update(cascadeZonesTable).set({ status: "OPEN" }).where(eq(cascadeZonesTable.zoneId, zoneId));
+  const st = zoneStates.get(zoneId);
+  if (st) st.status = "OPEN";
+  console.log(`[zone ${zoneId}] ARMED → OPEN (first position filled)`);
+  broadcastZoneUpdate(zoneId);
+}
+
 async function attachLimitOrderToZone(
   accountId: string,
   orderId: string,
@@ -2405,6 +2436,7 @@ async function recordZonePositionFill(
       const st = zoneStates.get(zoneId);
       if (st) st.trackedPositions.set(positionId, { volume, entryPrice, tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false });
       console.log(`[zone ${zoneId}] linked filled positionId=${positionId} @${entryPrice} vol=${volume}${i > 0 ? ` (after ${i} retries)` : ""}`);
+      void activateArmedZone(zoneId);
       return;
     } catch (e) {
       lastErr = e;
@@ -2798,8 +2830,10 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
   }
   // Evaluate OPEN and RISK_FREE zones — Risk Free closes the losing entries
   // and arms a protective SL, but the TP ladder must keep running on the
-  // surviving best entry. Only CLOSED zones are skipped.
+  // surviving best entry. ARMED = pending limits only (no TP engine yet).
+  // Only CLOSED zones are skipped.
   if (!st || st.status === "CLOSED") return;
+  if (st.status === "ARMED") return;
   if (st.busy) return;
   st.busy = true;
   try {
@@ -3286,7 +3320,7 @@ export function startZoneTpMonitor(): void {
         try {
           const rows = await db.select({ zoneId: cascadeZonesTable.zoneId })
             .from(cascadeZonesTable)
-            .where(inArray(cascadeZonesTable.status, ["OPEN", "RISK_FREE"]));
+            .where(inArray(cascadeZonesTable.status, ["OPEN", "RISK_FREE", "ARMED"]));
           for (const row of rows) {
             if (!zoneStates.has(row.zoneId)) await loadZone(row.zoneId);
           }
@@ -3296,7 +3330,7 @@ export function startZoneTpMonitor(): void {
       })();
     }
     for (const [zoneId, st] of zoneStates.entries()) {
-      if (st.status !== "CLOSED") void evaluateZone(zoneId, token);
+      if (st.status !== "CLOSED" && st.status !== "ARMED") void evaluateZone(zoneId, token);
     }
   }, 3_000);
   console.log("[zone-monitor] started (3 s interval)");
@@ -3336,7 +3370,10 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
     tp2SlMoved: false, tp2BeAttempts: 0,
     tp2SlIsBestEffort: (z as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
     autoBeAtTp: sanitizeAutoBeAtTp((z as { autoBeAtTp?: number }).autoBeAtTp),
-    status: z.status === "CLOSED" ? "CLOSED" : z.status === "RISK_FREE" ? "RISK_FREE" : "OPEN",
+    status: z.status === "CLOSED" ? "CLOSED"
+      : z.status === "RISK_FREE" ? "RISK_FREE"
+        : z.status === "ARMED" ? "ARMED"
+          : "OPEN",
     busy: false,
     trackedPositions: new Map(),
   };
@@ -3393,7 +3430,7 @@ export async function loadZoneState(): Promise<void> {
     // Load both OPEN and RISK_FREE zones — the monitor evaluates both
     // (RISK_FREE zones still need TP progression on the surviving entry).
     const zones = await db.select().from(cascadeZonesTable)
-      .where(inArray(cascadeZonesTable.status, ["OPEN", "RISK_FREE"]));
+      .where(inArray(cascadeZonesTable.status, ["OPEN", "RISK_FREE", "ARMED"]));
     for (const z of zones) {
       zoneStates.set(z.zoneId, rowToZoneState(z));
       if (z.userId) zoneIdToUserId.set(z.zoneId, z.userId);
@@ -3828,6 +3865,10 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     // DB errors propagate as 500; CLOSED zones and missing zones are 404.
     const st = await loadZone(zoneId);
     if (!st || st.accountId !== accountId || st.status === "CLOSED") { res.status(404).json({ error: "Zone not found" }); return; }
+    if (st.status === "ARMED") {
+      res.status(409).json({ error: "Zone not active yet — wait for the first order to fill" });
+      return;
+    }
     const zps = await db.select().from(zonePositionsTable)
       .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
     const trackedIds = new Set(zps.map(z => z.positionId));
@@ -3975,6 +4016,91 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
     broadcastZoneUpdate(zoneId);
     logEvent("zone.close", { accountId, zoneId, closedCount: live.length, trigger: "user" });
     res.json({ ok: true, closedCount: live.length });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// POST /api/mt5/account/:accountId/zones/arm
+// Prepare an @-price cascade zone (status ARMED) before the client places
+// pending limits at the ladder prices. First fill promotes ARMED → OPEN.
+router.post("/mt5/account/:accountId/zones/arm", checkOwner, async (req: Request, res: Response) => {
+  const { accountId } = req.params as { accountId: string };
+  const trading = getTradingStatus();
+  if (!trading.trading_enabled) {
+    res.status(503).json({ error: trading.message });
+    return;
+  }
+  try {
+    const raw = req.body as Record<string, unknown>;
+    const direction: "buy" | "sell" | null =
+      raw.direction === "sell" ? "sell" : raw.direction === "buy" ? "buy" : null;
+    if (!direction) {
+      res.status(400).json({ error: "direction must be buy or sell" });
+      return;
+    }
+    const anchorPrice = Number(raw.anchorPrice);
+    if (!(anchorPrice > 0)) {
+      res.status(400).json({ error: "anchorPrice must be a positive number" });
+      return;
+    }
+    const volume = Number(raw.volume ?? 0);
+    if (volume < ZONE_MIN_LOT_PER_ENTRY) {
+      res.status(400).json({
+        error: `volume must be at least ${ZONE_MIN_LOT_PER_ENTRY}`,
+      });
+      return;
+    }
+    const pickPrice = (v: unknown): number | null =>
+      typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+    const tp1Price = pickPrice(raw.tp1Price);
+    const tp2Price = pickPrice(raw.tp2Price);
+    const tp3Price = pickPrice(raw.tp3Price);
+    const tp4Price = pickPrice(raw.tp4Price);
+    const cmp = direction === "buy"
+      ? (a: number, b: number) => a > b
+      : (a: number, b: number) => a < b;
+    const tpsValid =
+      tp1Price != null && tp2Price != null && tp3Price != null &&
+      cmp(tp1Price, anchorPrice) && cmp(tp2Price, tp1Price) && cmp(tp3Price, tp2Price) &&
+      (tp4Price == null || cmp(tp4Price, tp3Price));
+    if (!tpsValid) {
+      res.status(400).json({
+        error: `TP1–TP3 must be in strictly ${direction === "buy" ? "ascending" : "descending"} order on the profitable side of anchorPrice`,
+      });
+      return;
+    }
+    const pickPct = (v: unknown, def: number): number => {
+      const n = typeof v === "number" && Number.isFinite(v) ? v : def;
+      return Math.min(100, Math.max(0, n));
+    };
+    const tp1Pct = pickPct(raw.tp1Pct, 25);
+    const tp2Pct = pickPct(raw.tp2Pct, 25);
+    const tp3Pct = pickPct(raw.tp3Pct, 25);
+    const tp4Pct = pickPct(raw.tp4Pct, 25);
+    const clientZoneId = typeof raw.zoneId === "string" ? raw.zoneId.trim() : "";
+    const uId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
+    const zoneState = prepareZoneForCascade(
+      accountId, direction, uId,
+      {
+        tp1Price: tp1Price!, tp2Price: tp2Price!, tp3Price: tp3Price!, tp4Price,
+        tp1Pct, tp2Pct, tp3Pct, tp4Pct,
+        autoBeAtTp: raw.autoBeAtTp,
+      },
+      volume,
+      clientZoneId || undefined,
+      anchorPrice,
+    );
+    zoneState.status = "ARMED";
+    zoneState.anchorPrice = anchorPrice;
+    await persistArmedZone(zoneState, uId);
+    zoneStates.set(zoneState.zoneId, zoneState);
+    pendingZoneAssoc.set(accountId, { zoneId: zoneState.zoneId, direction, expiresAt: Date.now() + ZONE_ASSOC_WINDOW_MS });
+    const accountPending = pendingZoneByZone.get(accountId) ?? new Map();
+    accountPending.set(zoneState.zoneId, { zoneId: zoneState.zoneId, direction, expiresAt: Date.now() + ZONE_ASSOC_WINDOW_MS });
+    pendingZoneByZone.set(accountId, accountPending);
+    broadcastZoneUpdate(zoneState.zoneId);
+    res.json({ ok: true, zoneId: zoneState.zoneId });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }

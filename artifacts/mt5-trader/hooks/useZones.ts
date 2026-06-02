@@ -30,7 +30,7 @@ export interface Zone {
   // every tick. Surfaced as a warning chip on the active-zone card.
   tp2SlIsBestEffort?: boolean;
   cashoutDone: boolean;
-  status: "OPEN" | "RISK_FREE" | "CLOSED";
+  status: "OPEN" | "RISK_FREE" | "CLOSED" | "ARMED";
   createdAt: number;
   closedAt?: number | null;
   /** Broker realized P&L for the zone (profit+commission+swap). Set when zone closes. */

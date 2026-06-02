@@ -125,11 +125,23 @@ export default function ZoneCard({
     }
   };
 
-  const statusLabel = zone.status === "RISK_FREE" ? "RISK-FREE" : zone.status === "CLOSED" ? "CLOSED" : "ACTIVE";
-  const statusColor = zone.status === "RISK_FREE" ? C.gold : zone.status === "CLOSED" ? C.textMuted : C.buy;
+  const statusLabel = zone.status === "ARMED"
+    ? "ORDER NOT ACTIVE"
+    : zone.status === "RISK_FREE"
+      ? "RISK-FREE"
+      : zone.status === "CLOSED"
+        ? "CLOSED"
+        : "ACTIVE";
+  const statusColor = zone.status === "ARMED"
+    ? C.textMuted
+    : zone.status === "RISK_FREE"
+      ? C.gold
+      : zone.status === "CLOSED"
+        ? C.textMuted
+        : C.buy;
 
   const canRiskFree =
-    !historical && zone.status === "OPEN" && zone.positionCount >= 1 && !!onRiskFree;
+    !historical && (zone.status === "OPEN" || zone.status === "RISK_FREE") && zone.positionCount >= 1 && !!onRiskFree;
   // Close Zone is allowed for any non-historical, non-closed zone that still
   // has at least one tracked position. We allow it on RISK_FREE zones too —
   // the user might want to bail out completely even after going risk-free.

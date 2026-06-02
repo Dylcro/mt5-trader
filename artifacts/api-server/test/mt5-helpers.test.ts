@@ -299,6 +299,12 @@ describe("rowToZoneState (restart-hydration path)", () => {
     expect(st.status).toBe("OPEN");
   });
 
+  it("preserves ARMED status for @-price pending cascades", () => {
+    const st = rowToZoneState(makeRow({ status: "ARMED", anchorPrice: 4450 }));
+    expect(st.status).toBe("ARMED");
+    expect(st.anchorPrice).toBe(4450);
+  });
+
   it("preserves RISK_FREE status so monitor keeps evaluating surviving entry", () => {
     const st = rowToZoneState(makeRow({ status: "RISK_FREE", tp1Hit: true, tp2Hit: true }));
     expect(st.status).toBe("RISK_FREE");

@@ -92,7 +92,7 @@ export default function DashboardScreen() {
     }, [status, accountId, syncSession]),
   );
 
-  const openZones = zones.filter((z) => z.status === "OPEN" || z.status === "RISK_FREE");
+  const openZones = zones.filter((z) => z.status === "OPEN" || z.status === "RISK_FREE" || z.status === "ARMED");
   const closedAll = zones.filter((z) => z.status === "CLOSED");
   const periodClosed = useMemo(
     () => filterClosedZonesByPeriod(zones, period),
