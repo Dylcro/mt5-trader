@@ -4468,6 +4468,24 @@ router.get("/mt5/account/:accountId/price", checkOwner, async (req: Request, res
   }
 });
 
+// GET /api/mt5/account/:accountId/display-fx?to=GBP&region=london
+// Returns FX rate: display amount = usdAmount * rate (XAUUSD risk is quoted in USD).
+router.get("/mt5/account/:accountId/display-fx", checkOwner, async (req: Request, res: Response) => {
+  try {
+    const token = getToken();
+    const region = qstr(req.query.region) || DEFAULT_REGION;
+    const accountId = String(req.params.accountId);
+    const to = qstr(req.query.to) || "USD";
+    const { rate, currency } = await usdToTargetRate(
+      token, region, accountId, to,
+      (t, r, a, s) => fetchSymbolPrice(t, r, a, s),
+    );
+    return res.json({ from: "USD", to: currency, rate });
+  } catch (err) {
+    return res.status(500).json({ error: err instanceof Error ? err.message : "FX rate failed" });
+  }
+});
+
 // GET /api/mt5/account/:accountId/positions?region=london
 router.get("/mt5/account/:accountId/positions", checkOwner, async (req: Request, res: Response) => {
   try {
