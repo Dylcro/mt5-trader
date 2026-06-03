@@ -22,6 +22,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import { useTrading } from "@/context/TradingContext";
 import { inferCascadeDirectionFromTrigger } from "@/lib/cascadeAtPrice";
+import { newCascadeZoneId, parseZoneIdFromComment } from "@/lib/zoneComments";
 import { buildCascadeLevels, useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
 import { usePlatformStatus } from "@/hooks/usePlatformStatus";
@@ -403,6 +404,7 @@ export default function TradeScreen() {
   // Per-cascade watcher entry — each cascade gets its own entry so they never interfere
   type WatcherEntry = {
     id: string; // unique per cascade placement
+    zoneId: string;
     entryPrice: number;
     direction: "buy" | "sell";
     pipsTarget: number;
@@ -464,12 +466,10 @@ export default function TradeScreen() {
           const base = apiBaseRef.current;
           const rgn = regionRef.current;
 
-          // Fetch ALL fresh pending orders and cancel every limit of matching direction.
-          // This is the most reliable approach — avoids fragile ID/price matching
-          // that can fail when REST placement doesn't echo back orderId or broker
-          // normalises prices.
-          const expectedType = snapshot.direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT";
-          const idSet = new Set<string>();
+          // Cancel only THIS cascade's pending limits (zone comment or known orderIds).
+          // Never cancel every limit on the account for that direction — that wiped
+          // unrelated cascades when buy then sell (or a second tap) ran close together.
+          const idSet = new Set<string>(snapshot.limitOrderIds ?? []);
 
           if (accId && base) {
             try {
@@ -484,14 +484,16 @@ export default function TradeScreen() {
 
                 for (const ord of freshOrders) {
                   const ordId = String(ord.id ?? ord.orderId ?? "");
-                  const ordType = String(ord.type ?? "");
                   if (!ordId) continue;
-                  // Cancel all pending limits of matching direction
-                  if (ordType === expectedType || (ordType.includes("LIMIT") && ordType.includes(snapshot.direction === "buy" ? "BUY" : "SELL"))) {
+                  const comment = String(ord.comment ?? "");
+                  const ordZone = parseZoneIdFromComment(comment);
+                  if (ordZone === snapshot.zoneId) {
                     idSet.add(ordId);
+                    continue;
                   }
+                  if (idSet.has(ordId)) continue;
                 }
-                console.log(`[tp-watcher id=${snapshot.id}] fresh fetch: ${freshOrders.length} total orders, ${idSet.size} ${expectedType} to cancel`);
+                console.log(`[tp-watcher id=${snapshot.id}] fresh fetch: ${freshOrders.length} total orders, ${idSet.size} for zone ${snapshot.zoneId} to cancel`);
               } else {
                 console.log(`[tp-watcher id=${snapshot.id}] orders fetch failed: ${res.status}`);
               }
@@ -638,7 +640,9 @@ export default function TradeScreen() {
       const tp2Price = round2(trigger + sign * tp2Pips * PIP);
       const tp3Price = round2(trigger + sign * tp3Pips * PIP);
       const tp4Price = tp4Pips > 0 ? round2(trigger + sign * tp4Pips * PIP) : undefined;
+      const armZoneId = newCascadeZoneId();
       const result = await placeArmedCascadeAtPrice({
+        zoneId: armZoneId,
         direction: dir,
         volume: cascadeLotSize,
         anchorPrice: trigger,
@@ -661,6 +665,7 @@ export default function TradeScreen() {
           const tpTrigger = dir === "buy" ? trigger + cs.takeProfitPips * 0.10 : trigger - cs.takeProfitPips * 0.10;
           tpWatchersRef.current.push({
             id: cascadeId,
+            zoneId: result.zoneId ?? armZoneId,
             entryPrice: trigger,
             direction: dir,
             pipsTarget: cs.takeProfitPips,
@@ -736,7 +741,9 @@ export default function TradeScreen() {
       const tp2Price = round2(mktPrice + sign * tp2Pips * PIP);
       const tp3Price = round2(mktPrice + sign * tp3Pips * PIP);
       const tp4Price = tp4Pips > 0 ? round2(mktPrice + sign * tp4Pips * PIP) : undefined;
+      const cascadeZoneId = newCascadeZoneId();
       const result = await placeCascadeOrders({
+        zoneId: cascadeZoneId,
         direction: dir,
         volume: cascadeLotSize,
         limitEntries: levels.limitEntries,
@@ -764,6 +771,7 @@ export default function TradeScreen() {
           console.log(`[tp-watcher id=${cascadeId}] arming +${cs.takeProfitPips}pip dir=${dir} entry(bid)=${watcherEntryPrice} trigger=${tpTrigger} posId=${result.marketPositionId}`);
           tpWatchersRef.current.push({
             id: cascadeId,
+            zoneId: result.zoneId || cascadeZoneId,
             entryPrice: watcherEntryPrice,
             direction: dir,
             pipsTarget: cs.takeProfitPips,

@@ -35,6 +35,32 @@ function buildTpPricesFromSettings(
   };
 }
 
+/** Server hit flags latch on the client — never flash off due to poll/SSE races. */
+export function latchZoneTpHits(prev: Zone | undefined, next: Zone): Zone {
+  if (!prev) return next;
+  return {
+    ...next,
+    tp1Hit: next.tp1Hit || prev.tp1Hit,
+    tp2Hit: next.tp2Hit || prev.tp2Hit,
+    tp3Hit: next.tp3Hit || prev.tp3Hit,
+    tp4Hit: next.tp4Hit || prev.tp4Hit,
+    hitEnabledTpCount: Math.max(
+      next.hitEnabledTpCount ?? 0,
+      prev.hitEnabledTpCount ?? 0,
+      ([1, 2, 3, 4] as const).filter((n) => zoneReachedTpLevel(
+        {
+          ...next,
+          tp1Hit: next.tp1Hit || prev.tp1Hit,
+          tp2Hit: next.tp2Hit || prev.tp2Hit,
+          tp3Hit: next.tp3Hit || prev.tp3Hit,
+          tp4Hit: next.tp4Hit || prev.tp4Hit,
+        },
+        n,
+      )).length,
+    ),
+  };
+}
+
 /** Recompute TP tally from per-level hit flags (SSE payloads may omit counts). */
 export function enrichZoneDisplayFields(zone: Zone): Zone {
   const tp1Enabled = zone.tp1Enabled !== false;
@@ -50,27 +76,48 @@ export function enrichZoneDisplayFields(zone: Zone): Zone {
   };
 }
 
-/** Client-side progress when the zones API omits live fields. */
+/**
+ * Live gold bar + distance — driven by price, but the *target* rung comes from
+ * server tp1Hit…tp4Hit (latched). Never show "TP1 ready" after TP1 is already hit.
+ */
 export function enrichZoneLiveFields(zone: Zone, price: Price | null): Zone {
-  if (zone.status === "CLOSED" || zone.status === "ARMED" || !price || zone.anchorPrice <= 0) return zone;
-  if (zone.nextTp && zone.nextTp > 0 && zone.pipsToNextTp != null) return zone;
+  if (zone.status === "CLOSED" || zone.status === "ARMED" || !price || zone.anchorPrice <= 0) {
+    return zone;
+  }
 
   const dir = zone.direction;
   const cmp = dir === "buy" ? price.bid : price.ask;
   const tps: (number | null)[] = [zone.tp1Price, zone.tp2Price, zone.tp3Price, zone.tp4Price];
   const enabled = [zone.tp1Enabled !== false, zone.tp2Enabled !== false, zone.tp3Enabled !== false, zone.tp4Enabled !== false];
-  const hit = [zone.tp1Hit, zone.tp2Hit, zone.tp3Hit, zone.tp4Hit];
+  const hit = [
+    zone.tp1Enabled !== false && Boolean(zone.tp1Hit),
+    zone.tp2Enabled !== false && Boolean(zone.tp2Hit),
+    zone.tp3Enabled !== false && Boolean(zone.tp3Hit),
+    zone.tp4Enabled !== false && Boolean(zone.tp4Hit),
+  ];
 
   let nextTp: 0 | 1 | 2 | 3 | 4 = 0;
   if (enabled[0] && !hit[0]) nextTp = 1;
   else if (enabled[1] && !hit[1]) nextTp = 2;
   else if (enabled[2] && !hit[2]) nextTp = 3;
   else if (enabled[3] && !hit[3] && tps[3] != null) nextTp = 4;
-  if (nextTp === 0) return { ...zone, currentPrice: cmp };
+
+  if (nextTp === 0) {
+    return {
+      ...zone,
+      currentPrice: cmp,
+      nextTp: 0,
+      nextTpPrice: null,
+      pipsToNextTp: null,
+      progressPct: 100,
+    };
+  }
 
   const nextPx = tps[nextTp - 1];
   const prevPx = nextTp === 1 ? zone.anchorPrice : (tps[nextTp - 2] ?? zone.anchorPrice);
-  if (nextPx == null) return { ...zone, currentPrice: cmp, nextTp };
+  if (nextPx == null) {
+    return { ...zone, currentPrice: cmp, nextTp };
+  }
 
   const sign = dir === "buy" ? 1 : -1;
   const remaining = (nextPx - cmp) / PIP * sign;
