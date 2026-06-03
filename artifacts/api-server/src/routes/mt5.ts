@@ -820,7 +820,8 @@ function markOrderCompleted(accountId: string, orderId: string): void {
 // many times per second; we cap each zone at one evaluation per
 // STREAMING_EVAL_MIN_INTERVAL_MS so the broker isn't hammered on duplicates.
 // The 3 s timer remains as a safety net for ticks lost to a streaming dropout.
-const STREAMING_EVAL_MIN_INTERVAL_MS = 300;
+// Faster re-eval on stream ticks — was 300 ms and made TP partials feel laggy.
+const STREAMING_EVAL_MIN_INTERVAL_MS = 100;
 const lastStreamingEvalAt = new Map<string, number>(); // zoneId → epoch ms
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2346,7 +2347,7 @@ const ZONE_MIN_LOT_PER_ENTRY    = 0.01; // broker minimum; lots ≥ 0.04 get 25%
 // requiring the comparison side to print the exact level.
 const ZONE_TP_TOLERANCE_PIPS    = 4;
 // Max ticks we'll retry the SL→BE move after TP2 partials are closed.
-// At the 3 s monitor interval (plus streaming tick attempts) this is
+// At the 2 s monitor interval (plus streaming tick attempts) this is
 // roughly 15 s of trying; enough to ride out a transient broker burp
 // but bounded so a hard rejection (code 10016) doesn't loop forever.
 const MAX_TP2_BE_ATTEMPTS       = 5;
@@ -3257,6 +3258,15 @@ function latestPrice(accountId: string): { bid: number; ask: number } | null {
   return { bid: t.bid, ask: t.ask };
 }
 
+/** Stream tick cache — avoid a MetaAPI REST round-trip on every evaluateZone tick. */
+function latestPriceIfFresh(accountId: string, maxAgeMs = 2_000): { bid: number; ask: number } | null {
+  const ticks = tickStore.get(accountId);
+  if (!ticks || ticks.length === 0) return null;
+  const t = ticks[ticks.length - 1]!;
+  if (Date.now() - t.time > maxAgeMs) return null;
+  return { bid: t.bid, ask: t.ask };
+}
+
 // Sort positions for a zone: worst → best.
 // BUY worst = highest entry; SELL worst = lowest entry.
 function sortZonePositions(positions: LivePosition[], direction: "buy" | "sell"): LivePosition[] {
@@ -3565,7 +3575,11 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       return;
     }
 
-    const price = await fetchSymbolPrice(token, region, st.accountId, live[0]!.symbol || "XAUUSD");
+    const symbol = live[0]!.symbol || "XAUUSD";
+    let price = latestPriceIfFresh(st.accountId);
+    if (!price) {
+      price = await fetchSymbolPrice(token, region, st.accountId, symbol);
+    }
     if (!price) return;
     // For BUY closes use bid; for SELL closes use ask. Allow TP checks when
     // absolute TP prices are set even if anchor was closed before persisting.
@@ -3929,8 +3943,8 @@ export function startZoneTpMonitor(): void {
     for (const [zoneId, st] of zoneStates.entries()) {
       if (st.status !== "CLOSED" && st.status !== "ARMED") void evaluateZone(zoneId, token);
     }
-  }, 3_000);
-  console.log("[zone-monitor] started (3 s interval)");
+  }, 2_000);
+  console.log("[zone-monitor] started (2 s interval)");
 }
 
 // Convert a cascadeZonesTable row to a ZoneState (transient fields get safe defaults).
@@ -4528,9 +4542,8 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       : ZONE_RISK_FREE_PIPS;
     const sl = computeRiskFreeSl(st.direction, best.openPrice, pips);
     const slOk = await modifyZonePositionSl(token, region, accountId, best.id, sl);
-    await cancelZoneLimits(token, region, accountId, zoneId);
     if (failed.length > 0 || !slOk) {
-      // Don't flip status — caller can retry. Surface what's still broken.
+      // Don't flip status or cancel limits — caller can retry without losing the ladder.
       console.warn(`[zone ${zoneId}] risk-free partial: failedCloses=${failed.length} slOk=${slOk}`);
       res.status(207).json({
         ok: false,
@@ -4542,6 +4555,8 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       });
       return;
     }
+    // Only drop unfilled cascade limits once risk-free fully succeeded on this zone.
+    await cancelZoneLimits(token, region, accountId, zoneId);
     for (const r of closeResults) {
       if (!r.ok) continue;
       await db.update(zonePositionsTable)
