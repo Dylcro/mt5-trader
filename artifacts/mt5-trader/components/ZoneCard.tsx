@@ -7,6 +7,8 @@ import Colors from "@/constants/colors";
 import type { Zone } from "@/hooks/useZones";
 
 const C = Colors.dark;
+const CLOSE_WORST_BLUE = "#6EC1E4";
+const DELETE_LIMITS_INDIGO = "#7B6CF0";
 
 function formatPrice(n: number) {
   return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -198,9 +200,9 @@ export default function ZoneCard({
     await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     const errMsg = result.message ?? "Please try again.";
     if (Platform.OS === "web" && typeof window !== "undefined") {
-      window.alert(`Couldn't delete orders\n\n${errMsg}`);
+      window.alert(`Couldn't delete limits\n\n${errMsg}`);
     } else {
-      Alert.alert("Couldn't delete orders", errMsg);
+      Alert.alert("Couldn't delete limits", errMsg);
     }
   };
 
@@ -221,14 +223,14 @@ export default function ZoneCard({
     await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     const errMsg = result.message ?? "Please try again.";
     if (Platform.OS === "web" && typeof window !== "undefined") {
-      window.alert(`Couldn't close worst positions\n\n${errMsg}`);
+      window.alert(`Couldn't keep best entry\n\n${errMsg}`);
     } else {
-      Alert.alert("Couldn't close worst positions", errMsg);
+      Alert.alert("Couldn't keep best entry", errMsg);
     }
   };
 
   const actionBusy = busy || worstBusy || closeBusy || delBusy;
-  const showActionColumn = canCancelOrders || showCloseAllWorst;
+  const showActionRow = canRiskFree || showCloseAllWorst || canCancelOrders;
 
   return (
     <View style={[styles.card, historical && { opacity: 0.85 }]}>
@@ -251,6 +253,26 @@ export default function ZoneCard({
             </Text>
           </View>
         </View>
+        {canCloseZone && (
+          <Pressable
+            style={({ pressed }) => [
+              styles.closeZoneTopBtn,
+              pressed && { opacity: 0.75 },
+              closeBusy && { opacity: 0.5 },
+            ]}
+            onPress={handleCloseZone}
+            disabled={actionBusy}
+          >
+            {closeBusy ? (
+              <ActivityIndicator size="small" color={C.sell} />
+            ) : (
+              <>
+                <Feather name="x-octagon" size={10} color={C.sell} />
+                <Text style={styles.closeZoneTopText}>Close Zone</Text>
+              </>
+            )}
+          </Pressable>
+        )}
         <View style={[styles.statusBadge, { borderColor: statusColor }]}>
           <Text style={[styles.statusText, { color: statusColor }]}>{statusLabel}</Text>
         </View>
@@ -338,7 +360,7 @@ export default function ZoneCard({
         </View>
       )}
 
-      {(canRiskFree || canCloseZone || showActionColumn) && (
+      {showActionRow && (
         <View style={styles.actionRow}>
           {canRiskFree && (
             <Pressable
@@ -361,70 +383,47 @@ export default function ZoneCard({
               )}
             </Pressable>
           )}
-          {canCloseZone && (
+          {showCloseAllWorst && (
             <Pressable
               style={({ pressed }) => [
-                styles.closeBtn,
+                styles.worstBtn,
                 { flex: 1 },
-                pressed && { opacity: 0.75 },
-                closeBusy && { opacity: 0.5 },
+                pressed && canCloseAllWorst && { opacity: 0.75 },
+                (!canCloseAllWorst || worstBusy) && { opacity: 0.45 },
               ]}
-              onPress={handleCloseZone}
-              disabled={actionBusy}
+              onPress={() => { void runCloseAllWorst(); }}
+              disabled={actionBusy || !canCloseAllWorst}
             >
-              {closeBusy ? (
-                <ActivityIndicator size="small" color={C.sell} />
+              {worstBusy ? (
+                <ActivityIndicator size="small" color={CLOSE_WORST_BLUE} />
               ) : (
                 <>
-                  <Feather name="x-octagon" size={13} color={C.sell} />
-                  <Text style={styles.closeBtnText}>Close Zone</Text>
+                  <Feather name="filter" size={13} color={CLOSE_WORST_BLUE} />
+                  <Text style={styles.worstBtnText} numberOfLines={1}>Keep Best</Text>
                 </>
               )}
             </Pressable>
           )}
-          {showActionColumn && (
-            <View style={styles.actionColumn}>
-              {canCancelOrders && (
-                <Pressable
-                  style={({ pressed }) => [
-                    styles.delBtn,
-                    pressed && { opacity: 0.75 },
-                    delBusy && { opacity: 0.5 },
-                  ]}
-                  onPress={handleCancelOrders}
-                  disabled={actionBusy}
-                >
-                  {delBusy ? (
-                    <ActivityIndicator size="small" color={C.textSecondary} />
-                  ) : (
-                    <>
-                      <Feather name="trash-2" size={13} color={C.textSecondary} />
-                      <Text style={styles.delBtnText}>Delete Orders</Text>
-                    </>
-                  )}
-                </Pressable>
+          {canCancelOrders && (
+            <Pressable
+              style={({ pressed }) => [
+                styles.limitsBtn,
+                { flex: 1 },
+                pressed && { opacity: 0.75 },
+                delBusy && { opacity: 0.5 },
+              ]}
+              onPress={handleCancelOrders}
+              disabled={actionBusy}
+            >
+              {delBusy ? (
+                <ActivityIndicator size="small" color={DELETE_LIMITS_INDIGO} />
+              ) : (
+                <>
+                  <Feather name="trash-2" size={13} color={DELETE_LIMITS_INDIGO} />
+                  <Text style={styles.limitsBtnText} numberOfLines={1}>Delete Limits</Text>
+                </>
               )}
-              {showCloseAllWorst && (
-                <Pressable
-                  style={({ pressed }) => [
-                    styles.delBtn,
-                    pressed && canCloseAllWorst && { opacity: 0.75 },
-                    (!canCloseAllWorst || worstBusy) && { opacity: 0.45 },
-                  ]}
-                  onPress={() => { void runCloseAllWorst(); }}
-                  disabled={actionBusy || !canCloseAllWorst}
-                >
-                  {worstBusy ? (
-                    <ActivityIndicator size="small" color={C.textSecondary} />
-                  ) : (
-                    <>
-                      <Feather name="filter" size={13} color={C.textSecondary} />
-                      <Text style={styles.delBtnText} numberOfLines={1}>Close Worst</Text>
-                    </>
-                  )}
-                </Pressable>
-              )}
-            </View>
+            </Pressable>
           )}
         </View>
       )}
@@ -445,6 +444,25 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
+    gap: 8,
+  },
+  closeZoneTopBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: C.sell,
+    backgroundColor: "rgba(229,57,53,0.12)",
+  },
+  closeZoneTopText: {
+    fontSize: 9,
+    fontFamily: "Inter_700Bold",
+    color: C.sell,
+    letterSpacing: 0.2,
   },
   leftGroup: {
     flexDirection: "row",
@@ -631,10 +649,6 @@ const styles = StyleSheet.create({
     gap: 8,
     alignItems: "stretch",
   },
-  actionColumn: {
-    flex: 1,
-    gap: 8,
-  },
   rfBtn: {
     flexDirection: "row",
     alignItems: "center",
@@ -652,7 +666,7 @@ const styles = StyleSheet.create({
     color: C.gold,
     letterSpacing: 0.3,
   },
-  closeBtn: {
+  worstBtn: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
@@ -660,16 +674,16 @@ const styles = StyleSheet.create({
     paddingVertical: 9,
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: C.sell,
-    backgroundColor: "rgba(229,57,53,0.08)",
+    borderColor: CLOSE_WORST_BLUE,
+    backgroundColor: "rgba(110,193,228,0.12)",
   },
-  closeBtnText: {
+  worstBtnText: {
     fontSize: 13,
     fontFamily: "Inter_700Bold",
-    color: C.sell,
+    color: CLOSE_WORST_BLUE,
     letterSpacing: 0.3,
   },
-  delBtn: {
+  limitsBtn: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
@@ -677,13 +691,13 @@ const styles = StyleSheet.create({
     paddingVertical: 9,
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: C.border,
-    backgroundColor: "rgba(255,255,255,0.04)",
+    borderColor: DELETE_LIMITS_INDIGO,
+    backgroundColor: "rgba(123,108,240,0.12)",
   },
-  delBtnText: {
+  limitsBtnText: {
     fontSize: 13,
     fontFamily: "Inter_700Bold",
-    color: C.textSecondary,
+    color: DELETE_LIMITS_INDIGO,
     letterSpacing: 0.3,
   },
 });

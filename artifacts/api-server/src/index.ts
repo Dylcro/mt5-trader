@@ -162,9 +162,23 @@ async function ensureTables(): Promise<void> {
     );
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id            SERIAL PRIMARY KEY,
+      full_name     TEXT,
+      email         TEXT NOT NULL UNIQUE,
+      password_hash TEXT,
+      created_at    TIMESTAMP NOT NULL DEFAULT NOW(),
+      locked        BOOLEAN NOT NULL DEFAULT FALSE,
+      locked_reason TEXT
+    );
     ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS full_name TEXT,
+      ADD COLUMN IF NOT EXISTS email TEXT,
+      ADD COLUMN IF NOT EXISTS password_hash TEXT,
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       ADD COLUMN IF NOT EXISTS locked BOOLEAN NOT NULL DEFAULT FALSE,
       ADD COLUMN IF NOT EXISTS locked_reason TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users (email);
     ALTER TABLE support_tickets
       ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'unread';
   `);
