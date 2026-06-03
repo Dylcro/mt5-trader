@@ -169,6 +169,7 @@ export function buildDisplayActiveZones(
     const merged: Zone = enrichZoneDisplayFields({
       ...z,
       positionCount: linked.length > 0 ? linked.length : z.positionCount,
+      trackedOnServer: true,
     });
     out.push(enrichZoneLiveFields(merged, price));
   }
@@ -187,7 +188,7 @@ export function buildDisplayActiveZones(
       : apiRow?.status === "ARMED"
         ? "ARMED"
         : "OPEN";
-    out.push(enrichZoneLiveFields(enrichZoneDisplayFields({ ...syn, status }), price));
+    out.push(enrichZoneLiveFields(enrichZoneDisplayFields({ ...syn, status, trackedOnServer: false }), price));
     seen.add(zoneId);
   };
 
@@ -205,6 +206,7 @@ export function buildDisplayActiveZones(
       ...syn,
       status: apiRow?.status === "ARMED" ? "ARMED" : "ARMED",
       positionCount: 0,
+      trackedOnServer: false,
     }), price));
     seen.add(zoneId);
   }

@@ -144,11 +144,14 @@ export default function ZoneCard({
         ? C.textMuted
         : C.buy;
 
+  const serverTracked = zone.trackedOnServer !== false;
   const canRiskFree =
-    !historical && (zone.status === "OPEN" || zone.status === "RISK_FREE") && zone.positionCount >= 1 && !!onRiskFree;
+    serverTracked
+    && !historical && (zone.status === "OPEN" || zone.status === "RISK_FREE") && zone.positionCount >= 1 && !!onRiskFree;
   // Secure Profits: one leg per tap (profit or loss on that leg — ladder position only).
   const showCloseAllWorst =
-    !historical
+    serverTracked
+    && !historical
     && zone.status !== "CLOSED"
     && zone.status !== "ARMED"
     && !!onCloseAllWorst;
@@ -157,13 +160,15 @@ export default function ZoneCard({
   // has at least one tracked position. We allow it on RISK_FREE zones too —
   // the user might want to bail out completely even after going risk-free.
   const canCloseZone =
-    !historical && zone.status !== "CLOSED" && zone.positionCount >= 1 && !!onCloseZone;
+    serverTracked
+    && !historical && zone.status !== "CLOSED" && zone.positionCount >= 1 && !!onCloseZone;
   // Delete Orders cancels pending cascade limit fills without touching open
   // positions. Only meaningful on non-historical, non-closed zones — we
   // always show the button when those conditions hold and let the server
   // no-op (cancelledCount:0) if there's nothing pending.
   const canCancelOrders =
-    !historical && zone.status !== "CLOSED" && !!onCancelOrders;
+    serverTracked
+    && !historical && zone.status !== "CLOSED" && !!onCancelOrders;
 
   const runCloseZone = async () => {
     if (!onCloseZone || closeBusy) return;
@@ -235,6 +240,11 @@ export default function ZoneCard({
 
   return (
     <View style={[styles.card, historical && { opacity: 0.85 }]}>
+      {!serverTracked && !historical ? (
+        <Text style={styles.syncHint}>
+          Zone still syncing — pull to refresh on Positions, then try again.
+        </Text>
+      ) : null}
       <View style={styles.topRow}>
         <View style={styles.leftGroup}>
           <View style={[styles.dirPill, isBuy ? styles.dirPillBuy : styles.dirPillSell]}>
@@ -440,6 +450,11 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: C.border,
     gap: 12,
+  },
+  syncHint: {
+    fontSize: 11,
+    color: C.gold,
+    lineHeight: 15,
   },
   topRow: {
     flexDirection: "row",

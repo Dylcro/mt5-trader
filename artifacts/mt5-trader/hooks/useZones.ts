@@ -52,6 +52,8 @@ export interface Zone {
   nextTpPrice?: number | null;
   pipsToNextTp?: number | null;
   progressPct?: number | null;
+  /** False when the card is rebuilt from MT5 comments only — zone actions may 404 until refresh. */
+  trackedOnServer?: boolean;
 }
 
 async function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
