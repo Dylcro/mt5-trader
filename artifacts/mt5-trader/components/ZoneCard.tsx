@@ -227,20 +227,8 @@ export default function ZoneCard({
     }
   };
 
-  const handleCloseAllWorst = () => {
-    const n = Math.max(0, zone.positionCount - 1);
-    const msg = `Close ${n} worse ${n === 1 ? "position" : "positions"}? The best entry keeps running.`;
-    if (Platform.OS === "web" && typeof window !== "undefined") {
-      if (window.confirm(msg)) void runCloseAllWorst();
-      return;
-    }
-    Alert.alert("Close All Worst", msg, [
-      { text: "Cancel", style: "cancel" },
-      { text: "Close", style: "destructive", onPress: () => { void runCloseAllWorst(); } },
-    ]);
-  };
-
   const actionBusy = busy || worstBusy || closeBusy || delBusy;
+  const showActionColumn = canCancelOrders || showCloseAllWorst;
 
   return (
     <View style={[styles.card, historical && { opacity: 0.85 }]}>
@@ -350,8 +338,7 @@ export default function ZoneCard({
         </View>
       )}
 
-      {(canRiskFree || showCloseAllWorst || canCloseZone || canCancelOrders) && (
-        <>
+      {(canRiskFree || canCloseZone || showActionColumn) && (
         <View style={styles.actionRow}>
           {canRiskFree && (
             <Pressable
@@ -395,49 +382,51 @@ export default function ZoneCard({
               )}
             </Pressable>
           )}
-          {canCancelOrders && (
-            <Pressable
-              style={({ pressed }) => [
-                styles.delBtn,
-                { flex: 1 },
-                pressed && { opacity: 0.75 },
-                delBusy && { opacity: 0.5 },
-              ]}
-              onPress={handleCancelOrders}
-              disabled={actionBusy}
-            >
-              {delBusy ? (
-                <ActivityIndicator size="small" color={C.textSecondary} />
-              ) : (
-                <>
-                  <Feather name="trash-2" size={13} color={C.textSecondary} />
-                  <Text style={styles.delBtnText}>Delete Orders</Text>
-                </>
+          {showActionColumn && (
+            <View style={styles.actionColumn}>
+              {canCancelOrders && (
+                <Pressable
+                  style={({ pressed }) => [
+                    styles.delBtn,
+                    pressed && { opacity: 0.75 },
+                    delBusy && { opacity: 0.5 },
+                  ]}
+                  onPress={handleCancelOrders}
+                  disabled={actionBusy}
+                >
+                  {delBusy ? (
+                    <ActivityIndicator size="small" color={C.textSecondary} />
+                  ) : (
+                    <>
+                      <Feather name="trash-2" size={13} color={C.textSecondary} />
+                      <Text style={styles.delBtnText}>Delete Orders</Text>
+                    </>
+                  )}
+                </Pressable>
               )}
-            </Pressable>
+              {showCloseAllWorst && (
+                <Pressable
+                  style={({ pressed }) => [
+                    styles.delBtn,
+                    pressed && canCloseAllWorst && { opacity: 0.75 },
+                    (!canCloseAllWorst || worstBusy) && { opacity: 0.45 },
+                  ]}
+                  onPress={() => { void runCloseAllWorst(); }}
+                  disabled={actionBusy || !canCloseAllWorst}
+                >
+                  {worstBusy ? (
+                    <ActivityIndicator size="small" color={C.textSecondary} />
+                  ) : (
+                    <>
+                      <Feather name="filter" size={13} color={C.textSecondary} />
+                      <Text style={styles.delBtnText} numberOfLines={1}>Close Worst</Text>
+                    </>
+                  )}
+                </Pressable>
+              )}
+            </View>
           )}
         </View>
-        {showCloseAllWorst && (
-          <Pressable
-            style={({ pressed }) => [
-              styles.worstBtn,
-              pressed && canCloseAllWorst && { opacity: 0.75 },
-              (!canCloseAllWorst || worstBusy) && { opacity: 0.45 },
-            ]}
-            onPress={canCloseAllWorst ? handleCloseAllWorst : undefined}
-            disabled={actionBusy || !canCloseAllWorst}
-          >
-            {worstBusy ? (
-              <ActivityIndicator size="small" color={C.text} />
-            ) : (
-              <>
-                <Feather name="filter" size={13} color={C.text} />
-                <Text style={styles.worstBtnText}>Close All Worst</Text>
-              </>
-            )}
-          </Pressable>
-        )}
-        </>
       )}
     </View>
   );
@@ -640,6 +629,11 @@ const styles = StyleSheet.create({
   actionRow: {
     flexDirection: "row",
     gap: 8,
+    alignItems: "stretch",
+  },
+  actionColumn: {
+    flex: 1,
+    gap: 8,
   },
   rfBtn: {
     flexDirection: "row",
@@ -690,23 +684,6 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontFamily: "Inter_700Bold",
     color: C.textSecondary,
-    letterSpacing: 0.3,
-  },
-  worstBtn: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 6,
-    paddingVertical: 9,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: C.border,
-    backgroundColor: "rgba(255,255,255,0.06)",
-  },
-  worstBtnText: {
-    fontSize: 13,
-    fontFamily: "Inter_700Bold",
-    color: C.text,
     letterSpacing: 0.3,
   },
 });
