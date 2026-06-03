@@ -2,6 +2,7 @@ import app from "./app";
 import { pool } from "@workspace/db";
 import { loadCascadeConfig, startAutoConnect, startConnectionWatchdog, loadZoneState, startZoneTpMonitor, loadNotificationPrefs } from "./routes/mt5";
 import { loadPlatformFlags } from "./lib/platformFlags";
+import { ensureUsersAuthSchema } from "./lib/ensureUsersAuthSchema";
 
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err);
@@ -182,6 +183,7 @@ async function ensureTables(): Promise<void> {
     ALTER TABLE support_tickets
       ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'unread';
   `);
+  await ensureUsersAuthSchema(pool);
 }
 
 async function main() {
