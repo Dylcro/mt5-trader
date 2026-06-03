@@ -304,9 +304,9 @@ export default function PositionsScreen() {
     if (!accountId) return;
     return subscribeAccountEvents(accountId, (type) => {
       if (type === "pending_order") void refreshPendingOrders();
-      if (type === "zone_update") void refreshZones();
+      // zone_update is patched in useZones — full refresh here caused TP hit chips to flicker.
     });
-  }, [accountId, refreshPendingOrders, refreshZones]);
+  }, [accountId, refreshPendingOrders]);
 
   // Poll while focused so MT5-side closes/cancels appear without manual refresh.
   useFocusEffect(

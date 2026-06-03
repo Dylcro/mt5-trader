@@ -318,7 +318,7 @@ export default function ZoneCard({
         </View>
       )}
 
-      {!historical && zone.status !== "CLOSED" && zone.nextTp && zone.nextTp > 0 && (
+      {!historical && zone.status !== "CLOSED" && zone.nextTp != null && zone.nextTp > 0 && (
         <View style={styles.progressBlock}>
           <View style={styles.progressHeader}>
             <Text style={styles.progressLabel} numberOfLines={1}>
@@ -331,12 +331,12 @@ export default function ZoneCard({
             <Text
               style={[
                 styles.progressDistance,
-                typeof zone.pipsToNextTp === "number" && zone.pipsToNextTp <= 0 && { color: C.buy },
+                typeof zone.pipsToNextTp === "number" && zone.pipsToNextTp <= 0.3 && { color: C.gold },
               ]}
             >
               {typeof zone.pipsToNextTp === "number"
-                ? zone.pipsToNextTp <= 0
-                  ? "ready"
+                ? zone.pipsToNextTp <= 0.3
+                  ? "at level"
                   : `${zone.pipsToNextTp.toFixed(1)}p away`
                 : "—"}
             </Text>
@@ -345,7 +345,13 @@ export default function ZoneCard({
             <View
               style={[
                 styles.progressFill,
-                { width: `${typeof zone.progressPct === "number" ? zone.progressPct : 0}%` },
+                {
+                  width: `${Math.max(
+                    0,
+                    Math.min(100, typeof zone.progressPct === "number" ? zone.progressPct : 0),
+                  )}%`,
+                },
+                typeof zone.pipsToNextTp === "number" && zone.pipsToNextTp <= 0.3 && styles.progressFillAtLevel,
               ]}
             />
           </View>
@@ -640,6 +646,10 @@ const styles = StyleSheet.create({
   progressFill: {
     height: "100%",
     backgroundColor: C.gold,
+    borderRadius: 2,
+  },
+  progressFillAtLevel: {
+    width: "100%",
   },
   histRow: {
     flexDirection: "row",

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { subscribeAccountEvents } from "@/lib/accountEventBus";
-import { enrichZoneDisplayFields } from "@/lib/zoneDisplay";
+import { enrichZoneDisplayFields, latchZoneTpHits } from "@/lib/zoneDisplay";
 import { getAuthToken } from "@/lib/authToken";
 
 const API_BASE = process.env.EXPO_PUBLIC_API_URL ?? "";
@@ -100,7 +100,12 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
         return;
       }
       const data = (await res.json()) as Zone[];
-      setZones(Array.isArray(data) ? data.map(enrichZoneDisplayFields) : []);
+      setZones((prev) => {
+        const byId = new Map(prev.map((z) => [z.zoneId, z]));
+        return Array.isArray(data)
+          ? data.map((row) => enrichZoneDisplayFields(latchZoneTpHits(byId.get(row.zoneId), row)))
+          : [];
+      });
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -136,7 +141,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
             if (!has) return prev;
             return prev.map((z) =>
               z.zoneId === update.zoneId
-                ? enrichZoneDisplayFields({ ...z, ...update, status: "CLOSED", closedAt })
+                ? enrichZoneDisplayFields(latchZoneTpHits(z, { ...z, ...update, status: "CLOSED", closedAt }))
                 : z,
             );
           });
@@ -145,7 +150,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
         setZones((prev) =>
           prev.map((z) => {
             if (z.zoneId !== update.zoneId) return z;
-            return enrichZoneDisplayFields({ ...z, ...update });
+            return enrichZoneDisplayFields(latchZoneTpHits(z, { ...z, ...update }));
           }),
         );
       } else if (type === "deal" || type === "pending_order") {
