@@ -4503,7 +4503,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
         bestPositionId: best.id,
         closedCount: others.length - failed.length,
         failedPositionIds: failed,
-        message: "Some positions failed to close — retry Close All Worst to clear the rest.",
+        message: "Some positions failed to close — tap Keep Best again to clear the rest.",
       });
       return;
     }
