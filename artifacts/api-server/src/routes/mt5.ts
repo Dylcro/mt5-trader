@@ -1677,6 +1677,26 @@ export function zoneHasTpTargets(st: {
     .some((p) => p != null && p > 0);
 }
 
+/**
+ * True when live MT5 volume shows this TP level's partial was already taken
+ * (broker TP filled before our tick saw the price cross, etc.).
+ */
+export function positionShowsTpLevelApplied(
+  currentVol: number,
+  origVol: number,
+  level: 1 | 2 | 3 | 4,
+  tpPcts: { tp1Pct: number; tp2Pct: number; tp3Pct: number },
+): boolean {
+  if (!(origVol > 0) || !(currentVol > 0)) return false;
+  const tpPct = level === 1 ? tpPcts.tp1Pct : level === 2 ? tpPcts.tp2Pct : level === 3 ? tpPcts.tp3Pct : 0;
+  const priorPct = level === 1 ? 0
+    : level === 2 ? tpPcts.tp1Pct
+      : level === 3 ? tpPcts.tp1Pct + tpPcts.tp2Pct
+        : tpPcts.tp1Pct + tpPcts.tp2Pct + tpPcts.tp3Pct;
+  const keepFractionGate = Math.max(0, (100 - priorPct - tpPct + 1) / 100);
+  return currentVol <= origVol * keepFractionGate;
+}
+
 /** Cascade limits are cancelled only on the first successful TP2, never on TP1. */
 export function shouldCancelCascadeLimitsAtTpStage(
   tpStage: 1 | 2 | 3 | 4,
@@ -3286,40 +3306,77 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       console.warn(`[zone ${zoneId}] tracked-positions DB query failed, using in-memory cache (${trackedIds.size} ids): ${(e as Error).message}`);
     }
     if (zps.length === 0) {
-      if (!syncReady.has(st.accountId)) return;
       const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, st.accountId, zoneId);
       const brokerLegs = await brokerHasOpenLegsForZone(token, region, st.accountId, zoneId);
-      if (!brokerLegs && !pendingLeft) {
-        if (!shouldAutoCloseZoneAfterPositionExit(st, false, false)) {
-          console.log(`[zone ${zoneId}] empty tracked rows but defer zone close (pre-TP2 policy)`);
-          return;
-        }
-        const closedAt = Date.now();
-        await withDbRetry(`evalZone.emptyClose zone=${zoneId}`,
-          () => db.update(cascadeZonesTable)
-            .set({ status: "CLOSED", closedAt })
-            .where(eq(cascadeZonesTable.zoneId, zoneId)),
-        ).catch(() => {/* logged inside withDbRetry */});
-        const wasRiskFree = st.status === "RISK_FREE";
-        st.status = "CLOSED";
-        await finalizeZoneClose(st.accountId, zoneId, await buildCloseFinalizeOptsForZone(
-          st.accountId, zoneId, { wasRiskFree, direction: st.direction },
-        ));
-        void settleZoneClosedPnl(st.accountId, zoneId);
-        logEvent("zone.close", { accountId: st.accountId, zoneId, trigger: "empty_reconcile" });
+      if (brokerLegs) {
+        await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st);
         try {
-          const tkn = getToken();
-          cancelZoneLimits(tkn, region, st.accountId, zoneId)
-            .catch((e: Error) => console.warn(`[zone ${zoneId}] empty reconcile cancelZoneLimits:`, e.message))
-            .finally(() => broadcastZoneUpdate(zoneId));
-        } catch {
-          broadcastZoneUpdate(zoneId);
+          const rows = await withDbRetry(`evalZone.relinkRefresh zone=${zoneId}`, () => db.select().from(zonePositionsTable)
+            .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
+          );
+          zps = rows.map((r) => ({
+            positionId: r.positionId, volume: Number(r.volume), entryPrice: Number(r.entryPrice),
+          }));
+          trackedIds = new Set(zps.map((z) => z.positionId));
+          dbOk = true;
+          for (const z of zps) {
+            const existing = st.trackedPositions.get(z.positionId);
+            st.trackedPositions.set(z.positionId, {
+              volume: z.volume, entryPrice: z.entryPrice,
+              tp1Hit: existing?.tp1Hit ?? false,
+              tp2Hit: existing?.tp2Hit ?? false,
+              tp3Hit: existing?.tp3Hit ?? false,
+              tp4Hit: existing?.tp4Hit ?? false,
+            });
+          }
+          console.log(`[zone ${zoneId}] relinked ${zps.length} open leg(s) for TP engine`);
+        } catch (e) {
+          zps = Array.from(st.trackedPositions.entries()).map(([positionId, v]) => ({
+            positionId, volume: v.volume, entryPrice: v.entryPrice,
+          }));
+          trackedIds = new Set(zps.map((z) => z.positionId));
+          console.warn(`[zone ${zoneId}] relink refresh failed, using cache (${trackedIds.size} ids): ${(e as Error).message}`);
         }
       }
-      return;
+      if (zps.length === 0) {
+        if (!syncReady.has(st.accountId)) return;
+        if (!brokerLegs && !pendingLeft) {
+          if (!shouldAutoCloseZoneAfterPositionExit(st, false, false)) {
+            console.log(`[zone ${zoneId}] empty tracked rows but defer zone close (pre-TP2 policy)`);
+            return;
+          }
+          const closedAt = Date.now();
+          await withDbRetry(`evalZone.emptyClose zone=${zoneId}`,
+            () => db.update(cascadeZonesTable)
+              .set({ status: "CLOSED", closedAt })
+              .where(eq(cascadeZonesTable.zoneId, zoneId)),
+          ).catch(() => {/* logged inside withDbRetry */});
+          const wasRiskFree = st.status === "RISK_FREE";
+          st.status = "CLOSED";
+          await finalizeZoneClose(st.accountId, zoneId, await buildCloseFinalizeOptsForZone(
+            st.accountId, zoneId, { wasRiskFree, direction: st.direction },
+          ));
+          void settleZoneClosedPnl(st.accountId, zoneId);
+          logEvent("zone.close", { accountId: st.accountId, zoneId, trigger: "empty_reconcile" });
+          try {
+            const tkn = getToken();
+            cancelZoneLimits(tkn, region, st.accountId, zoneId)
+              .catch((e: Error) => console.warn(`[zone ${zoneId}] empty reconcile cancelZoneLimits:`, e.message))
+              .finally(() => broadcastZoneUpdate(zoneId));
+          } catch {
+            broadcastZoneUpdate(zoneId);
+          }
+        }
+        return;
+      }
     }
     const allLive = await fetchOpenPositions(token, region, st.accountId);
-    const live = allLive.filter(p => trackedIds.has(p.id));
+    let live = allLive.filter(p => trackedIds.has(p.id));
+    if (live.length === 0 && await brokerHasOpenLegsForZone(token, region, st.accountId, zoneId)) {
+      await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st);
+      live = (await fetchOpenPositions(token, region, st.accountId))
+        .filter((p) => positionBelongsToZone(p, zoneId) || trackedIds.has(p.id));
+    }
     // Skip the destructive reconciliation path (which permanently marks
     // positions CLOSED in the DB) when we're operating off the cache —
     // we can't trust "missing from live" without a confirmed DB view.
@@ -3545,8 +3602,18 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     const needTP4 = st.tp4Enabled ? live.filter(p => tp1Satisfied(p) && tp2Satisfied(p) && tp3Satisfied(p) && !st.trackedPositions.get(p.id)?.tp4Hit) : [];
 
     // TP1 — positions that haven't had their first partial yet
-    if (needTP1.length > 0 && st.tp1Price != null && hit(st.tp1Price)) {
-      console.log(`[zone ${zoneId}] TP1 trigger @${cmpPrice} (tp1=${st.tp1Price}) — ${needTP1.length}/${live.length} position(s) need TP1`);
+    const tp1AtPrice = st.tp1Price != null && hit(st.tp1Price);
+    const tp1BrokerApplied = needTP1.filter((p) => {
+      const row = zpsById.get(p.id);
+      const origVol = row ? Number(row.volume) : 0;
+      return positionShowsTpLevelApplied(p.volume, origVol, 1, st);
+    });
+    if (needTP1.length > 0 && st.tp1Price != null && (tp1AtPrice || tp1BrokerApplied.length > 0)) {
+      const trigger = tp1AtPrice ? "price" : "broker-volume";
+      console.log(
+        `[zone ${zoneId}] TP1 trigger (${trigger}) @${cmpPrice} (tp1=${st.tp1Price}) — `
+        + `${needTP1.length}/${live.length} need TP1, ${tp1BrokerApplied.length} already partial on broker`,
+      );
       const ok = await closePartialForLevel(1, needTP1);
       if (ok) {
         const ids = needTP1.map(p => p.id);

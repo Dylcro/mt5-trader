@@ -25,6 +25,7 @@ import {
   countEnabledTps,
   countHitEnabledTps,
   tpDisplayState,
+  positionShowsTpLevelApplied,
   shouldCancelCascadeLimitsAtTpStage,
   shouldAutoCloseZoneAfterPositionExit,
   sumDealPnlForPositions,
@@ -733,6 +734,13 @@ describe("disabled TP history", () => {
     } as Parameters<typeof makeRow>[0]));
     expect(st.tp3Hit).toBe(false);
     expect(st.tp3Enabled).toBe(false);
+  });
+});
+
+describe("positionShowsTpLevelApplied", () => {
+  it("detects TP1 partial from reduced live volume (25% split)", () => {
+    expect(positionShowsTpLevelApplied(0.03, 0.04, 1, { tp1Pct: 25, tp2Pct: 25, tp3Pct: 25 })).toBe(true);
+    expect(positionShowsTpLevelApplied(0.04, 0.04, 1, { tp1Pct: 25, tp2Pct: 25, tp3Pct: 25 })).toBe(false);
   });
 });
 
