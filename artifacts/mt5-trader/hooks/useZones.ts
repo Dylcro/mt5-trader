@@ -222,8 +222,11 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
         return { ok: false, message: hint };
       }
       void refresh();
+      if (res.ok && data.skipped) {
+        if (data.message) return { ok: false, message: data.message };
+        return { ok: true, closedCount: data.closedCount ?? 0 };
+      }
       const succeeded = data.ok === true
-        || data.skipped === true
         || (typeof data.bestPositionId === "string" && data.bestPositionId.length > 0);
       if (res.ok && succeeded) {
         return { ok: true, closedCount: data.closedCount ?? 0 };
@@ -232,7 +235,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
         return { ok: false, message: data.message ?? data.error };
       }
       if (res.status === 404) {
-        return { ok: false, message: "Close All Worst API not found — merge and publish the latest API on Replit." };
+        return { ok: false, message: data.error ?? "Zone not found — refresh Positions and try again." };
       }
       return {
         ok: false,

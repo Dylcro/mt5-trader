@@ -868,36 +868,28 @@ describe("pickNextLegToTrimForSecureProfits (one leg per tap)", () => {
     symbol: "XAUUSD",
   });
 
-  it("BUY: closes nearest rung above best even when that leg is in profit", () => {
+  it("BUY: peels from best upward — nearest above best first", () => {
+    const best = leg("l3", 3020);
     const positions = [
-      { ...leg("anchor", 3000), profit: 50 },
-      { ...leg("l1", 3010), profit: 12 },
-      { ...leg("l2", 3020), profit: -3 },
+      leg("anchor", 3050),
+      leg("l1", 3040),
+      leg("l2", 3030),
+      best,
     ];
-    const best = positions[0]!;
-    expect(pickNextLegToTrimForSecureProfits(positions, best, "buy")?.id).toBe("l1");
+    expect(pickNextLegToTrimForSecureProfits(positions, best, "buy")?.id).toBe("l2");
+    const after = [leg("anchor", 3050), leg("l1", 3040), best];
+    expect(pickNextLegToTrimForSecureProfits(after, best, "buy")?.id).toBe("l1");
+    const last = [leg("anchor", 3050), best];
+    expect(pickNextLegToTrimForSecureProfits(last, best, "buy")?.id).toBe("anchor");
   });
 
-  it("BUY: closes the entry nearest above best (lowest among others)", () => {
+  it("SELL: peels from best downward — nearest below best first", () => {
+    const best = leg("l2", 3040);
     const positions = [
-      leg("anchor", 3000),
-      leg("l1", 3010),
-      leg("l2", 3020),
-      leg("l3", 3030),
+      leg("anchor", 3020),
+      leg("l1", 3030),
+      best,
     ];
-    const best = leg("anchor", 3000);
-    expect(pickNextLegToTrimForSecureProfits(positions, best, "buy")?.id).toBe("l1");
-    const afterL1 = [best, leg("l2", 3020), leg("l3", 3030)];
-    expect(pickNextLegToTrimForSecureProfits(afterL1, best, "buy")?.id).toBe("l2");
-  });
-
-  it("SELL: closes the entry nearest below best (highest among others)", () => {
-    const positions = [
-      leg("anchor", 3030),
-      leg("l1", 3020),
-      leg("l2", 3010),
-    ];
-    const best = leg("anchor", 3030);
     expect(pickNextLegToTrimForSecureProfits(positions, best, "sell")?.id).toBe("l1");
   });
 });
