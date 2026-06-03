@@ -246,7 +246,7 @@ export default function PositionsScreen() {
     refreshPositions, refreshPendingOrders, refreshAccountInfo,
     closePosition, cancelOrder, accountId, region, sseConnected, price, syncSession,
   } = useTrading();
-  const { zones, refresh: refreshZones, riskFree, closeZone, cancelZoneOrders } = useZones(accountId, {
+  const { zones, refresh: refreshZones, riskFree, closeZone, closeAllWorst, cancelZoneOrders } = useZones(accountId, {
     includeClosed: true, pollIntervalMs: 10_000, sseConnected, region,
   });
   const { settings: cs } = useCascadeSettings();
@@ -445,6 +445,7 @@ export default function PositionsScreen() {
                       key={z.zoneId}
                       zone={z}
                       onRiskFree={riskFree}
+                      onCloseAllWorst={closeAllWorst}
                       onCloseZone={handleCloseZone}
                       onCancelOrders={handleCancelZoneOrders}
                       riskFreePips={cs.riskFreePips}

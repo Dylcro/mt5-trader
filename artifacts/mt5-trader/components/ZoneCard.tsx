@@ -89,6 +89,7 @@ interface ZoneCardProps {
     zoneId: string,
     opts?: { riskFreePips?: number },
   ) => Promise<{ ok: boolean; message?: string }>;
+  onCloseAllWorst?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
   onCloseZone?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
   onCancelOrders?: (zoneId: string) => Promise<{ ok: boolean; message?: string; cancelledCount?: number }>;
   riskFreePips?: number;
@@ -96,11 +97,12 @@ interface ZoneCardProps {
 }
 
 export default function ZoneCard({
-  zone, onRiskFree, onCloseZone, onCancelOrders, riskFreePips,
+  zone, onRiskFree, onCloseAllWorst, onCloseZone, onCancelOrders, riskFreePips,
   historical = false,
 }: ZoneCardProps) {
   const isBuy = zone.direction === "buy";
   const [busy, setBusy] = useState(false);
+  const [worstBusy, setWorstBusy] = useState(false);
   const [closeBusy, setCloseBusy] = useState(false);
   const [delBusy, setDelBusy] = useState(false);
 
@@ -142,6 +144,12 @@ export default function ZoneCard({
 
   const canRiskFree =
     !historical && (zone.status === "OPEN" || zone.status === "RISK_FREE") && zone.positionCount >= 1 && !!onRiskFree;
+  const showCloseAllWorst =
+    !historical
+    && zone.status !== "CLOSED"
+    && zone.status !== "ARMED"
+    && !!onCloseAllWorst;
+  const canCloseAllWorst = showCloseAllWorst && zone.positionCount >= 2;
   // Close Zone is allowed for any non-historical, non-closed zone that still
   // has at least one tracked position. We allow it on RISK_FREE zones too —
   // the user might want to bail out completely even after going risk-free.
@@ -199,6 +207,28 @@ export default function ZoneCard({
   const handleCancelOrders = () => {
     void runCancelOrders();
   };
+
+  const runCloseAllWorst = async () => {
+    if (!onCloseAllWorst || worstBusy) return;
+    setWorstBusy(true);
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    const result = await onCloseAllWorst(zone.zoneId);
+    setWorstBusy(false);
+    if (result.ok) {
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      return;
+    }
+    await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    const errMsg = result.message ?? "Please try again.";
+    if (Platform.OS === "web" && typeof window !== "undefined") {
+      window.alert(`Couldn't close worst positions\n\n${errMsg}`);
+    } else {
+      Alert.alert("Couldn't close worst positions", errMsg);
+    }
+  };
+
+  const actionBusy = busy || worstBusy || closeBusy || delBusy;
+  const showActionColumn = canCancelOrders || showCloseAllWorst;
 
   return (
     <View style={[styles.card, historical && { opacity: 0.85 }]}>
@@ -308,7 +338,7 @@ export default function ZoneCard({
         </View>
       )}
 
-      {(canRiskFree || canCloseZone || canCancelOrders) && (
+      {(canRiskFree || canCloseZone || showActionColumn) && (
         <View style={styles.actionRow}>
           {canRiskFree && (
             <Pressable
@@ -319,7 +349,7 @@ export default function ZoneCard({
                 busy && { opacity: 0.5 },
               ]}
               onPress={handleRiskFree}
-              disabled={busy || closeBusy || delBusy}
+              disabled={actionBusy}
             >
               {busy ? (
                 <ActivityIndicator size="small" color={C.gold} />
@@ -340,7 +370,7 @@ export default function ZoneCard({
                 closeBusy && { opacity: 0.5 },
               ]}
               onPress={handleCloseZone}
-              disabled={closeBusy || busy || delBusy}
+              disabled={actionBusy}
             >
               {closeBusy ? (
                 <ActivityIndicator size="small" color={C.sell} />
@@ -352,26 +382,49 @@ export default function ZoneCard({
               )}
             </Pressable>
           )}
-          {canCancelOrders && (
-            <Pressable
-              style={({ pressed }) => [
-                styles.delBtn,
-                { flex: 1 },
-                pressed && { opacity: 0.75 },
-                delBusy && { opacity: 0.5 },
-              ]}
-              onPress={handleCancelOrders}
-              disabled={delBusy || busy || closeBusy}
-            >
-              {delBusy ? (
-                <ActivityIndicator size="small" color={C.textSecondary} />
-              ) : (
-                <>
-                  <Feather name="trash-2" size={13} color={C.textSecondary} />
-                  <Text style={styles.delBtnText}>Delete Orders</Text>
-                </>
+          {showActionColumn && (
+            <View style={styles.actionColumn}>
+              {canCancelOrders && (
+                <Pressable
+                  style={({ pressed }) => [
+                    styles.delBtn,
+                    pressed && { opacity: 0.75 },
+                    delBusy && { opacity: 0.5 },
+                  ]}
+                  onPress={handleCancelOrders}
+                  disabled={actionBusy}
+                >
+                  {delBusy ? (
+                    <ActivityIndicator size="small" color={C.textSecondary} />
+                  ) : (
+                    <>
+                      <Feather name="trash-2" size={13} color={C.textSecondary} />
+                      <Text style={styles.delBtnText}>Delete Orders</Text>
+                    </>
+                  )}
+                </Pressable>
               )}
-            </Pressable>
+              {showCloseAllWorst && (
+                <Pressable
+                  style={({ pressed }) => [
+                    styles.delBtn,
+                    pressed && canCloseAllWorst && { opacity: 0.75 },
+                    (!canCloseAllWorst || worstBusy) && { opacity: 0.45 },
+                  ]}
+                  onPress={() => { void runCloseAllWorst(); }}
+                  disabled={actionBusy || !canCloseAllWorst}
+                >
+                  {worstBusy ? (
+                    <ActivityIndicator size="small" color={C.textSecondary} />
+                  ) : (
+                    <>
+                      <Feather name="filter" size={13} color={C.textSecondary} />
+                      <Text style={styles.delBtnText} numberOfLines={1}>Close Worst</Text>
+                    </>
+                  )}
+                </Pressable>
+              )}
+            </View>
           )}
         </View>
       )}
@@ -575,6 +628,11 @@ const styles = StyleSheet.create({
   },
   actionRow: {
     flexDirection: "row",
+    gap: 8,
+    alignItems: "stretch",
+  },
+  actionColumn: {
+    flex: 1,
     gap: 8,
   },
   rfBtn: {

@@ -199,6 +199,52 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
 
   // Cancel pending cascade limit orders for the zone without touching open
   // positions. Powers the "Delete Orders" button on each zone card.
+  const closeAllWorst = useCallback(async (
+    zoneId: string,
+  ): Promise<{ ok: boolean; message?: string; closedCount?: number }> => {
+    if (!API_BASE || !accountId) return { ok: false, message: "No account" };
+    try {
+      const res = await authFetch(
+        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/close-worst${zoneTradeQuery(region)}`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+      );
+      const raw = await res.text();
+      let data: {
+        ok?: boolean; message?: string; error?: string;
+        closedCount?: number; skipped?: boolean; bestPositionId?: string;
+      } = {};
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        const hint = res.headers.get("content-type")?.includes("text/html")
+          ? "Server returned HTML — publish the latest API on Replit (close-worst route missing)."
+          : "Invalid server response.";
+        return { ok: false, message: hint };
+      }
+      void refresh();
+      const succeeded = data.ok === true
+        || data.skipped === true
+        || (typeof data.bestPositionId === "string" && data.bestPositionId.length > 0);
+      if (res.ok && succeeded) {
+        return { ok: true, closedCount: data.closedCount ?? 0 };
+      }
+      if (data.error || data.message) {
+        return { ok: false, message: data.message ?? data.error };
+      }
+      if (res.status === 404) {
+        return { ok: false, message: "Close All Worst API not found — merge and publish the latest API on Replit." };
+      }
+      return {
+        ok: false,
+        message: res.ok
+          ? "Unexpected server response — publish the latest API on Replit."
+          : `HTTP ${res.status}`,
+      };
+    } catch (e) {
+      return { ok: false, message: (e as Error).message };
+    }
+  }, [accountId, region, refresh]);
+
   const cancelZoneOrders = useCallback(async (
     zoneId: string,
   ): Promise<{ ok: boolean; message?: string; cancelledCount?: number }> => {
@@ -230,5 +276,5 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     }
   }, [accountId, region, refresh]);
 
-  return { zones, loading, error, refresh, riskFree, closeZone, cancelZoneOrders };
+  return { zones, loading, error, refresh, riskFree, closeZone, closeAllWorst, cancelZoneOrders };
 }

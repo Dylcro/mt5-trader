@@ -27,12 +27,15 @@ import {
   tpDisplayState,
   positionShowsTpLevelApplied,
   shouldCancelCascadeLimitsAtTpStage,
+  shouldCancelCascadeLimitsForZone,
   shouldAutoCloseZoneAfterPositionExit,
   sumDealPnlForPositions,
   sumRealizedTradePnlFromDeals,
   sanitizeAutoBeAtTp,
   resolveAutoBeAtTp,
   isAutoBeTriggerSatisfied,
+  pickBestZonePositionByFloatingPnl,
+  pickBestZonePositionForCloseWorst,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
@@ -756,6 +759,11 @@ describe("cascade limit cancel timing", () => {
     expect(shouldCancelCascadeLimitsAtTpStage(2, { tp1Hit: true, tp2Hit: true })).toBe(false);
   });
 
+  it("close-worst / cleanup: cancel pending limits only after zone TP2", () => {
+    expect(shouldCancelCascadeLimitsForZone({ tp2Hit: false })).toBe(false);
+    expect(shouldCancelCascadeLimitsForZone({ tp2Hit: true })).toBe(true);
+  });
+
   it("defers auto zone-close while OPEN pre-TP2 with pending limits", () => {
     expect(shouldAutoCloseZoneAfterPositionExit(
       { status: "OPEN", tp2Hit: false },
@@ -803,6 +811,50 @@ describe("sumRealizedTradePnlFromDeals (dashboard period P&L)", () => {
       { type: "DEAL_TYPE_SELL", entryType: "DEAL_ENTRY_OUT", symbol: "XAUUSD", profit: -10, commission: 0, swap: -0.2 },
     ];
     expect(sumRealizedTradePnlFromDeals(deals)).toBe(39.3);
+  });
+});
+
+describe("pickBestZonePositionForCloseWorst", () => {
+  const leg = (id: string, openPrice: number, profit?: number) => ({
+    id,
+    openPrice,
+    volume: 0.01,
+    type: "POSITION_TYPE_BUY",
+    symbol: "XAUUSD",
+    profit,
+  });
+
+  it("picks highest floating P&L", () => {
+    const positions = [
+      leg("3", 3010, -5),
+      leg("1", 3000, 12),
+      leg("2", 3005, 8),
+    ];
+    expect(pickBestZonePositionByFloatingPnl(positions).id).toBe("1");
+    expect(pickBestZonePositionForCloseWorst(positions, "buy").id).toBe("1");
+  });
+
+  it("ties: earliest ticket id wins", () => {
+    const positions = [leg("100", 3000, 5), leg("50", 3010, 5)];
+    expect(pickBestZonePositionByFloatingPnl(positions).id).toBe("50");
+  });
+
+  it("BUY without profit: lowest entry (best)", () => {
+    const positions = [
+      leg("a", 3010),
+      leg("b", 2995),
+      leg("c", 3005),
+    ];
+    expect(pickBestZonePositionForCloseWorst(positions, "buy").id).toBe("b");
+  });
+
+  it("SELL without profit: highest entry (best)", () => {
+    const positions = [
+      leg("a", 3010),
+      leg("b", 2995),
+      leg("c", 3005),
+    ];
+    expect(pickBestZonePositionForCloseWorst(positions, "sell").id).toBe("a");
   });
 });
 
