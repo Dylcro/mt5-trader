@@ -39,6 +39,7 @@ import {
   pickNextLegToTrimForSecureProfits,
   shiftZonePricesWithAnchor,
   resolveOrigVolForPartial,
+  shouldSkipZoneAutoCloseAfterPositionExit,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
@@ -875,6 +876,14 @@ describe("shiftZonePricesWithAnchor", () => {
     expect(st.tp1Price).toBe(2652.4);
     expect(st.tp2Price).toBe(2656.4);
     expect(st.tp3Price).toBe(2660.4);
+  });
+});
+
+describe("shouldSkipZoneAutoCloseAfterPositionExit", () => {
+  it("skips when risk-free or broker still has zone legs", () => {
+    expect(shouldSkipZoneAutoCloseAfterPositionExit("RISK_FREE", false)).toBe(true);
+    expect(shouldSkipZoneAutoCloseAfterPositionExit("OPEN", true)).toBe(true);
+    expect(shouldSkipZoneAutoCloseAfterPositionExit("OPEN", false)).toBe(false);
   });
 });
 

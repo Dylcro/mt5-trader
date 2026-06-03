@@ -2947,9 +2947,20 @@ async function markZonePositionClosed(
       const zoneStatus = st?.status ?? zoneMeta?.status ?? "CLOSED";
       const tp2Hit = st?.tp2Hit ?? Boolean(zoneMeta?.tp2Hit);
       const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, accountId, zoneId);
-      const brokerStillOpen = await zoneHasLiveTrackedPositionsOnBroker(token, region, accountId, zoneId);
-      if (brokerStillOpen) {
-        console.log(`[markClosed] zone ${zoneId} DB empty but broker still has open legs — skip auto-close`);
+      let brokerStillOpen = await zoneHasLiveTrackedPositionsOnBroker(token, region, accountId, zoneId);
+      if (!brokerStillOpen) {
+        for (let i = 0; i < 2 && !brokerStillOpen; i++) {
+          await sleep(1000);
+          brokerStillOpen = await zoneHasLiveTrackedPositionsOnBroker(token, region, accountId, zoneId);
+        }
+      }
+      if (shouldSkipZoneAutoCloseAfterPositionExit(zoneStatus, brokerStillOpen)) {
+        console.log(
+          `[markClosed] zone ${zoneId} skip auto-close (status=${zoneStatus} brokerOpen=${brokerStillOpen})`,
+        );
+        if (brokerStillOpen && st) {
+          void resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+        }
         return;
       }
       if (!shouldAutoCloseZoneAfterPositionExit(
@@ -3318,6 +3329,16 @@ export function resolveOrigVolForPartial(
   if (rowVolume != null && rowVolume > 0) return rowVolume;
   if (zoneOriginalVolume > 0) return zoneOriginalVolume;
   return liveVolume;
+}
+
+/** Risk-free leaves one survivor — never auto-close the zone from a deal handler race. */
+export function shouldSkipZoneAutoCloseAfterPositionExit(
+  zoneStatus: string,
+  brokerStillOpen: boolean,
+): boolean {
+  if (zoneStatus === "RISK_FREE") return true;
+  if (brokerStillOpen) return true;
+  return false;
 }
 
 export function pickNextLegToTrimForSecureProfits(
@@ -4536,6 +4557,33 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       .set({ status: "RISK_FREE", wentRiskFree: true })
       .where(eq(cascadeZonesTable.zoneId, zoneId));
     st.status = "RISK_FREE";
+    const survivorVol = st.originalVolume > 0 ? st.originalVolume : best.volume;
+    const [survivorRow] = await db.select({ status: zonePositionsTable.status })
+      .from(zonePositionsTable)
+      .where(and(
+        eq(zonePositionsTable.zoneId, zoneId),
+        eq(zonePositionsTable.positionId, best.id),
+      ))
+      .limit(1);
+    if (survivorRow) {
+      await db.update(zonePositionsTable)
+        .set({ status: "OPEN", entryPrice: best.openPrice, volume: survivorVol })
+        .where(and(
+          eq(zonePositionsTable.zoneId, zoneId),
+          eq(zonePositionsTable.positionId, best.id),
+        ));
+    } else {
+      await recordZonePositionFill(zoneId, best.id, best.openPrice, survivorVol);
+    }
+    const cached = st.trackedPositions.get(best.id);
+    st.trackedPositions.set(best.id, {
+      volume: survivorVol,
+      entryPrice: best.openPrice,
+      tp1Hit: cached?.tp1Hit ?? false,
+      tp2Hit: cached?.tp2Hit ?? false,
+      tp3Hit: cached?.tp3Hit ?? false,
+      tp4Hit: cached?.tp4Hit ?? false,
+    });
     broadcastZoneUpdate(zoneId);
     broadcastToAccount(accountId, "deal", { type: "position_changed" });
     console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl} (pips=${pips})`);
@@ -4676,7 +4724,10 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
     }
 
     if (live.length === 0) {
-      res.status(409).json({ error: "No open positions in this zone" });
+      const hint = st.status === "RISK_FREE"
+        ? "Risk-free survivor not visible — pull to refresh on Positions, then try Close Zone again."
+        : "No open positions in this zone";
+      res.status(409).json({ error: hint });
       return;
     }
 
