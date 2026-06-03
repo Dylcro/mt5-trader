@@ -7,7 +7,7 @@ import Colors from "@/constants/colors";
 import type { Zone } from "@/hooks/useZones";
 
 const C = Colors.dark;
-const CLOSE_WORST_BLUE = "#6EC1E4";
+const SECURE_PROFITS_BLUE = "#6EC1E4";
 const DELETE_LIMITS_INDIGO = "#7B6CF0";
 
 function formatPrice(n: number) {
@@ -146,6 +146,7 @@ export default function ZoneCard({
 
   const canRiskFree =
     !historical && (zone.status === "OPEN" || zone.status === "RISK_FREE") && zone.positionCount >= 1 && !!onRiskFree;
+  // Secure Profits: one leg per tap (profit or loss on that leg — ladder position only).
   const showCloseAllWorst =
     !historical
     && zone.status !== "CLOSED"
@@ -223,9 +224,9 @@ export default function ZoneCard({
     await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     const errMsg = result.message ?? "Please try again.";
     if (Platform.OS === "web" && typeof window !== "undefined") {
-      window.alert(`Couldn't keep best entry\n\n${errMsg}`);
+      window.alert(`Couldn't secure profits\n\n${errMsg}`);
     } else {
-      Alert.alert("Couldn't keep best entry", errMsg);
+      Alert.alert("Couldn't secure profits", errMsg);
     }
   };
 
@@ -386,7 +387,7 @@ export default function ZoneCard({
           {showCloseAllWorst && (
             <Pressable
               style={({ pressed }) => [
-                styles.worstBtn,
+                styles.secureBtn,
                 { flex: 1 },
                 pressed && canCloseAllWorst && { opacity: 0.75 },
                 (!canCloseAllWorst || worstBusy) && { opacity: 0.45 },
@@ -395,11 +396,11 @@ export default function ZoneCard({
               disabled={actionBusy || !canCloseAllWorst}
             >
               {worstBusy ? (
-                <ActivityIndicator size="small" color={CLOSE_WORST_BLUE} />
+                <ActivityIndicator size="small" color={SECURE_PROFITS_BLUE} />
               ) : (
                 <>
-                  <Feather name="filter" size={13} color={CLOSE_WORST_BLUE} />
-                  <Text style={styles.worstBtnText} numberOfLines={1}>Keep Best</Text>
+                  <Feather name="trending-up" size={13} color={SECURE_PROFITS_BLUE} />
+                  <Text style={styles.secureBtnText} numberOfLines={1}>Secure Profits</Text>
                 </>
               )}
             </Pressable>
@@ -666,7 +667,7 @@ const styles = StyleSheet.create({
     color: C.gold,
     letterSpacing: 0.3,
   },
-  worstBtn: {
+  secureBtn: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
@@ -674,13 +675,13 @@ const styles = StyleSheet.create({
     paddingVertical: 9,
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: CLOSE_WORST_BLUE,
+    borderColor: SECURE_PROFITS_BLUE,
     backgroundColor: "rgba(110,193,228,0.12)",
   },
-  worstBtnText: {
+  secureBtnText: {
     fontSize: 13,
     fontFamily: "Inter_700Bold",
-    color: CLOSE_WORST_BLUE,
+    color: SECURE_PROFITS_BLUE,
     letterSpacing: 0.3,
   },
   limitsBtn: {

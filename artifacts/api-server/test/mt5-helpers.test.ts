@@ -36,6 +36,7 @@ import {
   isAutoBeTriggerSatisfied,
   pickBestZonePositionByFloatingPnl,
   pickBestZonePositionForCloseWorst,
+  pickNextLegToTrimForSecureProfits,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
@@ -855,6 +856,49 @@ describe("pickBestZonePositionForCloseWorst", () => {
       leg("c", 3005),
     ];
     expect(pickBestZonePositionForCloseWorst(positions, "sell").id).toBe("a");
+  });
+});
+
+describe("pickNextLegToTrimForSecureProfits (one leg per tap)", () => {
+  const leg = (id: string, openPrice: number) => ({
+    id,
+    openPrice,
+    volume: 0.01,
+    type: "POSITION_TYPE_BUY",
+    symbol: "XAUUSD",
+  });
+
+  it("BUY: closes nearest rung above best even when that leg is in profit", () => {
+    const positions = [
+      { ...leg("anchor", 3000), profit: 50 },
+      { ...leg("l1", 3010), profit: 12 },
+      { ...leg("l2", 3020), profit: -3 },
+    ];
+    const best = positions[0]!;
+    expect(pickNextLegToTrimForSecureProfits(positions, best, "buy")?.id).toBe("l1");
+  });
+
+  it("BUY: closes the entry nearest above best (lowest among others)", () => {
+    const positions = [
+      leg("anchor", 3000),
+      leg("l1", 3010),
+      leg("l2", 3020),
+      leg("l3", 3030),
+    ];
+    const best = leg("anchor", 3000);
+    expect(pickNextLegToTrimForSecureProfits(positions, best, "buy")?.id).toBe("l1");
+    const afterL1 = [best, leg("l2", 3020), leg("l3", 3030)];
+    expect(pickNextLegToTrimForSecureProfits(afterL1, best, "buy")?.id).toBe("l2");
+  });
+
+  it("SELL: closes the entry nearest below best (highest among others)", () => {
+    const positions = [
+      leg("anchor", 3030),
+      leg("l1", 3020),
+      leg("l2", 3010),
+    ];
+    const best = leg("anchor", 3030);
+    expect(pickNextLegToTrimForSecureProfits(positions, best, "sell")?.id).toBe("l1");
   });
 });
 
