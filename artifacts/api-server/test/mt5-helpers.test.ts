@@ -37,6 +37,8 @@ import {
   pickBestZonePositionByFloatingPnl,
   pickBestZonePositionForCloseWorst,
   pickNextLegToTrimForSecureProfits,
+  shiftZonePricesWithAnchor,
+  resolveOrigVolForPartial,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
@@ -856,6 +858,35 @@ describe("pickBestZonePositionForCloseWorst", () => {
       leg("c", 3005),
     ];
     expect(pickBestZonePositionForCloseWorst(positions, "sell").id).toBe("a");
+  });
+});
+
+describe("shiftZonePricesWithAnchor", () => {
+  it("shifts anchor and all TP prices by fill delta", () => {
+    const st = {
+      anchorPrice: 2650,
+      tp1Price: 2652,
+      tp2Price: 2656,
+      tp3Price: 2660,
+      tp4Price: null as number | null,
+    };
+    shiftZonePricesWithAnchor(st, 2650.4);
+    expect(st.anchorPrice).toBe(2650.4);
+    expect(st.tp1Price).toBe(2652.4);
+    expect(st.tp2Price).toBe(2656.4);
+    expect(st.tp3Price).toBe(2660.4);
+  });
+});
+
+describe("resolveOrigVolForPartial", () => {
+  it("prefers DB row volume over live volume after partial", () => {
+    expect(resolveOrigVolForPartial(0.04, 0.04, 0.03)).toBe(0.04);
+  });
+  it("falls back to zone originalVolume when row missing", () => {
+    expect(resolveOrigVolForPartial(undefined, 0.04, 0.03)).toBe(0.04);
+  });
+  it("uses live volume only when nothing else is known", () => {
+    expect(resolveOrigVolForPartial(undefined, 0, 0.03)).toBe(0.03);
   });
 });
 

@@ -2823,7 +2823,8 @@ async function resolveLivePositionsForZoneAction(
         ));
       relinked++;
     } else if (!row) {
-      await recordZonePositionFill(zoneId, p.id, p.openPrice, p.volume);
+      const seedVol = st.originalVolume > 0 ? st.originalVolume : p.volume;
+      await recordZonePositionFill(zoneId, p.id, p.openPrice, seedVol);
       relinked++;
     }
     const cached = st.trackedPositions.get(p.id);
@@ -3284,6 +3285,41 @@ export function pickBestZonePositionForCloseWorst(
  * BUY limits step down from anchor — peel from best upward until anchor is last.
  * The closed leg may be in profit or loss.
  */
+/** When the market fill price differs from the tap-time anchor, shift absolute TP prices by the same delta. */
+export function shiftZonePricesWithAnchor(
+  st: {
+    anchorPrice: number;
+    tp1Price: number | null;
+    tp2Price: number | null;
+    tp3Price: number | null;
+    tp4Price: number | null;
+  },
+  newAnchor: number,
+): number {
+  const oldAnchor = st.anchorPrice;
+  const delta = newAnchor - oldAnchor;
+  if (!Number.isFinite(delta) || Math.abs(delta) < 0.0001) return oldAnchor;
+  const shift = (p: number | null) =>
+    p != null && p > 0 ? parseFloat((p + delta).toFixed(2)) : p;
+  st.anchorPrice = parseFloat(newAnchor.toFixed(2));
+  st.tp1Price = shift(st.tp1Price);
+  st.tp2Price = shift(st.tp2Price);
+  st.tp3Price = shift(st.tp3Price);
+  st.tp4Price = shift(st.tp4Price);
+  return oldAnchor;
+}
+
+/** Original per-leg volume for TP partials — never use post-partial live volume as the baseline. */
+export function resolveOrigVolForPartial(
+  rowVolume: number | undefined,
+  zoneOriginalVolume: number,
+  liveVolume: number,
+): number {
+  if (rowVolume != null && rowVolume > 0) return rowVolume;
+  if (zoneOriginalVolume > 0) return zoneOriginalVolume;
+  return liveVolume;
+}
+
 export function pickNextLegToTrimForSecureProfits(
   positions: LivePosition[],
   best: LivePosition,
@@ -3599,7 +3635,11 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       // TP price before their close request hits the broker.
       const results = await Promise.all(positionsSubset.map(async p => {
         const row = zpsById.get(p.id);
-        const origVol = row ? Number(row.volume) : p.volume;
+        const origVol = resolveOrigVolForPartial(
+          row ? Number(row.volume) : undefined,
+          st.originalVolume,
+          p.volume,
+        );
         if (!(origVol > 0)) return true;
         if (level === 4) {
           return closeZonePosition(token, region, st.accountId, p.id);
@@ -3663,7 +3703,11 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     const tp1AtPrice = st.tp1Price != null && hit(st.tp1Price);
     const tp1BrokerApplied = needTP1.filter((p) => {
       const row = zpsById.get(p.id);
-      const origVol = row ? Number(row.volume) : 0;
+      const origVol = resolveOrigVolForPartial(
+        row ? Number(row.volume) : undefined,
+        st.originalVolume,
+        p.volume,
+      );
       return positionShowsTpLevelApplied(p.volume, origVol, 1, st);
     });
     if (needTP1.length > 0 && st.tp1Price != null && (tp1AtPrice || tp1BrokerApplied.length > 0)) {
@@ -4411,12 +4455,23 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     // DB-first read: loadZone checks cache first, then hydrates from DB on miss.
     // DB errors propagate as 500; CLOSED zones and missing zones are 404.
     const st = await loadZone(zoneId);
-    if (!st || st.accountId !== accountId || st.status === "CLOSED") { res.status(404).json({ error: "Zone not found" }); return; }
+    if (!st) {
+      res.status(404).json({ error: "Zone not found." });
+      return;
+    }
+    if (st.accountId !== accountId) {
+      res.status(403).json({ error: "This zone does not belong to this account." });
+      return;
+    }
     if (st.status === "ARMED") {
       res.status(409).json({ error: "Zone not active yet — wait for the first order to fill" });
       return;
     }
     const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+    if (st.status === "CLOSED" && live.length === 0) {
+      res.status(409).json({ error: "This zone is already closed — no open positions on the broker." });
+      return;
+    }
     if (live.length === 0) {
       res.status(409).json({ error: "No open positions in this zone" }); return;
     }
@@ -5834,14 +5889,23 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
                   const positions = await fetchOpenPositions(getToken(), region, accountId);
                   const me = positions.find(p => p.id === positionId);
                   if (me && me.openPrice > 0 && me.openPrice !== zoneState.anchorPrice) {
-                    zoneState.anchorPrice = me.openPrice;
+                    const oldAnchor = shiftZonePricesWithAnchor(zoneState, me.openPrice);
                     const existingPos = zoneState.trackedPositions.get(positionId);
                     zoneState.trackedPositions.set(positionId, { volume, entryPrice: me.openPrice, tp1Hit: existingPos?.tp1Hit ?? false, tp2Hit: existingPos?.tp2Hit ?? false, tp3Hit: existingPos?.tp3Hit ?? false, tp4Hit: existingPos?.tp4Hit ?? false });
+                    console.log(
+                      `[zone ${zoneState.zoneId}] anchor ${oldAnchor} → ${me.openPrice} (TPs shifted to match fill)`,
+                    );
                     await Promise.all([
                       db.update(cascadeZonesTable)
-                        .set({ anchorPrice: me.openPrice })
+                        .set({
+                          anchorPrice: zoneState.anchorPrice,
+                          tp1Price: zoneState.tp1Price,
+                          tp2Price: zoneState.tp2Price,
+                          tp3Price: zoneState.tp3Price,
+                          tp4Price: zoneState.tp4Price,
+                        })
                         .where(eq(cascadeZonesTable.zoneId, zoneState.zoneId))
-                        .catch((e: Error) => console.warn(`[zone ${zoneState.zoneId}] anchor update failed:`, e.message)),
+                        .catch((e: Error) => console.warn(`[zone ${zoneState.zoneId}] anchor/TP update failed:`, e.message)),
                       db.update(zonePositionsTable)
                         .set({ entryPrice: me.openPrice })
                         .where(and(

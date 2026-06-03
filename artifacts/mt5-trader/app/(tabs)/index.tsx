@@ -1063,7 +1063,7 @@ export default function TradeScreen() {
             <View style={styles.sectionCard}>
               <View style={styles.sectionHeader}>
                 <Text style={styles.sectionTitle}>Lot Size (per order)</Text>
-                <Text style={styles.sectionHint}>1 lot = 100 oz gold</Text>
+                <Text style={styles.sectionHint}>Each new leg — not your open size after a TP</Text>
               </View>
               <StepInput value={cascadeLotSize} onChange={setCascadeLotSize} step={0.01} min={0.01} max={100} decimals={2} />
             </View>
@@ -1197,7 +1197,7 @@ export default function TradeScreen() {
             <View style={styles.sectionCard}>
               <View style={styles.sectionHeader}>
                 <Text style={styles.sectionTitle}>Lot Size (per order)</Text>
-                <Text style={styles.sectionHint}>From Settings cascade</Text>
+                <Text style={styles.sectionHint}>Each new leg — not size left after a TP</Text>
               </View>
               <StepInput value={cascadeLotSize} onChange={setCascadeLotSize} step={0.01} min={0.01} max={100} decimals={2} />
               <Pressable
