@@ -1336,6 +1336,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       if (placed === 0) {
         return { success: false, placed, failed, message: errors[0] ?? "All orders failed to place", zoneId };
       }
+      if (accountId) emitAccountEvent(accountId, "zones_changed", { zoneId });
       if (failed > 0) {
         return { success: true, placed, failed, message: `${placed}/${total} placed. Failed: ${errors.join("; ")}`, zoneId, marketPositionId, limitOrderIds };
       }
@@ -1415,6 +1416,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         const msg = failed > 0
           ? `${placed}/${total} pending orders placed · zone armed @ ${params.anchorPrice}`
           : `Cascade armed @ ${params.anchorPrice} · ${placed} pending orders`;
+        if (accountId) emitAccountEvent(accountId, "zones_changed", { zoneId: armedZoneId });
         return { success: true, placed, failed, message: msg, zoneId: armedZoneId, limitOrderIds };
       } catch (err) {
         return { success: false, placed: 0, failed: total, message: err instanceof Error ? err.message : "Arm failed" };

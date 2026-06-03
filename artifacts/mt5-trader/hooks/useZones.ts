@@ -134,26 +134,28 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
       if (type === "zone_update") {
         const update = data as Partial<Zone> & { zoneId?: string };
         if (!update.zoneId) return;
-        if (update.status === "CLOSED") {
-          setZones((prev) => {
+        setZones((prev) => {
+          // New zone on server — partial SSE can't build a full card; fetch once.
+          if (!prev.some((z) => z.zoneId === update.zoneId)) {
+            queueMicrotask(() => void refresh());
+            return prev;
+          }
+          if (update.status === "CLOSED") {
             const closedAt = update.closedAt ?? Date.now();
-            const has = prev.some((z) => z.zoneId === update.zoneId);
-            if (!has) return prev;
             return prev.map((z) =>
               z.zoneId === update.zoneId
                 ? enrichZoneDisplayFields(latchZoneTpHits(z, { ...z, ...update, status: "CLOSED", closedAt }))
                 : z,
             );
-          });
-          return;
-        }
-        setZones((prev) =>
-          prev.map((z) => {
+          }
+          return prev.map((z) => {
             if (z.zoneId !== update.zoneId) return z;
             return enrichZoneDisplayFields(latchZoneTpHits(z, { ...z, ...update }));
-          }),
-        );
-      } else if (type === "deal" || type === "pending_order") {
+          });
+        });
+        return;
+      }
+      if (type === "deal" || type === "pending_order" || type === "zones_changed") {
         void refresh();
       }
     });

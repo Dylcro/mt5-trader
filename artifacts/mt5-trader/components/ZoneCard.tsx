@@ -242,7 +242,7 @@ export default function ZoneCard({
     <View style={[styles.card, historical && { opacity: 0.85 }]}>
       {!serverTracked && !historical ? (
         <Text style={styles.syncHint}>
-          Zone still syncing — pull to refresh on Positions, then try again.
+          Linking zone to server… buttons unlock in a moment (no refresh needed).
         </Text>
       ) : null}
       <View style={styles.topRow}>
