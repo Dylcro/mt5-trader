@@ -6,7 +6,8 @@ if (!process.env.DATABASE_URL) {
 }
 
 export default defineConfig({
-  schema: path.join(__dirname, "./src/schema/index.ts"),
+  // Load every table file directly (not only the barrel) so push sees all columns.
+  schema: path.join(__dirname, "./src/schema"),
   dialect: "postgresql",
   dbCredentials: {
     url: process.env.DATABASE_URL,
