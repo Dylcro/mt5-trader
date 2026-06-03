@@ -1707,6 +1707,11 @@ type HistoryDealRow = {
   type?: string;
   entryType?: string;
   symbol?: string;
+  reason?: string;
+  closeReason?: string;
+  comment?: string;
+  price?: number;
+  openPrice?: number;
 };
 
 const REALIZED_DEAL_ENTRIES = new Set(["DEAL_ENTRY_OUT", "DEAL_ENTRY_INOUT"]);
@@ -1724,6 +1729,25 @@ export function sumRealizedTradePnlFromDeals(deals: HistoryDealRow[]): number {
     sum += Number(d.profit ?? 0) + Number(d.commission ?? 0) + Number(d.swap ?? 0);
   }
   return Math.round(sum * 100) / 100;
+}
+
+/** True if any closing deal for these positions exited via broker stop / stop-out. */
+export function inferZoneStopLossFromDeals(
+  deals: HistoryDealRow[],
+  positionIds: Set<string>,
+): { stopLossExit: boolean; exitPrice: number | null } {
+  let exitPrice: number | null = null;
+  let stopLossExit = false;
+  for (const d of deals) {
+    const pid = d.positionId != null ? String(d.positionId) : "";
+    if (!pid || !positionIds.has(pid)) continue;
+    const entry = d.entryType ?? "";
+    if (!REALIZED_DEAL_ENTRIES.has(entry)) continue;
+    const px = exitPriceFromDeal(d);
+    if (px != null) exitPrice = px;
+    if (dealIndicatesStopLoss(d)) stopLossExit = true;
+  }
+  return { stopLossExit, exitPrice };
 }
 
 /** Sum realized P&L from broker deals for the given MT5 position ids. */
@@ -1765,7 +1789,6 @@ async function settleZoneClosedPnl(accountId: string, zoneId: string): Promise<v
       .where(and(eq(cascadeZonesTable.zoneId, zoneId), eq(cascadeZonesTable.accountId, accountId)))
       .limit(1);
     if (!zone || zone.status !== "CLOSED" || zone.closedAt == null) return;
-    if (zone.closedPnl != null) return;
 
     const posRows = await db.select({ positionId: zonePositionsTable.positionId })
       .from(zonePositionsTable)
@@ -1782,13 +1805,64 @@ async function settleZoneClosedPnl(accountId: string, zoneId: string): Promise<v
       Number(zone.createdAt),
       Number(zone.closedAt) + 120_000,
     );
-    const pnl = sumDealPnlForPositions(deals, positionIds);
-    await db.update(cascadeZonesTable)
-      .set({ closedPnl: pnl })
-      .where(eq(cascadeZonesTable.zoneId, zoneId));
-    console.log(`[zone ${zoneId}] closedPnl=${pnl} (${positionIds.size} position(s))`);
+    if (zone.closedPnl == null) {
+      const pnl = sumDealPnlForPositions(deals, positionIds);
+      await db.update(cascadeZonesTable)
+        .set({ closedPnl: pnl })
+        .where(eq(cascadeZonesTable.zoneId, zoneId));
+      console.log(`[zone ${zoneId}] closedPnl=${pnl} (${positionIds.size} position(s))`);
+    }
+
+    if (!zone.slHit && !zone.riskFreeSlExit) {
+      const { stopLossExit, exitPrice } = inferZoneStopLossFromDeals(deals, positionIds);
+      if (stopLossExit) {
+        await finalizeZoneClose(accountId, zoneId, {
+          stopLossExit: true,
+          wasRiskFree: Boolean((zone as { wentRiskFree?: boolean }).wentRiskFree),
+          exitPrice: exitPrice ?? undefined,
+          exitPriceFromDeal: exitPrice != null && exitPrice > 0,
+        });
+      }
+    }
   } catch (e) {
     console.warn(`[zone ${zoneId}] settleZoneClosedPnl failed:`, (e as Error).message);
+  }
+}
+
+/** Build finalize opts from broker history (reconcile / restart closes). */
+async function buildCloseFinalizeOptsForZone(
+  accountId: string,
+  zoneId: string,
+  partial: { wasRiskFree: boolean; direction: "buy" | "sell" },
+): Promise<CloseFinalizeOpts> {
+  const base: CloseFinalizeOpts = {
+    wasRiskFree: partial.wasRiskFree,
+    exitPrice: exitPriceForZoneClose(accountId, partial.direction),
+  };
+  try {
+    const [zone] = await db.select().from(cascadeZonesTable)
+      .where(and(eq(cascadeZonesTable.zoneId, zoneId), eq(cascadeZonesTable.accountId, accountId)))
+      .limit(1);
+    if (!zone?.closedAt) return base;
+    const posRows = await db.select({ positionId: zonePositionsTable.positionId })
+      .from(zonePositionsTable)
+      .where(eq(zonePositionsTable.zoneId, zoneId));
+    const positionIds = new Set(posRows.map((r) => r.positionId));
+    if (positionIds.size === 0) return base;
+    const token = getToken();
+    const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
+    const deals = await fetchAccountHistoryDeals(
+      token, region, accountId, Number(zone.createdAt), Number(zone.closedAt) + 120_000,
+    );
+    const { stopLossExit, exitPrice } = inferZoneStopLossFromDeals(deals, positionIds);
+    return {
+      ...base,
+      stopLossExit,
+      exitPrice: exitPrice ?? base.exitPrice,
+      exitPriceFromDeal: exitPrice != null && exitPrice > 0,
+    };
+  } catch {
+    return base;
   }
 }
 
@@ -1865,10 +1939,6 @@ export function zonePrimaryOutcome(row: {
   tp4Price?: number | null;
 }): ZonePrimaryOutcome {
   if (row.status !== "CLOSED") return "NONE";
-  if (row.riskFreeSlExit) return "RF";
-  if (row.slHit) return "SL";
-  if (Boolean(row.tp4Hit) && row.tp4Enabled !== false) return "TP4";
-  if (row.manualClose) return "MANUAL";
   const final = row.finalTpReached ?? computeFinalTpReached({
     tp1Enabled: row.tp1Enabled ?? true,
     tp2Enabled: row.tp2Enabled ?? true,
@@ -1880,9 +1950,15 @@ export function zonePrimaryOutcome(row: {
     tp4Hit: Boolean(row.tp4Hit),
     tp4Price: row.tp4Price,
   });
+  // Highest TP reached wins before RF / SL / MANUAL (zone-classification-spec).
+  if (final >= 4 && row.tp4Enabled !== false) return "TP4";
+  if (Boolean(row.tp4Hit) && row.tp4Enabled !== false) return "TP4";
   if (final >= 3 && row.tp3Enabled !== false) return "TP3";
   if (final >= 2 && row.tp2Enabled !== false) return "TP2";
   if (final >= 1 && row.tp1Enabled !== false) return "TP1";
+  if (row.riskFreeSlExit) return "RF";
+  if (row.slHit) return "SL";
+  if (row.manualClose) return "MANUAL";
   return "MANUAL";
 }
 
@@ -1891,7 +1967,13 @@ export function dealIndicatesStopLoss(deal: unknown): boolean {
   if (!deal || typeof deal !== "object") return false;
   const d = deal as Record<string, unknown>;
   const reason = String(d.reason ?? d.closeReason ?? "").toUpperCase();
-  if (reason.includes("SL") || reason.includes("STOP_LOSS") || reason.includes("STOP LOSS")) {
+  if (
+    reason.includes("SL")
+    || reason.includes("STOP_LOSS")
+    || reason.includes("STOP LOSS")
+    || reason.includes("STOP_OUT")
+    || reason.includes("STOPOUT")
+  ) {
     return true;
   }
   const comment = String(d.comment ?? "").toUpperCase();
@@ -3220,10 +3302,9 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         ).catch(() => {/* logged inside withDbRetry */});
         const wasRiskFree = st.status === "RISK_FREE";
         st.status = "CLOSED";
-        await finalizeZoneClose(st.accountId, zoneId, {
-          wasRiskFree,
-          exitPrice: exitPriceForZoneClose(st.accountId, st.direction),
-        });
+        await finalizeZoneClose(st.accountId, zoneId, await buildCloseFinalizeOptsForZone(
+          st.accountId, zoneId, { wasRiskFree, direction: st.direction },
+        ));
         void settleZoneClosedPnl(st.accountId, zoneId);
         logEvent("zone.close", { accountId: st.accountId, zoneId, trigger: "empty_reconcile" });
         try {
@@ -3291,10 +3372,9 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         ).catch(() => {/* logged inside withDbRetry */});
         const wasRiskFree = st.status === "RISK_FREE";
         st.status = "CLOSED";
-        await finalizeZoneClose(st.accountId, zoneId, {
-          wasRiskFree,
-          exitPrice: exitPriceForZoneClose(st.accountId, st.direction),
-        });
+        await finalizeZoneClose(st.accountId, zoneId, await buildCloseFinalizeOptsForZone(
+          st.accountId, zoneId, { wasRiskFree, direction: st.direction },
+        ));
         void settleZoneClosedPnl(st.accountId, zoneId);
         logEvent("zone.close", { accountId: st.accountId, zoneId, trigger: "reconciliation" });
         // Cancel any outstanding cascade limit orders so they don't orphan on
@@ -4069,7 +4149,11 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
       try {
       if (!includeClosed && z.status === "CLOSED") continue;
       let row = z;
-      if (z.status === "CLOSED" && z.closedPnl == null && settleBudget > 0) {
+      const needsSettle = z.status === "CLOSED" && (
+        z.closedPnl == null
+        || (!(z as { slHit?: boolean }).slHit && !(z as { riskFreeSlExit?: boolean }).riskFreeSlExit)
+      );
+      if (needsSettle && settleBudget > 0) {
         settleBudget -= 1;
         try {
           await settleZoneClosedPnl(accountId, z.zoneId);

@@ -45,15 +45,15 @@ export type ZonePrimaryOutcome = "RF" | "SL" | "MANUAL" | "TP4" | "TP3" | "TP2" 
 export function zonePrimaryOutcome(z: Zone): ZonePrimaryOutcome {
   if (z.primaryOutcome) return z.primaryOutcome;
   if (z.status !== "CLOSED") return "NONE";
-  if (z.riskFreeSlExit) return "RF";
-  if (z.slHit) return "SL";
-  if (z.tp4Hit && isTp4LevelEnabled(z)) return "TP4";
-  if (z.manualClose) return "MANUAL";
   const final = z.finalTpReached ?? 0;
   if (final >= 4 && isTp4LevelEnabled(z)) return "TP4";
+  if (z.tp4Hit && isTp4LevelEnabled(z)) return "TP4";
   if (final >= 3 && z.tp3Enabled !== false) return "TP3";
   if (final >= 2 && z.tp2Enabled !== false) return "TP2";
   if (final >= 1 && z.tp1Enabled !== false) return "TP1";
+  if (z.riskFreeSlExit) return "RF";
+  if (z.slHit) return "SL";
+  if (z.manualClose) return "MANUAL";
   return "MANUAL";
 }
 
