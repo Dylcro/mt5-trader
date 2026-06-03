@@ -254,6 +254,7 @@ export default function PositionsScreen() {
     () => buildDisplayActiveZones(zones, positions, cs, price, pendingOrders),
     [zones, positions, cs, price, pendingOrders],
   );
+  const hasUnsyncedZones = displayActiveZones.some((z) => z.trackedOnServer === false);
   const displayZoneIds = useMemo(
     () => new Set(displayActiveZones.map((z) => z.zoneId)),
     [displayActiveZones],
@@ -307,6 +308,18 @@ export default function PositionsScreen() {
       // zone_update is patched in useZones — full refresh here caused TP hit chips to flicker.
     });
   }, [accountId, refreshPendingOrders]);
+
+  // MT5 positions often arrive before the API zone row — auto-link without pull-to-refresh.
+  useEffect(() => {
+    if (!accountId || !hasUnsyncedZones) return;
+    void refreshZones();
+    const t1 = setTimeout(() => void refreshZones(), 600);
+    const t2 = setTimeout(() => void refreshZones(), 1500);
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
+  }, [accountId, hasUnsyncedZones, refreshZones, positions.length, pendingOrders.length]);
 
   // Poll while focused so MT5-side closes/cancels appear without manual refresh.
   useFocusEffect(
