@@ -54,6 +54,10 @@ vi.mock("drizzle-orm", async (importOriginal) => {
 });
 
 vi.mock("@workspace/db", () => ({
+  // ensureCascadeZoneRfColumns() runs ALTER via pool on loadZone / loadZoneState
+  pool: {
+    query: vi.fn(() => Promise.resolve({ rows: [] })),
+  },
   db: {
     select: () => ({
       from: (t: { _key?: string }) =>
