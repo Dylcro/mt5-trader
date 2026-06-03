@@ -3280,9 +3280,9 @@ export function pickBestZonePositionForCloseWorst(
 }
 
 /**
- * One leg per tap: the open position on the next rung away from best on the entry ladder.
- * BUY → close the lowest entry above best; SELL → close the highest entry below best.
- * The closed leg may be in profit or loss — only entry distance from best matters.
+ * One leg per tap: close the open leg nearest best on the entry ladder (toward anchor).
+ * BUY limits step down from anchor — peel from best upward until anchor is last.
+ * The closed leg may be in profit or loss.
  */
 export function pickNextLegToTrimForSecureProfits(
   positions: LivePosition[],
@@ -4499,8 +4499,12 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     const st = await loadZone(zoneId);
-    if (!st || st.accountId !== accountId || st.status === "CLOSED") {
-      res.status(404).json({ error: "Zone not found" });
+    if (!st) {
+      res.status(404).json({ error: "Zone not found." });
+      return;
+    }
+    if (st.accountId !== accountId) {
+      res.status(403).json({ error: "This zone does not belong to this account." });
       return;
     }
     if (st.status === "ARMED") {
@@ -4508,8 +4512,18 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
       return;
     }
     const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+    if (st.status === "CLOSED") {
+      if (live.length === 0) {
+        res.status(409).json({ error: "This zone is already closed — no open positions on the broker." });
+        return;
+      }
+      console.log(`[zone ${zoneId}] secure-profits on CLOSED zone with ${live.length} open broker leg(s)`);
+    }
     if (live.length < 2) {
-      res.json({ ok: true, closedCount: 0, skipped: true, positionCount: live.length });
+      const message = live.length === 1
+        ? "Only one position left — Secure Profits keeps the best entry. Use Close Zone (top) to exit it."
+        : "No open positions in this zone.";
+      res.json({ ok: true, closedCount: 0, skipped: true, positionCount: live.length, message });
       return;
     }
     const best = pickBestZonePositionForCloseWorst(live, st.direction);
