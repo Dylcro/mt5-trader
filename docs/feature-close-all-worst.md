@@ -15,6 +15,9 @@ surgical: it closes only the non-best positions, and does **nothing else**.
   (BUY zone → lowest entry price; SELL zone → highest entry price. Same result in a same-lot
   cascade. Use floating P&L as the canonical measure so it's robust to unequal lots.)
 - **Keep the best position open. Close every other open position** in the zone via MetaAPI.
+- **Cancel unfilled cascade limit orders** when the zone has already hit **TP2** (same rule as the
+  automatic TP engine — never on TP1 only; pre-TP2 trims leave pending limits so the ladder can
+  still fill).
 - **Do NOT move the stop loss** on the surviving position, and do NOT change the zone SL.
   (This is the key difference from the Risk Free button, which moves the SL to break-even.)
 - The zone **stays ACTIVE**, keeps its SL, and continues to cascade exactly as before.

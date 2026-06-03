@@ -1705,6 +1705,11 @@ export function shouldCancelCascadeLimitsAtTpStage(
   return tpStage === 2 && zone.tp1Hit && !zone.tp2Hit;
 }
 
+/** Unfilled cascade limits are stale once TP2 has fired (same as evaluateZone after TP2). */
+export function shouldCancelCascadeLimitsForZone(zone: { tp2Hit: boolean }): boolean {
+  return zone.tp2Hit;
+}
+
 /**
  * When the last tracked position row closes, defer auto zone-close + limit cancel
  * if the zone is still OPEN pre-TP2 and unfilled cascade limits remain on the broker.
@@ -3130,6 +3135,8 @@ async function cancelZoneLimits(
 interface LivePosition {
   id: string; openPrice: number; volume: number; type: string; symbol: string;
   magic?: number; comment?: string;
+  /** MetaAPI floating P&L (profit field on open positions). */
+  profit?: number;
 }
 
 async function fetchOpenPositions(token: string, region: string, accountId: string): Promise<LivePosition[]> {
@@ -3147,6 +3154,7 @@ async function fetchOpenPositions(token: string, region: string, accountId: stri
     symbol: String(p.symbol ?? ""),
     magic: p.magic != null ? Number(p.magic) : undefined,
     comment: p.comment != null ? String(p.comment) : undefined,
+    profit: p.profit != null ? Number(p.profit) : undefined,
   })).filter(p => p.id);
 }
 
@@ -3241,6 +3249,34 @@ function latestPrice(accountId: string): { bid: number; ask: number } | null {
 // BUY worst = highest entry; SELL worst = lowest entry.
 function sortZonePositions(positions: LivePosition[], direction: "buy" | "sell"): LivePosition[] {
   return positions.slice().sort((a, b) => direction === "buy" ? b.openPrice - a.openPrice : a.openPrice - b.openPrice);
+}
+
+function comparePositionIdsEarliest(a: string, b: string): number {
+  const na = Number(a);
+  const nb = Number(b);
+  if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
+  return a.localeCompare(b);
+}
+
+/** Highest floating P&L wins; ties → earliest ticket id. */
+export function pickBestZonePositionByFloatingPnl(positions: LivePosition[]): LivePosition {
+  return positions.slice().sort((a, b) => {
+    const diff = (b.profit ?? 0) - (a.profit ?? 0);
+    if (diff !== 0) return diff;
+    return comparePositionIdsEarliest(a.id, b.id);
+  })[0]!;
+}
+
+/** Close All Worst: best by floating P&L when available, else entry ladder. */
+export function pickBestZonePositionForCloseWorst(
+  positions: LivePosition[],
+  direction: "buy" | "sell",
+): LivePosition {
+  if (positions.some((p) => p.profit != null && !Number.isNaN(p.profit))) {
+    return pickBestZonePositionByFloatingPnl(positions);
+  }
+  const sorted = sortZonePositions(positions, direction);
+  return sorted[sorted.length - 1]!;
 }
 
 async function evaluateZone(zoneId: string, token: string): Promise<void> {
@@ -4427,6 +4463,70 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     broadcastToAccount(accountId, "deal", { type: "position_changed" });
     console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl} (pips=${pips})`);
     res.json({ ok: true, bestPositionId: best.id, sl, pips, closedCount: others.length });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// POST /api/mt5/account/:accountId/zones/:zoneId/close-worst
+// Close every open leg except the best (highest floating P&L). Does not move SL/TP
+// or change zone status — partial mid-zone trim only.
+router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, async (req: Request, res: Response) => {
+  const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
+  try {
+    const token = getToken();
+    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
+    const st = await loadZone(zoneId);
+    if (!st || st.accountId !== accountId || st.status === "CLOSED") {
+      res.status(404).json({ error: "Zone not found" });
+      return;
+    }
+    if (st.status === "ARMED") {
+      res.status(409).json({ error: "Zone not active yet — wait for the first order to fill" });
+      return;
+    }
+    const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+    if (live.length < 2) {
+      res.json({ ok: true, closedCount: 0, skipped: true, positionCount: live.length });
+      return;
+    }
+    const best = pickBestZonePositionForCloseWorst(live, st.direction);
+    const others = live.filter((p) => p.id !== best.id);
+    const { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, others);
+    for (const p of others) {
+      if (!failed.includes(p.id)) st.trackedPositions.delete(p.id);
+    }
+    if (failed.length > 0) {
+      console.warn(`[zone ${zoneId}] close-worst partial: failedCloses=${failed.length}`);
+      res.status(207).json({
+        ok: false,
+        bestPositionId: best.id,
+        closedCount: others.length - failed.length,
+        failedPositionIds: failed,
+        message: "Some positions failed to close — retry Close All Worst to clear the rest.",
+      });
+      return;
+    }
+    // Same as a normal TP2 hit: wipe unfilled cascade limits once the zone has reached TP2.
+    // Pre-TP2, pending limits stay so the ladder can still fill.
+    let limitsCancelled = false;
+    if (shouldCancelCascadeLimitsForZone(st)) {
+      await cancelZoneLimits(token, region, accountId, zoneId);
+      limitsCancelled = true;
+    }
+    broadcastZoneUpdate(zoneId);
+    broadcastToAccount(accountId, "deal", { type: "position_changed" });
+    console.log(
+      `[zone ${zoneId}] close-worst: kept posId=${best.id} @${best.openPrice} profit=${best.profit ?? "n/a"} `
+      + `closed=${others.length} limitsCancelled=${limitsCancelled}`,
+    );
+    res.json({
+      ok: true,
+      bestPositionId: best.id,
+      closedCount: others.length,
+      positionCount: 1,
+      limitsCancelled,
+    });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }

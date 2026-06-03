@@ -199,6 +199,28 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
 
   // Cancel pending cascade limit orders for the zone without touching open
   // positions. Powers the "Delete Orders" button on each zone card.
+  const closeAllWorst = useCallback(async (
+    zoneId: string,
+  ): Promise<{ ok: boolean; message?: string; closedCount?: number }> => {
+    if (!API_BASE || !accountId) return { ok: false, message: "No account" };
+    try {
+      const res = await authFetch(
+        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/close-worst${zoneTradeQuery(region)}`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+      );
+      const data = await res.json().catch(() => ({})) as {
+        ok?: boolean; message?: string; error?: string; closedCount?: number; skipped?: boolean;
+      };
+      void refresh();
+      if (res.ok && (data.ok || data.skipped)) {
+        return { ok: true, closedCount: data.closedCount ?? 0 };
+      }
+      return { ok: false, message: data.message ?? data.error ?? `HTTP ${res.status}` };
+    } catch (e) {
+      return { ok: false, message: (e as Error).message };
+    }
+  }, [accountId, region, refresh]);
+
   const cancelZoneOrders = useCallback(async (
     zoneId: string,
   ): Promise<{ ok: boolean; message?: string; cancelledCount?: number }> => {
@@ -230,5 +252,5 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     }
   }, [accountId, region, refresh]);
 
-  return { zones, loading, error, refresh, riskFree, closeZone, cancelZoneOrders };
+  return { zones, loading, error, refresh, riskFree, closeZone, closeAllWorst, cancelZoneOrders };
 }
