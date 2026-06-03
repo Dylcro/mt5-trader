@@ -21,9 +21,17 @@ function makeToken(userId: number, email: string): string {
 
 function registerDbErrorMessage(err: unknown): string {
   const code = (err as { code?: string })?.code;
+  const detail = (err as { detail?: string })?.detail ?? "";
+  const message = err instanceof Error ? err.message : String(err);
   if (code === "23505") return "An account with this email already exists.";
-  if (code === "42703") {
+  if (code === "42703" || message.includes("does not exist")) {
     return "Server database needs an update — republish the API on Replit (latest main).";
+  }
+  if (code === "23502" || message.includes("null value") || message.includes("violates not-null")) {
+    const col = detail.match(/column "([^"]+)"/)?.[1];
+    return col
+      ? `Sign-up blocked by an old database column (${col}). Republish the API on Replit, then try again.`
+      : "Sign-up blocked by an outdated database layout. Republish the API on Replit, then try again.";
   }
   return "Registration failed. Please try again.";
 }
@@ -91,7 +99,8 @@ router.post("/register", async (req: Request, res: Response): Promise<void> => {
 
     res.json({ token: makeToken(user.id, user.email), user: { id: user.id, email: user.email, fullName: user.fullName } });
   } catch (err) {
-    console.error("[auth/register]", err);
+    const e = err as { code?: string; detail?: string };
+    console.error("[auth/register]", e.code ?? "?", e.detail ?? (err as Error).message, err);
     res.status(500).json({ error: registerDbErrorMessage(err) });
   }
 });
