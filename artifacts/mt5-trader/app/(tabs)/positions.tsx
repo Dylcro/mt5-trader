@@ -246,15 +246,16 @@ export default function PositionsScreen() {
     refreshPositions, refreshPendingOrders, refreshAccountInfo,
     closePosition, cancelOrder, accountId, region, sseConnected, price, syncSession,
   } = useTrading();
+  const { apiZones, refreshApiZones, placedZoneIds } = useTrading();
   const { zones, refresh: refreshZones, riskFree, closeZone, closeAllWorst, cancelZoneOrders } = useZones(accountId, {
     includeClosed: true, pollIntervalMs: 10_000, sseConnected, region,
   });
   const { settings: cs } = useCascadeSettings();
+  const zonesForDisplay = apiZones.length > 0 ? apiZones : zones;
   const displayActiveZones = useMemo(
-    () => buildDisplayActiveZones(zones, positions, cs, price, pendingOrders),
-    [zones, positions, cs, price, pendingOrders],
+    () => buildDisplayActiveZones(zonesForDisplay, positions, cs, price, pendingOrders, placedZoneIds),
+    [zonesForDisplay, positions, cs, price, pendingOrders, placedZoneIds],
   );
-  const hasUnsyncedZones = displayActiveZones.some((z) => z.trackedOnServer === false);
   const displayZoneIds = useMemo(
     () => new Set(displayActiveZones.map((z) => z.zoneId)),
     [displayActiveZones],
@@ -287,7 +288,7 @@ export default function PositionsScreen() {
   const handleCloseZone = useCallback(
     async (zoneId: string) => {
       const result = await closeZone(zoneId);
-      await Promise.all([refreshPendingOrders(), refreshZones()]);
+      await Promise.all([refreshPendingOrders(), refreshZones(), refreshApiZones()]);
       return result;
     },
     [closeZone, refreshPendingOrders, refreshZones],
@@ -296,10 +297,10 @@ export default function PositionsScreen() {
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
     await Promise.all([
-      refreshZones(), refreshPositions(), refreshPendingOrders(), refreshAccountInfo(),
+      refreshZones(), refreshApiZones(), refreshPositions(), refreshPendingOrders(), refreshAccountInfo(),
     ]);
     setRefreshing(false);
-  }, [refreshZones, refreshPositions, refreshPendingOrders, refreshAccountInfo]);
+  }, [refreshZones, refreshApiZones, refreshPositions, refreshPendingOrders, refreshAccountInfo]);
 
   useEffect(() => {
     if (!accountId) return;
@@ -309,18 +310,6 @@ export default function PositionsScreen() {
     });
   }, [accountId, refreshPendingOrders]);
 
-  // MT5 positions often arrive before the API zone row — auto-link without pull-to-refresh.
-  useEffect(() => {
-    if (!accountId || !hasUnsyncedZones) return;
-    void refreshZones();
-    const t1 = setTimeout(() => void refreshZones(), 600);
-    const t2 = setTimeout(() => void refreshZones(), 1500);
-    return () => {
-      clearTimeout(t1);
-      clearTimeout(t2);
-    };
-  }, [accountId, hasUnsyncedZones, refreshZones, positions.length, pendingOrders.length]);
-
   // Poll while focused so MT5-side closes/cancels appear without manual refresh.
   useFocusEffect(
     useCallback(() => {
@@ -329,6 +318,7 @@ export default function PositionsScreen() {
       const sync = () => void Promise.all([
         syncSession(),
         refreshZones(),
+        refreshApiZones(),
         refreshPositions(),
         refreshPendingOrders(),
         refreshAccountInfo(),
@@ -336,7 +326,7 @@ export default function PositionsScreen() {
       sync();
       const id = setInterval(sync, 4_000);
       return () => clearInterval(id);
-    }, [status, accountId, syncSession, refreshZones, refreshPositions, refreshPendingOrders, refreshAccountInfo]),
+    }, [status, accountId, syncSession, refreshZones, refreshApiZones, refreshPositions, refreshPendingOrders, refreshAccountInfo]),
   );
 
   const handleCancelOrder = useCallback(

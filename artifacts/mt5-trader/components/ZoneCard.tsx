@@ -144,7 +144,8 @@ export default function ZoneCard({
         ? C.textMuted
         : C.buy;
 
-  const serverTracked = zone.trackedOnServer !== false;
+  // Buttons stay usable from MT5 fills / cascade before /zones round-trip — no "linking" gate.
+  const serverTracked = zone.trackedOnServer !== false || zone.positionCount >= 1;
   const canRiskFree =
     serverTracked
     && !historical && (zone.status === "OPEN" || zone.status === "RISK_FREE") && zone.positionCount >= 1 && !!onRiskFree;
@@ -240,11 +241,6 @@ export default function ZoneCard({
 
   return (
     <View style={[styles.card, historical && { opacity: 0.85 }]}>
-      {!serverTracked && !historical ? (
-        <Text style={styles.syncHint}>
-          Linking zone to server… buttons unlock in a moment (no refresh needed).
-        </Text>
-      ) : null}
       <View style={styles.topRow}>
         <View style={styles.leftGroup}>
           <View style={[styles.dirPill, isBuy ? styles.dirPillBuy : styles.dirPillSell]}>
@@ -456,11 +452,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: C.border,
     gap: 12,
-  },
-  syncHint: {
-    fontSize: 11,
-    color: C.gold,
-    lineHeight: 15,
   },
   topRow: {
     flexDirection: "row",

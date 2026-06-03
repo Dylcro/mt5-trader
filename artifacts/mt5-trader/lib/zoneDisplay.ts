@@ -199,6 +199,7 @@ export function buildDisplayActiveZones(
   cs: CascadeSettings,
   price: Price | null,
   pendingOrders: PendingOrder[] = [],
+  trustedZoneIds?: ReadonlySet<string>,
 ): Zone[] {
   const apiById = new Map(apiZones.map((z) => [z.zoneId, z]));
   const closedIds = new Set(
@@ -235,7 +236,11 @@ export function buildDisplayActiveZones(
       : apiRow?.status === "ARMED"
         ? "ARMED"
         : "OPEN";
-    out.push(enrichZoneLiveFields(enrichZoneDisplayFields({ ...syn, status, trackedOnServer: false }), price));
+    out.push(enrichZoneLiveFields(enrichZoneDisplayFields({
+      ...syn,
+      status,
+      trackedOnServer: trustedZoneIds?.has(zoneId) ?? false,
+    }), price));
     seen.add(zoneId);
   };
 
@@ -251,9 +256,9 @@ export function buildDisplayActiveZones(
     if (!syn) continue;
     out.push(enrichZoneLiveFields(enrichZoneDisplayFields({
       ...syn,
-      status: apiRow?.status === "ARMED" ? "ARMED" : "ARMED",
+      status: "ARMED",
       positionCount: 0,
-      trackedOnServer: false,
+      trackedOnServer: trustedZoneIds?.has(zoneId) ?? false,
     }), price));
     seen.add(zoneId);
   }

@@ -11,7 +11,9 @@ import React, {
 } from "react";
 import { AppState, Platform, type AppStateStatus } from "react-native";
 
-import { emitAccountEvent } from "@/lib/accountEventBus";
+import type { Zone } from "@/hooks/useZones";
+import { emitAccountEvent, subscribeAccountEvents } from "@/lib/accountEventBus";
+import { fetchAccountZones } from "@/lib/accountZones";
 import { getAuthToken } from "@/lib/authToken";
 import { buildCascadeComment, newCascadeZoneId } from "@/lib/zoneComments";
 
@@ -129,6 +131,11 @@ interface TradingContextValue {
   connectionWarm: boolean;
   /** Refresh broker session (price, positions, account). Safe to call when already warm. */
   syncSession: (force?: boolean) => Promise<void>;
+  /** Zone list kept warm app-wide (Trade + Positions) — not tied to Positions tab mount. */
+  apiZones: Zone[];
+  refreshApiZones: () => Promise<void>;
+  /** Zone IDs from a successful cascade this session — buttons work before /zones round-trip. */
+  placedZoneIds: ReadonlySet<string>;
 }
 
 export interface PlaceTradeParams {
@@ -274,6 +281,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const lastPriceAtRef = useRef(0);
 
   const [cascadeNotification, setCascadeNotification] = useState<CascadeNotification | null>(null);
+  const [apiZones, setApiZones] = useState<Zone[]>([]);
+  const apiZonesRef = useRef<Zone[]>([]);
+  const [placedZoneIds, setPlacedZoneIds] = useState<Set<string>>(() => new Set());
 
   const priceIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const positionsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -510,6 +520,78 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
+  const markCascadePlaced = useCallback((zoneId: string) => {
+    if (!zoneId) return;
+    setPlacedZoneIds((prev) => {
+      const next = new Set(prev);
+      next.add(zoneId);
+      return next;
+    });
+  }, []);
+
+  const refreshApiZones = useCallback(async () => {
+    const accId = accountId;
+    if (!accId || status !== "connected") return;
+    try {
+      const rows = await fetchAccountZones(accId, apiZonesRef.current, true);
+      apiZonesRef.current = rows;
+      setApiZones(rows);
+      setPlacedZoneIds((prev) => {
+        const next = new Set(prev);
+        for (const z of rows) {
+          if (z.status === "OPEN" || z.status === "RISK_FREE" || z.status === "ARMED") {
+            next.delete(z.zoneId);
+          }
+        }
+        return next;
+      });
+    } catch (e) {
+      console.warn("[refreshApiZones]", (e as Error).message);
+    }
+  }, [accountId, status]);
+
+  useEffect(() => {
+    if (!accountId || status !== "connected") {
+      setApiZones([]);
+      apiZonesRef.current = [];
+      setPlacedZoneIds(new Set());
+      return;
+    }
+    void refreshApiZones();
+    const id = setInterval(() => void refreshApiZones(), 15_000);
+    const unsub = subscribeAccountEvents(accountId, (type, data) => {
+      if (type === "zone_update") {
+        const update = data as Partial<Zone> & { zoneId?: string };
+        if (!update.zoneId) return;
+        setApiZones((prev) => {
+          if (!prev.some((z) => z.zoneId === update.zoneId)) {
+            queueMicrotask(() => void refreshApiZones());
+            return prev;
+          }
+          if (update.status === "CLOSED") {
+            const closedAt = update.closedAt ?? Date.now();
+            return prev.map((z) =>
+              z.zoneId === update.zoneId
+                ? { ...z, ...update, status: "CLOSED" as const, closedAt }
+                : z,
+            );
+          }
+          return prev.map((z) =>
+            z.zoneId === update.zoneId ? { ...z, ...update } : z,
+          );
+        });
+        return;
+      }
+      if (type === "deal" || type === "pending_order" || type === "zones_changed") {
+        void refreshApiZones();
+      }
+    });
+    return () => {
+      clearInterval(id);
+      unsub();
+    };
+  }, [accountId, status, refreshApiZones]);
+
   const fetchPendingOrdersData = useCallback(async (accId: string, accRegion: string): Promise<PendingOrder[]> => {
     const res = await authFetch(`${API_BASE}/mt5/account/${accId}/orders?region=${accRegion}`);
     if (!res.ok) throw new Error(`Orders fetch failed: ${res.status}`);
@@ -536,12 +618,12 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     onDeal: () => {
       const r = regionRef.current;
       const a = accountId;
-      // Emit to the bus so useZones can react (e.g. refresh zone list on deal).
       emitAccountEvent(a, "deal", {});
       void Promise.all([
         fetchPositionsData(a, r).then(setPositions).catch(() => {}),
         fetchPendingOrdersData(a, r).then(setPendingOrders).catch(() => {}),
         fetchAccountInfoData(a, r).then(setAccountInfo).catch(() => {}),
+        refreshApiZones(),
       ]);
     },
     onPendingOrder: () => {
@@ -1330,19 +1412,20 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         errors.push(err instanceof Error ? err.message : "Unknown error");
       }
 
-      // Refresh in background — don't delay success feedback
-      void Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
+      void Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo(), refreshApiZones()]);
 
       if (placed === 0) {
         return { success: false, placed, failed, message: errors[0] ?? "All orders failed to place", zoneId };
       }
+      markCascadePlaced(zoneId);
+      void refreshApiZones();
       if (accountId) emitAccountEvent(accountId, "zones_changed", { zoneId });
       if (failed > 0) {
         return { success: true, placed, failed, message: `${placed}/${total} placed. Failed: ${errors.join("; ")}`, zoneId, marketPositionId, limitOrderIds };
       }
       return { success: true, placed, failed, message: `${placed} orders placed — 1 market + ${params.limitEntries.length} limit`, zoneId, marketPositionId, limitOrderIds };
     },
-    [status, connectionWarm, wakeConnection, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, accountId, region]
+    [status, connectionWarm, wakeConnection, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, refreshApiZones, markCascadePlaced, accountId, region]
   );
 
   const placeArmedCascadeAtPrice = useCallback(
@@ -1416,13 +1499,15 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         const msg = failed > 0
           ? `${placed}/${total} pending orders placed · zone armed @ ${params.anchorPrice}`
           : `Cascade armed @ ${params.anchorPrice} · ${placed} pending orders`;
+        markCascadePlaced(armedZoneId);
+        void refreshApiZones();
         if (accountId) emitAccountEvent(accountId, "zones_changed", { zoneId: armedZoneId });
         return { success: true, placed, failed, message: msg, zoneId: armedZoneId, limitOrderIds };
       } catch (err) {
         return { success: false, placed: 0, failed: total, message: err instanceof Error ? err.message : "Arm failed" };
       }
     },
-    [status, connectionWarm, wakeConnection, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, accountId, region],
+    [status, connectionWarm, wakeConnection, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, refreshApiZones, markCascadePlaced, accountId, region],
   );
 
   const closePosition = useCallback(
@@ -1500,6 +1585,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         sseConnected,
         connectionWarm,
         syncSession: wakeConnection,
+        apiZones,
+        refreshApiZones,
+        placedZoneIds,
       }}
     >
       {children}
