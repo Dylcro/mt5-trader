@@ -13,6 +13,7 @@ import {
   zoneHasTpTargets,
   computeFinalTpReached,
   dealIndicatesStopLoss,
+  inferZoneStopLossFromDeals,
   resolveCloseOutcome,
   inferCloseOutcomeFromExitPrice,
   inferManualCloseFromExitPrice,
@@ -580,8 +581,20 @@ describe("disabled TP history", () => {
   it("dealIndicatesStopLoss detects broker SL reasons", () => {
     expect(dealIndicatesStopLoss({ reason: "DEAL_REASON_SL" })).toBe(true);
     expect(dealIndicatesStopLoss({ reason: "STOP_LOSS" })).toBe(true);
+    expect(dealIndicatesStopLoss({ reason: "DEAL_REASON_STOP_OUT" })).toBe(true);
     expect(dealIndicatesStopLoss({ comment: "stop loss" })).toBe(true);
     expect(dealIndicatesStopLoss({ reason: "CLIENT" })).toBe(false);
+  });
+
+  it("inferZoneStopLossFromDeals flags SL when any zone position exits on stop", () => {
+    const ids = new Set(["p1", "p2"]);
+    const deals = [
+      { positionId: "p1", entryType: "DEAL_ENTRY_OUT", type: "DEAL_TYPE_SELL", reason: "CLIENT", price: 2610 },
+      { positionId: "p2", entryType: "DEAL_ENTRY_OUT", type: "DEAL_TYPE_SELL", reason: "DEAL_REASON_SL", price: 2595 },
+    ];
+    const r = inferZoneStopLossFromDeals(deals, ids);
+    expect(r.stopLossExit).toBe(true);
+    expect(r.exitPrice).toBe(2595);
   });
 
   it("resolveCloseOutcome respects persisted flags", () => {
@@ -660,11 +673,21 @@ describe("disabled TP history", () => {
       manualClose: false,
     };
     expect(zonePrimaryOutcome({ ...base, finalTpReached: 3 })).toBe("TP3");
-    expect(zonePrimaryOutcome({ ...base, manualClose: true, finalTpReached: 3 })).toBe("MANUAL");
+    expect(zonePrimaryOutcome({ ...base, manualClose: true, finalTpReached: 3 })).toBe("TP3");
     expect(zonePrimaryOutcome({ ...base, tp4Hit: true, finalTpReached: 4 })).toBe("TP4");
-    expect(zonePrimaryOutcome({ ...base, slHit: true })).toBe("SL");
-    expect(zonePrimaryOutcome({ ...base, riskFreeSlExit: true })).toBe("RF");
-    expect(zonePrimaryOutcome({ ...base, riskFreeSlExit: true, slHit: true })).toBe("RF");
+    expect(zonePrimaryOutcome({ ...base, slHit: true })).toBe("TP3");
+    expect(zonePrimaryOutcome({
+      ...base,
+      tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
+      slHit: true, finalTpReached: 0,
+    })).toBe("SL");
+    expect(zonePrimaryOutcome({ ...base, riskFreeSlExit: true })).toBe("TP3");
+    expect(zonePrimaryOutcome({ ...base, riskFreeSlExit: true, slHit: true })).toBe("TP3");
+    expect(zonePrimaryOutcome({
+      ...base,
+      tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
+      riskFreeSlExit: true, slHit: false, finalTpReached: 0,
+    })).toBe("RF");
   });
 
   it("inferCloseOutcomeFromExitPrice: sell zone mirrors buy", () => {
