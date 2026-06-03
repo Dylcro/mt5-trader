@@ -1,7 +1,8 @@
-import type { Position, PendingOrder, Price } from "@/context/TradingContext";
+import type { PendingOrder, Position, Price } from "@/context/TradingContext";
 import type { CascadeSettings } from "@/hooks/useCascadeSettings";
 import type { Zone } from "@/hooks/useZones";
 import { parseZoneIdFromComment } from "@/lib/zoneComments";
+import { isTp4LevelEnabled, zoneReachedTpLevel } from "@/lib/zoneStats";
 
 const PIP = 0.1;
 
@@ -34,9 +35,24 @@ function buildTpPricesFromSettings(
   };
 }
 
+/** Recompute TP tally from per-level hit flags (SSE payloads may omit counts). */
+export function enrichZoneDisplayFields(zone: Zone): Zone {
+  const tp1Enabled = zone.tp1Enabled !== false;
+  const tp2Enabled = zone.tp2Enabled !== false;
+  const tp3Enabled = zone.tp3Enabled !== false;
+  const tp4On = isTp4LevelEnabled(zone);
+  const enabledTpCount = [tp1Enabled, tp2Enabled, tp3Enabled, tp4On].filter(Boolean).length;
+  const hit = ([1, 2, 3, 4] as const).filter((n) => zoneReachedTpLevel(zone, n)).length;
+  return {
+    ...zone,
+    enabledTpCount: zone.enabledTpCount ?? enabledTpCount,
+    hitEnabledTpCount: zone.hitEnabledTpCount ?? hit,
+  };
+}
+
 /** Client-side progress when the zones API omits live fields. */
 export function enrichZoneLiveFields(zone: Zone, price: Price | null): Zone {
-  if (zone.status === "CLOSED" || !price || zone.anchorPrice <= 0) return zone;
+  if (zone.status === "CLOSED" || zone.status === "ARMED" || !price || zone.anchorPrice <= 0) return zone;
   if (zone.nextTp && zone.nextTp > 0 && zone.pipsToNextTp != null) return zone;
 
   const dir = zone.direction;
@@ -117,32 +133,80 @@ export function groupPositionsByZoneId(positions: Position[]): Map<string, Posit
   return map;
 }
 
-/** Active zones for Positions: API rows + cascade groups discovered from MT5 comments. */
+function groupPendingByZoneId(orders: PendingOrder[]): Map<string, PendingOrder[]> {
+  const map = new Map<string, PendingOrder[]>();
+  for (const o of orders) {
+    const zid = parseZoneIdFromComment(o.comment);
+    if (!zid) continue;
+    const arr = map.get(zid) ?? [];
+    arr.push(o);
+    map.set(zid, arr);
+  }
+  return map;
+}
+
+/** Active zones for Positions/Dashboard: API rows + MT5 comments (positions + pending). */
 export function buildDisplayActiveZones(
   apiZones: Zone[],
   positions: Position[],
   cs: CascadeSettings,
   price: Price | null,
+  pendingOrders: PendingOrder[] = [],
 ): Zone[] {
-  const active = apiZones.filter((z) => z.status === "OPEN" || z.status === "RISK_FREE");
+  const apiById = new Map(apiZones.map((z) => [z.zoneId, z]));
+  const closedIds = new Set(
+    apiZones.filter((z) => z.status === "CLOSED").map((z) => z.zoneId),
+  );
+  const active = apiZones.filter((z) => z.status === "OPEN" || z.status === "RISK_FREE" || z.status === "ARMED");
   const byComment = groupPositionsByZoneId(positions);
+  const byPending = groupPendingByZoneId(pendingOrders);
   const seen = new Set<string>();
   const out: Zone[] = [];
 
   for (const z of active) {
     seen.add(z.zoneId);
     const linked = byComment.get(z.zoneId) ?? [];
-    const merged: Zone = {
+    const merged: Zone = enrichZoneDisplayFields({
       ...z,
-      positionCount: Math.max(z.positionCount, linked.length),
-    };
+      positionCount: linked.length > 0 ? linked.length : z.positionCount,
+    });
     out.push(enrichZoneLiveFields(merged, price));
   }
 
-  for (const [zoneId, linked] of byComment) {
-    if (seen.has(zoneId)) continue;
+  const discoverFromMt5 = (zoneId: string, linked: Position[]) => {
+    if (seen.has(zoneId)) return;
+    const apiRow = apiById.get(zoneId);
+    if (apiRow && (apiRow.status === "OPEN" || apiRow.status === "RISK_FREE" || apiRow.status === "ARMED")) {
+      return;
+    }
+    if (closedIds.has(zoneId) && linked.length === 0) return;
     const syn = syntheticZoneFromPositions(zoneId, linked, cs);
-    if (syn) out.push(enrichZoneLiveFields(syn, price));
+    if (!syn) return;
+    const status = apiRow?.status === "RISK_FREE"
+      ? "RISK_FREE"
+      : apiRow?.status === "ARMED"
+        ? "ARMED"
+        : "OPEN";
+    out.push(enrichZoneLiveFields(enrichZoneDisplayFields({ ...syn, status }), price));
+    seen.add(zoneId);
+  };
+
+  for (const [zoneId, linked] of byComment) {
+    discoverFromMt5(zoneId, linked);
+  }
+
+  for (const zoneId of byPending.keys()) {
+    if (seen.has(zoneId) || closedIds.has(zoneId)) continue;
+    const apiRow = apiById.get(zoneId);
+    if (apiRow?.status === "OPEN" || apiRow?.status === "RISK_FREE" || apiRow?.status === "ARMED") continue;
+    const syn = syntheticZoneFromPositions(zoneId, [], cs);
+    if (!syn) continue;
+    out.push(enrichZoneLiveFields(enrichZoneDisplayFields({
+      ...syn,
+      status: apiRow?.status === "ARMED" ? "ARMED" : "ARMED",
+      positionCount: 0,
+    }), price));
+    seen.add(zoneId);
   }
 
   return out;

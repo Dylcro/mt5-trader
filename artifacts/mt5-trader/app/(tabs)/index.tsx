@@ -20,12 +20,12 @@ import Colors from "@/constants/colors";
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
-import { useTrading, type SLMode } from "@/context/TradingContext";
+import { useTrading } from "@/context/TradingContext";
+import { inferCascadeDirectionFromTrigger } from "@/lib/cascadeAtPrice";
 import { buildCascadeLevels, useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
 import { usePlatformStatus } from "@/hooks/usePlatformStatus";
 
-const LOT_SIZE_SINGLE_KEY = "lot_size_single";
 const LOT_SIZE_CASCADE_KEY = "lot_size_cascade";
 
 const C = Colors.dark;
@@ -63,7 +63,7 @@ function resolveSyncUi(
 }
 
 type Direction = "buy" | "sell";
-type TradeMode = "single" | "cascade";
+type TradeMode = "cascade" | "atPrice";
 
 function formatPrice(n: number) {
   return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -219,6 +219,7 @@ function CascadeLadder({
   lotSize,
   numPositions,
   formatUsdMoney,
+  firstLegPending = false,
 }: {
   marketPrice: number;
   limitEntries: number[];
@@ -227,6 +228,8 @@ function CascadeLadder({
   lotSize: number;
   numPositions: number;
   formatUsdMoney: (usd: number) => string;
+  /** At-price mode: anchor leg is a pending limit, not a market fill. */
+  firstLegPending?: boolean;
 }) {
   const color = direction === "buy" ? C.buy : C.sell;
   // Exactly numPositions legs: 1 market + (numPositions - 1) limits.
@@ -253,7 +256,7 @@ function CascadeLadder({
           <View style={styles.ladderLine} />
           <View style={styles.ladderEntry}>
             <Text style={[styles.ladderEntryLabel, { color }]}>
-              {direction === "buy" ? "BUY" : "SELL"} #1 · MARKET
+              {direction === "buy" ? "BUY" : "SELL"} #1 · {firstLegPending ? "LIMIT @ trigger" : "MARKET"}
             </Text>
             <Text style={styles.ladderEntryPrice}>{formatPrice(marketPrice)}</Text>
           </View>
@@ -319,7 +322,7 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { status, price, priceError, priceStale, accountInfo, placeTrade, placeCascadeOrders, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, connectionWarm, syncSession } = useTrading();
+  const { status, price, priceError, priceStale, accountInfo, placeCascadeOrders, placeArmedCascadeAtPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, connectionWarm, syncSession } = useTrading();
 
   const syncReady =
     status === "connected" &&
@@ -372,18 +375,8 @@ export default function TradeScreen() {
   // Mode
   const [tradeMode, setTradeMode] = useState<TradeMode>("cascade");
 
-  // Single trade state
-  const [direction, setDirection] = useState<Direction>("buy");
-  const [lotSize, setLotSizeRaw] = useState(0.01);
-  const setLotSize = useCallback((v: number) => {
-    setLotSizeRaw(v);
-    void AsyncStorage.setItem(LOT_SIZE_SINGLE_KEY, String(v));
-  }, []);
-  const [slMode, setSlMode] = useState<SLMode>("points");
-  const [slPips, setSlPips] = useState(50);
-  const [slPercent, setSlPercent] = useState(1);
-  const [slManual, setSlManual] = useState(0);
-  const [slManualText, setSlManualText] = useState("");
+  // At-price trigger
+  const [triggerPriceText, setTriggerPriceText] = useState("");
 
   // Cascade state
   const [cascadeDirection, setCascadeDirection] = useState<Direction>("buy");
@@ -422,10 +415,8 @@ export default function TradeScreen() {
   // Load persisted lot sizes from AsyncStorage. Also runs on tab focus so that
   // values set in the Settings tab are picked up without a full app restart.
   const loadLotSizes = useCallback(() => {
-    AsyncStorage.getMany([LOT_SIZE_SINGLE_KEY, LOT_SIZE_CASCADE_KEY]).then((record) => {
-      const single = record[LOT_SIZE_SINGLE_KEY];
+    AsyncStorage.getMany([LOT_SIZE_CASCADE_KEY]).then((record) => {
       const cascade = record[LOT_SIZE_CASCADE_KEY];
-      if (single) setLotSizeRaw(parseFloat(single));
       if (cascade) {
         const parsed = parseFloat(cascade);
         const safe = Number.isFinite(parsed) && parsed >= 0.01 ? parsed : 0.01;
@@ -580,55 +571,116 @@ export default function TradeScreen() {
     return () => loop.stop();
   }, [status, blinkAnim]);
 
-  const marketEntry = direction === "buy" ? (price?.ask ?? 0) : (price?.bid ?? 0);
-  const balance = accountInfo?.balance ?? 10000;
-  const sl = computeSL(slMode, direction, marketEntry, slPips, slPercent, slManual, lotSize, balance);
-  const riskDollars = computeRiskDollars(slMode, direction, marketEntry, slPips, slPercent, slManual, lotSize, balance);
-  const slRef = useRef(sl);
-  useEffect(() => { slRef.current = sl; }, [sl]);
-
   // Cascade levels — built from live market price (ask for buy, bid for sell)
   const cascadeMarketPrice = cascadeDirection === "buy" ? (price?.ask ?? 0) : (price?.bid ?? 0);
   const cascadeLevels = cascadeMarketPrice > 0
     ? buildCascadeLevels(cascadeMarketPrice, cascadeDirection, cascadeSettings)
     : null;
 
-  const handleSingleTrade = useCallback(async (dir?: Direction) => {
-    const resolvedDir = dir ?? direction;
-    console.log("[single] btn pressed dir=" + resolvedDir + " isPlacing=" + String(isPlacingRef.current) + " status=" + statusRef.current + " lot=" + String(lotSize));
+  const triggerPrice = parseFloat(triggerPriceText);
+  const inferredAtPriceDir =
+    price && Number.isFinite(triggerPrice) && triggerPrice > 0
+      ? inferCascadeDirectionFromTrigger(triggerPrice, price.bid)
+      : null;
+  const atPriceLevels =
+    inferredAtPriceDir && triggerPrice > 0
+      ? buildCascadeLevels(triggerPrice, inferredAtPriceDir, cascadeSettings)
+      : null;
+
+  const handleAtPriceArm = useCallback(async () => {
+    const p = priceRef.current;
+    const cs = cascadeSettingsRef.current;
+    const bid = p?.bid ?? 0;
+    const trigger = parseFloat(triggerPriceText);
     if (isPlacingRef.current) return;
     if (statusRef.current !== "connected") {
-      Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
+      Alert.alert("Not Connected", "Connect MT5 in Settings first.");
       return;
     }
     if (!platformRef.current.trading_enabled) {
       Alert.alert("Trading paused", platformRef.current.message || "Trading is temporarily paused.");
       return;
     }
-    // Lock button and fire haptics simultaneously — don't await haptics before locking
+    if (!p || bid <= 0) {
+      Alert.alert("No Price", "Wait for live price, then try again.");
+      return;
+    }
+    if (!Number.isFinite(trigger) || trigger <= 0) {
+      Alert.alert("Invalid price", "Enter a trigger price (e.g. 4450).");
+      return;
+    }
+    const dir = inferCascadeDirectionFromTrigger(trigger, bid);
+    if (!dir) {
+      Alert.alert("Same as market", "Trigger must be above bid (SELL) or below bid (BUY). Use Cascade for instant market entry.");
+      return;
+    }
+    const { tp1Pips, tp2Pips, tp3Pips, tp4Pips } = cs;
+    const pipsOk =
+      tp1Pips > 0 && tp2Pips > tp1Pips && tp3Pips > tp2Pips &&
+      (tp4Pips === 0 || tp4Pips > tp3Pips);
+    if (!pipsOk) {
+      Alert.alert("Invalid TP Settings", "Fix TP pip levels in Settings.");
+      return;
+    }
+    if (cascadeLotSize < 0.01) {
+      Alert.alert("Lot Too Small", "Minimum cascade lot is 0.01.");
+      return;
+    }
+    const levels = buildCascadeLevels(trigger, dir, cs);
     isPlacingRef.current = true;
     setIsPlacing(true);
-    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    if (dir) setDirection(dir);
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
     try {
-      const result = await placeTrade({ direction: resolvedDir, volume: lotSize, stopLoss: slRef.current });
+      const PIP = 0.10;
+      const sign = dir === "buy" ? 1 : -1;
+      const round2 = (v: number) => parseFloat(v.toFixed(2));
+      const tp1Price = round2(trigger + sign * tp1Pips * PIP);
+      const tp2Price = round2(trigger + sign * tp2Pips * PIP);
+      const tp3Price = round2(trigger + sign * tp3Pips * PIP);
+      const tp4Price = tp4Pips > 0 ? round2(trigger + sign * tp4Pips * PIP) : undefined;
+      const result = await placeArmedCascadeAtPrice({
+        direction: dir,
+        volume: cascadeLotSize,
+        anchorPrice: trigger,
+        limitEntries: levels.limitEntries,
+        stopLoss: levels.stopLoss,
+        tp1Price, tp2Price, tp3Price, tp4Price,
+        tp1Pct: cs.tp1Enabled ? cs.tp1Pct : 0,
+        tp2Pct: cs.tp2Enabled ? cs.tp2Pct : 0,
+        tp3Pct: cs.tp3Enabled ? cs.tp3Pct : 0,
+        tp4Pct: cs.tp4Enabled ? cs.tp4Pct : 0,
+        autoBeAtTp: cs.autoBeAtTp,
+      });
       if (result.success) {
+        setTriggerPriceText("");
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        showToast(`${resolvedDir.toUpperCase()} order placed ✓  ${lotSize} lot XAUUSD`, "success", true);
+        showToast(result.message, "success", true);
+        if (cs.takeProfitEnabled && cs.takeProfitPips > 0) {
+          const cascadeId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+          const readyAt = Date.now() + 3000;
+          const tpTrigger = dir === "buy" ? trigger + cs.takeProfitPips * 0.10 : trigger - cs.takeProfitPips * 0.10;
+          tpWatchersRef.current.push({
+            id: cascadeId,
+            entryPrice: trigger,
+            direction: dir,
+            pipsTarget: cs.takeProfitPips,
+            readyAt,
+            limitOrderIds: result.limitOrderIds,
+            limitPrices: [trigger, ...levels.limitEntries],
+          });
+          setArmedWatchers((prev) => [...prev, { id: cascadeId, trigger: tpTrigger, dir, pips: cs.takeProfitPips }]);
+        }
       } else {
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
         showToast(result.message, "error");
       }
     } catch (err) {
-      // Guarantees button unlocks even if placeTrade throws unexpectedly —
-      // otherwise the button silently appears dead until the app restarts.
-      console.log("[single] exception: " + String(err));
-      showToast(err instanceof Error ? err.message : "Trade failed", "error");
+      showToast(err instanceof Error ? err.message : "Arm failed", "error");
     } finally {
       isPlacingRef.current = false;
       setIsPlacing(false);
     }
-  }, [direction, lotSize, placeTrade, showToast]);
+  }, [triggerPriceText, cascadeLotSize, placeArmedCascadeAtPrice, showToast]);
 
   const handleCascadeTrade = useCallback(async (dir: Direction) => {
     const p = priceRef.current;
@@ -862,40 +914,41 @@ export default function TradeScreen() {
           )}
         </View>
 
-        {/* BUY / SELL — always visible, above mode toggle */}
+        {/* BUY / SELL — always mounted (fixed layout); inactive (black) in At price mode */}
         {(() => {
+          const cascadeActive = tradeMode === "cascade";
           const tradeBlocked = !syncReady;
+          const labelColor = cascadeActive ? undefined : C.textMuted;
           return (
             <View style={styles.cascadeExecRow}>
               <Pressable
                 style={({ pressed }) => [
                   styles.cascadeExecBtn,
-                  styles.cascadeExecBtnBuy,
-                  tradeBlocked && !isPlacing && { opacity: 0.5 },
-                  pressed && { opacity: 0.8, transform: [{ scale: 0.97 }] },
-                  isPlacing && { opacity: 0.6 },
+                  cascadeActive ? styles.cascadeExecBtnBuy : styles.cascadeExecBtnInactive,
+                  cascadeActive && tradeBlocked && !isPlacing && { opacity: 0.5 },
+                  cascadeActive && pressed && { opacity: 0.8, transform: [{ scale: 0.97 }] },
+                  cascadeActive && isPlacing && { opacity: 0.6 },
                 ]}
                 onPress={() => {
-                  if (tradeMode === "cascade") {
-                    setCascadeDirection("buy");
-                    void handleCascadeTrade("buy");
-                  } else {
-                    void handleSingleTrade("buy");
-                  }
+                  if (!cascadeActive) return;
+                  setCascadeDirection("buy");
+                  void handleCascadeTrade("buy");
                 }}
-                disabled={isPlacing}
+                disabled={!cascadeActive || isPlacing || tradeBlocked}
               >
-                {isPlacing && (tradeMode === "cascade" ? cascadeDirection === "buy" : direction === "buy") ? (
+                {cascadeActive && isPlacing && cascadeDirection === "buy" ? (
                   <ActivityIndicator color="#000" />
                 ) : (
                   <>
-                    <Feather name="trending-up" size={20} color="#000" />
-                    <Text style={[styles.cascadeExecLabel, { color: "#000" }]}>BUY</Text>
-                    {price && (
+                    <Feather name="trending-up" size={20} color={cascadeActive ? "#000" : C.textMuted} />
+                    <Text style={[styles.cascadeExecLabel, labelColor != null && { color: labelColor }]}>
+                      BUY
+                    </Text>
+                    {cascadeActive && price ? (
                       <Text style={[styles.cascadeExecPrice, { color: "#000" }]}>
                         {formatPrice(price.ask)}
                       </Text>
-                    )}
+                    ) : null}
                   </>
                 )}
               </Pressable>
@@ -903,32 +956,31 @@ export default function TradeScreen() {
               <Pressable
                 style={({ pressed }) => [
                   styles.cascadeExecBtn,
-                  styles.cascadeExecBtnSell,
-                  tradeBlocked && !isPlacing && { opacity: 0.5 },
-                  pressed && { opacity: 0.8, transform: [{ scale: 0.97 }] },
-                  isPlacing && { opacity: 0.6 },
+                  cascadeActive ? styles.cascadeExecBtnSell : styles.cascadeExecBtnInactive,
+                  cascadeActive && tradeBlocked && !isPlacing && { opacity: 0.5 },
+                  cascadeActive && pressed && { opacity: 0.8, transform: [{ scale: 0.97 }] },
+                  cascadeActive && isPlacing && { opacity: 0.6 },
                 ]}
                 onPress={() => {
-                  if (tradeMode === "cascade") {
-                    setCascadeDirection("sell");
-                    void handleCascadeTrade("sell");
-                  } else {
-                    void handleSingleTrade("sell");
-                  }
+                  if (!cascadeActive) return;
+                  setCascadeDirection("sell");
+                  void handleCascadeTrade("sell");
                 }}
-                disabled={isPlacing}
+                disabled={!cascadeActive || isPlacing || tradeBlocked}
               >
-                {isPlacing && (tradeMode === "cascade" ? cascadeDirection === "sell" : direction === "sell") ? (
+                {cascadeActive && isPlacing && cascadeDirection === "sell" ? (
                   <ActivityIndicator color="#fff" />
                 ) : (
                   <>
-                    <Feather name="trending-down" size={20} color="#fff" />
-                    <Text style={[styles.cascadeExecLabel, { color: "#fff" }]}>SELL</Text>
-                    {price && (
+                    <Feather name="trending-down" size={20} color={cascadeActive ? "#fff" : C.textMuted} />
+                    <Text style={[styles.cascadeExecLabel, cascadeActive ? { color: "#fff" } : { color: C.textMuted }]}>
+                      SELL
+                    </Text>
+                    {cascadeActive && price ? (
                       <Text style={[styles.cascadeExecPrice, { color: "#fff" }]}>
                         {formatPrice(price.bid)}
                       </Text>
-                    )}
+                    ) : null}
                   </>
                 )}
               </Pressable>
@@ -969,12 +1021,12 @@ export default function TradeScreen() {
             </Text>
           </Pressable>
           <Pressable
-            style={[styles.modeBtn, tradeMode === "single" && styles.modeBtnActive]}
-            onPress={() => { setTradeMode("single"); Haptics.selectionAsync(); }}
+            style={[styles.modeBtn, tradeMode === "atPrice" && styles.modeBtnActive]}
+            onPress={() => { setTradeMode("atPrice"); Haptics.selectionAsync(); }}
           >
-            <Feather name="zap" size={14} color={tradeMode === "single" ? C.gold : C.textSecondary} />
-            <Text style={[styles.modeBtnText, tradeMode === "single" && styles.modeBtnTextActive]}>
-              Single Order
+            <Feather name="crosshair" size={14} color={tradeMode === "atPrice" ? C.gold : C.textSecondary} />
+            <Text style={[styles.modeBtnText, tradeMode === "atPrice" && styles.modeBtnTextActive]}>
+              At price
             </Text>
           </Pressable>
         </View>
@@ -1091,112 +1143,108 @@ export default function TradeScreen() {
           </>
         )}
 
-        {/* ═══ SINGLE MODE ════════════════════════════════════════════════════ */}
-        {tradeMode === "single" && (
+        {/* ═══ AT PRICE MODE ══════════════════════════════════════════════════ */}
+        {tradeMode === "atPrice" && (
           <>
-            {/* Lot Size */}
             <View style={styles.sectionCard}>
               <View style={styles.sectionHeader}>
-                <Text style={styles.sectionTitle}>Lot Size</Text>
-                <Text style={styles.sectionHint}>1 lot = 100 oz gold</Text>
-              </View>
-              <StepInput value={lotSize} onChange={setLotSize} step={0.01} min={0.01} max={100} decimals={2} />
-            </View>
-
-            {/* Stop Loss */}
-            <View style={styles.sectionCard}>
-              <View style={styles.sectionHeader}>
-                <Text style={styles.sectionTitle}>Stop Loss</Text>
-                <Text style={[styles.sectionHint, { color: C.sell }]}>
-                  {sl != null ? `SL: ${formatPrice(sl)}` : "No SL set"}
+                <Text style={styles.sectionTitle}>Trigger price</Text>
+                <Text style={styles.sectionHint}>
+                  {price
+                    ? `Bid ${formatPrice(price.bid)} · below = BUY · above = SELL`
+                    : "Connect for live bid"}
                 </Text>
               </View>
-              <View style={styles.slModeRow}>
-                {SL_OPTIONS.map((opt) => (
-                  <Pressable
-                    key={opt.key}
-                    style={[styles.slModeBtn, slMode === opt.key && styles.slModeBtnActive]}
-                    onPress={() => { setSlMode(opt.key); Haptics.selectionAsync(); }}
-                  >
-                    <Feather name={opt.icon as any} size={12} color={slMode === opt.key ? C.gold : C.textSecondary} />
-                    <Text style={[styles.slModeLabel, slMode === opt.key && styles.slModeLabelActive]}>
-                      {opt.label}
-                    </Text>
-                  </Pressable>
-                ))}
-              </View>
-
-              {slMode === "points" && (
-                <View style={styles.slInputArea}>
-                  <StepInput value={slPips} onChange={setSlPips} step={5} min={5} max={500} decimals={0} />
-                  <Text style={styles.slNote}>
-                    {marketEntry > 0 && sl != null
-                      ? `Entry ${formatPrice(marketEntry)} → SL ${formatPrice(sl)}  (${slPips} pips = ${(slPips * PIP_SIZE).toFixed(2)})`
-                      : "Connect to see calculated SL"}
-                  </Text>
-                </View>
-              )}
-
-              {slMode === "percent" && (
-                <View style={styles.slInputArea}>
-                  <StepInput value={slPercent} onChange={setSlPercent} step={0.1} min={0.1} max={20} decimals={1} />
-                  <Text style={styles.slNote}>
-                    {marketEntry > 0 && sl != null
-                      ? `Risk ${formatUsdMoney(riskDollars)} → SL ${formatPrice(sl)}`
-                      : "Connect to calculate"}
-                  </Text>
-                </View>
-              )}
-
-              {slMode === "manual" && (
-                <View style={styles.slInputArea}>
-                  <TextInput
-                    style={styles.manualInput}
-                    placeholder="Enter exact SL price"
-                    placeholderTextColor={C.textMuted}
-                    keyboardType="decimal-pad"
-                    value={slManualText}
-                    onChangeText={(t) => {
-                      setSlManualText(t);
-                      const n = parseFloat(t);
-                      if (!isNaN(n)) setSlManual(n);
-                    }}
-                  />
-                  {sl != null && marketEntry > 0 && (
-                    <Text style={styles.slNote}>
-                      {`Distance: ${Math.abs(marketEntry - sl).toFixed(2)}  (${(Math.abs(marketEntry - sl) / PIP_SIZE).toFixed(0)} pips)`}
-                    </Text>
-                  )}
-                </View>
-              )}
+              <TextInput
+                style={styles.manualInput}
+                placeholder="e.g. 4450"
+                placeholderTextColor={C.textMuted}
+                keyboardType="decimal-pad"
+                value={triggerPriceText}
+                onChangeText={setTriggerPriceText}
+              />
+              {inferredAtPriceDir && atPriceLevels ? (
+                <Text style={[styles.slNote, { color: inferredAtPriceDir === "buy" ? C.buy : C.sell, marginTop: 8 }]}>
+                  {`${inferredAtPriceDir.toUpperCase()} cascade @ ${formatPrice(triggerPrice)} · SL ${formatPrice(atPriceLevels.stopLoss)}`}
+                </Text>
+              ) : null}
             </View>
 
-            {/* Risk Summary */}
-            {status === "connected" && marketEntry > 0 && (
-              <View style={styles.riskCard}>
-                <View style={styles.riskRow}>
-                  <Text style={styles.riskLabel}>Entry</Text>
-                  <Text style={styles.riskValue}>{formatPrice(marketEntry)}</Text>
-                </View>
-                <View style={styles.riskRow}>
-                  <Text style={styles.riskLabel}>Stop Loss</Text>
-                  <Text style={[styles.riskValue, { color: C.sell }]}>
-                    {sl != null ? formatPrice(sl) : "None"}
-                  </Text>
-                </View>
-                <View style={styles.riskRow}>
-                  <Text style={styles.riskLabel}>Est. Risk</Text>
-                  <Text style={[styles.riskValue, { color: C.gold }]}>{formatUsdMoney(riskDollars)}</Text>
-                </View>
-                {accountInfo && (
-                  <View style={styles.riskRow}>
-                    <Text style={styles.riskLabel}>Balance</Text>
-                    <Text style={styles.riskValue}>{formatMoney(accountInfo.balance)}</Text>
-                  </View>
+            <View style={styles.cascadeSummaryRow}>
+              <View style={styles.cascadeSummaryItem}>
+                <Text style={styles.cascadeSummaryValue}>{cascadeSettings.numPositions}</Text>
+                <Text style={styles.cascadeSummaryLabel}>ORDERS</Text>
+              </View>
+              <View style={styles.cascadeSummaryDivider} />
+              <View style={styles.cascadeSummaryItem}>
+                <Text style={styles.cascadeSummaryValue}>{cascadeSettings.pipsBetween}</Text>
+                <Text style={styles.cascadeSummaryLabel}>PIP STEP</Text>
+              </View>
+              <View style={styles.cascadeSummaryDivider} />
+              <View style={styles.cascadeSummaryItem}>
+                <Text style={[styles.cascadeSummaryValue, { color: C.sell }]}>{cascadeSettings.slPips}</Text>
+                <Text style={styles.cascadeSummaryLabel}>SL PIPS</Text>
+              </View>
+              <View style={styles.cascadeSummaryDivider} />
+              <View style={styles.cascadeSummaryItem}>
+                <Text style={styles.cascadeSummaryValue}>
+                  {atPriceLevels ? formatPrice(atPriceLevels.stopLoss) : "—"}
+                </Text>
+                <Text style={[styles.cascadeSummaryLabel, { color: C.sell }]}>SL PRICE</Text>
+              </View>
+            </View>
+
+            <View style={styles.sectionCard}>
+              <View style={styles.sectionHeader}>
+                <Text style={styles.sectionTitle}>Lot Size (per order)</Text>
+                <Text style={styles.sectionHint}>From Settings cascade</Text>
+              </View>
+              <StepInput value={cascadeLotSize} onChange={setCascadeLotSize} step={0.01} min={0.01} max={100} decimals={2} />
+              <Pressable
+                style={({ pressed }) => [
+                  styles.atPriceOkBtn,
+                  { marginTop: 14 },
+                  (!syncReady || !inferredAtPriceDir) && !isPlacing && { opacity: 0.5 },
+                  pressed && { opacity: 0.85 },
+                  isPlacing && { opacity: 0.6 },
+                ]}
+                onPress={() => void handleAtPriceArm()}
+                disabled={isPlacing || !syncReady || !inferredAtPriceDir}
+              >
+                {isPlacing ? (
+                  <ActivityIndicator color="#000" />
+                ) : (
+                  <>
+                    <Feather name="check" size={20} color="#000" />
+                    <Text style={styles.atPriceOkLabel}>OK — arm cascade</Text>
+                  </>
                 )}
+              </Pressable>
+            </View>
+
+            {atPriceLevels && inferredAtPriceDir && triggerPrice > 0 ? (
+              <CascadeLadder
+                marketPrice={triggerPrice}
+                limitEntries={atPriceLevels.limitEntries}
+                stopLoss={atPriceLevels.stopLoss}
+                direction={inferredAtPriceDir}
+                lotSize={cascadeLotSize}
+                numPositions={cascadeSettings.numPositions}
+                formatUsdMoney={formatUsdMoney}
+                firstLegPending
+              />
+            ) : (
+              <View style={styles.cascadeHint}>
+                <Feather name="info" size={14} color={C.textMuted} />
+                <Text style={styles.cascadeHintText}>
+                  Enter a price above or below live bid to preview the cascade ladder (uses Settings).
+                </Text>
               </View>
             )}
 
+            <Text style={styles.cascadeStatusHint}>
+              Zone appears as ORDER NOT ACTIVE until the first order fills, then ACTIVE (same buttons as cascade).
+            </Text>
           </>
         )}
       </ScrollView>
@@ -1562,6 +1610,17 @@ const styles = StyleSheet.create({
   },
   cascadeExecBtnBuy: { backgroundColor: C.buy },
   cascadeExecBtnSell: { backgroundColor: C.sell },
+  cascadeExecBtnInactive: { backgroundColor: C.navy },
+  atPriceOkBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10,
+    backgroundColor: C.gold,
+    borderRadius: 14,
+    paddingVertical: 16,
+  },
+  atPriceOkLabel: { fontSize: 17, fontFamily: "Inter_700Bold", color: "#000", letterSpacing: 0.5 },
   cascadeExecLabel: { fontSize: 18, fontFamily: "Inter_700Bold", letterSpacing: 1.5 },
   cascadeExecPrice: { fontSize: 12, fontFamily: "Inter_400Regular", opacity: 0.75 },
   cascadeStatusHint: {

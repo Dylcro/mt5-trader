@@ -1,6 +1,6 @@
 import { Feather } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -21,6 +21,7 @@ import { useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useZones } from "@/hooks/useZones";
 import ZoneCard from "@/components/ZoneCard";
 import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
+import { subscribeAccountEvents } from "@/lib/accountEventBus";
 import {
   buildDisplayActiveZones,
   pendingWithoutZone,
@@ -240,12 +241,18 @@ function PendingOrderCard({ order, onCancel }: { order: PendingOrder; onCancel: 
 export default function PositionsScreen() {
   const insets = useSafeAreaInsets();
   const { formatMoney } = useDisplayCurrency();
-  const { positions, pendingOrders, status, refreshPositions, refreshPendingOrders, closePosition, cancelOrder, accountId, sseConnected, price, syncSession } = useTrading();
-  const { zones, refresh: refreshZones, riskFree, closeZone, cancelZoneOrders } = useZones(accountId, { includeClosed: true, pollIntervalMs: 10_000, sseConnected });
+  const {
+    positions, pendingOrders, status, accountInfo,
+    refreshPositions, refreshPendingOrders, refreshAccountInfo,
+    closePosition, cancelOrder, accountId, region, sseConnected, price, syncSession,
+  } = useTrading();
+  const { zones, refresh: refreshZones, riskFree, closeZone, cancelZoneOrders } = useZones(accountId, {
+    includeClosed: true, pollIntervalMs: 10_000, sseConnected, region,
+  });
   const { settings: cs } = useCascadeSettings();
   const displayActiveZones = useMemo(
-    () => buildDisplayActiveZones(zones, positions, cs, price),
-    [zones, positions, cs, price],
+    () => buildDisplayActiveZones(zones, positions, cs, price, pendingOrders),
+    [zones, positions, cs, price, pendingOrders],
   );
   const displayZoneIds = useMemo(
     () => new Set(displayActiveZones.map((z) => z.zoneId)),
@@ -267,11 +274,39 @@ export default function PositionsScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
 
+  const handleCancelZoneOrders = useCallback(
+    async (zoneId: string) => {
+      const result = await cancelZoneOrders(zoneId);
+      await refreshPendingOrders();
+      return result;
+    },
+    [cancelZoneOrders, refreshPendingOrders],
+  );
+
+  const handleCloseZone = useCallback(
+    async (zoneId: string) => {
+      const result = await closeZone(zoneId);
+      await Promise.all([refreshPendingOrders(), refreshZones()]);
+      return result;
+    },
+    [closeZone, refreshPendingOrders, refreshZones],
+  );
+
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
-    await Promise.all([refreshZones(), refreshPositions(), refreshPendingOrders()]);
+    await Promise.all([
+      refreshZones(), refreshPositions(), refreshPendingOrders(), refreshAccountInfo(),
+    ]);
     setRefreshing(false);
-  }, [refreshZones, refreshPositions, refreshPendingOrders]);
+  }, [refreshZones, refreshPositions, refreshPendingOrders, refreshAccountInfo]);
+
+  useEffect(() => {
+    if (!accountId) return;
+    return subscribeAccountEvents(accountId, (type) => {
+      if (type === "pending_order") void refreshPendingOrders();
+      if (type === "zone_update") void refreshZones();
+    });
+  }, [accountId, refreshPendingOrders, refreshZones]);
 
   // Poll while focused so MT5-side closes/cancels appear without manual refresh.
   useFocusEffect(
@@ -283,11 +318,12 @@ export default function PositionsScreen() {
         refreshZones(),
         refreshPositions(),
         refreshPendingOrders(),
+        refreshAccountInfo(),
       ]);
       sync();
       const id = setInterval(sync, 4_000);
       return () => clearInterval(id);
-    }, [status, accountId, syncSession, refreshZones, refreshPositions, refreshPendingOrders]),
+    }, [status, accountId, syncSession, refreshZones, refreshPositions, refreshPendingOrders, refreshAccountInfo]),
   );
 
   const handleCancelOrder = useCallback(
@@ -337,7 +373,10 @@ export default function PositionsScreen() {
     setCancellingAll(false);
   }, [cancellingAll, orphanPendingOrders, cancelOrder]);
 
-  const totalPL = positions.reduce((sum, p) => sum + p.profit, 0);
+  const totalPL =
+    accountInfo != null
+      ? accountInfo.equity - accountInfo.balance
+      : positions.reduce((sum, p) => sum + p.profit, 0);
   const webTopPad = Platform.OS === "web" ? 67 : 0;
   const showStandalone = standalonePositions.length > 0;
   const hasAnything =
@@ -360,7 +399,7 @@ export default function PositionsScreen() {
           <View>
             <Text style={styles.plBannerLabel}>TOTAL FLOATING P&L</Text>
             <Text style={styles.plBannerSub}>
-              {positions.length} position{positions.length === 1 ? "" : "s"} open
+              {accountInfo != null ? "Account floating" : `${positions.length} position${positions.length === 1 ? "" : "s"} open`}
               {displayActiveZones.length > 0
                 ? ` · ${displayActiveZones.length} zone${displayActiveZones.length === 1 ? "" : "s"}`
                 : ""}
@@ -406,8 +445,8 @@ export default function PositionsScreen() {
                       key={z.zoneId}
                       zone={z}
                       onRiskFree={riskFree}
-                      onCloseZone={closeZone}
-                      onCancelOrders={cancelZoneOrders}
+                      onCloseZone={handleCloseZone}
+                      onCancelOrders={handleCancelZoneOrders}
                       riskFreePips={cs.riskFreePips}
                     />
                   ))}

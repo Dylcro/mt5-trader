@@ -59,10 +59,10 @@ function TpChip({ label, state }: { label: string; state: TpChipState }) {
 }
 
 function tpEnabledAtPlacement(zone: Zone, level: 1 | 2 | 3 | 4): boolean {
-  if (level === 1) return zone.tp1Enabled === true;
-  if (level === 2) return zone.tp2Enabled === true;
-  if (level === 3) return zone.tp3Enabled === true;
-  return zone.tp4Enabled === true;
+  if (level === 1) return zone.tp1Enabled !== false;
+  if (level === 2) return zone.tp2Enabled !== false;
+  if (level === 3) return zone.tp3Enabled !== false;
+  return zone.tp4Enabled !== false;
 }
 
 function tpChipState(zone: Zone, level: 1 | 2 | 3 | 4): TpChipState {
@@ -125,11 +125,23 @@ export default function ZoneCard({
     }
   };
 
-  const statusLabel = zone.status === "RISK_FREE" ? "RISK-FREE" : zone.status === "CLOSED" ? "CLOSED" : "ACTIVE";
-  const statusColor = zone.status === "RISK_FREE" ? C.gold : zone.status === "CLOSED" ? C.textMuted : C.buy;
+  const statusLabel = zone.status === "ARMED"
+    ? "ORDER NOT ACTIVE"
+    : zone.status === "RISK_FREE"
+      ? "RISK-FREE"
+      : zone.status === "CLOSED"
+        ? "CLOSED"
+        : "ACTIVE";
+  const statusColor = zone.status === "ARMED"
+    ? C.textMuted
+    : zone.status === "RISK_FREE"
+      ? C.gold
+      : zone.status === "CLOSED"
+        ? C.textMuted
+        : C.buy;
 
   const canRiskFree =
-    !historical && zone.status === "OPEN" && zone.positionCount >= 1 && !!onRiskFree;
+    !historical && (zone.status === "OPEN" || zone.status === "RISK_FREE") && zone.positionCount >= 1 && !!onRiskFree;
   // Close Zone is allowed for any non-historical, non-closed zone that still
   // has at least one tracked position. We allow it on RISK_FREE zones too —
   // the user might want to bail out completely even after going risk-free.

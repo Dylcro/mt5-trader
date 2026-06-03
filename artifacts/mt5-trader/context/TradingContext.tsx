@@ -116,6 +116,8 @@ interface TradingContextValue {
   reconnectFromServer: () => Promise<void>;
   placeTrade: (params: PlaceTradeParams) => Promise<{ success: boolean; message: string }>;
   placeCascadeOrders: (params: CascadeOrderParams) => Promise<{ success: boolean; placed: number; failed: number; message: string; marketPositionId?: string; limitOrderIds?: string[] }>;
+  /** @-price cascade: ARMED zone + pending limits at ladder (Settings cascade). */
+  placeArmedCascadeAtPrice: (params: ArmedCascadeParams) => Promise<{ success: boolean; placed: number; failed: number; message: string; zoneId?: string; limitOrderIds?: string[] }>;
   closePosition: (positionId: string) => Promise<{ success: boolean; message: string }>;
   cancelOrder: (orderId: string) => Promise<{ success: boolean; message: string }>;
   refreshPositions: () => Promise<void>;
@@ -179,6 +181,25 @@ export interface CascadeOrderParams {
   tp4Pct?: number;
   autoBeAtTp?: number;
   /** Optional — generated automatically when omitted. */
+  zoneId?: string;
+}
+
+export interface ArmedCascadeParams {
+  direction: "buy" | "sell";
+  volume: number;
+  /** Anchor / trigger price for the ladder. */
+  anchorPrice: number;
+  limitEntries: number[];
+  stopLoss: number;
+  tp1Price: number;
+  tp2Price: number;
+  tp3Price: number;
+  tp4Price?: number;
+  tp1Pct?: number;
+  tp2Pct?: number;
+  tp3Pct?: number;
+  tp4Pct?: number;
+  autoBeAtTp?: number;
   zoneId?: string;
 }
 
@@ -526,6 +547,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     onPendingOrder: () => {
       const r = regionRef.current;
       const a = accountId;
+      emitAccountEvent(a, "pending_order", {});
       void fetchPendingOrdersData(a, r).then(setPendingOrders).catch(() => {});
     },
     onZoneUpdate: (data: unknown) => {
@@ -1322,6 +1344,85 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     [status, connectionWarm, wakeConnection, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, accountId, region]
   );
 
+  const placeArmedCascadeAtPrice = useCallback(
+    async (params: ArmedCascadeParams): Promise<{ success: boolean; placed: number; failed: number; message: string; zoneId?: string; limitOrderIds?: string[] }> => {
+      if (status !== "connected") return { success: false, placed: 0, failed: 0, message: "Not connected" };
+      if (!connectionWarm) await wakeConnection();
+      const zoneId = params.zoneId ?? newCascadeZoneId();
+      const limitPrices = [params.anchorPrice, ...params.limitEntries];
+      const total = limitPrices.length;
+      const limitOrderIds: string[] = [];
+      try {
+        const armRes = await authFetch(
+          `${API_BASE}/mt5/account/${accountId}/zones/arm?region=${region}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              zoneId,
+              direction: params.direction,
+              anchorPrice: params.anchorPrice,
+              volume: params.volume,
+              tp1Price: params.tp1Price,
+              tp2Price: params.tp2Price,
+              tp3Price: params.tp3Price,
+              tp4Price: params.tp4Price,
+              tp1Pct: params.tp1Pct,
+              tp2Pct: params.tp2Pct,
+              tp3Pct: params.tp3Pct,
+              tp4Pct: params.tp4Pct,
+              autoBeAtTp: params.autoBeAtTp,
+            }),
+          },
+        );
+        const armData = await safeJson<{ ok?: boolean; zoneId?: string; error?: string }>(armRes);
+        if (!armRes.ok || !armData.ok) {
+          return { success: false, placed: 0, failed: total, message: armData.error ?? "Failed to arm zone" };
+        }
+        const armedZoneId = armData.zoneId ?? zoneId;
+        let placed = 0;
+        let failed = 0;
+        const errors: string[] = [];
+        const limitResults = await Promise.all(
+          limitPrices.map((limitPrice, i) =>
+            submitOrderRaw({
+              direction: params.direction,
+              volume: params.volume,
+              limitPrice,
+              stopLoss: params.stopLoss,
+              comment: buildCascadeComment(armedZoneId, i + 1, total),
+              zoneId: armedZoneId,
+            }),
+          ),
+        );
+        for (const r of limitResults) {
+          if (r.success) {
+            placed++;
+            if (r.orderId) limitOrderIds.push(r.orderId);
+          } else {
+            failed++;
+            errors.push(r.message);
+          }
+        }
+        void Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
+        if (placed === 0) {
+          await authFetch(
+            `${API_BASE}/mt5/account/${accountId}/zones/${encodeURIComponent(armedZoneId)}/close?region=${region}`,
+            { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+          ).catch(() => {});
+          return { success: false, placed: 0, failed: total, message: errors[0] ?? "All pending orders failed" };
+        }
+        const msg = failed > 0
+          ? `${placed}/${total} pending orders placed · zone armed @ ${params.anchorPrice}`
+          : `Cascade armed @ ${params.anchorPrice} · ${placed} pending orders`;
+        return { success: true, placed, failed, message: msg, zoneId: armedZoneId, limitOrderIds };
+      } catch (err) {
+        return { success: false, placed: 0, failed: total, message: err instanceof Error ? err.message : "Arm failed" };
+      }
+    },
+    [status, connectionWarm, wakeConnection, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, accountId, region],
+  );
+
   const closePosition = useCallback(
     async (positionId: string): Promise<{ success: boolean; message: string }> => {
       if (status !== "connected") return { success: false, message: "Not connected" };
@@ -1387,6 +1488,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         reconnectFromServer,
         placeTrade,
         placeCascadeOrders,
+        placeArmedCascadeAtPrice,
         closePosition,
         cancelOrder,
         refreshPositions,

@@ -1,7 +1,7 @@
 import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { createRequire } from "module";
-import { db, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable, cascadeZonesTable, zonePositionsTable, zoneOrdersTable, notificationPrefsTable, usersTable } from "@workspace/db";
+import { db, pool, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable, cascadeZonesTable, zonePositionsTable, zoneOrdersTable, notificationPrefsTable, usersTable } from "@workspace/db";
 import { and, eq, inArray, isNotNull } from "drizzle-orm";
 import { JWT_SECRET } from "./auth";
 import { getTradingStatus } from "../lib/platformFlags";
@@ -119,6 +119,22 @@ const activeRegions = new Map<string, string>();  // accountId → region (used 
 interface KnownAccount { accountId: string; userId?: string; region: string; }
 const knownAccounts = new Map<string, KnownAccount>(); // accountId → KnownAccount
 let sdkInstance: InstanceType<typeof MetaApi> | null = null;
+
+/** Idempotent — safe when drizzle push was skipped (RF history columns). */
+let cascadeRfColumnsReady: Promise<void> | null = null;
+export async function ensureCascadeZoneRfColumns(): Promise<void> {
+  if (!cascadeRfColumnsReady) {
+    cascadeRfColumnsReady = pool.query(`
+      ALTER TABLE cascade_zones
+        ADD COLUMN IF NOT EXISTS went_risk_free BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS risk_free_sl_exit BOOLEAN NOT NULL DEFAULT FALSE;
+    `).then(() => undefined).catch((e) => {
+      cascadeRfColumnsReady = null;
+      throw e;
+    });
+  }
+  await cascadeRfColumnsReady;
+}
 
 async function upsertStoredAccount(params: {
   accountId: string;
@@ -541,24 +557,115 @@ function broadcastToAccount(accountId: string, event: string, data: unknown): vo
   }
 }
 
-function broadcastZoneUpdate(zoneId: string): void {
-  const st = zoneStates.get(zoneId);
-  if (!st) return;
-  broadcastToAccount(st.accountId, "zone_update", {
-    zoneId,
-    status: st.status,
-    tp1Hit: st.tp1Hit,
-    tp2Hit: st.tp2Hit,
-    tp3Hit: st.tp3Hit,
-    tp4Hit: st.tp4Hit ?? false,
-    tp1Enabled: st.tp1Enabled,
-    tp2Enabled: st.tp2Enabled,
-    tp3Enabled: st.tp3Enabled,
-    tp4Enabled: st.tp4Enabled,
-    tp2SlIsBestEffort: (st as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
-    manualClose: (st as { manualClose?: boolean }).manualClose ?? false,
-    slHit: (st as { slHit?: boolean }).slHit ?? false,
+async function mergeZoneHitsFromPositions(
+  zoneId: string,
+  row: {
+    tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean;
+    tp1Enabled?: boolean; tp2Enabled?: boolean; tp3Enabled?: boolean; tp4Enabled?: boolean;
+  },
+): Promise<{
+  tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean; positionCount: number;
+  tp1Enabled: boolean; tp2Enabled: boolean; tp3Enabled: boolean; tp4Enabled: boolean;
+}> {
+  const tp1Enabled = row.tp1Enabled ?? true;
+  const tp2Enabled = row.tp2Enabled ?? true;
+  const tp3Enabled = row.tp3Enabled ?? true;
+  const tp4Enabled = row.tp4Enabled ?? true;
+  const [zoneMeta] = await db.select({ tp4Price: cascadeZonesTable.tp4Price })
+    .from(cascadeZonesTable).where(eq(cascadeZonesTable.zoneId, zoneId)).limit(1);
+  const tp4Price = zoneMeta?.tp4Price != null ? Number(zoneMeta.tp4Price) : null;
+  const posRows = await db.select().from(zonePositionsTable)
+    .where(eq(zonePositionsTable.zoneId, zoneId));
+  const open = posRows.filter((r) => r.status === "OPEN");
+  let tp1Hit = Boolean(row.tp1Hit) || posRows.some((r) => r.tp1Hit);
+  let tp2Hit = Boolean(row.tp2Hit) || posRows.some((r) => r.tp2Hit);
+  let tp3Hit = Boolean(row.tp3Hit) || posRows.some((r) => r.tp3Hit);
+  let tp4Hit = Boolean(row.tp4Hit) || posRows.some((r) => r.tp4Hit);
+  const sanitized = sanitizeZoneTpLadder({
+    tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+    tp1Hit, tp2Hit, tp3Hit, tp4Hit, tp4Price,
   });
+  tp1Hit = sanitized.tp1Hit;
+  tp2Hit = sanitized.tp2Hit;
+  tp3Hit = sanitized.tp3Hit;
+  tp4Hit = sanitized.tp4Hit;
+  if (tp1Hit !== row.tp1Hit || tp2Hit !== row.tp2Hit || tp3Hit !== row.tp3Hit || tp4Hit !== row.tp4Hit) {
+    await db.update(cascadeZonesTable)
+      .set({ tp1Hit, tp2Hit, tp3Hit, tp4Hit })
+      .where(eq(cascadeZonesTable.zoneId, zoneId))
+      .catch((e: Error) => console.warn(`[zone ${zoneId}] hit-flag sync failed:`, e.message));
+    const st = zoneStates.get(zoneId);
+    if (st) {
+      st.tp1Hit = tp1Hit;
+      st.tp2Hit = tp2Hit;
+      st.tp3Hit = tp3Hit;
+      st.tp4Hit = tp4Hit;
+    }
+  }
+  return {
+    tp1Hit, tp2Hit, tp3Hit, tp4Hit, positionCount: open.length,
+    tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+  };
+}
+
+function broadcastZoneUpdate(zoneId: string): void {
+  void (async () => {
+    const st = zoneStates.get(zoneId);
+    const [dbRow] = await db.select().from(cascadeZonesTable)
+      .where(eq(cascadeZonesTable.zoneId, zoneId))
+      .limit(1);
+    if (!st && !dbRow) return;
+    const accountId = st?.accountId ?? dbRow!.accountId;
+    const base = dbRow ?? {
+      status: st!.status,
+      tp1Hit: st!.tp1Hit, tp2Hit: st!.tp2Hit, tp3Hit: st!.tp3Hit, tp4Hit: st!.tp4Hit,
+      tp1Enabled: st!.tp1Enabled, tp2Enabled: st!.tp2Enabled, tp3Enabled: st!.tp3Enabled, tp4Enabled: st!.tp4Enabled,
+    };
+    const merged = await mergeZoneHitsFromPositions(zoneId, {
+      tp1Hit: Boolean(base.tp1Hit),
+      tp2Hit: Boolean(base.tp2Hit),
+      tp3Hit: Boolean(base.tp3Hit),
+      tp4Hit: Boolean(base.tp4Hit ?? false),
+      tp1Enabled: (base as { tp1Enabled?: boolean }).tp1Enabled,
+      tp2Enabled: (base as { tp2Enabled?: boolean }).tp2Enabled,
+      tp3Enabled: (base as { tp3Enabled?: boolean }).tp3Enabled,
+      tp4Enabled: (base as { tp4Enabled?: boolean }).tp4Enabled,
+    });
+    const tp4Price = (dbRow as { tp4Price?: number | null } | undefined)?.tp4Price != null
+      ? Number((dbRow as { tp4Price: number }).tp4Price)
+      : st?.tp4Price ?? null;
+    const enabledTpCount = countEnabledTps({
+      tp1Enabled: merged.tp1Enabled, tp2Enabled: merged.tp2Enabled,
+      tp3Enabled: merged.tp3Enabled, tp4Enabled: merged.tp4Enabled,
+      tp4Price,
+    });
+    const hitEnabledTpCount = countHitEnabledTps({
+      tp1Enabled: merged.tp1Enabled, tp2Enabled: merged.tp2Enabled,
+      tp3Enabled: merged.tp3Enabled, tp4Enabled: merged.tp4Enabled,
+      tp1Hit: merged.tp1Hit, tp2Hit: merged.tp2Hit, tp3Hit: merged.tp3Hit, tp4Hit: merged.tp4Hit,
+      tp4Price,
+    });
+    broadcastToAccount(accountId, "zone_update", {
+      zoneId,
+      status: st?.status ?? String(dbRow!.status),
+      tp1Hit: merged.tp1Hit,
+      tp2Hit: merged.tp2Hit,
+      tp3Hit: merged.tp3Hit,
+      tp4Hit: merged.tp4Hit,
+      tp1Enabled: merged.tp1Enabled,
+      tp2Enabled: merged.tp2Enabled,
+      tp3Enabled: merged.tp3Enabled,
+      tp4Enabled: merged.tp4Enabled,
+      enabledTpCount,
+      hitEnabledTpCount,
+      positionCount: merged.positionCount,
+      tp2SlIsBestEffort: (dbRow as { tp2SlIsBestEffort?: boolean } | undefined)?.tp2SlIsBestEffort
+        ?? (st as { tp2SlIsBestEffort?: boolean } | undefined)?.tp2SlIsBestEffort ?? false,
+      manualClose: (dbRow as { manualClose?: boolean } | undefined)?.manualClose ?? false,
+      slHit: (dbRow as { slHit?: boolean } | undefined)?.slHit ?? false,
+      riskFreeSlExit: (dbRow as { riskFreeSlExit?: boolean } | undefined)?.riskFreeSlExit ?? false,
+    });
+  })();
 }
 
 // ── Stream-health tracking ──────────────────────────────────────────────────
@@ -1705,13 +1812,17 @@ export function tpDisplayState(
   return "pending";
 }
 
-export function countEnabledTps(flags: { tp1Enabled: boolean; tp2Enabled: boolean; tp3Enabled: boolean; tp4Enabled: boolean }): number {
+export function countEnabledTps(flags: {
+  tp1Enabled: boolean; tp2Enabled: boolean; tp3Enabled: boolean; tp4Enabled: boolean;
+  tp4Price?: number | null;
+}): number {
   return [flags.tp1Enabled, flags.tp2Enabled, flags.tp3Enabled, flags.tp4Enabled].filter(Boolean).length;
 }
 
 export function countHitEnabledTps(z: {
   tp1Enabled: boolean; tp2Enabled: boolean; tp3Enabled: boolean; tp4Enabled: boolean;
   tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean;
+  tp4Price?: number | null;
 }): number {
   let n = 0;
   if (z.tp1Enabled && z.tp1Hit) n++;
@@ -1724,6 +1835,7 @@ export function countHitEnabledTps(z: {
 export function computeFinalTpReached(z: {
   tp1Enabled: boolean; tp2Enabled: boolean; tp3Enabled: boolean; tp4Enabled: boolean;
   tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean;
+  tp4Price?: number | null;
 }): 0 | 1 | 2 | 3 | 4 {
   let last: 0 | 1 | 2 | 3 | 4 = 0;
   if (z.tp1Enabled && z.tp1Hit) last = 1;
@@ -1731,6 +1843,47 @@ export function computeFinalTpReached(z: {
   if (z.tp3Enabled && z.tp3Hit) last = 3;
   if (z.tp4Enabled && z.tp4Hit) last = 4;
   return last;
+}
+
+export type ZonePrimaryOutcome = "RF" | "SL" | "MANUAL" | "TP4" | "TP3" | "TP2" | "TP1" | "NONE";
+
+/** One history bucket per closed zone (not per position leg). */
+export function zonePrimaryOutcome(row: {
+  status: string;
+  riskFreeSlExit?: boolean;
+  slHit?: boolean;
+  manualClose?: boolean;
+  finalTpReached?: 0 | 1 | 2 | 3 | 4;
+  tp1Enabled?: boolean;
+  tp2Enabled?: boolean;
+  tp3Enabled?: boolean;
+  tp4Enabled?: boolean;
+  tp1Hit?: boolean;
+  tp2Hit?: boolean;
+  tp3Hit?: boolean;
+  tp4Hit?: boolean;
+  tp4Price?: number | null;
+}): ZonePrimaryOutcome {
+  if (row.status !== "CLOSED") return "NONE";
+  if (row.riskFreeSlExit) return "RF";
+  if (row.slHit) return "SL";
+  if (Boolean(row.tp4Hit) && row.tp4Enabled !== false) return "TP4";
+  if (row.manualClose) return "MANUAL";
+  const final = row.finalTpReached ?? computeFinalTpReached({
+    tp1Enabled: row.tp1Enabled ?? true,
+    tp2Enabled: row.tp2Enabled ?? true,
+    tp3Enabled: row.tp3Enabled ?? true,
+    tp4Enabled: row.tp4Enabled ?? true,
+    tp1Hit: Boolean(row.tp1Hit),
+    tp2Hit: Boolean(row.tp2Hit),
+    tp3Hit: Boolean(row.tp3Hit),
+    tp4Hit: Boolean(row.tp4Hit),
+    tp4Price: row.tp4Price,
+  });
+  if (final >= 3 && row.tp3Enabled !== false) return "TP3";
+  if (final >= 2 && row.tp2Enabled !== false) return "TP2";
+  if (final >= 1 && row.tp1Enabled !== false) return "TP1";
+  return "MANUAL";
 }
 
 /** True when a broker deal indicates the position exited via stop loss. */
@@ -1745,22 +1898,135 @@ export function dealIndicatesStopLoss(deal: unknown): boolean {
   return comment.includes("STOP LOSS") || comment.includes("[SL");
 }
 
-type CloseFinalizeOpts = { userInitiated?: boolean; stopLossExit?: boolean };
+type CloseFinalizeOpts = {
+  userInitiated?: boolean;
+  stopLossExit?: boolean;
+  /** Zone was RISK_FREE when the last leg closed (or wentRiskFree persisted). */
+  wasRiskFree?: boolean;
+  exitPrice?: number;
+  /** True when exitPrice is the broker fill from a deal, not live bid/ask. */
+  exitPriceFromDeal?: boolean;
+};
+
+export function exitPriceFromDeal(deal: unknown): number | null {
+  if (!deal || typeof deal !== "object") return null;
+  const d = deal as Record<string, unknown>;
+  const p = Number(d.price ?? d.openPrice ?? 0);
+  return Number.isFinite(p) && p > 0 ? p : null;
+}
+
+/** TP4 left manual in MT5 (tp4 pips = 0 → no tp4Price on the zone). */
+export function isManualTp4Zone(tp4Price: number | null | undefined, tp4Enabled: boolean): boolean {
+  return Boolean(tp4Enabled) && (tp4Price == null || !(tp4Price > 0));
+}
+
+/** Enforce ladder order — TP4 cannot be hit without TP3, etc. Strips manual-TP4 false positives. */
+export function sanitizeZoneTpLadder<T extends {
+  tp1Enabled?: boolean; tp2Enabled?: boolean; tp3Enabled?: boolean; tp4Enabled?: boolean;
+  tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean;
+  tp4Price?: number | null;
+}>(z: T): T {
+  const tp1Enabled = z.tp1Enabled ?? true;
+  const tp2Enabled = z.tp2Enabled ?? true;
+  const tp3Enabled = z.tp3Enabled ?? true;
+  const tp4Enabled = z.tp4Enabled ?? true;
+  const tp1Hit = tp1Enabled && Boolean(z.tp1Hit);
+  const tp2Hit = tp2Enabled && tp1Hit && Boolean(z.tp2Hit);
+  const tp3Hit = tp3Enabled && tp2Hit && Boolean(z.tp3Hit);
+  const manualTp4 = isManualTp4Zone(z.tp4Price, tp4Enabled);
+  const tp4Hit = tp4Enabled && Boolean(z.tp4Hit) && (
+    manualTp4 ? true : tp3Hit
+  );
+  return { ...z, tp1Hit, tp2Hit, tp3Hit, tp4Hit };
+}
+
+/** Exit at/above TP3 region (manual TP4 leg) for buy; at/below for sell. */
+export function exitPriceBeyondTp3(
+  direction: "buy" | "sell",
+  exitPrice: number,
+  tp3Price: number | null,
+): boolean {
+  if (tp3Price == null || !(tp3Price > 0) || !(exitPrice > 0)) return false;
+  return direction === "buy" ? exitPrice >= tp3Price : exitPrice <= tp3Price;
+}
+
+/** Early bailout in MT5 before TP1. */
+export function exitPriceBeforeTp1(
+  direction: "buy" | "sell",
+  exitPrice: number,
+  tp1Price: number | null,
+): boolean {
+  if (tp1Price == null || !(tp1Price > 0) || !(exitPrice > 0)) return false;
+  return direction === "buy" ? exitPrice < tp1Price : exitPrice > tp1Price;
+}
+
+/**
+ * Classify MT5/app zone close from broker fill price.
+ * - manualClose: early exit before TP1 was ever reached (History MANUAL column).
+ * - tp4Hit: manual TP4 slice closed at/above TP3, or automated TP4 price reached.
+ * - TP1 already hit then closed below TP1: keeps tp1Hit, not manualClose.
+ */
+export function inferCloseOutcomeFromExitPrice(
+  zone: {
+    direction: "buy" | "sell";
+    tp1Price: number | null;
+    tp3Price: number | null;
+    tp4Price: number | null;
+    tp4Enabled: boolean;
+    tp1Hit?: boolean;
+    tp4Hit?: boolean;
+  },
+  exitPrice: number | null | undefined,
+): { tp4Hit: boolean; manualClose: boolean } {
+  const tp1Hit = Boolean(zone.tp1Hit);
+  const priorTp4 = Boolean(zone.tp4Hit);
+
+  if (exitPrice == null || !(exitPrice > 0)) {
+    return { tp4Hit: priorTp4, manualClose: !tp1Hit && !priorTp4 };
+  }
+
+  if (exitPriceBeforeTp1(zone.direction, exitPrice, zone.tp1Price)) {
+    if (tp1Hit) return { tp4Hit: false, manualClose: false };
+    return { tp4Hit: false, manualClose: true };
+  }
+
+  if (isManualTp4Zone(zone.tp4Price, zone.tp4Enabled)
+    && exitPriceBeyondTp3(zone.direction, exitPrice, zone.tp3Price)) {
+    return { tp4Hit: true, manualClose: false };
+  }
+
+  if (zone.tp4Price != null && zone.tp4Price > 0
+    && exitPriceBeyondTp3(zone.direction, exitPrice, zone.tp4Price)) {
+    return { tp4Hit: true, manualClose: false };
+  }
+
+  return { tp4Hit: priorTp4, manualClose: false };
+}
+
+export function inferManualCloseFromExitPrice(
+  zone: Parameters<typeof inferCloseOutcomeFromExitPrice>[0],
+  exitPrice: number | null | undefined,
+): boolean {
+  return inferCloseOutcomeFromExitPrice(zone, exitPrice).manualClose;
+}
 
 /** Resolve close outcome for API/history (backfills legacy CLOSED rows missing flags). */
 export function resolveCloseOutcome(row: {
   status: string;
   tp4Enabled: boolean;
   tp4Hit: boolean;
+  tp4Price?: number | null;
   manualClose?: boolean;
   slHit?: boolean;
-}): { manualClose: boolean; slHit: boolean } {
-  if (row.manualClose || row.slHit) {
-    return { manualClose: Boolean(row.manualClose), slHit: Boolean(row.slHit) };
+  riskFreeSlExit?: boolean;
+}): { manualClose: boolean; slHit: boolean; riskFreeSlExit: boolean } {
+  if (row.riskFreeSlExit) return { manualClose: false, slHit: false, riskFreeSlExit: true };
+  if (row.slHit) return { manualClose: false, slHit: true, riskFreeSlExit: false };
+  if (row.status !== "CLOSED") return { manualClose: false, slHit: false, riskFreeSlExit: false };
+  if (row.manualClose != null) {
+    return { manualClose: Boolean(row.manualClose), slHit: false, riskFreeSlExit: false };
   }
-  if (row.status !== "CLOSED") return { manualClose: false, slHit: false };
-  const tp4Done = Boolean(row.tp4Enabled) && Boolean(row.tp4Hit);
-  return { manualClose: !tp4Done, slHit: false };
+  return { manualClose: Boolean(row.manualClose), slHit: false, riskFreeSlExit: false };
 }
 
 /** Persist how a closed zone ended (manual app/MT5 exit vs SL vs TP ladder). */
@@ -1776,31 +2042,88 @@ async function finalizeZoneClose(
     if (!row || row.status !== "CLOSED") return;
 
     let slHit = Boolean(opts.stopLossExit);
-    let manualClose = Boolean(opts.userInitiated);
-    const tp4Done = Boolean(row.tp4Enabled) && Boolean(row.tp4Hit);
-
-    if (!slHit && !manualClose) {
-      if (tp4Done) {
-        manualClose = false;
-      } else {
-        // Closed without TP4 automation — treat as manual exit (app or MT5).
-        manualClose = true;
-      }
+    let riskFreeSlExit = false;
+    if (slHit && (opts.wasRiskFree || Boolean(row.wentRiskFree))) {
+      riskFreeSlExit = true;
+      slHit = false;
     }
-    if (slHit) manualClose = false;
+    const baseFlags = {
+      tp1Enabled: Boolean(row.tp1Enabled),
+      tp2Enabled: Boolean(row.tp2Enabled),
+      tp3Enabled: Boolean(row.tp3Enabled),
+      tp4Enabled: Boolean(row.tp4Enabled),
+      tp4Price: row.tp4Price,
+    };
+    let sanitized = sanitizeZoneTpLadder({
+      ...baseFlags,
+      tp1Hit: Boolean(row.tp1Hit),
+      tp2Hit: Boolean(row.tp2Hit),
+      tp3Hit: Boolean(row.tp3Hit),
+      tp4Hit: Boolean(row.tp4Hit),
+    });
+    let manualClose = false;
+
+    if (slHit) {
+      manualClose = false;
+    } else if (opts.exitPriceFromDeal && opts.exitPrice != null && opts.exitPrice > 0) {
+      const inferred = inferCloseOutcomeFromExitPrice(
+        {
+          direction: row.direction as "buy" | "sell",
+          tp1Price: row.tp1Price,
+          tp3Price: row.tp3Price,
+          tp4Price: row.tp4Price,
+          tp4Enabled: baseFlags.tp4Enabled,
+          tp1Hit: sanitized.tp1Hit,
+          tp4Hit: sanitized.tp4Hit,
+        },
+        opts.exitPrice,
+      );
+      manualClose = inferred.manualClose;
+      sanitized = sanitizeZoneTpLadder({
+        ...baseFlags,
+        ...sanitized,
+        tp4Hit: inferred.tp4Hit || sanitized.tp4Hit,
+      });
+    } else if (opts.userInitiated) {
+      manualClose = !sanitized.tp1Hit && !sanitized.tp4Hit;
+    } else {
+      manualClose = !sanitized.tp1Hit && !sanitized.tp4Hit;
+    }
 
     await db.update(cascadeZonesTable)
-      .set({ slHit, manualClose })
+      .set({
+        slHit, manualClose, riskFreeSlExit,
+        tp1Hit: sanitized.tp1Hit,
+        tp2Hit: sanitized.tp2Hit,
+        tp3Hit: sanitized.tp3Hit,
+        tp4Hit: sanitized.tp4Hit,
+      })
       .where(eq(cascadeZonesTable.zoneId, zoneId));
     const st = zoneStates.get(zoneId);
     if (st) {
-      (st as ZoneState & { slHit?: boolean; manualClose?: boolean }).slHit = slHit;
+      st.tp1Hit = sanitized.tp1Hit;
+      st.tp2Hit = sanitized.tp2Hit;
+      st.tp3Hit = sanitized.tp3Hit;
+      st.tp4Hit = sanitized.tp4Hit;
+      (st as ZoneState & { slHit?: boolean; manualClose?: boolean; riskFreeSlExit?: boolean }).slHit = slHit;
       (st as ZoneState & { manualClose?: boolean }).manualClose = manualClose;
+      (st as ZoneState & { riskFreeSlExit?: boolean }).riskFreeSlExit = riskFreeSlExit;
     }
-    console.log(`[zone ${zoneId}] close outcome sl=${slHit} manual=${manualClose}`);
+    console.log(`[zone ${zoneId}] close outcome rfSl=${riskFreeSlExit} sl=${slHit} manual=${manualClose} tp4Hit=${sanitized.tp4Hit} exit=${opts.exitPrice ?? "n/a"} deal=${opts.exitPriceFromDeal ?? false}`);
   } catch (e) {
     console.warn(`[zone ${zoneId}] finalizeZoneClose failed:`, (e as Error).message);
   }
+}
+
+function exitPriceForZoneClose(
+  accountId: string,
+  direction: "buy" | "sell",
+  explicit?: number,
+): number | undefined {
+  if (explicit != null && explicit > 0) return explicit;
+  const px = latestPrice(accountId);
+  if (!px) return undefined;
+  return direction === "buy" ? px.bid : px.ask;
 }
 
 // ── Zone TP Engine ───────────────────────────────────────────────────────────
@@ -1855,7 +2178,7 @@ interface ZoneState {
   tp2SlIsBestEffort: boolean;
   /** Auto SL→BE after this TP partial (1, 2, or 3). Baked in at zone creation. */
   autoBeAtTp: 1 | 2 | 3;
-  status: "OPEN" | "RISK_FREE" | "CLOSED";
+  status: "OPEN" | "RISK_FREE" | "CLOSED" | "ARMED";
   busy: boolean; // debounce: prevent overlapping monitor ticks for this zone
   // In-memory mirror of zone_positions(status=OPEN) for this zone, used as a
   // fallback when the DB query inside evaluateZone fails — prevents transient
@@ -2221,6 +2544,62 @@ async function persistPreparedZone(
   logEvent("zone.create", { accountId: state.accountId, zoneId: state.zoneId, direction: state.direction, anchorPrice: state.anchorPrice, positionId, volume });
 }
 
+/** Armed @-price cascade: zone row only — no positions until first limit fills. */
+async function persistArmedZone(state: ZoneState, userId: string | undefined): Promise<void> {
+  const now = Date.now();
+  await db.insert(cascadeZonesTable).values({
+    zoneId: state.zoneId, accountId: state.accountId, userId: userId ?? null,
+    direction: state.direction, anchorPrice: state.anchorPrice,
+    tp1Price: state.tp1Price, tp2Price: state.tp2Price,
+    tp3Price: state.tp3Price, tp4Price: state.tp4Price,
+    tp1Pct: state.tp1Pct, tp2Pct: state.tp2Pct, tp3Pct: state.tp3Pct, tp4Pct: state.tp4Pct,
+    tp1Enabled: state.tp1Enabled, tp2Enabled: state.tp2Enabled, tp3Enabled: state.tp3Enabled, tp4Enabled: state.tp4Enabled,
+    originalVolume: state.originalVolume,
+    cashoutPips: state.cashoutPips, cashoutDone: false,
+    tp1Hit: state.tp1Hit, tp2Hit: state.tp2Hit, tp3Hit: state.tp3Hit, tp4Hit: state.tp4Hit,
+    autoBeAtTp: state.autoBeAtTp,
+    status: "ARMED", createdAt: now,
+  }).onConflictDoNothing();
+  if (userId) zoneIdToUserId.set(state.zoneId, userId);
+  logEvent("zone.arm", { accountId: state.accountId, zoneId: state.zoneId, direction: state.direction, anchorPrice: state.anchorPrice });
+}
+
+/** After delete-orders on an @-price zone with no fills, remove it from the app. */
+async function closeArmedZoneIfDisarmed(
+  accountId: string, zoneId: string, token: string, region: string,
+  opts?: { force?: boolean },
+): Promise<void> {
+  const st = await loadZone(zoneId);
+  if (!st || st.accountId !== accountId || st.status !== "ARMED") return;
+  const openRows = await db.select().from(zonePositionsTable)
+    .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
+  if (openRows.length > 0) return;
+  if (!opts?.force) {
+    const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, accountId, zoneId);
+    if (pendingLeft) return;
+  }
+  const closedAt = Date.now();
+  await db.update(cascadeZonesTable)
+    .set({ status: "CLOSED", closedAt, manualClose: true })
+    .where(eq(cascadeZonesTable.zoneId, zoneId));
+  st.status = "CLOSED";
+  await finalizeZoneClose(accountId, zoneId, {
+    exitPrice: exitPriceForZoneClose(accountId, st.direction),
+  });
+  console.log(`[zone ${zoneId}] ARMED disarmed — no pending orders or positions, zone closed`);
+}
+
+async function activateArmedZone(zoneId: string): Promise<void> {
+  const [row] = await db.select({ status: cascadeZonesTable.status })
+    .from(cascadeZonesTable).where(eq(cascadeZonesTable.zoneId, zoneId)).limit(1);
+  if (!row || row.status !== "ARMED") return;
+  await db.update(cascadeZonesTable).set({ status: "OPEN" }).where(eq(cascadeZonesTable.zoneId, zoneId));
+  const st = zoneStates.get(zoneId);
+  if (st) st.status = "OPEN";
+  console.log(`[zone ${zoneId}] ARMED → OPEN (first position filled)`);
+  broadcastZoneUpdate(zoneId);
+}
+
 async function attachLimitOrderToZone(
   accountId: string,
   orderId: string,
@@ -2282,6 +2661,7 @@ async function recordZonePositionFill(
       const st = zoneStates.get(zoneId);
       if (st) st.trackedPositions.set(positionId, { volume, entryPrice, tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false });
       console.log(`[zone ${zoneId}] linked filled positionId=${positionId} @${entryPrice} vol=${volume}${i > 0 ? ` (after ${i} retries)` : ""}`);
+      void activateArmedZone(zoneId);
       return;
     } catch (e) {
       lastErr = e;
@@ -2292,6 +2672,102 @@ async function recordZonePositionFill(
     }
   }
   console.error(`[zone ${zoneId}] fill persist FAILED after retries for posId=${positionId} @${entryPrice}:`, (lastErr as Error)?.message);
+}
+
+/**
+ * All open MT5 legs for this zone (DB OPEN rows ∪ comment/magic-tagged positions).
+ * Anchor is often missing from OPEN rows while limits are tracked — union prevents
+ * close-zone from closing only the ladder and leaving the market entry running.
+ */
+async function resolveLivePositionsForZoneAction(
+  token: string,
+  region: string,
+  accountId: string,
+  zoneId: string,
+  st: ZoneState,
+): Promise<LivePosition[]> {
+  const allLive = await fetchOpenPositions(token, region, accountId);
+  const openRows = await db.select().from(zonePositionsTable)
+    .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
+  const trackedIds = new Set(openRows.map((z) => z.positionId));
+  const fromDb = allLive.filter((p) => trackedIds.has(p.id));
+  const tagged = allLive.filter((p) => positionBelongsToZone(p, zoneId));
+  const byId = new Map<string, LivePosition>();
+  for (const p of fromDb) byId.set(p.id, p);
+  for (const p of tagged) byId.set(p.id, p);
+  const live = [...byId.values()];
+  if (live.length === 0) return [];
+
+  let relinked = 0;
+  for (const p of live) {
+    const [row] = await db.select({ status: zonePositionsTable.status })
+      .from(zonePositionsTable)
+      .where(and(
+        eq(zonePositionsTable.zoneId, zoneId),
+        eq(zonePositionsTable.positionId, p.id),
+      ))
+      .limit(1);
+    if (row?.status === "CLOSED") {
+      await db.update(zonePositionsTable)
+        .set({ status: "OPEN" })
+        .where(and(
+          eq(zonePositionsTable.zoneId, zoneId),
+          eq(zonePositionsTable.positionId, p.id),
+        ));
+      relinked++;
+    } else if (!row) {
+      await recordZonePositionFill(zoneId, p.id, p.openPrice, p.volume);
+      relinked++;
+    }
+    const cached = st.trackedPositions.get(p.id);
+    st.trackedPositions.set(p.id, {
+      volume: p.volume,
+      entryPrice: p.openPrice,
+      tp1Hit: cached?.tp1Hit ?? false,
+      tp2Hit: cached?.tp2Hit ?? false,
+      tp3Hit: cached?.tp3Hit ?? false,
+      tp4Hit: cached?.tp4Hit ?? false,
+    });
+  }
+  if (relinked > 0 || tagged.length > fromDb.length) {
+    console.log(
+      `[zone ${zoneId}] resolved ${live.length} leg(s) for zone action (dbOpen=${fromDb.length} tagged=${tagged.length} relinked=${relinked})`,
+    );
+  }
+  return live;
+}
+
+async function markZonePositionsClosedInDb(zoneId: string, positionIds: string[]): Promise<void> {
+  if (positionIds.length === 0) return;
+  await db.update(zonePositionsTable)
+    .set({ status: "CLOSED" })
+    .where(and(
+      eq(zonePositionsTable.zoneId, zoneId),
+      inArray(zonePositionsTable.positionId, positionIds),
+    ));
+}
+
+async function closeLiveZoneLegs(
+  token: string,
+  region: string,
+  accountId: string,
+  zoneId: string,
+  live: LivePosition[],
+): Promise<{ failed: string[] }> {
+  const closeResults = await Promise.all(
+    live.map(async (p) => {
+      try {
+        return { id: p.id, ok: await closeZonePosition(token, region, accountId, p.id) };
+      } catch (e) {
+        console.warn(`[zone ${zoneId}] close threw for posId=${p.id}:`, (e as Error).message);
+        return { id: p.id, ok: false };
+      }
+    }),
+  );
+  const failed = closeResults.filter((r) => !r.ok).map((r) => r.id);
+  const closedIds = closeResults.filter((r) => r.ok).map((r) => r.id);
+  await markZonePositionsClosedInDb(zoneId, closedIds);
+  return { failed };
 }
 
 // Called on every DEAL_ENTRY_OUT. A partial close ALSO fires this event with
@@ -2382,8 +2858,13 @@ async function markZonePositionClosed(
         .where(eq(cascadeZonesTable.zoneId, zoneId))
       );
       if (st) st.status = "CLOSED";
+      const exitPx = exitPriceFromDeal(exitDeal);
+      const dir = (st?.direction ?? "buy") as "buy" | "sell";
       await finalizeZoneClose(accountId, zoneId, {
         stopLossExit: dealIndicatesStopLoss(exitDeal),
+        wasRiskFree: zoneStatus === "RISK_FREE",
+        exitPrice: exitPx ?? exitPriceForZoneClose(accountId, dir),
+        exitPriceFromDeal: exitPx != null && exitPx > 0,
       });
       void settleZoneClosedPnl(accountId, zoneId);
       logEvent("zone.close", { accountId, zoneId, trigger: "position.closed" });
@@ -2623,6 +3104,7 @@ async function zoneHasLiveTrackedPositionsOnBroker(
 // if the REST call fails, then null if neither has data.
 async function fetchSymbolPrice(
   token: string, region: string, accountId: string, symbol: string,
+  opts?: { useTickFallback?: boolean },
 ): Promise<{ bid: number; ask: number } | null> {
   recordApiCall(accountId);
   try {
@@ -2637,6 +3119,7 @@ async function fetchSymbolPrice(
   } catch {
     /* fall through to tick cache */
   }
+  if (opts?.useTickFallback === false) return null;
   const ticks = tickStore.get(accountId);
   if (ticks && ticks.length > 0) {
     const t = ticks[ticks.length - 1]!;
@@ -2670,8 +3153,10 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
   }
   // Evaluate OPEN and RISK_FREE zones — Risk Free closes the losing entries
   // and arms a protective SL, but the TP ladder must keep running on the
-  // surviving best entry. Only CLOSED zones are skipped.
+  // surviving best entry. ARMED = pending limits only (no TP engine yet).
+  // Only CLOSED zones are skipped.
   if (!st || st.status === "CLOSED") return;
+  if (st.status === "ARMED") return;
   if (st.busy) return;
   st.busy = true;
   try {
@@ -2733,8 +3218,12 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
             .set({ status: "CLOSED", closedAt })
             .where(eq(cascadeZonesTable.zoneId, zoneId)),
         ).catch(() => {/* logged inside withDbRetry */});
+        const wasRiskFree = st.status === "RISK_FREE";
         st.status = "CLOSED";
-        await finalizeZoneClose(st.accountId, zoneId, {});
+        await finalizeZoneClose(st.accountId, zoneId, {
+          wasRiskFree,
+          exitPrice: exitPriceForZoneClose(st.accountId, st.direction),
+        });
         void settleZoneClosedPnl(st.accountId, zoneId);
         logEvent("zone.close", { accountId: st.accountId, zoneId, trigger: "empty_reconcile" });
         try {
@@ -2800,8 +3289,12 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
             .set({ status: "CLOSED", closedAt })
             .where(eq(cascadeZonesTable.zoneId, zoneId))
         ).catch(() => {/* logged inside withDbRetry */});
+        const wasRiskFree = st.status === "RISK_FREE";
         st.status = "CLOSED";
-        await finalizeZoneClose(st.accountId, zoneId, {});
+        await finalizeZoneClose(st.accountId, zoneId, {
+          wasRiskFree,
+          exitPrice: exitPriceForZoneClose(st.accountId, st.direction),
+        });
         void settleZoneClosedPnl(st.accountId, zoneId);
         logEvent("zone.close", { accountId: st.accountId, zoneId, trigger: "reconciliation" });
         // Cancel any outstanding cascade limit orders so they don't orphan on
@@ -3154,7 +3647,7 @@ export function startZoneTpMonitor(): void {
         try {
           const rows = await db.select({ zoneId: cascadeZonesTable.zoneId })
             .from(cascadeZonesTable)
-            .where(inArray(cascadeZonesTable.status, ["OPEN", "RISK_FREE"]));
+            .where(inArray(cascadeZonesTable.status, ["OPEN", "RISK_FREE", "ARMED"]));
           for (const row of rows) {
             if (!zoneStates.has(row.zoneId)) await loadZone(row.zoneId);
           }
@@ -3164,7 +3657,7 @@ export function startZoneTpMonitor(): void {
       })();
     }
     for (const [zoneId, st] of zoneStates.entries()) {
-      if (st.status !== "CLOSED") void evaluateZone(zoneId, token);
+      if (st.status !== "CLOSED" && st.status !== "ARMED") void evaluateZone(zoneId, token);
     }
   }, 3_000);
   console.log("[zone-monitor] started (3 s interval)");
@@ -3204,7 +3697,10 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
     tp2SlMoved: false, tp2BeAttempts: 0,
     tp2SlIsBestEffort: (z as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
     autoBeAtTp: sanitizeAutoBeAtTp((z as { autoBeAtTp?: number }).autoBeAtTp),
-    status: z.status === "CLOSED" ? "CLOSED" : z.status === "RISK_FREE" ? "RISK_FREE" : "OPEN",
+    status: z.status === "CLOSED" ? "CLOSED"
+      : z.status === "RISK_FREE" ? "RISK_FREE"
+        : z.status === "ARMED" ? "ARMED"
+          : "OPEN",
     busy: false,
     trackedPositions: new Map(),
   };
@@ -3218,6 +3714,7 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
 export async function loadZone(zoneId: string): Promise<ZoneState | null> {
   const cached = zoneStates.get(zoneId);
   if (cached) return cached;
+  await ensureCascadeZoneRfColumns();
   // Intentionally no try/catch — DB errors bubble up to the route handler
   // which wraps everything in try/catch and returns 500.
   const [z] = await db.select().from(cascadeZonesTable)
@@ -3240,9 +3737,9 @@ export async function loadZone(zoneId: string): Promise<ZoneState | null> {
         st.trackedPositions.set(zp.positionId, {
           volume: Number(zp.volume), entryPrice: Number(zp.entryPrice),
           tp1Hit: Boolean(zp.tp1Hit) || st.tp1Hit,
-          tp2Hit: Boolean(zp.tp2Hit) || st.tp2Hit,
-          tp3Hit: Boolean(zp.tp3Hit) || st.tp3Hit,
-          tp4Hit: Boolean(zp.tp4Hit) || (st.tp4Hit ?? false),
+          tp2Hit: Boolean(zp.tp2Hit),
+          tp3Hit: Boolean(zp.tp3Hit),
+          tp4Hit: Boolean(zp.tp4Hit),
         });
       }
     } catch { /* non-fatal — evaluateZone will re-read from DB */ }
@@ -3258,10 +3755,11 @@ export const _zoneStatesForTest = zoneStates;
 // watching zones placed in previous server sessions.
 export async function loadZoneState(): Promise<void> {
   try {
+    await ensureCascadeZoneRfColumns();
     // Load both OPEN and RISK_FREE zones — the monitor evaluates both
     // (RISK_FREE zones still need TP progression on the surviving entry).
     const zones = await db.select().from(cascadeZonesTable)
-      .where(inArray(cascadeZonesTable.status, ["OPEN", "RISK_FREE"]));
+      .where(inArray(cascadeZonesTable.status, ["OPEN", "RISK_FREE", "ARMED"]));
     for (const z of zones) {
       zoneStates.set(z.zoneId, rowToZoneState(z));
       if (z.userId) zoneIdToUserId.set(z.zoneId, z.userId);
@@ -3281,11 +3779,10 @@ export async function loadZoneState(): Promise<void> {
         const st = zoneStates.get(zp.zoneId);
         if (st) st.trackedPositions.set(zp.positionId, {
           volume: Number(zp.volume), entryPrice: Number(zp.entryPrice),
-          // Migration safety: same zone-level floor logic as loadZone.
           tp1Hit: Boolean(zp.tp1Hit) || st.tp1Hit,
-          tp2Hit: Boolean(zp.tp2Hit) || st.tp2Hit,
-          tp3Hit: Boolean(zp.tp3Hit) || st.tp3Hit,
-          tp4Hit: Boolean(zp.tp4Hit) || (st.tp4Hit ?? false),
+          tp2Hit: Boolean(zp.tp2Hit),
+          tp3Hit: Boolean(zp.tp3Hit),
+          tp4Hit: Boolean(zp.tp4Hit),
         });
       }
     } catch (e) {
@@ -3559,6 +4056,7 @@ router.get("/mt5/account/:accountId/stream", checkOwner, (req: Request, res: Res
 // GET /api/mt5/account/:accountId/zones — list active + risk-free zones with live position count.
 router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res: Response) => {
   try {
+    await ensureCascadeZoneRfColumns();
     const { accountId } = req.params as { accountId: string };
     const includeClosed = qstr(req.query.includeClosed) === "true";
     const zones = await db.select().from(cascadeZonesTable)
@@ -3585,25 +4083,14 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
       } else if (z.status === "CLOSED" && z.closedPnl == null) {
         void settleZoneClosedPnl(accountId, z.zoneId);
       }
-      const openPositions = await db.select().from(zonePositionsTable)
-        .where(and(eq(zonePositionsTable.zoneId, row.zoneId), eq(zonePositionsTable.status, "OPEN")));
-      const finalTpReached = computeFinalTpReached({
-        tp1Enabled: (row as { tp1Enabled?: boolean }).tp1Enabled ?? (Number(row.tp1Pct ?? 25) > 0),
-        tp2Enabled: (row as { tp2Enabled?: boolean }).tp2Enabled ?? (Number(row.tp2Pct ?? 25) > 0),
-        tp3Enabled: (row as { tp3Enabled?: boolean }).tp3Enabled ?? (Number(row.tp3Pct ?? 25) > 0),
-        tp4Enabled: (row as { tp4Enabled?: boolean }).tp4Enabled ?? (Number(row.tp4Pct ?? 25) > 0),
-        tp1Hit: row.tp1Hit, tp2Hit: row.tp2Hit, tp3Hit: row.tp3Hit, tp4Hit: row.tp4Hit ?? false,
-      });
       const tp1Enabled = (row as { tp1Enabled?: boolean }).tp1Enabled ?? (Number(row.tp1Pct ?? 25) > 0);
       const tp2Enabled = (row as { tp2Enabled?: boolean }).tp2Enabled ?? (Number(row.tp2Pct ?? 25) > 0);
       const tp3Enabled = (row as { tp3Enabled?: boolean }).tp3Enabled ?? (Number(row.tp3Pct ?? 25) > 0);
       const tp4Enabled = (row as { tp4Enabled?: boolean }).tp4Enabled ?? (Number(row.tp4Pct ?? 25) > 0);
-      const enabledTpCount = countEnabledTps({ tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled });
-      const hitEnabledTpCount = countHitEnabledTps({
-        tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+      let mergedHits = await mergeZoneHitsFromPositions(row.zoneId, {
         tp1Hit: row.tp1Hit, tp2Hit: row.tp2Hit, tp3Hit: row.tp3Hit, tp4Hit: row.tp4Hit ?? false,
+        tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
       });
-
       const dir = row.direction === "sell" ? "sell" : "buy";
       const anchor = Number(row.anchorPrice);
       // Resolve absolute TP prices, falling back to anchor + legacy pip distance.
@@ -3612,12 +4099,25 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
       const tp2Price = row.tp2Price != null ? Number(row.tp2Price) : (row.tp2Pips ? fromPips(Number(row.tp2Pips)) : null);
       const tp3Price = row.tp3Price != null ? Number(row.tp3Price) : (row.tp3Pips ? fromPips(Number(row.tp3Pips)) : null);
       const tp4Price = row.tp4Price != null ? Number(row.tp4Price) : null;
+      mergedHits = sanitizeZoneTpLadder({ ...mergedHits, tp4Price });
+      const positionCount = mergedHits.positionCount;
+      const finalTpReached = computeFinalTpReached({
+        tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+        tp1Hit: mergedHits.tp1Hit, tp2Hit: mergedHits.tp2Hit, tp3Hit: mergedHits.tp3Hit, tp4Hit: mergedHits.tp4Hit,
+        tp4Price,
+      });
+      const enabledTpCount = countEnabledTps({ tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled, tp4Price });
+      const hitEnabledTpCount = countHitEnabledTps({
+        tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+        tp1Hit: mergedHits.tp1Hit, tp2Hit: mergedHits.tp2Hit, tp3Hit: mergedHits.tp3Hit, tp4Hit: mergedHits.tp4Hit,
+        tp4Price,
+      });
 
       let nextTp: 0 | 1 | 2 | 3 | 4 = 0;
-      if (tp1Enabled && !row.tp1Hit) nextTp = 1;
-      else if (tp2Enabled && !row.tp2Hit) nextTp = 2;
-      else if (tp3Enabled && !row.tp3Hit) nextTp = 3;
-      else if (tp4Enabled && !row.tp4Hit && tp4Price != null) nextTp = 4;
+      if (tp1Enabled && !mergedHits.tp1Hit) nextTp = 1;
+      else if (tp2Enabled && !mergedHits.tp2Hit) nextTp = 2;
+      else if (tp3Enabled && !mergedHits.tp3Hit) nextTp = 3;
+      else if (tp4Enabled && !mergedHits.tp4Hit && tp4Price != null) nextTp = 4;
 
       let currentPrice: number | null = null;
       let nextTpPrice: number | null = null;
@@ -3648,7 +4148,7 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         direction: row.direction,
         anchorPrice: anchor,
         tp1Price, tp2Price, tp3Price, tp4Price,
-        tp1Hit: row.tp1Hit, tp2Hit: row.tp2Hit, tp3Hit: row.tp3Hit, tp4Hit: row.tp4Hit ?? false,
+        tp1Hit: mergedHits.tp1Hit, tp2Hit: mergedHits.tp2Hit, tp3Hit: mergedHits.tp3Hit, tp4Hit: mergedHits.tp4Hit,
         tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
         enabledTpCount, hitEnabledTpCount,
         tp2SlIsBestEffort: (row as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
@@ -3658,8 +4158,22 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         closedAt: row.closedAt != null ? Number(row.closedAt) : null,
         closedPnl: row.closedPnl != null ? Number(row.closedPnl) : null,
         finalTpReached,
-        ...resolveCloseOutcome(row),
-        positionCount: openPositions.length,
+        ...(() => {
+          const closeFlags = resolveCloseOutcome(row);
+          return {
+            ...closeFlags,
+            primaryOutcome: zonePrimaryOutcome({
+              status: row.status,
+              ...closeFlags,
+              manualClose: row.manualClose,
+              finalTpReached,
+              tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+              tp1Hit: mergedHits.tp1Hit, tp2Hit: mergedHits.tp2Hit, tp3Hit: mergedHits.tp3Hit, tp4Hit: mergedHits.tp4Hit,
+              tp4Price,
+            }),
+          };
+        })(),
+        positionCount,
         originalVolume: row.originalVolume != null ? Number(row.originalVolume) : 0,
         currentPrice,
         nextTp,
@@ -3682,16 +4196,18 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
 router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async (req: Request, res: Response) => {
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
+    await ensureCascadeZoneRfColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     // DB-first read: loadZone checks cache first, then hydrates from DB on miss.
     // DB errors propagate as 500; CLOSED zones and missing zones are 404.
     const st = await loadZone(zoneId);
     if (!st || st.accountId !== accountId || st.status === "CLOSED") { res.status(404).json({ error: "Zone not found" }); return; }
-    const zps = await db.select().from(zonePositionsTable)
-      .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
-    const trackedIds = new Set(zps.map(z => z.positionId));
-    const live = (await fetchOpenPositions(token, region, accountId)).filter(p => trackedIds.has(p.id));
+    if (st.status === "ARMED") {
+      res.status(409).json({ error: "Zone not active yet — wait for the first order to fill" });
+      return;
+    }
+    const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
     if (live.length === 0) {
       res.status(409).json({ error: "No open positions in this zone" }); return;
     }
@@ -3741,9 +4257,23 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       });
       return;
     }
-    await db.update(cascadeZonesTable).set({ status: "RISK_FREE" }).where(eq(cascadeZonesTable.zoneId, zoneId));
+    for (const r of closeResults) {
+      if (!r.ok) continue;
+      await db.update(zonePositionsTable)
+        .set({ status: "CLOSED" })
+        .where(and(
+          eq(zonePositionsTable.zoneId, zoneId),
+          eq(zonePositionsTable.positionId, r.id),
+        ))
+        .catch((e: Error) => console.warn(`[zone ${zoneId}] risk-free mark closed ${r.id}:`, e.message));
+      st.trackedPositions.delete(r.id);
+    }
+    await db.update(cascadeZonesTable)
+      .set({ status: "RISK_FREE", wentRiskFree: true })
+      .where(eq(cascadeZonesTable.zoneId, zoneId));
     st.status = "RISK_FREE";
     broadcastZoneUpdate(zoneId);
+    broadcastToAccount(accountId, "deal", { type: "position_changed" });
     console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl} (pips=${pips})`);
     res.json({ ok: true, bestPositionId: best.id, sl, pips, closedCount: others.length });
   } catch (err) {
@@ -3768,48 +4298,43 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
     // DB errors bubble up to the surrounding try/catch and return 500.
     const st = await loadZone(zoneId);
     if (!st || st.accountId !== accountId) { res.status(404).json({ error: "Zone not found" }); return; }
+
+    await cancelZoneLimits(token, region, accountId, zoneId);
+
+    const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+
+    // Zone already CLOSED in DB but anchor (or other leg) still open on MT5 — sweep.
     if (st.status === "CLOSED") {
-      // Zone already closed (reconciliation or a prior close beat us). Still
-      // attempt limit cancellation — if the monitor path ran first it may not
-      // have had the token or may have lost the race with limit fills. This is
-      // a cheap idempotent call that no-ops when nothing remains.
-      await cancelZoneLimits(token, region, accountId, zoneId).catch(() => {});
-      res.json({ ok: true, closedCount: 0, alreadyClosed: true });
+      if (live.length === 0) {
+        res.json({ ok: true, closedCount: 0, alreadyClosed: true });
+        return;
+      }
+      const { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, live);
+      for (const id of live.map((p) => p.id)) st.trackedPositions.delete(id);
+      if (failed.length > 0) {
+        res.status(207).json({
+          ok: false,
+          closedCount: live.length - failed.length,
+          failedPositionIds: failed,
+          message: "Some positions failed to close — retry Close Zone to clear the rest.",
+        });
+        return;
+      }
+      void settleZoneClosedPnl(accountId, zoneId);
+      broadcastZoneUpdate(zoneId);
+      broadcastToAccount(accountId, "deal", { type: "position_changed" });
+      logEvent("zone.close", { accountId, zoneId, closedCount: live.length, trigger: "user_cleanup" });
+      res.json({ ok: true, closedCount: live.length, cleanedUp: true });
       return;
     }
 
-    // Cancel pending cascade limits FIRST. If we closed positions first and
-    // then a cancel failed, the user would be left with un-anchored limits
-    // that could open new entries into a "closed" zone. Cancel-first ordering
-    // means the worst case is "limits gone, some positions still open" — much
-    // easier to retry from than the inverse.
-    await cancelZoneLimits(token, region, accountId, zoneId);
+    if (live.length === 0) {
+      res.status(409).json({ error: "No open positions in this zone" });
+      return;
+    }
 
-    // Collect tracked open positions from DB (source of truth for zone
-    // membership) and intersect with what the broker actually has open.
-    const zps = await db.select().from(zonePositionsTable)
-      .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
-    const trackedIds = new Set(zps.map(z => z.positionId));
-    const live = (await fetchOpenPositions(token, region, accountId)).filter(p => trackedIds.has(p.id));
-
-    // Close every tracked position in parallel — serial closes were a major
-    // source of "Close Zone takes seconds" lag. Each closeZonePosition is an
-    // independent POSITION_CLOSE_ID REST call and the broker handles them
-    // concurrently for distinct positionIds. Per-item try/catch keeps a
-    // single network throw from short-circuiting Promise.all and converting
-    // a partial-success into a generic 500 — callers depend on the 207
-    // `failedPositionIds` shape to know what to retry.
-    const closeResults = await Promise.all(
-      live.map(async (p) => {
-        try {
-          return { id: p.id, ok: await closeZonePosition(token, region, accountId, p.id) };
-        } catch (e) {
-          console.warn(`[zone ${zoneId}] close threw for posId=${p.id}:`, (e as Error).message);
-          return { id: p.id, ok: false };
-        }
-      }),
-    );
-    const failed: string[] = closeResults.filter((r) => !r.ok).map((r) => r.id);
+    const { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, live);
+    for (const id of live.map((p) => p.id)) st.trackedPositions.delete(id);
 
     if (failed.length > 0) {
       console.warn(`[zone ${zoneId}] close: failedCloses=${failed.length}/${live.length}`);
@@ -3822,17 +4347,107 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
       return;
     }
 
-    // All closes succeeded → flip the zone to CLOSED and clear in-memory state.
     const closedAt = Date.now();
     await db.update(cascadeZonesTable)
       .set({ status: "CLOSED", closedAt })
       .where(eq(cascadeZonesTable.zoneId, zoneId));
-    if (st) st.status = "CLOSED";
-    await finalizeZoneClose(accountId, zoneId, { userInitiated: true });
+    const wasRiskFree = st.status === "RISK_FREE";
+    st.status = "CLOSED";
+    await finalizeZoneClose(accountId, zoneId, {
+      wasRiskFree,
+      exitPrice: exitPriceForZoneClose(accountId, st.direction),
+      userInitiated: true,
+    });
     void settleZoneClosedPnl(accountId, zoneId);
     broadcastZoneUpdate(zoneId);
+    broadcastToAccount(accountId, "deal", { type: "position_changed" });
     logEvent("zone.close", { accountId, zoneId, closedCount: live.length, trigger: "user" });
     res.json({ ok: true, closedCount: live.length });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// POST /api/mt5/account/:accountId/zones/arm
+// Prepare an @-price cascade zone (status ARMED) before the client places
+// pending limits at the ladder prices. First fill promotes ARMED → OPEN.
+router.post("/mt5/account/:accountId/zones/arm", checkOwner, async (req: Request, res: Response) => {
+  const { accountId } = req.params as { accountId: string };
+  const trading = getTradingStatus();
+  if (!trading.trading_enabled) {
+    res.status(503).json({ error: trading.message });
+    return;
+  }
+  try {
+    const raw = req.body as Record<string, unknown>;
+    const direction: "buy" | "sell" | null =
+      raw.direction === "sell" ? "sell" : raw.direction === "buy" ? "buy" : null;
+    if (!direction) {
+      res.status(400).json({ error: "direction must be buy or sell" });
+      return;
+    }
+    const anchorPrice = Number(raw.anchorPrice);
+    if (!(anchorPrice > 0)) {
+      res.status(400).json({ error: "anchorPrice must be a positive number" });
+      return;
+    }
+    const volume = Number(raw.volume ?? 0);
+    if (volume < ZONE_MIN_LOT_PER_ENTRY) {
+      res.status(400).json({
+        error: `volume must be at least ${ZONE_MIN_LOT_PER_ENTRY}`,
+      });
+      return;
+    }
+    const pickPrice = (v: unknown): number | null =>
+      typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+    const tp1Price = pickPrice(raw.tp1Price);
+    const tp2Price = pickPrice(raw.tp2Price);
+    const tp3Price = pickPrice(raw.tp3Price);
+    const tp4Price = pickPrice(raw.tp4Price);
+    const cmp = direction === "buy"
+      ? (a: number, b: number) => a > b
+      : (a: number, b: number) => a < b;
+    const tpsValid =
+      tp1Price != null && tp2Price != null && tp3Price != null &&
+      cmp(tp1Price, anchorPrice) && cmp(tp2Price, tp1Price) && cmp(tp3Price, tp2Price) &&
+      (tp4Price == null || cmp(tp4Price, tp3Price));
+    if (!tpsValid) {
+      res.status(400).json({
+        error: `TP1–TP3 must be in strictly ${direction === "buy" ? "ascending" : "descending"} order on the profitable side of anchorPrice`,
+      });
+      return;
+    }
+    const pickPct = (v: unknown, def: number): number => {
+      const n = typeof v === "number" && Number.isFinite(v) ? v : def;
+      return Math.min(100, Math.max(0, n));
+    };
+    const tp1Pct = pickPct(raw.tp1Pct, 25);
+    const tp2Pct = pickPct(raw.tp2Pct, 25);
+    const tp3Pct = pickPct(raw.tp3Pct, 25);
+    const tp4Pct = pickPct(raw.tp4Pct, 25);
+    const clientZoneId = typeof raw.zoneId === "string" ? raw.zoneId.trim() : "";
+    const uId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
+    const zoneState = prepareZoneForCascade(
+      accountId, direction, uId,
+      {
+        tp1Price: tp1Price!, tp2Price: tp2Price!, tp3Price: tp3Price!, tp4Price,
+        tp1Pct, tp2Pct, tp3Pct, tp4Pct,
+        autoBeAtTp: raw.autoBeAtTp,
+      },
+      volume,
+      clientZoneId || undefined,
+      anchorPrice,
+    );
+    zoneState.status = "ARMED";
+    zoneState.anchorPrice = anchorPrice;
+    await persistArmedZone(zoneState, uId);
+    zoneStates.set(zoneState.zoneId, zoneState);
+    pendingZoneAssoc.set(accountId, { zoneId: zoneState.zoneId, direction, expiresAt: Date.now() + ZONE_ASSOC_WINDOW_MS });
+    const accountPending = pendingZoneByZone.get(accountId) ?? new Map();
+    accountPending.set(zoneState.zoneId, { zoneId: zoneState.zoneId, direction, expiresAt: Date.now() + ZONE_ASSOC_WINDOW_MS });
+    pendingZoneByZone.set(accountId, accountPending);
+    broadcastZoneUpdate(zoneState.zoneId);
+    res.json({ ok: true, zoneId: zoneState.zoneId });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }
@@ -3861,8 +4476,13 @@ router.post("/mt5/account/:accountId/zones/:zoneId/cancel-pending", checkOwner, 
       if (zid === zoneId) pendingAfter++;
     }
     const cancelledCount = Math.max(0, pendingBefore - pendingAfter);
+    await closeArmedZoneIfDisarmed(accountId, zoneId, token, region, { force: true });
+    broadcastToAccount(accountId, "pending_order", {});
+    broadcastZoneUpdate(zoneId);
+    const closed = (await db.select({ status: cascadeZonesTable.status }).from(cascadeZonesTable)
+      .where(eq(cascadeZonesTable.zoneId, zoneId)).limit(1))[0];
     console.log(`[zone ${zoneId}] cancel-pending: user-initiated, cancelled=${cancelledCount}/${pendingBefore}`);
-    res.json({ ok: true, cancelledCount });
+    res.json({ ok: true, cancelledCount, zoneClosed: closed?.status === "CLOSED" });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }
@@ -4536,7 +5156,7 @@ router.get("/mt5/account/:accountId/display-fx", checkOwner, async (req: Request
     const to = qstr(req.query.to) || "USD";
     const { rate, currency } = await usdToTargetRate(
       token, region, accountId, to,
-      (t, r, a, s) => fetchSymbolPrice(t, r, a, s),
+      (t, r, a, s) => fetchSymbolPrice(t, r, a, s, { useTickFallback: false }),
     );
     return res.json({ from: "USD", to: currency, rate });
   } catch (err) {

@@ -15,8 +15,10 @@ import { useFocusEffect } from "expo-router";
 import PeriodToggle from "@/components/PeriodToggle";
 import Colors from "@/constants/colors";
 import { useTrading } from "@/context/TradingContext";
+import { useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useRealizedPnl } from "@/hooks/useRealizedPnl";
 import { useZones } from "@/hooks/useZones";
+import { buildDisplayActiveZones } from "@/lib/zoneDisplay";
 import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
 import { normalizeDisplayCurrency } from "@/lib/displayCurrency";
 import { formatMoney as formatMoneyRaw, formatPrice } from "@/lib/formatters";
@@ -68,12 +70,16 @@ export default function DashboardScreen() {
     accountId,
     region,
     credentials,
+    positions,
+    pendingOrders,
     refreshPositions,
+    refreshPendingOrders,
     refreshAccountInfo,
     refreshPrice,
     sseConnected,
     syncSession,
   } = useTrading();
+  const { settings: cascadeSettings } = useCascadeSettings();
   const { zones, refresh, loading } = useZones(accountId, {
     includeClosed: true,
     pollIntervalMs: 10_000,
@@ -86,13 +92,23 @@ export default function DashboardScreen() {
   useFocusEffect(
     useCallback(() => {
       if (status !== "connected" || !accountId) return;
-      void syncSession();
-      const id = setInterval(() => void syncSession(), 10_000);
+      const sync = () => void Promise.all([
+        syncSession(),
+        refresh(),
+        refreshPositions(),
+        refreshPendingOrders(),
+      ]);
+      sync();
+      const id = setInterval(sync, 10_000);
       return () => clearInterval(id);
-    }, [status, accountId, syncSession]),
+    }, [status, accountId, syncSession, refresh, refreshPositions, refreshPendingOrders]),
   );
 
-  const openZones = zones.filter((z) => z.status === "OPEN" || z.status === "RISK_FREE");
+  const displayActiveZones = useMemo(
+    () => buildDisplayActiveZones(zones, positions, cascadeSettings, price, pendingOrders),
+    [zones, positions, cascadeSettings, price, pendingOrders],
+  );
+  const openZones = displayActiveZones;
   const closedAll = zones.filter((z) => z.status === "CLOSED");
   const periodClosed = useMemo(
     () => filterClosedZonesByPeriod(zones, period),
@@ -118,7 +134,9 @@ export default function DashboardScreen() {
 
   const onRefresh = async () => {
     setRefreshing(true);
-    await Promise.all([refresh(), refreshPositions(), refreshAccountInfo(), refreshPrice()]);
+    await Promise.all([
+      refresh(), refreshPositions(), refreshPendingOrders(), refreshAccountInfo(), refreshPrice(),
+    ]);
     setRefreshKey((k) => k + 1);
     setRefreshing(false);
   };

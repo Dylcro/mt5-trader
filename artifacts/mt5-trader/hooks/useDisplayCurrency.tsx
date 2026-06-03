@@ -100,7 +100,13 @@ export function DisplayCurrencyProvider({ children }: { children: React.ReactNod
         if (!res.ok || cancelled) return;
         const data = (await res.json()) as { rate?: number };
         const rate = Number(data.rate);
-        if (!cancelled && Number.isFinite(rate) && rate > 0) setUsdToDisplayRate(rate);
+        const plausible =
+          currency === "JPY"
+            ? rate >= 50 && rate <= 300
+            : rate >= 0.25 && rate <= 2.5;
+        if (!cancelled && Number.isFinite(rate) && rate > 0 && plausible) {
+          setUsdToDisplayRate(rate);
+        }
       } catch {
         if (!cancelled) setUsdToDisplayRate(1);
       }

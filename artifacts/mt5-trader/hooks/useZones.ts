@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { subscribeAccountEvents } from "@/lib/accountEventBus";
+import { enrichZoneDisplayFields } from "@/lib/zoneDisplay";
 import { getAuthToken } from "@/lib/authToken";
 
 const API_BASE = process.env.EXPO_PUBLIC_API_URL ?? "";
@@ -30,16 +31,20 @@ export interface Zone {
   // every tick. Surfaced as a warning chip on the active-zone card.
   tp2SlIsBestEffort?: boolean;
   cashoutDone: boolean;
-  status: "OPEN" | "RISK_FREE" | "CLOSED";
+  status: "OPEN" | "RISK_FREE" | "CLOSED" | "ARMED";
   createdAt: number;
   closedAt?: number | null;
   /** Broker realized P&L for the zone (profit+commission+swap). Set when zone closes. */
   closedPnl?: number | null;
   finalTpReached?: 0 | 1 | 2 | 3 | 4;
+  /** Single exit bucket for history stats (RF | SL | MANUAL | TP1–TP4). */
+  primaryOutcome?: "RF" | "SL" | "MANUAL" | "TP4" | "TP3" | "TP2" | "TP1" | "NONE";
   /** Closed by user/app or MT5 without TP4 automation. */
   manualClose?: boolean;
-  /** Closed because broker stop loss was hit. */
+  /** Closed because broker stop loss was hit (not risk-free SL). */
   slHit?: boolean;
+  /** SL on survivor after Risk free — History RF, not SL. */
+  riskFreeSlExit?: boolean;
   positionCount: number;
   originalVolume?: number;
   currentPrice?: number | null;
@@ -59,13 +64,20 @@ async function authFetch(url: string, options: RequestInit = {}): Promise<Respon
 interface UseZonesOptions {
   includeClosed?: boolean;
   pollIntervalMs?: number;
+  /** MetaAPI region for zone trade routes (must match connected account). */
+  region?: string;
   /** When true, SSE is live and zone_update events patch state directly.
    *  The poll interval is stretched to 60 s (safety net only). */
   sseConnected?: boolean;
 }
 
+function zoneTradeQuery(region?: string): string {
+  const r = (region?.trim() || "london");
+  return `?region=${encodeURIComponent(r)}`;
+}
+
 export function useZones(accountId: string, options: UseZonesOptions = {}) {
-  const { includeClosed = false, pollIntervalMs = 5_000, sseConnected = false } = options;
+  const { includeClosed = false, pollIntervalMs = 5_000, sseConnected = false, region } = options;
   // SSE zone_update events are the primary source of zone changes.
   // When connected: 60 s safety net (SSE handles all real-time updates).
   // When disconnected: 15 s fallback cadence (aligned with SSE fallback contract).
@@ -86,7 +98,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
         return;
       }
       const data = (await res.json()) as Zone[];
-      setZones(Array.isArray(data) ? data : []);
+      setZones(Array.isArray(data) ? data.map(enrichZoneDisplayFields) : []);
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -115,19 +127,26 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
       if (type === "zone_update") {
         const update = data as Partial<Zone> & { zoneId?: string };
         if (!update.zoneId) return;
-        setZones(prev =>
+        if (update.status === "CLOSED") {
+          setZones((prev) => {
+            const closedAt = update.closedAt ?? Date.now();
+            const has = prev.some((z) => z.zoneId === update.zoneId);
+            if (!has) return prev;
+            return prev.map((z) =>
+              z.zoneId === update.zoneId
+                ? enrichZoneDisplayFields({ ...z, ...update, status: "CLOSED", closedAt })
+                : z,
+            );
+          });
+          return;
+        }
+        setZones((prev) =>
           prev.map((z) => {
             if (z.zoneId !== update.zoneId) return z;
-            const next: Zone = { ...z, ...update };
-            if (update.status === "CLOSED") {
-              if (next.closedAt == null || next.closedAt <= 0) {
-                next.closedAt = Date.now();
-              }
-            }
-            return next;
+            return enrichZoneDisplayFields({ ...z, ...update });
           }),
         );
-      } else if (type === "deal") {
+      } else if (type === "deal" || type === "pending_order") {
         void refresh();
       }
     });
@@ -142,7 +161,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
       const body: Record<string, unknown> = {};
       if (opts.riskFreePips !== undefined) body.riskFreePips = opts.riskFreePips;
       const res = await authFetch(
-        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/risk-free`,
+        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/risk-free${zoneTradeQuery(region)}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -156,7 +175,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     } catch (e) {
       return { ok: false, message: (e as Error).message };
     }
-  }, [accountId, refresh]);
+  }, [accountId, region, refresh]);
 
   const closeZone = useCallback(async (
     zoneId: string,
@@ -164,7 +183,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     if (!API_BASE || !accountId) return { ok: false, message: "No account" };
     try {
       const res = await authFetch(
-        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/close`,
+        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/close${zoneTradeQuery(region)}`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
       );
       const data = await res.json().catch(() => ({})) as {
@@ -176,7 +195,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     } catch (e) {
       return { ok: false, message: (e as Error).message };
     }
-  }, [accountId, refresh]);
+  }, [accountId, region, refresh]);
 
   // Cancel pending cascade limit orders for the zone without touching open
   // positions. Powers the "Delete Orders" button on each zone card.
@@ -186,19 +205,30 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     if (!API_BASE || !accountId) return { ok: false, message: "No account" };
     try {
       const res = await authFetch(
-        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/cancel-pending`,
+        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/cancel-pending${zoneTradeQuery(region)}`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
       );
       const data = await res.json().catch(() => ({})) as {
-        ok?: boolean; message?: string; error?: string; cancelledCount?: number;
+        ok?: boolean; message?: string; error?: string; cancelledCount?: number; zoneClosed?: boolean;
       };
-      void refresh();
-      if (res.ok && data.ok) return { ok: true, cancelledCount: data.cancelledCount };
+      await refresh();
+      if (res.ok && data.ok) {
+        if (data.zoneClosed) {
+          setZones((prev) =>
+            prev.map((z) =>
+              z.zoneId === zoneId
+                ? { ...z, status: "CLOSED" as const, closedAt: z.closedAt ?? Date.now() }
+                : z,
+            ),
+          );
+        }
+        return { ok: true, cancelledCount: data.cancelledCount };
+      }
       return { ok: false, message: data.message ?? data.error ?? `HTTP ${res.status}` };
     } catch (e) {
       return { ok: false, message: (e as Error).message };
     }
-  }, [accountId, refresh]);
+  }, [accountId, region, refresh]);
 
   return { zones, loading, error, refresh, riskFree, closeZone, cancelZoneOrders };
 }
