@@ -1,20 +1,23 @@
-# Cursor brief — Feature: "Close All Worst" button
+# Cursor brief — Feature: "Secure Profits" button (API: close-worst)
 
 Add a new action to the zone card that, when a zone has **2 or more open positions**, keeps
-the single **best** position running and **closes all the others**.
+the **best** position and **closes one other leg per tap** — the rung nearest best on the
+entry ladder (repeatable as price moves).
 
 This is a deliberate **execution** feature (it closes live MT5 positions) — but keep it
 surgical: it closes only the non-best positions, and does **nothing else**.
 
 ## Behaviour
-- Trigger: user taps **Close All Worst** on an active zone.
+- Trigger: user taps **Secure Profits** on an active zone (one leg per tap).
 - Find that zone's **open** positions (match by the zone's magic number — see the multi-zone
   fix; do not rely on a global position list).
 - If **< 2** open positions: button disabled / no-op.
 - Determine the **best** position = the one with the highest current floating P&L.
   (BUY zone → lowest entry price; SELL zone → highest entry price. Same result in a same-lot
   cascade. Use floating P&L as the canonical measure so it's robust to unequal lots.)
-- **Keep the best position open. Close every other open position** in the zone via MetaAPI.
+- **Keep the best position open. Close one leg per tap** — BUY: lowest entry above best;
+  SELL: highest entry below best — via MetaAPI. The leg closed each tap may be **in profit
+  or loss**; only its place on the ladder vs best matters.
 - **Cancel unfilled cascade limit orders** when the zone has already hit **TP2** (same rule as the
   automatic TP engine — never on TP1 only; pre-TP2 trims leave pending limits so the ladder can
   still fill).

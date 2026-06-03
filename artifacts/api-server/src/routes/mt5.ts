@@ -3267,7 +3267,7 @@ export function pickBestZonePositionByFloatingPnl(positions: LivePosition[]): Li
   })[0]!;
 }
 
-/** Close All Worst: best by floating P&L when available, else entry ladder. */
+/** Secure Profits: best by floating P&L when available, else entry ladder. */
 export function pickBestZonePositionForCloseWorst(
   positions: LivePosition[],
   direction: "buy" | "sell",
@@ -3277,6 +3277,28 @@ export function pickBestZonePositionForCloseWorst(
   }
   const sorted = sortZonePositions(positions, direction);
   return sorted[sorted.length - 1]!;
+}
+
+/**
+ * One leg per tap: the open position on the next rung away from best on the entry ladder.
+ * BUY → close the lowest entry above best; SELL → close the highest entry below best.
+ * The closed leg may be in profit or loss — only entry distance from best matters.
+ */
+export function pickNextLegToTrimForSecureProfits(
+  positions: LivePosition[],
+  best: LivePosition,
+  direction: "buy" | "sell",
+): LivePosition | null {
+  const others = positions.filter((p) => p.id !== best.id);
+  if (others.length === 0) return null;
+  if (direction === "buy") {
+    const aboveBest = others.filter((p) => p.openPrice > best.openPrice);
+    const pool = aboveBest.length > 0 ? aboveBest : others;
+    return pool.slice().sort((a, b) => a.openPrice - b.openPrice)[0]!;
+  }
+  const belowBest = others.filter((p) => p.openPrice < best.openPrice);
+  const pool = belowBest.length > 0 ? belowBest : others;
+  return pool.slice().sort((a, b) => b.openPrice - a.openPrice)[0]!;
 }
 
 async function evaluateZone(zoneId: string, token: string): Promise<void> {
@@ -4469,8 +4491,8 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
 });
 
 // POST /api/mt5/account/:accountId/zones/:zoneId/close-worst
-// Close every open leg except the best (highest floating P&L). Does not move SL/TP
-// or change zone status — partial mid-zone trim only.
+// Secure Profits: each tap closes one leg — the rung nearest best on the entry ladder.
+// Best stays open; does not move SL/TP or close the whole zone.
 router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, async (req: Request, res: Response) => {
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
@@ -4491,22 +4513,26 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
       return;
     }
     const best = pickBestZonePositionForCloseWorst(live, st.direction);
-    const others = live.filter((p) => p.id !== best.id);
-    const { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, others);
-    for (const p of others) {
-      if (!failed.includes(p.id)) st.trackedPositions.delete(p.id);
+    const toClose = pickNextLegToTrimForSecureProfits(live, best, st.direction);
+    if (!toClose) {
+      res.json({ ok: true, closedCount: 0, skipped: true, positionCount: live.length });
+      return;
     }
+    const { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, [toClose]);
+    if (!failed.includes(toClose.id)) st.trackedPositions.delete(toClose.id);
     if (failed.length > 0) {
-      console.warn(`[zone ${zoneId}] close-worst partial: failedCloses=${failed.length}`);
+      console.warn(`[zone ${zoneId}] secure-profits close failed posId=${toClose.id}`);
       res.status(207).json({
         ok: false,
         bestPositionId: best.id,
-        closedCount: others.length - failed.length,
+        closedPositionId: toClose.id,
+        closedCount: 0,
         failedPositionIds: failed,
-        message: "Some positions failed to close — tap Keep Best again to clear the rest.",
+        message: "Could not close that leg — tap Secure Profits to try again.",
       });
       return;
     }
+    const remaining = live.length - 1;
     // Same as a normal TP2 hit: wipe unfilled cascade limits once the zone has reached TP2.
     // Pre-TP2, pending limits stay so the ladder can still fill.
     let limitsCancelled = false;
@@ -4517,14 +4543,15 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
     broadcastZoneUpdate(zoneId);
     broadcastToAccount(accountId, "deal", { type: "position_changed" });
     console.log(
-      `[zone ${zoneId}] close-worst: kept posId=${best.id} @${best.openPrice} profit=${best.profit ?? "n/a"} `
-      + `closed=${others.length} limitsCancelled=${limitsCancelled}`,
+      `[zone ${zoneId}] secure-profits: kept posId=${best.id} @${best.openPrice} `
+      + `closed posId=${toClose.id} @${toClose.openPrice} remaining=${remaining} limitsCancelled=${limitsCancelled}`,
     );
     res.json({
       ok: true,
       bestPositionId: best.id,
-      closedCount: others.length,
-      positionCount: 1,
+      closedPositionId: toClose.id,
+      closedCount: 1,
+      positionCount: remaining,
       limitsCancelled,
     });
   } catch (err) {
