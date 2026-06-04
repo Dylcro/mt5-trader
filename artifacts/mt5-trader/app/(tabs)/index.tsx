@@ -432,8 +432,6 @@ export default function TradeScreen() {
     useCallback(() => {
       if (status !== "connected") return;
       void syncSession(true);
-      const id = setInterval(() => void syncSession(true), 10_000);
-      return () => clearInterval(id);
     }, [status, syncSession]),
   );
 

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { subscribeAccountEvents } from "@/lib/accountEventBus";
+import { authFetch, authFetchWithTimeout } from "@/lib/authFetch";
 import { enrichZoneDisplayFields } from "@/lib/zoneDisplay";
 import { getAuthToken } from "@/lib/authToken";
 
@@ -52,13 +53,6 @@ export interface Zone {
   nextTpPrice?: number | null;
   pipsToNextTp?: number | null;
   progressPct?: number | null;
-}
-
-async function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
-  const token = await getAuthToken();
-  const headers: Record<string, string> = { ...(options.headers as Record<string, string> ?? {}) };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  return fetch(url, { ...options, headers });
 }
 
 interface UseZonesOptions {
@@ -160,7 +154,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     try {
       const body: Record<string, unknown> = {};
       if (opts.riskFreePips !== undefined) body.riskFreePips = opts.riskFreePips;
-      const res = await authFetch(
+      const res = await authFetchWithTimeout(
         `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/risk-free${zoneTradeQuery(region)}`,
         {
           method: "POST",
@@ -182,7 +176,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
   ): Promise<{ ok: boolean; message?: string; closedCount?: number }> => {
     if (!API_BASE || !accountId) return { ok: false, message: "No account" };
     try {
-      const res = await authFetch(
+      const res = await authFetchWithTimeout(
         `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/close${zoneTradeQuery(region)}`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
       );
@@ -204,7 +198,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
   ): Promise<{ ok: boolean; message?: string; closedCount?: number }> => {
     if (!API_BASE || !accountId) return { ok: false, message: "No account" };
     try {
-      const res = await authFetch(
+      const res = await authFetchWithTimeout(
         `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/close-worst${zoneTradeQuery(region)}`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
       );
@@ -250,14 +244,14 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
   ): Promise<{ ok: boolean; message?: string; cancelledCount?: number }> => {
     if (!API_BASE || !accountId) return { ok: false, message: "No account" };
     try {
-      const res = await authFetch(
+      const res = await authFetchWithTimeout(
         `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/cancel-pending${zoneTradeQuery(region)}`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
       );
       const data = await res.json().catch(() => ({})) as {
         ok?: boolean; message?: string; error?: string; cancelledCount?: number; zoneClosed?: boolean;
       };
-      await refresh();
+      void refresh();
       if (res.ok && data.ok) {
         if (data.zoneClosed) {
           setZones((prev) =>

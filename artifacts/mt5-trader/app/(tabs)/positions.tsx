@@ -244,7 +244,7 @@ export default function PositionsScreen() {
   const {
     positions, pendingOrders, status, accountInfo,
     refreshPositions, refreshPendingOrders, refreshAccountInfo,
-    closePosition, cancelOrder, accountId, region, sseConnected, price, syncSession,
+    closePosition, cancelOrder, accountId, region, sseConnected, price, ensureSessionForTrade,
   } = useTrading();
   const { zones, refresh: refreshZones, riskFree, closeZone, closeAllWorst, cancelZoneOrders } = useZones(accountId, {
     includeClosed: true, pollIntervalMs: 10_000, sseConnected, region,
@@ -274,10 +274,25 @@ export default function PositionsScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
 
+  const withSessionReady = useCallback(
+    async <T extends { ok: boolean; message?: string }>(run: () => Promise<T>): Promise<T> => {
+      const gate = await ensureSessionForTrade();
+      if (!gate.ready) {
+        return { ok: false, message: gate.message ?? "Session not ready." } as T;
+      }
+      try {
+        return await run();
+      } catch (e) {
+        return { ok: false, message: (e as Error).message } as T;
+      }
+    },
+    [ensureSessionForTrade],
+  );
+
   const handleCancelZoneOrders = useCallback(
     async (zoneId: string) => {
       const result = await cancelZoneOrders(zoneId);
-      await refreshPendingOrders();
+      void refreshPendingOrders();
       return result;
     },
     [cancelZoneOrders, refreshPendingOrders],
@@ -286,7 +301,7 @@ export default function PositionsScreen() {
   const handleCloseZone = useCallback(
     async (zoneId: string) => {
       const result = await closeZone(zoneId);
-      await Promise.all([refreshPendingOrders(), refreshZones()]);
+      void Promise.all([refreshPendingOrders(), refreshZones()]);
       return result;
     },
     [closeZone, refreshPendingOrders, refreshZones],
@@ -304,26 +319,22 @@ export default function PositionsScreen() {
     if (!accountId) return;
     return subscribeAccountEvents(accountId, (type) => {
       if (type === "pending_order") void refreshPendingOrders();
-      if (type === "zone_update") void refreshZones();
     });
-  }, [accountId, refreshPendingOrders, refreshZones]);
+  }, [accountId, refreshPendingOrders]);
 
-  // Poll while focused so MT5-side closes/cancels appear without manual refresh.
+  // Light poll while focused — no syncSession (full wake) here; it blocked zone buttons.
   useFocusEffect(
     useCallback(() => {
       if (status !== "connected" || !accountId) return;
-      void syncSession();
-      const sync = () => void Promise.all([
-        syncSession(),
+      const syncLight = () => void Promise.all([
         refreshZones(),
         refreshPositions(),
         refreshPendingOrders(),
-        refreshAccountInfo(),
       ]);
-      sync();
-      const id = setInterval(sync, 4_000);
+      syncLight();
+      const id = setInterval(syncLight, 10_000);
       return () => clearInterval(id);
-    }, [status, accountId, syncSession, refreshZones, refreshPositions, refreshPendingOrders, refreshAccountInfo]),
+    }, [status, accountId, refreshZones, refreshPositions, refreshPendingOrders]),
   );
 
   const handleCancelOrder = useCallback(
@@ -444,10 +455,18 @@ export default function PositionsScreen() {
                     <ZoneCard
                       key={z.zoneId}
                       zone={z}
-                      onRiskFree={riskFree}
-                      onCloseAllWorst={closeAllWorst}
-                      onCloseZone={handleCloseZone}
-                      onCancelOrders={handleCancelZoneOrders}
+                      onRiskFree={(zoneId, opts) =>
+                        withSessionReady(() => riskFree(zoneId, opts))
+                      }
+                      onCloseAllWorst={(zoneId) =>
+                        withSessionReady(() => closeAllWorst(zoneId))
+                      }
+                      onCloseZone={(zoneId) =>
+                        withSessionReady(() => handleCloseZone(zoneId))
+                      }
+                      onCancelOrders={(zoneId) =>
+                        withSessionReady(() => handleCancelZoneOrders(zoneId))
+                      }
                       riskFreePips={cs.riskFreePips}
                     />
                   ))}
