@@ -166,7 +166,7 @@ function HistoryCard({ zone }: { zone: Zone }) {
         ))}
         <ExitChip label="MANUAL" hit={Boolean(zone.manualClose)} variant="manual" />
         <ExitChip label="RF" hit={Boolean(zone.riskFreeSlExit)} variant="rf" />
-        <ExitChip label="SL" hit={Boolean(zone.slHit) && !zone.riskFreeSlExit && !zoneReachedTpLevel(zone, 1)} variant="sl" />
+        <ExitChip label="SL" hit={Boolean(zone.slHit) && !zone.riskFreeSlExit} variant="sl" />
       </View>
     </View>
   );
