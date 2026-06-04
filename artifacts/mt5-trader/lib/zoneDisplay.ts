@@ -168,10 +168,20 @@ function syntheticZoneFromPositions(
   };
 }
 
-export function groupPositionsByZoneId(positions: Position[]): Map<string, Position[]> {
+export function zoneIdForPosition(
+  p: Position,
+  hints?: ReadonlyMap<string, string>,
+): string | null {
+  return parseZoneIdFromComment(p.comment) ?? hints?.get(p.id) ?? null;
+}
+
+export function groupPositionsByZoneId(
+  positions: Position[],
+  hints?: ReadonlyMap<string, string>,
+): Map<string, Position[]> {
   const map = new Map<string, Position[]>();
   for (const p of positions) {
-    const zid = parseZoneIdFromComment(p.comment);
+    const zid = zoneIdForPosition(p, hints);
     if (!zid) continue;
     const arr = map.get(zid) ?? [];
     arr.push(p);
@@ -200,13 +210,14 @@ export function buildDisplayActiveZones(
   price: Price | null,
   pendingOrders: PendingOrder[] = [],
   trustedZoneIds?: ReadonlySet<string>,
+  positionZoneHints?: ReadonlyMap<string, string>,
 ): Zone[] {
   const apiById = new Map(apiZones.map((z) => [z.zoneId, z]));
   const closedIds = new Set(
     apiZones.filter((z) => z.status === "CLOSED").map((z) => z.zoneId),
   );
   const active = apiZones.filter((z) => z.status === "OPEN" || z.status === "RISK_FREE" || z.status === "ARMED");
-  const byComment = groupPositionsByZoneId(positions);
+  const byComment = groupPositionsByZoneId(positions, positionZoneHints);
   const byPending = groupPendingByZoneId(pendingOrders);
   const seen = new Set<string>();
   const out: Zone[] = [];
@@ -266,9 +277,13 @@ export function buildDisplayActiveZones(
   return out;
 }
 
-export function positionsWithoutZone(positions: Position[], zoneIds: Set<string>): Position[] {
+export function positionsWithoutZone(
+  positions: Position[],
+  zoneIds: Set<string>,
+  positionZoneHints?: ReadonlyMap<string, string>,
+): Position[] {
   return positions.filter((p) => {
-    const zid = parseZoneIdFromComment(p.comment);
+    const zid = zoneIdForPosition(p, positionZoneHints);
     return !zid || !zoneIds.has(zid);
   });
 }

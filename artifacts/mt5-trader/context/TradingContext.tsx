@@ -16,6 +16,7 @@ import { emitAccountEvent, subscribeAccountEvents } from "@/lib/accountEventBus"
 import { fetchAccountZones } from "@/lib/accountZones";
 import { getAuthToken } from "@/lib/authToken";
 import { buildCascadeComment, newCascadeZoneId } from "@/lib/zoneComments";
+import { PositionMetaCache } from "@/lib/positionMetaCache";
 
 // Secure credential helpers — used to silently re-establish the MetaAPI account
 // when the server tells us the previous accountId is dead (HTTP 410). The
@@ -136,6 +137,8 @@ interface TradingContextValue {
   refreshApiZones: () => Promise<void>;
   /** Zone IDs from a successful cascade this session — buttons work before /zones round-trip. */
   placedZoneIds: ReadonlySet<string>;
+  /** Last-known zone per position id (survives missing MT5 comments after resume). */
+  positionZoneHints: ReadonlyMap<string, string>;
 }
 
 export interface PlaceTradeParams {
@@ -284,6 +287,20 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const [apiZones, setApiZones] = useState<Zone[]>([]);
   const apiZonesRef = useRef<Zone[]>([]);
   const [placedZoneIds, setPlacedZoneIds] = useState<Set<string>>(() => new Set());
+  const positionMetaCacheRef = useRef(new PositionMetaCache());
+  const [positionZoneHints, setPositionZoneHints] = useState<ReadonlyMap<string, string>>(
+    () => new Map(),
+  );
+
+  const applyPositions = useCallback((raw: Position[]) => {
+    const merged = positionMetaCacheRef.current.mergePositions(raw);
+    setPositions(merged);
+    setPositionZoneHints(new Map(positionMetaCacheRef.current.getPositionZoneIds()));
+  }, []);
+
+  const applyPendingOrders = useCallback((raw: PendingOrder[]) => {
+    setPendingOrders(positionMetaCacheRef.current.mergePendingOrders(raw));
+  }, []);
 
   const priceIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const positionsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -555,6 +572,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       setApiZones([]);
       apiZonesRef.current = [];
       setPlacedZoneIds(new Set());
+      positionMetaCacheRef.current.clear();
+      setPositionZoneHints(new Map());
       return;
     }
     void refreshApiZones();
@@ -620,8 +639,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       const a = accountId;
       emitAccountEvent(a, "deal", {});
       void Promise.all([
-        fetchPositionsData(a, r).then(setPositions).catch(() => {}),
-        fetchPendingOrdersData(a, r).then(setPendingOrders).catch(() => {}),
+        fetchPositionsData(a, r).then(applyPositions).catch(() => {}),
+        fetchPendingOrdersData(a, r).then(applyPendingOrders).catch(() => {}),
         fetchAccountInfoData(a, r).then(setAccountInfo).catch(() => {}),
         refreshApiZones(),
       ]);
@@ -630,7 +649,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       const r = regionRef.current;
       const a = accountId;
       emitAccountEvent(a, "pending_order", {});
-      void fetchPendingOrdersData(a, r).then(setPendingOrders).catch(() => {});
+      void fetchPendingOrdersData(a, r).then(applyPendingOrders).catch(() => {});
     },
     onZoneUpdate: (data: unknown) => {
       emitAccountEvent(accountId, "zone_update", data);
@@ -656,8 +675,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
       const pollPositions = () =>
         Promise.all([
-          fetchPositionsData(accId, accRegion).then(setPositions).catch(() => {}),
-          fetchPendingOrdersData(accId, accRegion).then(setPendingOrders).catch(() => {}),
+          fetchPositionsData(accId, accRegion).then(applyPositions).catch(() => {}),
+          fetchPendingOrdersData(accId, accRegion).then(applyPendingOrders).catch(() => {}),
         ]);
 
       const pollEvents = async () => {
@@ -688,7 +707,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       positionsIntervalRef.current = null;
       eventsIntervalRef.current = setInterval(pollEvents, 5000);
     },
-    [fetchPriceData, fetchPositionsData, fetchPendingOrdersData, fetchAccountInfoData, applyLivePrice]
+    [fetchPriceData, fetchPositionsData, fetchPendingOrdersData, fetchAccountInfoData, applyLivePrice, applyPositions, applyPendingOrders]
   );
 
   // Keep the ref in sync so pollUntilConnected (declared before startPolling) can access it
@@ -715,9 +734,10 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           priceFailCountRef.current = 0;
           setPriceError(false);
         }).catch(() => {}),
-        fetchPositionsData(accountId, r).then(setPositions).catch(() => {}),
-        fetchPendingOrdersData(accountId, r).then(setPendingOrders).catch(() => {}),
+        fetchPositionsData(accountId, r).then(applyPositions).catch(() => {}),
+        fetchPendingOrdersData(accountId, r).then(applyPendingOrders).catch(() => {}),
         fetchAccountInfoData(accountId, r).then(setAccountInfo).catch(() => {}),
+        refreshApiZones(),
       ]);
     } catch {
       // Trade path will auto-retry if still stale.
@@ -729,7 +749,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       setConnectionWarm(fresh);
       if (!fresh) setPriceStale(true);
     }
-  }, [accountId, status, fetchPriceData, fetchPositionsData, fetchPendingOrdersData, fetchAccountInfoData, applyLivePrice]);
+  }, [accountId, status, fetchPriceData, fetchPositionsData, fetchPendingOrdersData, fetchAccountInfoData, applyLivePrice, applyPositions, applyPendingOrders, refreshApiZones]);
 
   const wakeConnectionRef = useRef<() => void>(() => {});
   wakeConnectionRef.current = () => { void wakeConnection(); };
@@ -839,8 +859,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       }, 4_000);
       positionsIntervalRef.current = setInterval(() => {
         void Promise.all([
-          fetchPositionsData(a, r).then(setPositions).catch(() => {}),
-          fetchPendingOrdersData(a, r).then(setPendingOrders).catch(() => {}),
+          fetchPositionsData(a, r).then(applyPositions).catch(() => {}),
+          fetchPendingOrdersData(a, r).then(applyPendingOrders).catch(() => {}),
         ]);
       }, 4_000);
     };
@@ -1074,6 +1094,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     setAccountInfo(null);
     setPositions([]);
     setPendingOrders([]);
+    positionMetaCacheRef.current.clear();
+    setPositionZoneHints(new Map());
     setPrice(null);
     lastPriceAtRef.current = 0;
     setPriceStale(true);
@@ -1130,13 +1152,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
   const refreshPositions = useCallback(async () => {
     if (status !== "connected" || !accountId) return;
-    try { setPositions(await fetchPositionsData(accountId, region)); } catch {}
-  }, [status, accountId, region, fetchPositionsData]);
+    try { applyPositions(await fetchPositionsData(accountId, region)); } catch {}
+  }, [status, accountId, region, fetchPositionsData, applyPositions]);
 
   const refreshPendingOrders = useCallback(async () => {
     if (status !== "connected" || !accountId) return;
-    try { setPendingOrders(await fetchPendingOrdersData(accountId, region)); } catch {}
-  }, [status, accountId, region, fetchPendingOrdersData]);
+    try { applyPendingOrders(await fetchPendingOrdersData(accountId, region)); } catch {}
+  }, [status, accountId, region, fetchPendingOrdersData, applyPendingOrders]);
 
   const refreshAccountInfo = useCallback(async () => {
     if (status !== "connected" || !accountId) return;
@@ -1588,6 +1610,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         apiZones,
         refreshApiZones,
         placedZoneIds,
+        positionZoneHints,
       }}
     >
       {children}

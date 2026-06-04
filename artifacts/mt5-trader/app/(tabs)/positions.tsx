@@ -246,23 +246,25 @@ export default function PositionsScreen() {
     refreshPositions, refreshPendingOrders, refreshAccountInfo,
     closePosition, cancelOrder, accountId, region, sseConnected, price, syncSession,
   } = useTrading();
-  const { apiZones, refreshApiZones, placedZoneIds } = useTrading();
+  const { apiZones, refreshApiZones, placedZoneIds, positionZoneHints } = useTrading();
   const { zones, refresh: refreshZones, riskFree, closeZone, closeAllWorst, cancelZoneOrders } = useZones(accountId, {
     includeClosed: true, pollIntervalMs: 10_000, sseConnected, region,
   });
   const { settings: cs } = useCascadeSettings();
   const zonesForDisplay = apiZones.length > 0 ? apiZones : zones;
   const displayActiveZones = useMemo(
-    () => buildDisplayActiveZones(zonesForDisplay, positions, cs, price, pendingOrders, placedZoneIds),
-    [zonesForDisplay, positions, cs, price, pendingOrders, placedZoneIds],
+    () => buildDisplayActiveZones(
+      zonesForDisplay, positions, cs, price, pendingOrders, placedZoneIds, positionZoneHints,
+    ),
+    [zonesForDisplay, positions, cs, price, pendingOrders, placedZoneIds, positionZoneHints],
   );
   const displayZoneIds = useMemo(
     () => new Set(displayActiveZones.map((z) => z.zoneId)),
     [displayActiveZones],
   );
   const standalonePositions = useMemo(
-    () => positionsWithoutZone(positions, displayZoneIds),
-    [positions, displayZoneIds],
+    () => positionsWithoutZone(positions, displayZoneIds, positionZoneHints),
+    [positions, displayZoneIds, positionZoneHints],
   );
   const orphanPendingOrders = useMemo(
     () => pendingWithoutZone(pendingOrders, displayZoneIds),
