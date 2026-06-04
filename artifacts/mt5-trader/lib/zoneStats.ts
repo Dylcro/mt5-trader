@@ -81,7 +81,7 @@ export function countManualCloses(zones: Zone[]): number {
 }
 
 export function countSlHits(zones: Zone[]): number {
-  return zones.filter((z) => Boolean(z.slHit) && !z.riskFreeSlExit).length;
+  return zones.filter((z) => Boolean(z.slHit) && !z.riskFreeSlExit && !zoneReachedTpLevel(z, 1)).length;
 }
 
 export function countRiskFreeSlExits(zones: Zone[]): number {

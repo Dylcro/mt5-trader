@@ -467,8 +467,8 @@ export default function PositionsScreen() {
                       onCancelOrders={(zoneId) =>
                         withSessionReady(() => handleCancelZoneOrders(zoneId))
                       }
-                      onCloseTpNow={(zoneId) =>
-                        withSessionReady(() => closeTpNow(zoneId))
+                      onCloseTpNow={(zoneId, tpLevel) =>
+                        withSessionReady(() => closeTpNow(zoneId, tpLevel))
                       }
                       riskFreePips={cs.riskFreePips}
                     />
