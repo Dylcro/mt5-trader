@@ -1281,7 +1281,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           tp1Enabled: (params.tp1Pct ?? 25) > 0,
           tp2Enabled: (params.tp2Pct ?? 25) > 0,
           tp3Enabled: (params.tp3Pct ?? 25) > 0,
-          tp4Enabled: (params.tp4Pct ?? 25) > 0 && params.tp4Price != null,
+          tp4Enabled: (params.tp4Pct ?? 0) > 0,
         },
         {
           tp1Price: params.tp1Price,
@@ -1441,8 +1441,33 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       if (!connectionWarm) await wakeConnection();
       const zoneId = params.zoneId ?? newCascadeZoneId();
       const limitPrices = [params.anchorPrice, ...params.limitEntries];
-      const total = limitPrices.length;
+      const legCount = limitPrices.length;
       const limitOrderIds: string[] = [];
+
+      const slices = validateCascadeLots(
+        params.volume,
+        {
+          tp1Pct: params.tp1Pct ?? 25,
+          tp2Pct: params.tp2Pct ?? 25,
+          tp3Pct: params.tp3Pct ?? 25,
+          tp4Pct: params.tp4Pct ?? 25,
+          tp1Enabled: (params.tp1Pct ?? 25) > 0,
+          tp2Enabled: (params.tp2Pct ?? 25) > 0,
+          tp3Enabled: (params.tp3Pct ?? 25) > 0,
+          tp4Enabled: (params.tp4Pct ?? 0) > 0,
+        },
+        {
+          tp1Price: params.tp1Price,
+          tp2Price: params.tp2Price,
+          tp3Price: params.tp3Price,
+          tp4Price: params.tp4Price,
+        },
+      );
+      const expected = slices.length * legCount;
+      if (slices.length === 0) {
+        return { success: false, placed: 0, failed: 0, message: "No enabled TP levels with valid lot size" };
+      }
+
       try {
         const armRes = await authFetch(
           `${API_BASE}/mt5/account/${accountId}/zones/arm?region=${region}`,
@@ -1468,25 +1493,29 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         );
         const armData = await safeJson<{ ok?: boolean; zoneId?: string; error?: string }>(armRes);
         if (!armRes.ok || !armData.ok) {
-          return { success: false, placed: 0, failed: total, message: armData.error ?? "Failed to arm zone" };
+          return { success: false, placed: 0, failed: legCount, message: armData.error ?? "Failed to arm zone" };
         }
         const armedZoneId = armData.zoneId ?? zoneId;
         let placed = 0;
         let failed = 0;
         const errors: string[] = [];
-        const limitResults = await Promise.all(
-          limitPrices.map((limitPrice, i) =>
-            submitOrderRaw({
-              direction: params.direction,
-              volume: params.volume,
-              limitPrice,
-              stopLoss: params.stopLoss,
-              comment: buildCascadeComment(armedZoneId, i + 1, total),
-              zoneId: armedZoneId,
-            }),
+        const orderResults = await Promise.all(
+          limitPrices.flatMap((limitPrice, i) =>
+            slices.map((slice) =>
+              submitOrderRaw({
+                direction: params.direction,
+                volume: slice.lot,
+                limitPrice,
+                stopLoss: params.stopLoss,
+                takeProfit: slice.tpPrice,
+                comment: buildCascadeComment(armedZoneId, i + 1, legCount),
+                zoneId: armedZoneId,
+                tpLevel: slice.level,
+              }),
+            ),
           ),
         );
-        for (const r of limitResults) {
+        for (const r of orderResults) {
           if (r.success) {
             placed++;
             if (r.orderId) limitOrderIds.push(r.orderId);
@@ -1501,14 +1530,14 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
             `${API_BASE}/mt5/account/${accountId}/zones/${encodeURIComponent(armedZoneId)}/close?region=${region}`,
             { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
           ).catch(() => {});
-          return { success: false, placed: 0, failed: total, message: errors[0] ?? "All pending orders failed" };
+          return { success: false, placed: 0, failed: expected, message: errors[0] ?? "All pending orders failed" };
         }
         const msg = failed > 0
-          ? `${placed}/${total} pending orders placed · zone armed @ ${params.anchorPrice}`
-          : `Cascade armed @ ${params.anchorPrice} · ${placed} pending orders`;
+          ? `${placed}/${expected} pending orders placed · zone armed @ ${params.anchorPrice}`
+          : `Cascade armed @ ${params.anchorPrice} · ${placed} native-TP pending orders (${legCount} legs × ${slices.length} slices)`;
         return { success: true, placed, failed, message: msg, zoneId: armedZoneId, limitOrderIds };
       } catch (err) {
-        return { success: false, placed: 0, failed: total, message: err instanceof Error ? err.message : "Arm failed" };
+        return { success: false, placed: 0, failed: legCount, message: err instanceof Error ? err.message : "Arm failed" };
       }
     },
     [status, connectionWarm, wakeConnection, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, accountId, region],
