@@ -3594,11 +3594,18 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       }
       if (zps.length === 0) {
         if (!syncReady.has(st.accountId)) return;
-        if (isZoneSettling(st)) {
-          console.log(`[zone ${zoneId}] settling (${Date.now() - st.createdAtMs}ms) — skip empty reconcile`);
-          return;
+        // Rebuild from in-memory cache when relink filled trackedPositions but DB read lagged.
+        if (st.trackedPositions.size > 0) {
+          zps = Array.from(st.trackedPositions.entries()).map(([positionId, v]) => ({
+            positionId, volume: v.volume, entryPrice: v.entryPrice,
+          }));
+          trackedIds = new Set(zps.map((z) => z.positionId));
         }
         if (!brokerLegs && !pendingLeft) {
+          if (isZoneSettling(st)) {
+            console.log(`[zone ${zoneId}] settling (${Date.now() - st.createdAtMs}ms) — skip empty close only`);
+            return;
+          }
           if (!shouldAutoCloseZoneAfterPositionExit(st, false, false)) {
             console.log(`[zone ${zoneId}] empty tracked rows but defer zone close (pre-TP2 policy)`);
             return;
@@ -3625,7 +3632,8 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
             broadcastZoneUpdate(zoneId);
           }
         }
-        return;
+        // Broker still has legs but no DB rows yet — keep evaluating TPs (don't bail here).
+        if (zps.length === 0 && !brokerLegs && !pendingLeft) return;
       }
     }
     const allLive = await fetchOpenPositions(token, region, st.accountId);
