@@ -94,12 +94,15 @@ interface ZoneCardProps {
   onCloseAllWorst?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
   onCloseZone?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
   onCancelOrders?: (zoneId: string) => Promise<{ ok: boolean; message?: string; cancelledCount?: number }>;
+  onCloseTpNow?: (zoneId: string) => Promise<{ ok: boolean; message?: string; tpLevel?: number; skipped?: boolean }>;
   riskFreePips?: number;
   historical?: boolean;
 }
 
+const TAKE_TP_GREEN = "#2E7D52";
+
 export default function ZoneCard({
-  zone, onRiskFree, onCloseAllWorst, onCloseZone, onCancelOrders, riskFreePips,
+  zone, onRiskFree, onCloseAllWorst, onCloseZone, onCancelOrders, onCloseTpNow, riskFreePips,
   historical = false,
 }: ZoneCardProps) {
   const isBuy = zone.direction === "buy";
@@ -107,6 +110,7 @@ export default function ZoneCard({
   const [worstBusy, setWorstBusy] = useState(false);
   const [closeBusy, setCloseBusy] = useState(false);
   const [delBusy, setDelBusy] = useState(false);
+  const [tpNowBusy, setTpNowBusy] = useState(false);
 
   const handleRiskFree = async () => {
     if (!onRiskFree || busy) return;
@@ -164,6 +168,13 @@ export default function ZoneCard({
   // no-op (cancelledCount:0) if there's nothing pending.
   const canCancelOrders =
     !historical && zone.status !== "CLOSED" && !!onCancelOrders;
+  const showTakeTp =
+    !historical
+    && (zone.status === "OPEN" || zone.status === "RISK_FREE")
+    && zone.positionCount >= 1
+    && !!onCloseTpNow
+    && (zone.nextTp ?? 0) > 0;
+  const takeTpLabel = zone.nextTp ? `Take TP${zone.nextTp}` : "Take TP";
 
   const runCloseZone = async () => {
     if (!onCloseZone || closeBusy) return;
@@ -230,7 +241,26 @@ export default function ZoneCard({
     }
   };
 
-  const actionBusy = busy || worstBusy || closeBusy || delBusy;
+  const runCloseTpNow = async () => {
+    if (!onCloseTpNow || tpNowBusy) return;
+    setTpNowBusy(true);
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    const result = await onCloseTpNow(zone.zoneId);
+    setTpNowBusy(false);
+    if (result.ok) {
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      return;
+    }
+    await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    const errMsg = result.message ?? "Please try again.";
+    if (Platform.OS === "web" && typeof window !== "undefined") {
+      window.alert(`Couldn't take TP\n\n${errMsg}`);
+    } else {
+      Alert.alert("Couldn't take TP", errMsg);
+    }
+  };
+
+  const actionBusy = busy || worstBusy || closeBusy || delBusy || tpNowBusy;
   const showActionRow = canRiskFree || showCloseAllWorst || canCancelOrders;
 
   return (
@@ -339,6 +369,26 @@ export default function ZoneCard({
               ]}
             />
           </View>
+          {showTakeTp && (
+            <Pressable
+              style={({ pressed }) => [
+                styles.takeTpBtn,
+                pressed && { opacity: 0.8 },
+                tpNowBusy && { opacity: 0.5 },
+              ]}
+              onPress={() => { void runCloseTpNow(); }}
+              disabled={actionBusy}
+            >
+              {tpNowBusy ? (
+                <ActivityIndicator size="small" color={TAKE_TP_GREEN} />
+              ) : (
+                <>
+                  <Feather name="target" size={13} color={TAKE_TP_GREEN} />
+                  <Text style={styles.takeTpBtnText}>{takeTpLabel}</Text>
+                </>
+              )}
+            </Pressable>
+          )}
         </View>
       )}
 
@@ -625,6 +675,24 @@ const styles = StyleSheet.create({
   progressFill: {
     height: "100%",
     backgroundColor: C.gold,
+  },
+  takeTpBtn: {
+    marginTop: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: TAKE_TP_GREEN,
+    backgroundColor: "rgba(46,125,82,0.12)",
+  },
+  takeTpBtnText: {
+    fontSize: 11,
+    fontFamily: "Inter_700Bold",
+    color: TAKE_TP_GREEN,
+    letterSpacing: 0.2,
   },
   histRow: {
     flexDirection: "row",

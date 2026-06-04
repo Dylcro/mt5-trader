@@ -1677,6 +1677,86 @@ export function zoneHasTpTargets(st: {
     .some((p) => p != null && p > 0);
 }
 
+/** Which TP levels still need a partial on at least one open leg (same rules as evaluateZone). */
+export function liveLegsNeedTpLevel(
+  st: {
+    tp1Enabled?: boolean;
+    tp2Enabled?: boolean;
+    tp3Enabled?: boolean;
+    tp4Enabled?: boolean;
+    trackedPositions: Map<string, { tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean }>;
+  },
+  liveIds: string[],
+): { need1: boolean; need2: boolean; need3: boolean; need4: boolean } {
+  let need1 = false;
+  let need2 = false;
+  let need3 = false;
+  let need4 = false;
+  for (const id of liveIds) {
+    const pos = st.trackedPositions.get(id);
+    if (!pos) continue;
+    const t1 = !st.tp1Enabled || pos.tp1Hit;
+    const t2 = !st.tp2Enabled || pos.tp2Hit;
+    const t3 = !st.tp3Enabled || pos.tp3Hit;
+    if (st.tp1Enabled && !pos.tp1Hit) need1 = true;
+    if (st.tp2Enabled && t1 && !pos.tp2Hit) need2 = true;
+    if (st.tp3Enabled && t1 && t2 && !pos.tp3Hit) need3 = true;
+    if (st.tp4Enabled && t1 && t2 && t3 && !pos.tp4Hit) need4 = true;
+  }
+  return { need1, need2, need3, need4 };
+}
+
+/** Unhit TP level whose price is closest to the live quote (manual "take TP now"). */
+export function pickNearestUnhitTpLevel(
+  z: {
+    direction: "buy" | "sell";
+    tp1Enabled?: boolean;
+    tp2Enabled?: boolean;
+    tp3Enabled?: boolean;
+    tp4Enabled?: boolean;
+    tp1Hit: boolean;
+    tp2Hit: boolean;
+    tp3Hit: boolean;
+    tp4Hit: boolean;
+    tp1Price: number | null;
+    tp2Price: number | null;
+    tp3Price: number | null;
+    tp4Price?: number | null;
+  },
+  cmpPrice: number,
+  liveNeeds?: { need1: boolean; need2: boolean; need3: boolean; need4: boolean },
+): 0 | 1 | 2 | 3 | 4 {
+  if (!(cmpPrice > 0)) return 0;
+  const sign = z.direction === "buy" ? 1 : -1;
+  const tp4En = z.tp4Enabled !== false;
+  const rows: Array<{ level: 1 | 2 | 3 | 4; score: number }> = [];
+  let firstLadder: 0 | 1 | 2 | 3 | 4 = 0;
+  const defs: Array<{
+    level: 1 | 2 | 3 | 4;
+    enabled: boolean;
+    zoneHit: boolean;
+    stillNeed: boolean;
+    price: number | null | undefined;
+  }> = [
+    { level: 1, enabled: z.tp1Enabled !== false, zoneHit: z.tp1Hit, stillNeed: liveNeeds?.need1 ?? !z.tp1Hit, price: z.tp1Price },
+    { level: 2, enabled: z.tp2Enabled !== false, zoneHit: z.tp2Hit, stillNeed: liveNeeds?.need2 ?? !z.tp2Hit, price: z.tp2Price },
+    { level: 3, enabled: z.tp3Enabled !== false, zoneHit: z.tp3Hit, stillNeed: liveNeeds?.need3 ?? !z.tp3Hit, price: z.tp3Price },
+    { level: 4, enabled: tp4En, zoneHit: z.tp4Hit, stillNeed: liveNeeds?.need4 ?? !z.tp4Hit, price: z.tp4Price },
+  ];
+  for (const d of defs) {
+    if (!d.enabled || !d.stillNeed) continue;
+    if (firstLadder === 0) firstLadder = d.level;
+    if (d.level === 4 && isManualTp4Zone(d.price ?? null, tp4En)) continue;
+    if (d.price == null || !(d.price > 0)) continue;
+    const remainingPips = ((d.price - cmpPrice) * sign) / PIP;
+    const score = remainingPips > 0 ? remainingPips : 0;
+    rows.push({ level: d.level, score });
+  }
+  if (rows.length === 0) return firstLadder;
+  rows.sort((a, b) => a.score - b.score);
+  return rows[0]!.level;
+}
+
 /**
  * True when live MT5 volume shows this TP level's partial was already taken
  * (broker TP filled before our tick saw the price cross, etc.).
@@ -3310,6 +3390,112 @@ export function pickNextLegToTrimForSecureProfits(
   return pool.slice().sort((a, b) => b.openPrice - a.openPrice)[0]!;
 }
 
+/** Manual "Close TP now" — same partial % as automatic TP for the chosen level. */
+async function commitZoneTpLevelPartial(
+  zoneId: string,
+  st: ZoneState,
+  level: 1 | 2 | 3 | 4,
+  token: string,
+): Promise<{ ok: boolean; message: string; level: number; positionCount: number }> {
+  const region = activeRegions.get(st.accountId) ?? knownAccounts.get(st.accountId)?.region ?? DEFAULT_REGION;
+  const live = await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st);
+  if (live.length === 0) {
+    return { ok: false, message: "No open positions in this zone", level, positionCount: 0 };
+  }
+  const rows = await db.select().from(zonePositionsTable)
+    .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
+  const zps = rows.map((r) => ({
+    positionId: r.positionId, volume: Number(r.volume), entryPrice: Number(r.entryPrice),
+  }));
+  const zpsById = new Map(zps.map((z) => [z.positionId, z]));
+  for (const z of zps) {
+    const existing = st.trackedPositions.get(z.positionId);
+    st.trackedPositions.set(z.positionId, {
+      volume: z.volume, entryPrice: z.entryPrice,
+      tp1Hit: existing?.tp1Hit ?? false,
+      tp2Hit: existing?.tp2Hit ?? false,
+      tp3Hit: existing?.tp3Hit ?? false,
+      tp4Hit: existing?.tp4Hit ?? false,
+    });
+  }
+  const tp1Satisfied = (p: LivePosition) => {
+    const pos = st.trackedPositions.get(p.id);
+    return !st.tp1Enabled || Boolean(pos?.tp1Hit);
+  };
+  const tp2Satisfied = (p: LivePosition) => {
+    const pos = st.trackedPositions.get(p.id);
+    return !st.tp2Enabled || Boolean(pos?.tp2Hit);
+  };
+  const tp3Satisfied = (p: LivePosition) => {
+    const pos = st.trackedPositions.get(p.id);
+    return !st.tp3Enabled || Boolean(pos?.tp3Hit);
+  };
+  const need =
+    level === 1 ? (st.tp1Enabled ? live.filter((p) => !st.trackedPositions.get(p.id)?.tp1Hit) : [])
+      : level === 2 ? (st.tp2Enabled ? live.filter((p) => tp1Satisfied(p) && !st.trackedPositions.get(p.id)?.tp2Hit) : [])
+        : level === 3 ? (st.tp3Enabled ? live.filter((p) => tp1Satisfied(p) && tp2Satisfied(p) && !st.trackedPositions.get(p.id)?.tp3Hit) : [])
+          : (st.tp4Enabled ? live.filter((p) => tp1Satisfied(p) && tp2Satisfied(p) && tp3Satisfied(p) && !st.trackedPositions.get(p.id)?.tp4Hit) : []);
+  if (need.length === 0) {
+    return { ok: false, message: `No positions still need TP${level}`, level, positionCount: 0 };
+  }
+  const tpPct = level === 1 ? st.tp1Pct : level === 2 ? st.tp2Pct : level === 3 ? st.tp3Pct : st.tp4Pct;
+  const priorPct = level === 1 ? 0 : level === 2 ? st.tp1Pct : level === 3 ? st.tp1Pct + st.tp2Pct : st.tp1Pct + st.tp2Pct + st.tp3Pct;
+  const keepFractionGate = Math.max(0, (100 - priorPct - tpPct + 1) / 100);
+  const results = await Promise.all(need.map(async (p) => {
+    const row = zpsById.get(p.id);
+    const origVol = row ? Number(row.volume) : p.volume;
+    if (!(origVol > 0)) return true;
+    if (level === 4) {
+      return closeZonePosition(token, region, st.accountId, p.id);
+    }
+    if (p.volume <= origVol * keepFractionGate) {
+      if (level > 1 && p.volume > 0) {
+        return closeZonePosition(token, region, st.accountId, p.id);
+      }
+      return true;
+    }
+    const partial = Math.max(0.01, parseFloat((origVol * (tpPct / 100)).toFixed(2)));
+    const vol = Math.min(partial, p.volume);
+    return vol < p.volume
+      ? closeZonePosition(token, region, st.accountId, p.id, vol)
+      : closeZonePosition(token, region, st.accountId, p.id);
+  }));
+  if (!results.every(Boolean)) {
+    return { ok: false, message: `TP${level} partial close failed on broker — try again`, level, positionCount: 0 };
+  }
+  const ids = need.map((p) => p.id);
+  const hitCol = level === 1 ? { tp1Hit: true } : level === 2 ? { tp2Hit: true } : level === 3 ? { tp3Hit: true } : { tp4Hit: true };
+  await db.update(zonePositionsTable).set(hitCol)
+    .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
+  for (const p of need) {
+    const pos = st.trackedPositions.get(p.id);
+    if (pos) {
+      if (level === 1) pos.tp1Hit = true;
+      else if (level === 2) pos.tp2Hit = true;
+      else if (level === 3) pos.tp3Hit = true;
+      else pos.tp4Hit = true;
+    }
+  }
+  const zoneHitCol =
+    level === 1 ? { tp1Hit: true } : level === 2 ? { tp2Hit: true } : level === 3 ? { tp3Hit: true } : { tp4Hit: true };
+  const zoneWasHit = level === 1 ? st.tp1Hit : level === 2 ? st.tp2Hit : level === 3 ? st.tp3Hit : st.tp4Hit;
+  if (!zoneWasHit) {
+    if (level === 2 && shouldCancelCascadeLimitsAtTpStage(2, st)) {
+      await cancelZoneLimits(token, region, st.accountId, zoneId);
+    }
+    await db.update(cascadeZonesTable).set(zoneHitCol).where(eq(cascadeZonesTable.zoneId, zoneId));
+    if (level === 1) st.tp1Hit = true;
+    else if (level === 2) st.tp2Hit = true;
+    else if (level === 3) st.tp3Hit = true;
+    else st.tp4Hit = true;
+    zoneNearNotifiedTp.set(zoneId, 0);
+    notifyZoneEvent(zoneId, "hit", level, 0, st.direction);
+  }
+  broadcastZoneUpdate(zoneId);
+  console.log(`[zone ${zoneId}] manual close-tp-now: TP${level} on ${ids.length} position(s)`);
+  return { ok: true, message: `TP${level} partial applied`, level, positionCount: ids.length };
+}
+
 async function evaluateZone(zoneId: string, token: string): Promise<void> {
   // loadZone is the single read path: cache-first, DB hydration on miss.
   // DB errors are caught here so a transient failure just skips this tick.
@@ -4498,6 +4684,55 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     broadcastToAccount(accountId, "deal", { type: "position_changed" });
     console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl} (pips=${pips})`);
     res.json({ ok: true, bestPositionId: best.id, sl, pips, closedCount: others.length });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// POST /api/mt5/account/:accountId/zones/:zoneId/close-tp-now
+// Take profit early: partial-close at the TP level nearest current price (same % as auto TP).
+router.post("/mt5/account/:accountId/zones/:zoneId/close-tp-now", checkOwner, async (req: Request, res: Response) => {
+  const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
+  try {
+    const token = getToken();
+    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
+    const st = await loadZone(zoneId);
+    if (!st || st.accountId !== accountId || st.status === "CLOSED") {
+      res.status(404).json({ error: "Zone not found" });
+      return;
+    }
+    if (st.status === "ARMED") {
+      res.status(409).json({ error: "Zone not active yet — wait for the first order to fill" });
+      return;
+    }
+    if (!zoneHasTpTargets(st)) {
+      res.status(409).json({ error: "No TP prices on this zone" });
+      return;
+    }
+    const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+    if (live.length === 0) {
+      res.status(409).json({ error: "No open positions in this zone" });
+      return;
+    }
+    const price = await fetchSymbolPrice(token, region, accountId, live[0]!.symbol || "XAUUSD");
+    if (!price) {
+      res.status(503).json({ error: "Could not read live price — try sync and retry" });
+      return;
+    }
+    const cmpPrice = st.direction === "buy" ? price.bid : price.ask;
+    const liveNeeds = liveLegsNeedTpLevel(st, live.map((p) => p.id));
+    const level = pickNearestUnhitTpLevel(st, cmpPrice, liveNeeds);
+    if (level === 0) {
+      res.json({ ok: true, skipped: true, message: "All enabled TPs already hit on this zone" });
+      return;
+    }
+    const result = await commitZoneTpLevelPartial(zoneId, st, level, token);
+    if (!result.ok) {
+      res.status(207).json({ ok: false, ...result });
+      return;
+    }
+    broadcastToAccount(accountId, "deal", { type: "position_changed" });
+    res.json({ ok: true, tpLevel: result.level, positionCount: result.positionCount, message: result.message });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }

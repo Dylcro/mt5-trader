@@ -36,6 +36,7 @@ import {
   isAutoBeTriggerSatisfied,
   pickBestZonePositionByFloatingPnl,
   pickBestZonePositionForCloseWorst,
+  pickNearestUnhitTpLevel,
   pickNextLegToTrimForSecureProfits,
 } from "../src/routes/mt5";
 
@@ -899,6 +900,38 @@ describe("pickNextLegToTrimForSecureProfits (one leg per tap)", () => {
     ];
     const best = leg("anchor", 3030);
     expect(pickNextLegToTrimForSecureProfits(positions, best, "sell")?.id).toBe("l1");
+  });
+});
+
+describe("pickNearestUnhitTpLevel", () => {
+  const base = {
+    direction: "buy" as const,
+    tp1Hit: false,
+    tp2Hit: false,
+    tp3Hit: false,
+    tp4Hit: false,
+    tp1Price: 3010,
+    tp2Price: 3020,
+    tp3Price: 3030,
+    tp4Price: null as number | null,
+  };
+
+  it("picks closest unhit TP by price (TP1 nearest)", () => {
+    expect(pickNearestUnhitTpLevel(base, 3009)).toBe(1);
+  });
+
+  it("after TP1+2 hit, picks TP3 when price is nearest to TP3", () => {
+    expect(pickNearestUnhitTpLevel(
+      { ...base, tp1Hit: true, tp2Hit: true },
+      3029,
+    )).toBe(3);
+  });
+
+  it("returns 0 when all enabled TPs are hit", () => {
+    expect(pickNearestUnhitTpLevel(
+      { ...base, tp1Hit: true, tp2Hit: true, tp3Hit: true, tp4Hit: true, tp4Enabled: false },
+      3035,
+    )).toBe(0);
   });
 });
 
