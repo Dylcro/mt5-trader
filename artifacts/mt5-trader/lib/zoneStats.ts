@@ -77,11 +77,11 @@ export function countZonesReachedTp(zones: Zone[], level: 1 | 2 | 3 | 4): number
 export const countTpHits = countZonesReachedTp;
 
 export function countManualCloses(zones: Zone[]): number {
-  return zones.filter((z) => Boolean(z.manualClose)).length;
+  return zones.filter((z) => zonePrimaryOutcome(z) === "MANUAL").length;
 }
 
 export function countSlHits(zones: Zone[]): number {
-  return zones.filter((z) => Boolean(z.slHit) && !z.riskFreeSlExit).length;
+  return zones.filter((z) => zonePrimaryOutcome(z) === "SL").length;
 }
 
 export function countRiskFreeSlExits(zones: Zone[]): number {
