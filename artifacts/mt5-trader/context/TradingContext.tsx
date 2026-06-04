@@ -115,7 +115,7 @@ interface TradingContextValue {
   disconnect: () => Promise<void>;
   reconnectFromServer: () => Promise<void>;
   placeTrade: (params: PlaceTradeParams) => Promise<{ success: boolean; message: string }>;
-  placeCascadeOrders: (params: CascadeOrderParams) => Promise<{ success: boolean; placed: number; failed: number; message: string; marketPositionId?: string; limitOrderIds?: string[] }>;
+  placeCascadeOrders: (params: CascadeOrderParams) => Promise<{ success: boolean; placed: number; failed: number; message: string; marketPositionId?: string; limitOrderIds?: string[]; zoneId?: string }>;
   /** @-price cascade: ARMED zone + pending limits at ladder (Settings cascade). */
   placeArmedCascadeAtPrice: (params: ArmedCascadeParams) => Promise<{ success: boolean; placed: number; failed: number; message: string; zoneId?: string; limitOrderIds?: string[] }>;
   closePosition: (positionId: string) => Promise<{ success: boolean; message: string }>;
@@ -1251,7 +1251,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   );
 
   const placeCascadeOrders = useCallback(
-    async (params: CascadeOrderParams): Promise<{ success: boolean; placed: number; failed: number; message: string; marketPositionId?: string; limitOrderIds?: string[] }> => {
+    async (params: CascadeOrderParams): Promise<{ success: boolean; placed: number; failed: number; message: string; marketPositionId?: string; limitOrderIds?: string[]; zoneId?: string }> => {
       if (status !== "connected") return { success: false, placed: 0, failed: 0, message: "Not connected" };
       if (!connectionWarm) {
         await wakeConnection();
@@ -1357,12 +1357,12 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       void Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
 
       if (placed === 0) {
-        return { success: false, placed, failed, message: errors[0] ?? "All orders failed to place" };
+        return { success: false, placed, failed, message: errors[0] ?? "All orders failed to place", zoneId };
       }
       if (failed > 0) {
-        return { success: true, placed, failed, message: `${placed}/${total} placed. Failed: ${errors.join("; ")}`, marketPositionId, limitOrderIds };
+        return { success: true, placed, failed, message: `${placed}/${total} placed. Failed: ${errors.join("; ")}`, marketPositionId, limitOrderIds, zoneId };
       }
-      return { success: true, placed, failed, message: `${placed} orders placed — 1 market + ${params.limitEntries.length} limit`, marketPositionId, limitOrderIds };
+      return { success: true, placed, failed, message: `${placed} orders placed — 1 market + ${params.limitEntries.length} limit`, marketPositionId, limitOrderIds, zoneId };
     },
     [status, connectionWarm, wakeConnection, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, accountId, region]
   );

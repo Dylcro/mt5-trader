@@ -1,15 +1,12 @@
 import type { Zone } from "@/hooks/useZones";
+import { tradingDayStartMs, weekTradingStartMs } from "@/lib/tradingDay";
 
 export type Period = "today" | "week";
 
-export function periodStartMs(period: Period): number {
-  const now = new Date();
-  if (period === "today") {
-    return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  }
-  const day = now.getDay();
-  const diff = day === 0 ? 6 : day - 1;
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate() - diff).getTime();
+/** Period bounds aligned to MT5: new trading day at 23:00 Europe/London. */
+export function periodStartMs(period: Period, now: Date = new Date()): number {
+  if (period === "today") return tradingDayStartMs(now);
+  return weekTradingStartMs(now);
 }
 
 export function filterClosedZonesByPeriod(zones: Zone[], period: Period): Zone[] {

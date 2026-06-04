@@ -1395,6 +1395,10 @@ function scheduleCascadeReconcile(accountId: string, region: string, token: stri
         const zid = parseZoneIdFromComment(comment);
         if (zid && isZoneStillPlacing(zid)) continue;
         if (orderMappedToActiveZone(accountId, oid)) continue;
+        if (zid) {
+          const z = zoneStates.get(zid);
+          if (z && z.status !== "CLOSED") continue;
+        }
         const orderTimeMs = o.time ? new Date(o.time).getTime() : 0;
         if (orderTimeMs > 0 && (nowMs - orderTimeMs) < CASCADE_LIMIT_GRACE_MS) continue;
         orphans.push({ id: oid, comment });
@@ -3291,7 +3295,9 @@ async function fetchOpenPositions(token: string, region: string, accountId: stri
   const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/positions`, {
     headers: authHeaders(token),
   });
-  if (!r.ok) return [];
+  if (!r.ok) {
+    throw new Error(`fetchOpenPositions ${r.status} for ${accountId}`);
+  }
   const arr = await r.json() as Array<Record<string, unknown>>;
   return arr.map((p) => ({
     id: String(p.id ?? p._id ?? ""),
