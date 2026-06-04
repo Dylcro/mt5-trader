@@ -270,32 +270,5 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     }
   }, [accountId, region, refresh]);
 
-  const closeTpNow = useCallback(async (
-    zoneId: string,
-  ): Promise<{ ok: boolean; message?: string; tpLevel?: number; skipped?: boolean }> => {
-    if (!API_BASE || !accountId) return { ok: false, message: "No account" };
-    try {
-      const res = await authFetchWithTimeout(
-        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/close-tp-now${zoneTradeQuery(region)}`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
-      );
-      const data = await res.json().catch(() => ({})) as {
-        ok?: boolean; message?: string; error?: string; tpLevel?: number; skipped?: boolean;
-      };
-      void refresh();
-      if (res.ok && data.ok) {
-        return {
-          ok: true,
-          tpLevel: data.tpLevel,
-          skipped: data.skipped,
-          message: data.message,
-        };
-      }
-      return { ok: false, message: data.message ?? data.error ?? `HTTP ${res.status}` };
-    } catch (e) {
-      return { ok: false, message: (e as Error).message };
-    }
-  }, [accountId, region, refresh]);
-
-  return { zones, loading, error, refresh, riskFree, closeZone, closeAllWorst, cancelZoneOrders, closeTpNow };
+  return { zones, loading, error, refresh, riskFree, closeZone, closeAllWorst, cancelZoneOrders };
 }
