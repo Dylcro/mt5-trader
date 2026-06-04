@@ -132,6 +132,8 @@ interface TradingContextValue {
   connectionWarm: boolean;
   /** Refresh broker session (price, positions, account). Safe to call when already warm. */
   syncSession: (force?: boolean) => Promise<void>;
+  /** Fast preflight before zone buttons — skips full wake when SSE + price are live. */
+  ensureSessionForTrade: () => Promise<{ ready: boolean; message?: string }>;
   /** Zone list kept warm app-wide (Trade + Positions) — not tied to Positions tab mount. */
   apiZones: Zone[];
   refreshApiZones: () => Promise<void>;
@@ -751,6 +753,27 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     }
   }, [accountId, status, fetchPriceData, fetchPositionsData, fetchPendingOrdersData, fetchAccountInfoData, applyLivePrice, applyPositions, applyPendingOrders, refreshApiZones]);
 
+  const ensureSessionForTrade = useCallback(async (): Promise<{ ready: boolean; message?: string }> => {
+    if (status !== "connected" || !accountId) {
+      return { ready: false, message: "Not connected — open Settings and connect MT5." };
+    }
+    const isPriceFresh = () =>
+      priceRef.current != null
+      && lastPriceAtRef.current > 0
+      && Date.now() - lastPriceAtRef.current <= PRICE_STALE_MS;
+    if (isPriceFresh()) {
+      return { ready: true };
+    }
+    await wakeConnection(false);
+    if (isPriceFresh()) {
+      return { ready: true };
+    }
+    return {
+      ready: false,
+      message: "Quotes not live yet. Open Trade, tap sync (↻), wait for price, then retry.",
+    };
+  }, [accountId, status, wakeConnection]);
+
   const wakeConnectionRef = useRef<() => void>(() => {});
   wakeConnectionRef.current = () => { void wakeConnection(); };
 
@@ -1314,9 +1337,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const placeTrade = useCallback(
     async (params: PlaceTradeParams): Promise<{ success: boolean; message: string }> => {
       if (status !== "connected") return { success: false, message: "Not connected" };
-      if (!connectionWarm) {
-        await wakeConnection();
-      }
+      const gate = await ensureSessionForTrade();
+      if (!gate.ready) return { success: false, message: gate.message ?? "Session not ready" };
       try {
         const result = await submitOrderRaw(params);
         // Refresh in background — don't block the success toast
@@ -1328,14 +1350,15 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         return { success: false, message: err instanceof Error ? err.message : "Trade failed" };
       }
     },
-    [status, connectionWarm, wakeConnection, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo]
+    [status, ensureSessionForTrade, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo]
   );
 
   const placeCascadeOrders = useCallback(
     async (params: CascadeOrderParams): Promise<{ success: boolean; placed: number; failed: number; message: string; zoneId: string; marketPositionId?: string; limitOrderIds?: string[] }> => {
       if (status !== "connected") return { success: false, placed: 0, failed: 0, message: "Not connected", zoneId: params.zoneId ?? "" };
-      if (!connectionWarm) {
-        await wakeConnection();
+      const gate = await ensureSessionForTrade();
+      if (!gate.ready) {
+        return { success: false, placed: 0, failed: 0, message: gate.message ?? "Session not ready", zoneId: params.zoneId ?? "" };
       }
       let placed = 0;
       let failed = 0;
@@ -1447,13 +1470,16 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       }
       return { success: true, placed, failed, message: `${placed} orders placed — 1 market + ${params.limitEntries.length} limit`, zoneId, marketPositionId, limitOrderIds };
     },
-    [status, connectionWarm, wakeConnection, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, refreshApiZones, markCascadePlaced, accountId, region]
+    [status, ensureSessionForTrade, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, refreshApiZones, markCascadePlaced, accountId, region]
   );
 
   const placeArmedCascadeAtPrice = useCallback(
     async (params: ArmedCascadeParams): Promise<{ success: boolean; placed: number; failed: number; message: string; zoneId?: string; limitOrderIds?: string[] }> => {
       if (status !== "connected") return { success: false, placed: 0, failed: 0, message: "Not connected" };
-      if (!connectionWarm) await wakeConnection();
+      const gate = await ensureSessionForTrade();
+      if (!gate.ready) {
+        return { success: false, placed: 0, failed: 0, message: gate.message ?? "Session not ready" };
+      }
       const zoneId = params.zoneId ?? newCascadeZoneId();
       const limitPrices = [params.anchorPrice, ...params.limitEntries];
       const total = limitPrices.length;
@@ -1529,7 +1555,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         return { success: false, placed: 0, failed: total, message: err instanceof Error ? err.message : "Arm failed" };
       }
     },
-    [status, connectionWarm, wakeConnection, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, refreshApiZones, markCascadePlaced, accountId, region],
+    [status, ensureSessionForTrade, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, refreshApiZones, markCascadePlaced, accountId, region],
   );
 
   const closePosition = useCallback(
@@ -1607,6 +1633,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         sseConnected,
         connectionWarm,
         syncSession: wakeConnection,
+        ensureSessionForTrade,
         apiZones,
         refreshApiZones,
         placedZoneIds,

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { subscribeAccountEvents } from "@/lib/accountEventBus";
 import { enrichZoneDisplayFields, latchZoneTpHits } from "@/lib/zoneDisplay";
-import { getAuthToken } from "@/lib/authToken";
+import { authFetch, authFetchWithTimeout } from "@/lib/authFetch";
 
 const API_BASE = process.env.EXPO_PUBLIC_API_URL ?? "";
 
@@ -56,13 +56,6 @@ export interface Zone {
   trackedOnServer?: boolean;
 }
 
-async function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
-  const token = await getAuthToken();
-  const headers: Record<string, string> = { ...(options.headers as Record<string, string> ?? {}) };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  return fetch(url, { ...options, headers });
-}
-
 interface UseZonesOptions {
   includeClosed?: boolean;
   pollIntervalMs?: number;
@@ -89,8 +82,9 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
   const [error, setError] = useState<string | null>(null);
   const inFlight = useRef(false);
 
-  const refresh = useCallback(async () => {
-    if (!API_BASE || !accountId || inFlight.current) return;
+  const refresh = useCallback(async (opts?: { force?: boolean }) => {
+    if (!API_BASE || !accountId) return;
+    if (inFlight.current && !opts?.force) return;
     inFlight.current = true;
     try {
       const qs = includeClosed ? "?includeClosed=true" : "";
@@ -169,7 +163,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     try {
       const body: Record<string, unknown> = {};
       if (opts.riskFreePips !== undefined) body.riskFreePips = opts.riskFreePips;
-      const res = await authFetch(
+      const res = await authFetchWithTimeout(
         `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/risk-free${zoneTradeQuery(region)}`,
         {
           method: "POST",
@@ -177,8 +171,10 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
           body: JSON.stringify(body),
         },
       );
-      const data = await res.json().catch(() => ({})) as { ok?: boolean; message?: string; error?: string };
-      void refresh();
+      const data = await res.json().catch(() => ({})) as {
+        ok?: boolean; message?: string; error?: string; failedPositionIds?: string[];
+      };
+      void refresh({ force: true });
       if (res.ok && data.ok) return { ok: true };
       return { ok: false, message: data.message ?? data.error ?? `HTTP ${res.status}` };
     } catch (e) {
@@ -191,14 +187,14 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
   ): Promise<{ ok: boolean; message?: string; closedCount?: number }> => {
     if (!API_BASE || !accountId) return { ok: false, message: "No account" };
     try {
-      const res = await authFetch(
+      const res = await authFetchWithTimeout(
         `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/close${zoneTradeQuery(region)}`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
       );
       const data = await res.json().catch(() => ({})) as {
         ok?: boolean; message?: string; error?: string; closedCount?: number;
       };
-      void refresh();
+      void refresh({ force: true });
       if (res.ok && data.ok) return { ok: true, closedCount: data.closedCount };
       return { ok: false, message: data.message ?? data.error ?? `HTTP ${res.status}` };
     } catch (e) {
@@ -213,7 +209,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
   ): Promise<{ ok: boolean; message?: string; closedCount?: number }> => {
     if (!API_BASE || !accountId) return { ok: false, message: "No account" };
     try {
-      const res = await authFetch(
+      const res = await authFetchWithTimeout(
         `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/close-worst${zoneTradeQuery(region)}`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
       );
@@ -230,7 +226,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
           : "Invalid server response.";
         return { ok: false, message: hint };
       }
-      void refresh();
+      void refresh({ force: true });
       if (res.ok && data.skipped) {
         if (data.message) return { ok: false, message: data.message };
         return { ok: true, closedCount: data.closedCount ?? 0 };
@@ -269,7 +265,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
       const data = await res.json().catch(() => ({})) as {
         ok?: boolean; message?: string; error?: string; cancelledCount?: number; zoneClosed?: boolean;
       };
-      await refresh();
+      void refresh({ force: true });
       if (res.ok && data.ok) {
         if (data.zoneClosed) {
           setZones((prev) =>
