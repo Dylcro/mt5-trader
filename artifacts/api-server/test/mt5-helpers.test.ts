@@ -37,6 +37,10 @@ import {
   pickBestZonePositionByFloatingPnl,
   pickBestZonePositionForCloseWorst,
   pickNextLegToTrimForSecureProfits,
+  setZoneLimitOrder,
+  getZoneLimitOrder,
+  orderIdsForZone,
+  deleteZoneLimitOrder,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
@@ -899,6 +903,26 @@ describe("pickNextLegToTrimForSecureProfits (one leg per tap)", () => {
     ];
     const best = leg("anchor", 3030);
     expect(pickNextLegToTrimForSecureProfits(positions, best, "sell")?.id).toBe("l1");
+  });
+});
+
+describe("zone limit order map (per-account scoping)", () => {
+  const acctA = "acct-a";
+  const acctB = "acct-b";
+  const zoneBuy = "z_buy";
+  const zoneSell = "z_sell";
+
+  it("isolates orderId→zoneId by MetaAPI accountId", () => {
+    setZoneLimitOrder(acctA, "ord-1", zoneBuy);
+    setZoneLimitOrder(acctB, "ord-1", zoneSell);
+    expect(getZoneLimitOrder(acctA, "ord-1")).toBe(zoneBuy);
+    expect(getZoneLimitOrder(acctB, "ord-1")).toBe(zoneSell);
+    expect(orderIdsForZone(acctA, zoneBuy)).toEqual(["ord-1"]);
+    expect(orderIdsForZone(acctB, zoneSell)).toEqual(["ord-1"]);
+    expect(orderIdsForZone(acctA, zoneSell)).toEqual([]);
+    deleteZoneLimitOrder(acctA, "ord-1");
+    expect(getZoneLimitOrder(acctA, "ord-1")).toBeUndefined();
+    expect(getZoneLimitOrder(acctB, "ord-1")).toBe(zoneSell);
   });
 });
 

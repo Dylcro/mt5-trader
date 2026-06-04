@@ -925,7 +925,7 @@ function makeDealListener(accountId: string) {
       // of MetaAPI REST immediately (REST cache can lag significantly).
       if (deal.orderId) markOrderCompleted(accountId, String(deal.orderId));
       if (deal.orderId && cascadePlacedOrderIds.has(String(deal.orderId))) {
-        let zoneId = zoneLimitOrders.get(String(deal.orderId));
+        let zoneId = getZoneLimitOrder(accountId, String(deal.orderId));
         // Backstop when in-memory mapping is missing: (1) DB by orderId,
         // (2) deal comment Cascade|zoneId|leg/total, (3) pendingZoneAssoc
         // with matching direction within ZONE_ASSOC_WINDOW_MS. No "oldest zone"
@@ -938,7 +938,7 @@ function makeDealListener(accountId: string) {
               .limit(1);
             if (dbRow[0]?.zoneId) {
               zoneId = dbRow[0].zoneId;
-              zoneLimitOrders.set(String(deal.orderId), zoneId);
+              setZoneLimitOrder(accountId, String(deal.orderId), zoneId);
               console.log(`[zone ${zoneId}] backstop-recovered from DB orderId=${deal.orderId} posId=${deal.positionId}`);
             }
           } catch (e) {
@@ -949,7 +949,7 @@ function makeDealListener(accountId: string) {
           const commentZone = parseZoneIdFromComment(String(deal.comment ?? ""));
           if (commentZone) {
             zoneId = commentZone;
-            zoneLimitOrders.set(String(deal.orderId), zoneId);
+            setZoneLimitOrder(accountId, String(deal.orderId), zoneId);
             console.log(`[zone ${zoneId}] backstop-recovered from deal comment orderId=${deal.orderId}`);
           }
         }
@@ -960,7 +960,7 @@ function makeDealListener(accountId: string) {
           const pending = resolvePendingZoneAssoc(accountId, direction);
           if (pending) {
             zoneId = pending.zoneId;
-            zoneLimitOrders.set(String(deal.orderId), zoneId);
+            setZoneLimitOrder(accountId, String(deal.orderId), zoneId);
             void db.insert(zoneOrdersTable)
               .values({ zoneId, orderId: String(deal.orderId), createdAt: Date.now() })
               .onConflictDoNothing()
@@ -2503,7 +2503,42 @@ const ZONE_ORPHAN_DRAIN_WINDOW_MS = 30_000;
 
 // In-memory state, hydrated from DB on startup.
 const zoneStates = new Map<string, ZoneState>();          // zoneId → state
-const zoneLimitOrders = new Map<string, string>();        // orderId → zoneId
+/** Per MetaAPI account: pending limit orderId → owning zoneId (never global across accounts). */
+const zoneLimitOrdersByAccount = new Map<string, Map<string, string>>();
+
+function zoneLimitMap(accountId: string): Map<string, string> {
+  let m = zoneLimitOrdersByAccount.get(accountId);
+  if (!m) {
+    m = new Map();
+    zoneLimitOrdersByAccount.set(accountId, m);
+  }
+  return m;
+}
+
+export function setZoneLimitOrder(accountId: string, orderId: string, zoneId: string): void {
+  if (!orderId) return;
+  zoneLimitMap(accountId).set(orderId, zoneId);
+}
+
+export function getZoneLimitOrder(accountId: string, orderId: string): string | undefined {
+  return zoneLimitMap(accountId).get(orderId);
+}
+
+export function deleteZoneLimitOrder(accountId: string, orderId: string): void {
+  zoneLimitMap(accountId).delete(orderId);
+}
+
+export function orderIdsForZone(accountId: string, zoneId: string): string[] {
+  const out: string[] = [];
+  for (const [oid, zid] of zoneLimitMap(accountId).entries()) {
+    if (zid === zoneId) out.push(oid);
+  }
+  return out;
+}
+
+function orderMappedToActiveZone(accountId: string, orderId: string): boolean {
+  return zoneLimitMap(accountId).has(orderId);
+}
 const pendingZoneAssoc = new Map<string, { zoneId: string; direction: "buy" | "sell"; expiresAt: number }>(); // accountId → most recent zone (legacy fallback)
 const pendingZoneByZone = new Map<string, Map<string, { zoneId: string; direction: "buy" | "sell"; expiresAt: number }>>(); // accountId → zoneId → assoc
 // Race buffer: when a cascade limit POST response arrives BEFORE the market
@@ -2600,7 +2635,7 @@ function prepareZoneForCascade(
         console.warn(`[zone ${zoneId}] skipping stale orphan orderId=${o.orderId} (buffered ${now - o.bufferedAt}ms ago, > ${ZONE_ORPHAN_DRAIN_WINDOW_MS}ms)`);
         continue;
       }
-      zoneLimitOrders.set(o.orderId, zoneId);
+      setZoneLimitOrder(accountId, o.orderId, zoneId);
       void db.insert(zoneOrdersTable)
         .values({ zoneId, orderId: o.orderId, createdAt: now })
         .onConflictDoNothing()
@@ -2715,7 +2750,7 @@ async function attachLimitOrderToZone(
 ): Promise<void> {
   const zoneFromComment = parseZoneIdFromComment(comment);
   if (zoneFromComment) {
-    zoneLimitOrders.set(orderId, zoneFromComment);
+    setZoneLimitOrder(accountId, orderId, zoneFromComment);
     try {
       await db.insert(zoneOrdersTable).values({
         zoneId: zoneFromComment, orderId, createdAt: Date.now(),
@@ -2738,7 +2773,7 @@ async function attachLimitOrderToZone(
     console.log(`[zone ?] buffered cascade limit orderId=${orderId} for account=${accountId} (no zone prepared yet)`);
     return;
   }
-  zoneLimitOrders.set(orderId, pending.zoneId);
+  setZoneLimitOrder(accountId, orderId, pending.zoneId);
   try {
     await db.insert(zoneOrdersTable).values({
       zoneId: pending.zoneId, orderId, createdAt: Date.now(),
@@ -3052,10 +3087,7 @@ async function modifyZonePositionSl(
 async function cancelZoneLimits(
   token: string, region: string, accountId: string, zoneId: string,
 ): Promise<void> {
-  const orderIds: string[] = [];
-  for (const [oid, zid] of zoneLimitOrders.entries()) {
-    if (zid === zoneId) orderIds.push(oid);
-  }
+  const orderIds: string[] = orderIdsForZone(accountId, zoneId);
   // DB fallback: the in-memory map can be empty if entries were never populated
   // (race on zone creation), lost during a server restart gap, or already
   // cleaned up. Always cross-check the DB so we don't skip live MT5 orders.
@@ -3064,7 +3096,7 @@ async function cancelZoneLimits(
       const dbOrders = await db.select().from(zoneOrdersTable).where(eq(zoneOrdersTable.zoneId, zoneId));
       for (const o of dbOrders) {
         orderIds.push(o.orderId);
-        zoneLimitOrders.set(o.orderId, zoneId);
+        setZoneLimitOrder(accountId, o.orderId, zoneId);
       }
     } catch (e) {
       console.warn(`[zone ${zoneId}] DB fallback order lookup failed:`, (e as Error).message);
@@ -3096,12 +3128,14 @@ async function cancelZoneLimits(
     const cascadeLive = liveOrders.filter(o => {
       const c = String(o.comment ?? "");
       if (!c.startsWith("Cascade")) return false;
-      if (zoneLimitOrders.has(o.id)) return false;
+      if (orderMappedToActiveZone(accountId, o.id)) return false;
       // Only blind-cancel orders explicitly tagged with THIS zoneId in the comment.
       return commentBelongsToZone(c, zoneId);
     });
     if (cascadeLive.length === 0) return;
-    console.log(`[zone ${zoneId}] blind-cancel ${cascadeLive.length} untracked cascade limit(s) (no orderId records found)`);
+    console.log(
+      `[zone ${zoneId}] cancelZoneLimits accountId=${accountId} blind-cancel ${cascadeLive.length} untracked cascade limit(s)`,
+    );
     await Promise.all(cascadeLive.map(async (o) => {
       const r = await tradeAction(token, region, accountId, { actionType: "ORDER_CANCEL", orderId: o.id });
       // Mark completed regardless of result — 4754 means already gone, which is
@@ -3116,10 +3150,13 @@ async function cancelZoneLimits(
     return;
   }
 
+  console.log(
+    `[zone ${zoneId}] cancelZoneLimits accountId=${accountId} cancelling ${orderIds.length} tracked limit order(s)`,
+  );
   const pending: Set<string> = new Set(liveOrders.map(o => o.id));
   await Promise.all(orderIds.map(async (oid) => {
     const forget = async () => {
-      zoneLimitOrders.delete(oid);
+      deleteZoneLimitOrder(accountId, oid);
       try { await db.delete(zoneOrdersTable).where(eq(zoneOrdersTable.orderId, oid)); } catch { /* ignore */ }
     };
     if (pending.size > 0 && !pending.has(oid)) {
@@ -3196,7 +3233,7 @@ export async function brokerHasOpenLegsForZone(
   ]);
   if (live.some((p) => positionBelongsToZone(p, zoneId))) return true;
   return orders.some((o) => {
-    if (zoneLimitOrders.get(o.id) === zoneId) return true;
+    if (getZoneLimitOrder(accountId, o.id) === zoneId) return true;
     if (o.magic != null && o.magic === zoneMagicNumber(zoneId)) return true;
     return commentBelongsToZone(o.comment, zoneId);
   });
@@ -3206,8 +3243,10 @@ async function zoneHasLivePendingCascadeLimits(
   token: string, region: string, accountId: string, zoneId: string,
 ): Promise<boolean> {
   const liveOrders = await fetchLivePendingOrders(token, region, accountId);
+  const expectedMagic = zoneMagicNumber(zoneId);
   return liveOrders.some((o) => {
-    if (zoneLimitOrders.get(o.id) === zoneId) return true;
+    if (getZoneLimitOrder(accountId, o.id) === zoneId) return true;
+    if (o.magic != null && o.magic === expectedMagic) return true;
     return commentBelongsToZone(o.comment, zoneId);
   });
 }
@@ -4004,9 +4043,17 @@ export async function loadZoneState(): Promise<void> {
     }
     if (zones.length > 0) console.log(`[zone] hydrated ${zones.length} OPEN zone(s) from db`);
     // Rehydrate zone↔limit-order mappings so pre-restart limits still resolve.
-    const orders = await db.select().from(zoneOrdersTable);
-    for (const o of orders) zoneLimitOrders.set(o.orderId, o.zoneId);
-    if (orders.length > 0) console.log(`[zone] hydrated ${orders.length} zone limit-order link(s) from db`);
+    const orders = await db.select({
+      orderId: zoneOrdersTable.orderId,
+      zoneId: zoneOrdersTable.zoneId,
+      accountId: cascadeZonesTable.accountId,
+    })
+      .from(zoneOrdersTable)
+      .innerJoin(cascadeZonesTable, eq(zoneOrdersTable.zoneId, cascadeZonesTable.zoneId));
+    for (const o of orders) {
+      setZoneLimitOrder(o.accountId, o.orderId, o.zoneId);
+    }
+    if (orders.length > 0) console.log(`[zone] hydrated ${orders.length} zone limit-order link(s) from db (per-account)`);
   } catch (e) {
     console.error("[zone] hydrate error:", (e as Error).message);
   }
@@ -4757,15 +4804,9 @@ router.post("/mt5/account/:accountId/zones/:zoneId/cancel-pending", checkOwner, 
   try {
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
-    let pendingBefore = 0;
-    for (const [, zid] of zoneLimitOrders.entries()) {
-      if (zid === zoneId) pendingBefore++;
-    }
+    const pendingBefore = orderIdsForZone(accountId, zoneId).length;
     await cancelZoneLimits(token, region, accountId, zoneId);
-    let pendingAfter = 0;
-    for (const [, zid] of zoneLimitOrders.entries()) {
-      if (zid === zoneId) pendingAfter++;
-    }
+    const pendingAfter = orderIdsForZone(accountId, zoneId).length;
     const cancelledCount = Math.max(0, pendingBefore - pendingAfter);
     await closeArmedZoneIfDisarmed(accountId, zoneId, token, region, { force: true });
     broadcastToAccount(accountId, "pending_order", {});
