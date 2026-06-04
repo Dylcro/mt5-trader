@@ -136,6 +136,105 @@ export async function ensureCascadeZoneRfColumns(): Promise<void> {
   await cascadeRfColumnsReady;
 }
 
+let zonePositionsTpLevelReady: Promise<void> | null = null;
+export async function ensureZonePositionsTpLevelColumn(): Promise<void> {
+  if (!zonePositionsTpLevelReady) {
+    zonePositionsTpLevelReady = pool.query(`
+      ALTER TABLE zone_positions ADD COLUMN IF NOT EXISTS tp_level SMALLINT;
+    `).then(() => undefined).catch((e) => {
+      zonePositionsTpLevelReady = null;
+      throw e;
+    });
+  }
+  await zonePositionsTpLevelReady;
+}
+
+function parseCascadeLeg(comment: string | undefined | null): {
+  zoneId: string;
+  leg: number;
+  total: number;
+} | null {
+  if (!comment) return null;
+  const m = comment.match(/^Cascade\|([^|]+)\|(\d+)\/(\d+)$/);
+  if (!m?.[1]) return null;
+  return { zoneId: m[1], leg: Number(m[2]), total: Number(m[3]) };
+}
+
+function parseTpLevelFromBody(v: unknown): 1 | 2 | 3 | 4 | null {
+  const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+  if (n === 1 || n === 2 || n === 3 || n === 4) return n;
+  return null;
+}
+
+/** Group live legs by cascade comment leg number (fallback: rounded entry price). */
+export function groupLivePositionsByCascadeLeg(
+  positions: LivePosition[],
+): Map<number, LivePosition[]> {
+  const map = new Map<number, LivePosition[]>();
+  for (const p of positions) {
+    const parsed = parseCascadeLeg(p.comment);
+    const key = parsed?.leg ?? Math.round(p.openPrice * 100);
+    const arr = map.get(key) ?? [];
+    arr.push(p);
+    map.set(key, arr);
+  }
+  return map;
+}
+
+function summedFloatingPnl(positions: LivePosition[]): number {
+  return positions.reduce((s, p) => s + (p.profit ?? 0), 0);
+}
+
+/** Best entry group for Risk Free — highest summed floating P&L, else best entry on ladder. */
+export function pickBestEntryGroup(
+  positions: LivePosition[],
+  direction: "buy" | "sell",
+): LivePosition[] {
+  const groups = groupLivePositionsByCascadeLeg(positions);
+  let bestKey = -1;
+  let bestScore = -Infinity;
+  let bestLeg = Infinity;
+  for (const [leg, group] of groups) {
+    const score = summedFloatingPnl(group);
+    const hasProfit = group.some((p) => p.profit != null && !Number.isNaN(p.profit));
+    const ladderScore = direction === "buy"
+      ? Math.max(...group.map((p) => p.openPrice))
+      : Math.min(...group.map((p) => p.openPrice));
+    const cmp = hasProfit ? score : ladderScore;
+    if (cmp > bestScore || (cmp === bestScore && leg < bestLeg)) {
+      bestScore = cmp;
+      bestKey = leg;
+      bestLeg = leg;
+    }
+  }
+  return bestKey >= 0 ? (groups.get(bestKey) ?? [positions[0]!]) : [positions[0]!];
+}
+
+/** Worst entry group for Secure Profits — lowest summed floating P&L. */
+export function pickWorstEntryGroup(
+  positions: LivePosition[],
+  direction: "buy" | "sell",
+): LivePosition[] {
+  const groups = groupLivePositionsByCascadeLeg(positions);
+  let worstKey = -1;
+  let worstScore = Infinity;
+  let worstLeg = Infinity;
+  for (const [leg, group] of groups) {
+    const score = summedFloatingPnl(group);
+    const hasProfit = group.some((p) => p.profit != null && !Number.isNaN(p.profit));
+    const ladderScore = direction === "buy"
+      ? Math.min(...group.map((p) => p.openPrice))
+      : Math.max(...group.map((p) => p.openPrice));
+    const cmp = hasProfit ? score : ladderScore;
+    if (cmp < worstScore || (cmp === worstScore && leg < worstLeg)) {
+      worstScore = cmp;
+      worstKey = leg;
+      worstLeg = leg;
+    }
+  }
+  return worstKey >= 0 ? (groups.get(worstKey) ?? [positions[0]!]) : [positions[0]!];
+}
+
 async function upsertStoredAccount(params: {
   accountId: string;
   region: string;
@@ -2057,6 +2156,8 @@ export function dealIndicatesStopLoss(deal: unknown): boolean {
     || reason.includes("STOP LOSS")
     || reason.includes("STOP_OUT")
     || reason.includes("STOPOUT")
+    || reason.endsWith("_SO")
+    || reason.endsWith("SO")
   ) {
     return true;
   }
@@ -2726,11 +2827,57 @@ function prepareZoneForCascade(
 // updated to the real fill price by the caller before this runs. evaluateZone
 // guards on `anchorPrice > 0`, so an unfilled anchor simply pauses TP checks
 // until this completes.
+async function latchNativeTpHit(
+  zoneId: string,
+  tpLevel: 1 | 2 | 3 | 4,
+  accountId: string,
+  token: string,
+  region: string,
+): Promise<void> {
+  await ensureZonePositionsTpLevelColumn();
+  let st = zoneStates.get(zoneId);
+  if (!st) {
+    try { st = await loadZone(zoneId); } catch { return; }
+  }
+  if (!st || st.accountId !== accountId) return;
+
+  const wasHit = tpLevel === 1 ? st.tp1Hit : tpLevel === 2 ? st.tp2Hit : tpLevel === 3 ? st.tp3Hit : st.tp4Hit;
+  const hitPatch =
+    tpLevel === 1 ? { tp1Hit: true }
+      : tpLevel === 2 ? { tp2Hit: true }
+        : tpLevel === 3 ? { tp3Hit: true }
+          : { tp4Hit: true };
+
+  await db.update(cascadeZonesTable)
+    .set(hitPatch)
+    .where(eq(cascadeZonesTable.zoneId, zoneId))
+    .catch((e: Error) => console.warn(`[zone ${zoneId}] native TP${tpLevel} latch DB failed:`, e.message));
+
+  if (tpLevel === 1) st.tp1Hit = true;
+  else if (tpLevel === 2) st.tp2Hit = true;
+  else if (tpLevel === 3) st.tp3Hit = true;
+  else st.tp4Hit = true;
+
+  zoneNearNotifiedTp.set(zoneId, 0);
+
+  if (tpLevel === 2 && !wasHit && shouldCancelCascadeLimitsAtTpStage(2, st)) {
+    await cancelZoneLimits(token, region, accountId, zoneId);
+    console.log(`[zone ${zoneId}] native TP2 — cancelled unfilled cascade limits`);
+  }
+
+  if (!wasHit) {
+    notifyZoneEvent(zoneId, "hit", tpLevel, 0, st.direction);
+    console.log(`[zone ${zoneId}] native TP${tpLevel} hit latched (listener)`);
+  }
+  broadcastZoneUpdate(zoneId);
+}
+
 async function persistPreparedZone(
   state: ZoneState,
   userId: string | undefined,
   positionId: string,
   volume: number,
+  tpLevel?: number | null,
 ): Promise<void> {
   // Intentionally no try/catch — DB errors are rethrown so the caller's
   // async block can enforce DB-first ordering: zoneStates is updated only
@@ -2751,10 +2898,12 @@ async function persistPreparedZone(
       autoBeAtTp: state.autoBeAtTp,
       status: "OPEN", createdAt: now,
     }).onConflictDoNothing());
+  await ensureZonePositionsTpLevelColumn();
   await withDbRetry(`persistZonePos ${state.zoneId}`, () =>
     db.insert(zonePositionsTable).values({
       zoneId: state.zoneId, positionId, entryPrice: state.anchorPrice, volume,
       status: "OPEN", createdAt: now,
+      tpLevel: tpLevel != null ? tpLevel : null,
     }).onConflictDoNothing());
   // Seed the in-memory cache for the anchor leg so a DB blip immediately
   // after zone creation can't blind evaluateZone to the market entry.
@@ -2863,6 +3012,7 @@ async function attachLimitOrderToZone(
 
 async function recordZonePositionFill(
   zoneId: string, positionId: string, entryPrice: number, volume: number,
+  tpLevel?: number | null,
 ): Promise<void> {
   // Retry on transient DB errors. Losing this insert means the position is
   // forever invisible to evaluateZone (no row → never in `live` → cashout and
@@ -2872,8 +3022,10 @@ async function recordZonePositionFill(
   let lastErr: unknown = null;
   for (let i = 0; i <= delays.length; i++) {
     try {
+      await ensureZonePositionsTpLevelColumn();
       await db.insert(zonePositionsTable).values({
         zoneId, positionId, entryPrice, volume, status: "OPEN", createdAt: Date.now(),
+        tpLevel: tpLevel != null ? tpLevel : null,
       }).onConflictDoNothing();
       // Mirror into the in-memory cache so evaluateZone keeps working through
       // DB blips even if the next select() throws.
@@ -3031,13 +3183,18 @@ async function markZonePositionClosed(
     // Join through cascade_zones so we only act on rows belonging to *this*
     // account — MT5 position IDs can be reused across accounts/brokers.
     const rows = await withDbRetry(`markClosed.lookup posId=${positionId}`, () => db
-      .select({ zoneId: zonePositionsTable.zoneId, zoneAccountId: cascadeZonesTable.accountId })
+      .select({
+        zoneId: zonePositionsTable.zoneId,
+        zoneAccountId: cascadeZonesTable.accountId,
+        tpLevel: zonePositionsTable.tpLevel,
+      })
       .from(zonePositionsTable)
       .innerJoin(cascadeZonesTable, eq(zonePositionsTable.zoneId, cascadeZonesTable.zoneId))
       .where(and(eq(zonePositionsTable.positionId, positionId), eq(cascadeZonesTable.accountId, accountId)))
       .limit(1)
     );
     const zoneId = rows[0]?.zoneId;
+    const closedTpLevel = parseTpLevelFromBody(rows[0]?.tpLevel);
     if (!zoneId) return;
     const st = zoneStates.get(zoneId);
     const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
@@ -3063,6 +3220,10 @@ async function markZonePositionClosed(
       }
     }
     if (stillOpen) return; // partial close — leave row as OPEN
+
+    if (closedTpLevel) {
+      await latchNativeTpHit(zoneId, closedTpLevel, accountId, token, region);
+    }
 
     await withDbRetry(`markClosed.update posId=${positionId}`, () => db.update(zonePositionsTable)
       .set({ status: "CLOSED" })
@@ -3163,6 +3324,7 @@ async function closeZonePosition(
     ? { actionType: "POSITION_PARTIAL", positionId, volume }
     : { actionType: "POSITION_CLOSE_ID", positionId };
   const r = await tradeAction(token, region, accountId, body);
+  if (r.code === 10036) return true;
   if (!r.ok) console.warn(`[zone] close posId=${positionId} vol=${volume ?? "full"} failed code=${r.code} msg="${r.message ?? ""}"`);
   return r.ok;
 }
@@ -3661,19 +3823,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     if (!zoneHasTpTargets(st)) return;
     const cmpPrice = st.direction === "buy" ? price.bid : price.ask;
 
-    // Spread/slippage tolerance: fire TP when price comes within
-    // ZONE_TP_TOLERANCE_PIPS of the target on the profitable side. Without
-    // this, a TP set at the exact bid/ask never triggers because the broker's
-    // spread keeps the comparison side just shy of the level (e.g. user sets
-    // TP1 at 2400.00, bid peaks at 2399.94 due to 6-pip spread, and the close
-    // never fires). 3 pips is a typical XAUUSD spread + a small slippage buffer.
-    const tol = ZONE_TP_TOLERANCE_PIPS * PIP;
-    const hit = (tp: number) => st.direction === "buy" ? cmpPrice >= (tp - tol) : cmpPrice <= (tp + tol);
-
-    // No auto cashout — the user closes upper entries manually if they want.
-    // All four cascade orders share the same SL and TP1-4 (set broker-side at
-    // placement); the engine just runs 25% partial closes on EVERY live entry
-    // as each TP level is hit.
+    // Native broker TPs close sub-positions; listener + backstop latch zone flags.
 
     // "Near next TP" detection — fire a push once per TP step when the live
     // distance crosses the user's threshold. Runs before the hit branches so a
@@ -3715,229 +3865,27 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       }
     }
 
-    // ── TP1-4 applied to EVERY active entry (25% per TP, of each entry's
-    //    own original volume). TP4 is optional — when set, closes whatever's
-    //    left of each entry. Each TP advances only after the previous one
-    //    has fired.
-    //
-    //   TP2 also: cancel any still-unfilled cascade limits. We deliberately
-    //   do NOT re-arm broker SLs at TP2 (each position was placed with a
-    //   broker SL already; nudging it to BE per position would be a
-    //   behaviour change the user didn't ask for in this simpler model).
-    const zpsById = new Map(zps.map(z => [z.positionId, z]));
-    const cascadeLot = st.originalVolume > 0 ? st.originalVolume : 0;
-    const lastEnabled = (lvl: 1 | 2 | 3 | 4) => isLastEnabledTpLevel(lvl, st);
-    let levelCarry = st.tpCarryLot;
-    const closePartialForLevel = async (
-      level: 1 | 2 | 3 | 4,
-      positionsSubset: typeof live,
-    ): Promise<boolean> => {
-      // Resolve this level's close % from the zone's baked-in split config.
-      const tpPct = level === 1 ? st.tp1Pct : level === 2 ? st.tp2Pct : level === 3 ? st.tp3Pct : st.tp4Pct;
-      // Gate: "if position is already at or below the fraction that would remain
-      // AFTER this level fires, the partial was already applied — skip (or close
-      // remainder for small-lot cases where rounding over-took the expected %)."
-      // Formula: remaining_after_level_N = (100 - sum_through_N) / 100.
-      // We subtract tpPct so the gate for TP1 (priorPct=0, tpPct=25) is 0.76,
-      // not 1.01 — a gate of 1.01 is always satisfied and silently skips every
-      // TP1 partial close, logging "TP1 complete" without actually closing.
-      const priorPct = level === 1 ? 0 : level === 2 ? st.tp1Pct : level === 3 ? st.tp1Pct + st.tp2Pct : st.tp1Pct + st.tp2Pct + st.tp3Pct;
-      const keepFractionGate = Math.max(0, (100 - priorPct - tpPct + 1) / 100);
-      // Fire all per-entry closes IN PARALLEL — in a fast market, serially
-      // awaiting each close can let later entries slip several pips past the
-      // TP price before their close request hits the broker.
-      let closedAny = false;
-      const results = await Promise.all(positionsSubset.map(async p => {
-        const row = zpsById.get(p.id);
-        const origVol = row ? Number(row.volume) : p.volume;
-        if (!(origVol > 0)) return true;
-        if (level === 4) {
-          const ok = await closeZonePosition(token, region, st.accountId, p.id);
-          if (ok) closedAny = true;
-          return ok;
+    // Backstop: native-TP sub-position gone from broker but deal listener missed.
+    {
+      const liveIds = new Set(live.map((p) => p.id));
+      const openWithLevel = await withDbRetry(`evalZone.tpBackstop zone=${zoneId}`, () => db
+        .select({ positionId: zonePositionsTable.positionId, tpLevel: zonePositionsTable.tpLevel })
+        .from(zonePositionsTable)
+        .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
+      ).catch(() => [] as { positionId: string; tpLevel: number | null }[]);
+      for (const row of openWithLevel) {
+        const lvl = parseTpLevelFromBody(row.tpLevel);
+        if (!lvl || liveIds.has(row.positionId)) continue;
+        const already =
+          lvl === 1 ? st.tp1Hit : lvl === 2 ? st.tp2Hit : lvl === 3 ? st.tp3Hit : st.tp4Hit;
+        if (!already) {
+          console.log(`[zone ${zoneId}] backstop latch TP${lvl} posId=${row.positionId} (gone from live)`);
+          await latchNativeTpHit(zoneId, lvl, st.accountId, token, region);
         }
-        // skip if this entry already had its partial for this level applied.
-        // Exception: small lots where rounding made a prior TP take more than
-        // its configured %, so remaining already fell below this level's gate.
-        // Close whatever is left now rather than drifting to a later TP.
-        if (p.volume <= origVol * keepFractionGate) {
-          if (level > 1 && p.volume > 0) {
-            console.log(`[zone ${zoneId}] TP${level} posId=${p.id} small-lot full-close (vol=${p.volume} <= gate=${(origVol * keepFractionGate).toFixed(4)})`);
-            return closeZonePosition(token, region, st.accountId, p.id);
-          }
-          console.log(`[zone ${zoneId}] TP${level} posId=${p.id} already-applied skip (vol=${p.volume} origVol=${origVol} gate=${(origVol * keepFractionGate).toFixed(4)})`);
-          return true;
-        }
-        const lotBase = cascadeLot > 0 ? cascadeLot : origVol;
-        const slice = computeTpSliceVolume({
-          cascadeLot: lotBase,
-          tpPct,
-          remainingVol: p.volume,
-          carryIn: levelCarry,
-          isLastEnabledTp: lastEnabled(level),
-        });
-        if (slice.action === "carry") {
-          levelCarry = slice.carryOut;
-          console.log(`[zone ${zoneId}] TP${level} posId=${p.id} slice<0.01 — carry ${levelCarry} to next enabled TP`);
-          return true;
-        }
-        const vol = slice.closeVol;
-        if (vol < 0.01) {
-          console.warn(`[zone ${zoneId}] TP${level} posId=${p.id} skip — no closable volume (remain=${p.volume})`);
-          return false;
-        }
-        console.log(`[zone ${zoneId}] TP${level} posId=${p.id} partial close vol=${vol} (cascadeLot=${lotBase} tpPct=${tpPct}% currentVol=${p.volume} action=${slice.action})`);
-        const ok = vol < p.volume
-          ? await closeZonePosition(token, region, st.accountId, p.id, vol)
-          : await closeZonePosition(token, region, st.accountId, p.id);
-        if (ok) closedAny = true;
-        return ok;
-      }));
-      st.tpCarryLot = levelCarry;
-      return closedAny && results.every(Boolean);
-    };
-
-    // Per-position TP evaluation — zone fires as one, but each position tracks
-    // its own stage independently.
-    //
-    // Example: main entry had TP1 applied (pos.tp1Hit=true). Price retraces,
-    // a cascade limit fills (pos.tp1Hit=false). Price returns to TP1:
-    //   → main entry skips (already has tp1Hit) — nothing happens, waits for TP2
-    //   → limit entry takes its TP1 partial close
-    // Price continues to TP2:
-    //   → BOTH entries get TP2 applied together
-    //
-    // All four buckets are computed UPFRONT so a position that gets TP1 in this
-    // tick is not also pulled into the TP2 bucket in the same tick.
-    //
-    // Zone-level tp1Hit/tp2Hit flags mean "at least one position has reached
-    // this level" and gate: near-TP notifications, cancelZoneLimits (first TP2),
-    // SL→BE trigger, and UI progress display.
-    const tp1Satisfied = (p: LivePosition) => {
-      const pos = st.trackedPositions.get(p.id);
-      return !st.tp1Enabled || Boolean(pos?.tp1Hit);
-    };
-    const tp2Satisfied = (p: LivePosition) => {
-      const pos = st.trackedPositions.get(p.id);
-      return !st.tp2Enabled || Boolean(pos?.tp2Hit);
-    };
-    const tp3Satisfied = (p: LivePosition) => {
-      const pos = st.trackedPositions.get(p.id);
-      return !st.tp3Enabled || Boolean(pos?.tp3Hit);
-    };
-    const needTP1 = st.tp1Enabled ? live.filter(p => !st.trackedPositions.get(p.id)?.tp1Hit) : [];
-    const needTP2 = st.tp2Enabled ? live.filter(p => tp1Satisfied(p) && !st.trackedPositions.get(p.id)?.tp2Hit) : [];
-    const needTP3 = st.tp3Enabled ? live.filter(p => tp1Satisfied(p) && tp2Satisfied(p) && !st.trackedPositions.get(p.id)?.tp3Hit) : [];
-    const needTP4 = st.tp4Enabled ? live.filter(p => tp1Satisfied(p) && tp2Satisfied(p) && tp3Satisfied(p) && !st.trackedPositions.get(p.id)?.tp4Hit) : [];
-
-    // TP1 — positions that haven't had their first partial yet
-    const tp1AtPrice = st.tp1Price != null && hit(st.tp1Price);
-    const tp1BrokerApplied = needTP1.filter((p) => {
-      const row = zpsById.get(p.id);
-      const origVol = row ? Number(row.volume) : 0;
-      return positionShowsTpLevelApplied(p.volume, origVol, 1, st);
-    });
-    if (needTP1.length > 0 && st.tp1Price != null && (tp1AtPrice || tp1BrokerApplied.length > 0)) {
-      const trigger = tp1AtPrice ? "price" : "broker-volume";
-      console.log(
-        `[zone ${zoneId}] TP1 trigger (${trigger}) @${cmpPrice} (tp1=${st.tp1Price}) — `
-        + `${needTP1.length}/${live.length} need TP1, ${tp1BrokerApplied.length} already partial on broker`,
-      );
-      const ok = await closePartialForLevel(1, needTP1);
-      if (ok) {
-        const ids = needTP1.map(p => p.id);
-        await db.update(zonePositionsTable).set({ tp1Hit: true })
-          .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
-        for (const p of needTP1) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp1Hit = true; }
-        if (!st.tp1Hit) {
-          await db.update(cascadeZonesTable).set({ tp1Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-          st.tp1Hit = true;
-          zoneNearNotifiedTp.set(zoneId, 0);
-          notifyZoneEvent(zoneId, "hit", 1, 0, st.direction);
-        }
-        broadcastZoneUpdate(zoneId);
-        console.log(`[zone ${zoneId}] TP1 complete (${ids.length} position(s))`);
-      } else {
-        console.warn(`[zone ${zoneId}] TP1 partial failure — will retry next tick`);
       }
     }
 
-    // TP2 — positions that have had TP1 but not TP2
-    if (needTP2.length > 0 && st.tp2Price != null && hit(st.tp2Price)) {
-      console.log(`[zone ${zoneId}] TP2 trigger @${cmpPrice} (tp2=${st.tp2Price}) — ${needTP2.length}/${live.length} position(s) need TP2`);
-      const ok = await closePartialForLevel(2, needTP2);
-      if (ok) {
-        const ids = needTP2.map(p => p.id);
-        await db.update(zonePositionsTable).set({ tp2Hit: true })
-          .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
-        for (const p of needTP2) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp2Hit = true; }
-        if (!st.tp2Hit) {
-          // Cancel unfilled cascade limits only after a successful TP2 partial (never on TP1).
-          if (shouldCancelCascadeLimitsAtTpStage(2, st)) {
-            await cancelZoneLimits(token, region, st.accountId, zoneId);
-          }
-          // Advance zone-level flag. Do NOT gate on SL→BE — the sticky-retry
-          // block below handles that; gating here caused the zone to re-enter
-          // every tick when the broker rejected the SL (code 10016).
-          await db.update(cascadeZonesTable).set({ tp2Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-          st.tp2Hit = true;
-          zoneNearNotifiedTp.set(zoneId, 0);
-          notifyZoneEvent(zoneId, "hit", 2, 0, st.direction);
-          console.log(`[zone ${zoneId}] TP2 partial closed + limits cancelled — SL→BE will be attempted next`);
-        } else {
-          console.log(`[zone ${zoneId}] TP2 partial closed for ${ids.length} additional position(s)`);
-        }
-        broadcastZoneUpdate(zoneId);
-      } else {
-        console.warn(`[zone ${zoneId}] TP2 partial close failed — will retry next tick`);
-      }
-    }
-
-    // TP3 — positions that have had TP2 but not TP3
-    if (needTP3.length > 0 && st.tp3Price != null && hit(st.tp3Price)) {
-      console.log(`[zone ${zoneId}] TP3 trigger @${cmpPrice} (tp3=${st.tp3Price}) — ${needTP3.length}/${live.length} position(s) need TP3`);
-      const ok = await closePartialForLevel(3, needTP3);
-      if (ok) {
-        const ids = needTP3.map(p => p.id);
-        await db.update(zonePositionsTable).set({ tp3Hit: true })
-          .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
-        for (const p of needTP3) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp3Hit = true; }
-        if (!st.tp3Hit) {
-          await db.update(cascadeZonesTable).set({ tp3Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-          st.tp3Hit = true;
-          zoneNearNotifiedTp.set(zoneId, 0);
-          notifyZoneEvent(zoneId, "hit", 3, 0, st.direction);
-        }
-        broadcastZoneUpdate(zoneId);
-        console.log(`[zone ${zoneId}] TP3 complete (${ids.length} position(s))`);
-      } else {
-        console.warn(`[zone ${zoneId}] TP3 partial failure — will retry next tick`);
-      }
-    }
-
-    // TP4 — optional final exit, positions that have had TP3 but not TP4
-    if (needTP4.length > 0 && st.tp4Price != null && hit(st.tp4Price)) {
-      console.log(`[zone ${zoneId}] TP4 trigger @${cmpPrice} (tp4=${st.tp4Price}) — closing remaining ${needTP4.length} position(s)`);
-      const ok = await closePartialForLevel(4, needTP4);
-      if (ok) {
-        const ids = needTP4.map(p => p.id);
-        await db.update(zonePositionsTable).set({ tp4Hit: true })
-          .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
-        for (const p of needTP4) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp4Hit = true; }
-        if (!st.tp4Hit) {
-          await db.update(cascadeZonesTable).set({ tp4Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-          st.tp4Hit = true;
-          zoneNearNotifiedTp.set(zoneId, 0);
-          notifyZoneEvent(zoneId, "hit", 4, 0, st.direction);
-        }
-        broadcastZoneUpdate(zoneId);
-        console.log(`[zone ${zoneId}] TP4 complete — final exit (${ids.length} position(s))`);
-      } else {
-        console.warn(`[zone ${zoneId}] TP4 close failed — will retry next tick`);
-      }
-    }
-
-    // Sticky SL→BE block, independent of the TP if/else chain above. Runs
+    // Sticky SL→BE block. Runs
     // every tick once TP2 partials have closed, until either true BE is
     // achieved (tp2SlMoved=true) or we've truly exhausted the attempt budget.
     //
@@ -4642,14 +4590,9 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     }
     // Same "best" leg as Secure Profits (floating P&L when available, else entry ladder).
     // Mismatch here caused RF to close the leg SP had just kept when both were tapped.
-    const best = pickBestZonePositionForCloseWorst(live, st.direction);
-    const others = live.filter((p) => p.id !== best.id);
-    // Close every "other" position in parallel — serial closes were the main
-    // cause of Risk Free taking ~1s × N positions. MetaAPI's REST trade
-    // endpoint accepts concurrent POSITION_CLOSE_ID for distinct positions.
-    // Each item is wrapped in try/catch so a single network throw cannot
-    // short-circuit Promise.all and turn a partial-success into a 500 — the
-    // caller relies on `failedPositionIds` to know what to retry.
+    const bestGroup = pickBestEntryGroup(live, st.direction);
+    const bestIds = new Set(bestGroup.map((p) => p.id));
+    const others = live.filter((p) => !bestIds.has(p.id));
     const closeResults = await Promise.all(
       others.map(async (p) => {
         try {
@@ -4661,24 +4604,23 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       }),
     );
     const failed: string[] = closeResults.filter((r) => !r.ok).map((r) => r.id);
-    // "Risk free" (misnomer — kept because the user calls it that): move SL
-    // by a SIGNED pip offset from the best entry. Client passes `riskFreePips`
-    // in the body (-30..+30, step 5). Negative = drawdown protection (small
-    // loss if reversed); positive = profit lock (tighter exit); 0 = exactly
-    // at entry. Falls back to ZONE_RISK_FREE_PIPS when omitted. See
-    // computeRiskFreeSl for direction math.
     const body = (req.body ?? {}) as { riskFreePips?: unknown };
     const pips = body.riskFreePips !== undefined
       ? sanitizeRiskFreePips(body.riskFreePips)
       : ZONE_RISK_FREE_PIPS;
-    const sl = computeRiskFreeSl(st.direction, best.openPrice, pips);
-    const slOk = await modifyZonePositionSl(token, region, accountId, best.id, sl);
+    const refEntry = bestGroup.reduce((s, p) => s + p.openPrice * p.volume, 0)
+      / Math.max(bestGroup.reduce((s, p) => s + p.volume, 0), 1e-9);
+    const sl = computeRiskFreeSl(st.direction, refEntry, pips);
+    const slResults = await Promise.all(
+      bestGroup.map((p) => modifyZonePositionSl(token, region, accountId, p.id, sl)),
+    );
+    const slOk = slResults.every(Boolean);
     if (failed.length > 0 || !slOk) {
       // Don't flip status — caller can retry. Surface what's still broken.
       console.warn(`[zone ${zoneId}] risk-free partial: failedCloses=${failed.length} slOk=${slOk}`);
       res.status(207).json({
         ok: false,
-        bestPositionId: best.id,
+        bestPositionId: bestGroup[0]?.id,
         sl, slOk,
         closedCount: others.length - failed.length,
         failedPositionIds: failed,
@@ -4707,8 +4649,8 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     st.status = "RISK_FREE";
     broadcastZoneUpdate(zoneId);
     broadcastToAccount(accountId, "deal", { type: "position_changed" });
-    console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl} (pips=${pips})`);
-    res.json({ ok: true, bestPositionId: best.id, sl, pips, closedCount: others.length });
+    console.log(`[zone ${zoneId}] risk-free: kept ${bestGroup.length} sub-pos @${refEntry} sl=${sl} (pips=${pips})`);
+    res.json({ ok: true, bestPositionId: bestGroup[0]?.id, sl, pips, closedCount: others.length });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }
@@ -4739,31 +4681,38 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
       return;
     }
     const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
-    if (live.length < 2) {
+    const entryGroups = groupLivePositionsByCascadeLeg(live);
+    if (entryGroups.size < 2) {
       res.json({ ok: true, closedCount: 0, skipped: true, positionCount: live.length });
       return;
     }
-    const best = pickBestZonePositionForCloseWorst(live, st.direction);
-    const toClose = pickNextLegToTrimForSecureProfits(live, best, st.direction);
-    if (!toClose) {
+    const bestGroup = pickBestEntryGroup(live, st.direction);
+    const worstGroup = pickWorstEntryGroup(live, st.direction);
+    const bestIds = new Set(bestGroup.map((p) => p.id));
+    const toCloseGroup = worstGroup.some((p) => !bestIds.has(p.id))
+      ? worstGroup
+      : live.filter((p) => !bestIds.has(p.id));
+    if (toCloseGroup.length === 0) {
       res.json({ ok: true, closedCount: 0, skipped: true, positionCount: live.length });
       return;
     }
-    const { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, [toClose]);
-    if (!failed.includes(toClose.id)) st.trackedPositions.delete(toClose.id);
+    const { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, toCloseGroup);
+    for (const p of toCloseGroup) {
+      if (!failed.includes(p.id)) st.trackedPositions.delete(p.id);
+    }
     if (failed.length > 0) {
-      console.warn(`[zone ${zoneId}] secure-profits close failed posId=${toClose.id}`);
+      console.warn(`[zone ${zoneId}] secure-profits close failed ${failed.length} sub-pos`);
       res.status(207).json({
         ok: false,
-        bestPositionId: best.id,
-        closedPositionId: toClose.id,
-        closedCount: 0,
+        bestPositionId: bestGroup[0]?.id,
+        closedPositionIds: toCloseGroup.map((p) => p.id),
+        closedCount: toCloseGroup.length - failed.length,
         failedPositionIds: failed,
-        message: "Could not close that leg — tap Secure Profits to try again.",
+        message: "Could not close that entry — tap Secure Profits to try again.",
       });
       return;
     }
-    const remaining = live.length - 1;
+    const remaining = live.length - toCloseGroup.length;
     // Same as a normal TP2 hit: wipe unfilled cascade limits once the zone has reached TP2.
     // Pre-TP2, pending limits stay so the ladder can still fill.
     let limitsCancelled = false;
@@ -4774,14 +4723,14 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
     broadcastZoneUpdate(zoneId);
     broadcastToAccount(accountId, "deal", { type: "position_changed" });
     console.log(
-      `[zone ${zoneId}] secure-profits: kept posId=${best.id} @${best.openPrice} `
-      + `closed posId=${toClose.id} @${toClose.openPrice} remaining=${remaining} limitsCancelled=${limitsCancelled}`,
+      `[zone ${zoneId}] secure-profits: kept ${bestGroup.length} sub-pos `
+      + `closed worst entry (${toCloseGroup.length} sub-pos) remaining=${remaining} limitsCancelled=${limitsCancelled}`,
     );
     res.json({
       ok: true,
-      bestPositionId: best.id,
-      closedPositionId: toClose.id,
-      closedCount: 1,
+      bestPositionId: bestGroup[0]?.id,
+      closedPositionIds: toCloseGroup.map((p) => p.id),
+      closedCount: toCloseGroup.length,
       positionCount: remaining,
       limitsCancelled,
     });
@@ -5998,10 +5947,23 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
               (anchorHint <= 0 || cmp(tp1Price, anchorHint)) &&
               cmp(tp2Price, tp1Price) && cmp(tp3Price, tp2Price) &&
               (tp4Price == null || cmp(tp4Price, tp3Price));
-            if (!tpsValid) {
+            const tpLevel = parseTpLevelFromBody(rawBody.tpLevel);
+            const attachZoneId = clientZoneId || parseZoneIdFromComment(comment) || "";
+            const hasZoneMeta = tp1Price != null && tp2Price != null && tp3Price != null;
+            const cascadeLegLot = Number(rawBody.cascadeLegLot ?? volume) || volume;
+
+            if (!hasZoneMeta && attachZoneId && tpLevel) {
+              const tick = latestPrice(accountId);
+              const entry = anchorHint > 0 ? anchorHint : (tick ? (direction === "buy" ? tick.ask : tick.bid) : 0);
+              void recordZonePositionFill(attachZoneId, positionId, entry, volume, tpLevel);
+            } else if (!tpsValid) {
               console.warn(`[trade] cascade has invalid/missing TP prices — zone will NOT be created: tp1=${tp1Price} tp2=${tp2Price} tp3=${tp3Price} tp4=${tp4Price}`);
-            } else if (volume < ZONE_MIN_LOT_PER_ENTRY) {
-              console.warn(`[trade] cascade lot ${volume} below broker minimum ${ZONE_MIN_LOT_PER_ENTRY} — zone will NOT be created`);
+            } else if (cascadeLegLot < ZONE_MIN_LOT_PER_ENTRY) {
+              console.warn(`[trade] cascade lot ${cascadeLegLot} below broker minimum ${ZONE_MIN_LOT_PER_ENTRY} — zone will NOT be created`);
+            } else if (attachZoneId && (zoneStates.has(attachZoneId) || (await db.select({ zoneId: cascadeZonesTable.zoneId }).from(cascadeZonesTable).where(eq(cascadeZonesTable.zoneId, attachZoneId)).limit(1)).length > 0)) {
+              const tick = latestPrice(accountId);
+              const entry = anchorHint > 0 ? anchorHint : (tick ? (direction === "buy" ? tick.ask : tick.bid) : 0);
+              void recordZonePositionFill(attachZoneId, positionId, entry, volume, tpLevel);
             } else {
               // SYNCHRONOUS: reserve zone + pending association *before* the
               // trade response returns, so any companion cascade limit that
@@ -6013,7 +5975,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
                   tp1Pct, tp2Pct, tp3Pct, tp4Pct,
                   autoBeAtTp: rawBody.autoBeAtTp,
                 },
-                volume,
+                cascadeLegLot,
                 clientZoneId || parseZoneIdFromComment(comment) || undefined,
                 anchorHint,
               );
@@ -6030,7 +5992,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
               // will still find this row and the monitor keeps tracking it.
               // evaluateZone guards on anchorPrice > 0, so a zero anchor just
               // pauses TP checks until the refinement below completes.
-              const earlyPersist = persistPreparedZone(zoneState, uId, positionId, volume);
+              const earlyPersist = persistPreparedZone(zoneState, uId, positionId, volume, tpLevel);
               void (async () => {
                 try {
                   await earlyPersist; // throws on DB failure — rethrown by persistPreparedZone

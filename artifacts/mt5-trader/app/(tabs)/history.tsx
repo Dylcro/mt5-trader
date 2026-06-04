@@ -161,14 +161,23 @@ function HistoryCard({ zone }: { zone: Zone }) {
         </View>
       </View>
 
-      <View style={styles.tpChipRow}>
-        {([1, 2, 3, 4] as const).map((n) => (
-          <TpChip key={n} n={n} zone={zone} />
-        ))}
-        <ExitChip label="MANUAL" hit={zonePrimaryOutcome(zone) === "MANUAL"} variant="manual" />
-        <ExitChip label="RF" hit={zonePrimaryOutcome(zone) === "RF"} variant="rf" />
-        <ExitChip label="SL" hit={zonePrimaryOutcome(zone) === "SL"} variant="sl" />
-      </View>
+      {(() => {
+        const outcome = zonePrimaryOutcome(zone);
+        return (
+          <View style={{ gap: 6 }}>
+            <View style={styles.tpChipRow}>
+              {([1, 2, 3, 4] as const).map((n) => (
+                <TpChip key={n} n={n} zone={zone} />
+              ))}
+            </View>
+            <View style={styles.tpChipRow}>
+              <ExitChip label="MANUAL" hit={outcome === "MANUAL"} variant="manual" />
+              <ExitChip label="RF" hit={outcome === "RF"} variant="rf" />
+              <ExitChip label="SL" hit={outcome === "SL"} variant="sl" />
+            </View>
+          </View>
+        );
+      })()}
     </View>
   );
 }
@@ -443,7 +452,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     gap: 4,
-    paddingVertical: 6,
+    paddingVertical: 8,
     borderRadius: 8,
     borderWidth: 1,
   },
@@ -480,7 +489,7 @@ const styles = StyleSheet.create({
     borderColor: C.textMuted,
   },
   tpChipText: {
-    fontSize: 10,
+    fontSize: 11,
     fontFamily: "Inter_600SemiBold",
     color: C.textMuted,
   },

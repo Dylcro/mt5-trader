@@ -1,4 +1,4 @@
-import { pgTable, serial, text, bigint, boolean, doublePrecision } from "drizzle-orm/pg-core";
+import { pgTable, serial, text, bigint, boolean, doublePrecision, integer } from "drizzle-orm/pg-core";
 
 export const cascadeZonesTable = pgTable("cascade_zones", {
   id:          serial("id").primaryKey(),
@@ -83,6 +83,8 @@ export const zonePositionsTable = pgTable("zone_positions", {
   tp2Hit:     boolean("tp2_hit").notNull().default(false),
   tp3Hit:     boolean("tp3_hit").notNull().default(false),
   tp4Hit:     boolean("tp4_hit").notNull().default(false),
+  /** Native broker TP level (1–4) this sub-position was armed for. */
+  tpLevel:    integer("tp_level"),
 });
 
 export type ZonePositionRow = typeof zonePositionsTable.$inferSelect;
