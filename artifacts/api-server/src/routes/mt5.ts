@@ -2807,7 +2807,11 @@ async function resolveLivePositionsForZoneAction(
 
   let relinked = 0;
   for (const p of live) {
-    const [row] = await db.select({ status: zonePositionsTable.status })
+    const [row] = await db.select({
+      status: zonePositionsTable.status,
+      volume: zonePositionsTable.volume,
+      entryPrice: zonePositionsTable.entryPrice,
+    })
       .from(zonePositionsTable)
       .where(and(
         eq(zonePositionsTable.zoneId, zoneId),
@@ -2827,9 +2831,14 @@ async function resolveLivePositionsForZoneAction(
       relinked++;
     }
     const cached = st.trackedPositions.get(p.id);
+    // Keep the original fill volume from DB for TP partial % math — broker
+    // live volume shrinks after partials; overwriting with p.volume makes the
+    // engine think TP1 already fired and skip real closes.
+    const origVol = row?.volume != null ? Number(row.volume) : p.volume;
+    const entry = row?.entryPrice != null ? Number(row.entryPrice) : p.openPrice;
     st.trackedPositions.set(p.id, {
-      volume: p.volume,
-      entryPrice: p.openPrice,
+      volume: origVol,
+      entryPrice: entry,
       tp1Hit: cached?.tp1Hit ?? false,
       tp2Hit: cached?.tp2Hit ?? false,
       tp3Hit: cached?.tp3Hit ?? false,
@@ -4420,9 +4429,10 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     if (live.length === 0) {
       res.status(409).json({ error: "No open positions in this zone" }); return;
     }
-    const sorted = sortZonePositions(live, st.direction); // worst → best
-    const best = sorted[sorted.length - 1]!;
-    const others = sorted.slice(0, -1);
+    // Same "best" leg as Secure Profits (floating P&L when available, else entry ladder).
+    // Mismatch here caused RF to close the leg SP had just kept when both were tapped.
+    const best = pickBestZonePositionForCloseWorst(live, st.direction);
+    const others = live.filter((p) => p.id !== best.id);
     // Close every "other" position in parallel — serial closes were the main
     // cause of Risk Free taking ~1s × N positions. MetaAPI's REST trade
     // endpoint accepts concurrent POSITION_CLOSE_ID for distinct positions.
@@ -4452,7 +4462,6 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       : ZONE_RISK_FREE_PIPS;
     const sl = computeRiskFreeSl(st.direction, best.openPrice, pips);
     const slOk = await modifyZonePositionSl(token, region, accountId, best.id, sl);
-    await cancelZoneLimits(token, region, accountId, zoneId);
     if (failed.length > 0 || !slOk) {
       // Don't flip status — caller can retry. Surface what's still broken.
       console.warn(`[zone ${zoneId}] risk-free partial: failedCloses=${failed.length} slOk=${slOk}`);
@@ -4477,6 +4486,10 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
         .catch((e: Error) => console.warn(`[zone ${zoneId}] risk-free mark closed ${r.id}:`, e.message));
       st.trackedPositions.delete(r.id);
     }
+    // Wipe unfilled cascade limits only after a successful risk-free — same
+    // contract as TP2 / close-zone. Doing this before success left zones OPEN
+    // with no limits and no RISK_FREE status when SL/close partially failed.
+    await cancelZoneLimits(token, region, accountId, zoneId);
     await db.update(cascadeZonesTable)
       .set({ status: "RISK_FREE", wentRiskFree: true })
       .where(eq(cascadeZonesTable.zoneId, zoneId));

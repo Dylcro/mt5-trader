@@ -129,6 +129,8 @@ interface TradingContextValue {
   connectionWarm: boolean;
   /** Refresh broker session (price, positions, account). Safe to call when already warm. */
   syncSession: (force?: boolean) => Promise<void>;
+  /** Fast preflight before zone buttons — skips full wake when price is live. */
+  ensureSessionForTrade: () => Promise<{ ready: boolean; message?: string }>;
 }
 
 export interface PlaceTradeParams {
@@ -648,6 +650,27 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       if (!fresh) setPriceStale(true);
     }
   }, [accountId, status, fetchPriceData, fetchPositionsData, fetchPendingOrdersData, fetchAccountInfoData, applyLivePrice]);
+
+  const ensureSessionForTrade = useCallback(async (): Promise<{ ready: boolean; message?: string }> => {
+    if (status !== "connected" || !accountId) {
+      return { ready: false, message: "Not connected — open Settings and connect MT5." };
+    }
+    const isPriceFresh = () =>
+      priceRef.current != null
+      && lastPriceAtRef.current > 0
+      && Date.now() - lastPriceAtRef.current <= PRICE_STALE_MS;
+    if (isPriceFresh()) {
+      return { ready: true };
+    }
+    await wakeConnection(false);
+    if (isPriceFresh()) {
+      return { ready: true };
+    }
+    return {
+      ready: false,
+      message: "Quotes not live yet. Open Trade, tap sync (↻), wait for price, then retry.",
+    };
+  }, [accountId, status, wakeConnection]);
 
   const wakeConnectionRef = useRef<() => void>(() => {});
   wakeConnectionRef.current = () => { void wakeConnection(); };
@@ -1498,6 +1521,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         sseConnected,
         connectionWarm,
         syncSession: wakeConnection,
+        ensureSessionForTrade,
       }}
     >
       {children}
