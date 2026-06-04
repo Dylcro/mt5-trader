@@ -2203,12 +2203,13 @@ export function resolveCloseOutcome(row: {
   tp4Enabled: boolean;
   tp4Hit: boolean;
   tp4Price?: number | null;
+  tp1Hit?: boolean;
   manualClose?: boolean;
   slHit?: boolean;
   riskFreeSlExit?: boolean;
 }): { manualClose: boolean; slHit: boolean; riskFreeSlExit: boolean } {
   if (row.riskFreeSlExit) return { manualClose: false, slHit: false, riskFreeSlExit: true };
-  if (row.slHit) return { manualClose: false, slHit: true, riskFreeSlExit: false };
+  if (row.slHit && !row.tp1Hit) return { manualClose: false, slHit: true, riskFreeSlExit: false };
   if (row.status !== "CLOSED") return { manualClose: false, slHit: false, riskFreeSlExit: false };
   if (row.manualClose != null) {
     return { manualClose: Boolean(row.manualClose), slHit: false, riskFreeSlExit: false };
@@ -2276,6 +2277,9 @@ async function finalizeZoneClose(
     } else {
       manualClose = !sanitized.tp1Hit && !sanitized.tp4Hit;
     }
+
+    // BE / broker stop after TP1+ is not an SL loss bucket (zone-classification-spec).
+    if (slHit && sanitized.tp1Hit) slHit = false;
 
     await db.update(cascadeZonesTable)
       .set({
@@ -4563,7 +4567,16 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         closedPnl: row.closedPnl != null ? Number(row.closedPnl) : null,
         finalTpReached,
         ...(() => {
-          const closeFlags = resolveCloseOutcome(row);
+          const closeFlags = resolveCloseOutcome({
+            status: row.status,
+            tp4Enabled,
+            tp4Hit: mergedHits.tp4Hit,
+            tp4Price,
+            tp1Hit: mergedHits.tp1Hit,
+            manualClose: row.manualClose,
+            slHit: row.slHit,
+            riskFreeSlExit: (row as { riskFreeSlExit?: boolean }).riskFreeSlExit,
+          });
           return {
             ...closeFlags,
             primaryOutcome: zonePrimaryOutcome({
@@ -4697,9 +4710,24 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-tp-now", checkOwner, as
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     const st = await loadZone(zoneId);
-    if (!st || st.accountId !== accountId || st.status === "CLOSED") {
+    if (!st || st.accountId !== accountId) {
       res.status(404).json({ error: "Zone not found" });
       return;
+    }
+    const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+    if (st.status === "CLOSED") {
+      if (live.length === 0) {
+        res.status(409).json({
+          error: "Zone already closed — no open size left (often after break-even stop at TP2)",
+          code: "ZONE_CLOSED",
+        });
+        return;
+      }
+      await db.update(cascadeZonesTable)
+        .set({ status: "OPEN", closedAt: null })
+        .where(eq(cascadeZonesTable.zoneId, zoneId));
+      st.status = "OPEN";
+      console.log(`[zone ${zoneId}] close-tp-now: reopened CLOSED zone (${live.length} leg(s))`);
     }
     if (st.status === "ARMED") {
       res.status(409).json({ error: "Zone not active yet — wait for the first order to fill" });
@@ -4709,7 +4737,6 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-tp-now", checkOwner, as
       res.status(409).json({ error: "No TP prices on this zone" });
       return;
     }
-    const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
     if (live.length === 0) {
       res.status(409).json({ error: "No open positions in this zone" });
       return;
@@ -4720,8 +4747,18 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-tp-now", checkOwner, as
       return;
     }
     const cmpPrice = st.direction === "buy" ? price.bid : price.ask;
-    const liveNeeds = liveLegsNeedTpLevel(st, live.map((p) => p.id));
-    const level = pickNearestUnhitTpLevel(st, cmpPrice, liveNeeds);
+    const liveIds = live.map((p) => p.id);
+    const liveNeeds = liveLegsNeedTpLevel(st, liveIds);
+    const body = (req.body && typeof req.body === "object" ? req.body : {}) as { tpLevel?: number };
+    const reqLevel = typeof body.tpLevel === "number" && Number.isFinite(body.tpLevel)
+      ? Math.trunc(body.tpLevel) as 1 | 2 | 3 | 4
+      : undefined;
+    let level = pickNearestUnhitTpLevel(st, cmpPrice, liveNeeds);
+    if (reqLevel === 1 && st.tp1Enabled !== false && liveNeeds.need1) level = 1;
+    else if (reqLevel === 2 && st.tp2Enabled !== false && liveNeeds.need2) level = 2;
+    else if (reqLevel === 3 && st.tp3Enabled !== false && liveNeeds.need3) level = 3;
+    else if (reqLevel === 4 && st.tp4Enabled !== false && liveNeeds.need4
+      && !isManualTp4Zone(st.tp4Price, st.tp4Enabled !== false)) level = 4;
     if (level === 0) {
       res.json({ ok: true, skipped: true, message: "All enabled TPs already hit on this zone" });
       return;

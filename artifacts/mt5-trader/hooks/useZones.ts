@@ -272,12 +272,14 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
 
   const closeTpNow = useCallback(async (
     zoneId: string,
+    tpLevel?: 0 | 1 | 2 | 3 | 4,
   ): Promise<{ ok: boolean; message?: string; tpLevel?: number; skipped?: boolean }> => {
     if (!API_BASE || !accountId) return { ok: false, message: "No account" };
     try {
+      const body = tpLevel != null && tpLevel > 0 ? JSON.stringify({ tpLevel }) : "{}";
       const res = await authFetchWithTimeout(
         `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/close-tp-now${zoneTradeQuery(region)}`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+        { method: "POST", headers: { "Content-Type": "application/json" }, body },
       );
       const data = await res.json().catch(() => ({})) as {
         ok?: boolean; message?: string; error?: string; tpLevel?: number; skipped?: boolean;

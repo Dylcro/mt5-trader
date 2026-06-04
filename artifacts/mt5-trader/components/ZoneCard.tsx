@@ -94,7 +94,10 @@ interface ZoneCardProps {
   onCloseAllWorst?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
   onCloseZone?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
   onCancelOrders?: (zoneId: string) => Promise<{ ok: boolean; message?: string; cancelledCount?: number }>;
-  onCloseTpNow?: (zoneId: string) => Promise<{ ok: boolean; message?: string; tpLevel?: number; skipped?: boolean }>;
+  onCloseTpNow?: (
+    zoneId: string,
+    tpLevel?: 0 | 1 | 2 | 3 | 4,
+  ) => Promise<{ ok: boolean; message?: string; tpLevel?: number; skipped?: boolean }>;
   riskFreePips?: number;
   historical?: boolean;
 }
@@ -245,7 +248,7 @@ export default function ZoneCard({
     if (!onCloseTpNow || tpNowBusy) return;
     setTpNowBusy(true);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    const result = await onCloseTpNow(zone.zoneId);
+    const result = await onCloseTpNow(zone.zoneId, zone.nextTp);
     setTpNowBusy(false);
     if (result.ok) {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);

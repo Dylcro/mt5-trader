@@ -629,6 +629,14 @@ describe("disabled TP history", () => {
       status: "CLOSED",
       tp4Enabled: true,
       tp4Hit: false,
+      tp1Hit: true,
+      manualClose: false,
+      slHit: true,
+    })).toEqual({ manualClose: false, slHit: false, riskFreeSlExit: false });
+    expect(resolveCloseOutcome({
+      status: "CLOSED",
+      tp4Enabled: true,
+      tp4Hit: false,
       manualClose: false,
       slHit: false,
       riskFreeSlExit: true,
