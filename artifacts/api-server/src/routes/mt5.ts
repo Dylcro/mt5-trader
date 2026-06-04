@@ -495,10 +495,64 @@ const pendingAppCascades = new Set<string>();
 // without this, every deploy/restart leaves previously-placed limits "unknown"
 // and their fills get re-cascaded as if they were brand-new user trades.
 const cascadePlacedOrderIds = new Set<string>();
-function trackCascadeOrder(accountId: string, orderId: string | undefined): void {
+/** Fresh zones / pending limits are protected from orphan sweeps and empty-reconcile cancels. */
+export const ZONE_SETTLE_MS = 60_000;
+export const PENDING_ORDER_CANCEL_MIN_AGE_MS = 60_000;
+
+export function isZoneSettling(st: { createdAtMs?: number }, nowMs = Date.now()): boolean {
+  const created = st.createdAtMs ?? 0;
+  if (created <= 0) return false;
+  return nowMs - created < ZONE_SETTLE_MS;
+}
+
+function pendingOrderAgeMs(order: { time?: string; openTime?: string }, nowMs = Date.now()): number | null {
+  const raw = order.time ?? order.openTime;
+  if (!raw) return null;
+  const t = new Date(raw).getTime();
+  if (!Number.isFinite(t) || t <= 0) return null;
+  return nowMs - t;
+}
+
+/** Unknown broker time → treat as young (do not cancel on a stale/empty snapshot). */
+export function shouldProtectPendingOrderFromCancel(ageMs: number | null): boolean {
+  if (ageMs == null) return true;
+  return ageMs < PENDING_ORDER_CANCEL_MIN_AGE_MS;
+}
+
+export function logPendingOrderCancel(ctx: {
+  caller: string;
+  accountId: string;
+  zoneId?: string;
+  orderId: string;
+  comment?: string;
+  ageMs: number | null;
+  matchedZone: boolean;
+  skipped?: boolean;
+  reason?: string;
+}): void {
+  console.log(
+    `[pending-cancel] caller=${ctx.caller} account=${ctx.accountId} zone=${ctx.zoneId ?? "—"} `
+    + `orderId=${ctx.orderId} ageMs=${ctx.ageMs ?? "unknown"} matchedZone=${ctx.matchedZone} `
+    + `comment="${ctx.comment ?? ""}" ${ctx.skipped ? `SKIP(${ctx.reason ?? "protected"})` : "EXECUTE"}`,
+  );
+}
+
+function trackCascadeOrder(
+  accountId: string,
+  orderId: string | undefined,
+  comment?: string,
+): void {
   if (!orderId) return;
   if (cascadePlacedOrderIds.has(orderId)) return;
   cascadePlacedOrderIds.add(orderId);
+  const zoneFromComment = parseZoneIdFromComment(comment);
+  if (zoneFromComment) {
+    zoneLimitOrders.set(orderId, zoneFromComment);
+    void db.insert(zoneOrdersTable)
+      .values({ zoneId: zoneFromComment, orderId, createdAt: Date.now() })
+      .onConflictDoNothing()
+      .catch((e: Error) => console.warn(`[zone ${zoneFromComment}] trackCascadeOrder persist orderId=${orderId}:`, e.message));
+  }
   if (cascadePlacedOrderIds.size > 5000) {
     const first = cascadePlacedOrderIds.values().next().value;
     if (first !== undefined) cascadePlacedOrderIds.delete(first);
@@ -1350,11 +1404,9 @@ async function placeCascadeLimitFast(
 }
 
 // ── Post-cascade orphan sweeper ─────────────────────────────────────────────
-// 15 s after a cascade fires, scan pending limit orders. Any "Cascade"-tagged
-// order whose orderId we did NOT track is an orphan (the most common cause:
-// a late streaming response that landed on MT5 but our cancel-duplicate failed
-// because the WebSocket was disconnecting). Cancel it.
-const RECONCILE_DELAY_MS = 15_000;
+// Legacy safety net: cancel truly untracked Cascade limits after a long grace.
+// Never runs against fresh orders — placement races were killing new ladders.
+const RECONCILE_DELAY_MS = 45_000;
 
 function scheduleCascadeReconcile(accountId: string, region: string, token: string): void {
   setTimeout(async () => {
@@ -1365,26 +1417,32 @@ function scheduleCascadeReconcile(accountId: string, region: string, token: stri
       if (!resp.ok) return;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const orders = (await resp.json()) as any[];
-      // Only treat orders older than 10s as "settled" — anything newer might
-      // belong to a cascade that's currently mid-placement (whose orderIds
-      // haven't yet been added to cascadePlacedOrderIds).
-      const ORPHAN_MIN_AGE_MS = 10_000;
       const nowMs = Date.now();
-      const orphans: { id: string; comment: string }[] = [];
+      const orphans: { id: string; comment: string; ageMs: number | null }[] = [];
       for (const o of orders) {
         const comment = String(o.comment ?? "");
         if (!comment.startsWith("Cascade")) continue;
         const oid = String(o.id ?? o._id ?? "");
         if (!oid) continue;
-        if (cascadePlacedOrderIds.has(oid)) continue; // we know about this one
-        // Skip very fresh orders to avoid eating a concurrent in-flight cascade
-        const orderTimeMs = o.time ? new Date(o.time).getTime() : 0;
-        if (orderTimeMs > 0 && (nowMs - orderTimeMs) < ORPHAN_MIN_AGE_MS) continue;
-        orphans.push({ id: oid, comment });
+        if (cascadePlacedOrderIds.has(oid)) continue;
+        if (zoneLimitOrders.has(oid)) continue;
+        const ageMs = pendingOrderAgeMs(o, nowMs);
+        if (shouldProtectPendingOrderFromCancel(ageMs)) continue;
+        orphans.push({ id: oid, comment, ageMs });
       }
       if (orphans.length === 0) return;
       console.warn(`[reconcile ${accountId}] found ${orphans.length} untracked Cascade order(s): ${orphans.map(o => `${o.id}(${o.comment})`).join(", ")}`);
       await Promise.all(orphans.map(async o => {
+        const zid = parseZoneIdFromComment(o.comment);
+        logPendingOrderCancel({
+          caller: "scheduleCascadeReconcile",
+          accountId,
+          zoneId: zid ?? undefined,
+          orderId: o.id,
+          comment: o.comment,
+          ageMs: o.ageMs,
+          matchedZone: Boolean(zid && zoneStates.has(zid)),
+        });
         try {
           const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
             method: "POST",
@@ -2287,6 +2345,8 @@ interface ZoneState {
   /** Auto SL→BE after this TP partial (1, 2, or 3). Baked in at zone creation. */
   autoBeAtTp: 1 | 2 | 3;
   status: "OPEN" | "RISK_FREE" | "CLOSED" | "ARMED";
+  /** Wall-clock ms when the zone row was created — guards empty-reconcile during placement. */
+  createdAtMs: number;
   busy: boolean; // debounce: prevent overlapping monitor ticks for this zone
   // In-memory mirror of zone_positions(status=OPEN) for this zone, used as a
   // fallback when the DB query inside evaluateZone fails — prevents transient
@@ -2522,9 +2582,13 @@ function resolvePendingZoneAssoc(
   if (direction) {
     const byZone = pendingZoneByZone.get(accountId);
     if (byZone) {
+      let newest: { zoneId: string; direction: "buy" | "sell"; expiresAt: number } | null = null;
       for (const entry of byZone.values()) {
-        if (entry.expiresAt >= now && entry.direction === direction) return entry;
+        if (entry.expiresAt >= now && entry.direction === direction) {
+          if (!newest || entry.expiresAt > newest.expiresAt) newest = entry;
+        }
       }
+      if (newest) return newest;
     }
   }
   const pending = pendingZoneAssoc.get(accountId);
@@ -2578,6 +2642,7 @@ function prepareZoneForCascade(
       tp1: tp1Enabled, tp2: tp2Enabled, tp3: tp3Enabled,
     }),
     status: "OPEN", busy: false,
+    createdAtMs: Date.now(),
     trackedPositions: new Map(),
   };
   // Do NOT set zoneStates here — the zone is added to the in-memory map only
@@ -2648,6 +2713,7 @@ async function persistPreparedZone(
   // Seed the in-memory cache for the anchor leg so a DB blip immediately
   // after zone creation can't blind evaluateZone to the market entry.
   state.trackedPositions.set(positionId, { volume, entryPrice: state.anchorPrice, tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false });
+  state.createdAtMs = now;
   if (userId) zoneIdToUserId.set(state.zoneId, userId);
   logEvent("zone.create", { accountId: state.accountId, zoneId: state.zoneId, direction: state.direction, anchorPrice: state.anchorPrice, positionId, volume });
 }
@@ -2668,6 +2734,7 @@ async function persistArmedZone(state: ZoneState, userId: string | undefined): P
     autoBeAtTp: state.autoBeAtTp,
     status: "ARMED", createdAt: now,
   }).onConflictDoNothing();
+  state.createdAtMs = now;
   if (userId) zoneIdToUserId.set(state.zoneId, userId);
   logEvent("zone.arm", { accountId: state.accountId, zoneId: state.zoneId, direction: state.direction, anchorPrice: state.anchorPrice });
 }
@@ -3055,7 +3122,13 @@ async function modifyZonePositionSl(
 
 async function cancelZoneLimits(
   token: string, region: string, accountId: string, zoneId: string,
+  caller = "cancelZoneLimits",
 ): Promise<void> {
+  const st = zoneStates.get(zoneId);
+  if (st && isZoneSettling(st)) {
+    console.log(`[zone ${zoneId}] ${caller}: zone settling (${Date.now() - st.createdAtMs}ms) — skip limit cancel`);
+    return;
+  }
   const orderIds: string[] = [];
   for (const [oid, zid] of zoneLimitOrders.entries()) {
     if (zid === zoneId) orderIds.push(oid);
@@ -3076,18 +3149,25 @@ async function cancelZoneLimits(
   }
   // Fetch live pending orders — used both for the tracked-ID path (to skip
   // already-gone orders) and the blind-cancel fallback below.
-  let liveOrders: Array<{ id: string; comment?: string }> = [];
+  let liveOrders: Array<{ id: string; comment?: string; time?: string; openTime?: string }> = [];
   try {
     const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`, {
       headers: authHeaders(token),
     });
     if (r.ok) {
-      const raw = await r.json() as Array<{ id?: string; _id?: string; comment?: string }>;
-      liveOrders = raw.map(o => ({ id: String(o.id ?? o._id ?? ""), comment: o.comment })).filter(o => o.id);
+      const raw = await r.json() as Array<{ id?: string; _id?: string; comment?: string; time?: string; openTime?: string }>;
+      liveOrders = raw.map(o => ({
+        id: String(o.id ?? o._id ?? ""),
+        comment: o.comment,
+        time: o.time != null ? String(o.time) : undefined,
+        openTime: o.openTime != null ? String(o.openTime) : undefined,
+      })).filter(o => o.id);
     }
   } catch (e) {
     console.warn(`[zone ${zoneId}] orders fetch error during cancel:`, (e as Error).message);
   }
+  const nowMs = Date.now();
+  const liveById = new Map(liveOrders.map((o) => [o.id, o]));
 
   if (orderIds.length === 0) {
     // Neither in-memory map nor DB had tracked order IDs — this can happen after
@@ -3107,6 +3187,30 @@ async function cancelZoneLimits(
     if (cascadeLive.length === 0) return;
     console.log(`[zone ${zoneId}] blind-cancel ${cascadeLive.length} untracked cascade limit(s) (no orderId records found)`);
     await Promise.all(cascadeLive.map(async (o) => {
+      const ageMs = pendingOrderAgeMs(liveById.get(o.id) ?? {}, nowMs);
+      if (shouldProtectPendingOrderFromCancel(ageMs)) {
+        logPendingOrderCancel({
+          caller: `${caller}.blind`,
+          accountId,
+          zoneId,
+          orderId: o.id,
+          comment: o.comment,
+          ageMs,
+          matchedZone: true,
+          skipped: true,
+          reason: "grace_period",
+        });
+        return;
+      }
+      logPendingOrderCancel({
+        caller: `${caller}.blind`,
+        accountId,
+        zoneId,
+        orderId: o.id,
+        comment: o.comment,
+        ageMs,
+        matchedZone: true,
+      });
       const r = await tradeAction(token, region, accountId, { actionType: "ORDER_CANCEL", orderId: o.id });
       // Mark completed regardless of result — 4754 means already gone, which is
       // still a signal the order is no longer live. Ensures MetaAPI REST filter fires.
@@ -3132,6 +3236,31 @@ async function cancelZoneLimits(
       markOrderCompleted(accountId, oid);
       await forget(); return;
     }
+    const meta = liveById.get(oid);
+    const ageMs = pendingOrderAgeMs(meta ?? {}, nowMs);
+    if (shouldProtectPendingOrderFromCancel(ageMs)) {
+      logPendingOrderCancel({
+        caller,
+        accountId,
+        zoneId,
+        orderId: oid,
+        comment: meta?.comment,
+        ageMs,
+        matchedZone: true,
+        skipped: true,
+        reason: "grace_period",
+      });
+      return;
+    }
+    logPendingOrderCancel({
+      caller,
+      accountId,
+      zoneId,
+      orderId: oid,
+      comment: meta?.comment,
+      ageMs,
+      matchedZone: true,
+    });
     const r = await tradeAction(token, region, accountId, { actionType: "ORDER_CANCEL", orderId: oid });
     // Mark completed regardless of outcome: success = cancelled now, 4754 = already
     // gone, 10036 = already closed — in all cases the order is no longer pending.
@@ -3465,6 +3594,10 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       }
       if (zps.length === 0) {
         if (!syncReady.has(st.accountId)) return;
+        if (isZoneSettling(st)) {
+          console.log(`[zone ${zoneId}] settling (${Date.now() - st.createdAtMs}ms) — skip empty reconcile`);
+          return;
+        }
         if (!brokerLegs && !pendingLeft) {
           if (!shouldAutoCloseZoneAfterPositionExit(st, false, false)) {
             console.log(`[zone ${zoneId}] empty tracked rows but defer zone close (pre-TP2 policy)`);
@@ -3485,7 +3618,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
           logEvent("zone.close", { accountId: st.accountId, zoneId, trigger: "empty_reconcile" });
           try {
             const tkn = getToken();
-            cancelZoneLimits(tkn, region, st.accountId, zoneId)
+            cancelZoneLimits(tkn, region, st.accountId, zoneId, "empty_reconcile")
               .catch((e: Error) => console.warn(`[zone ${zoneId}] empty reconcile cancelZoneLimits:`, e.message))
               .finally(() => broadcastZoneUpdate(zoneId));
           } catch {
@@ -3512,6 +3645,10 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     // and re-populates live positions. Without this check, active zones get
     // wrongly reconciled closed on every deployment/restart.
     if (live.length === 0 && !syncReady.has(st.accountId)) return;
+    if (live.length === 0 && isZoneSettling(st)) {
+      console.log(`[zone ${zoneId}] settling (${Date.now() - st.createdAtMs}ms) — skip position reconcile close`);
+      return;
+    }
     if (live.length === 0) {
       // Reconciliation: all tracked positions are gone (possibly closed during
       // a server restart — DEAL_ENTRY_OUT events from that window are lost
@@ -3564,7 +3701,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         // AFTER cancellation so the client only redraws once limits are gone.
         try {
           const tkn = getToken();
-          cancelZoneLimits(tkn, region, st.accountId, zoneId)
+          cancelZoneLimits(tkn, region, st.accountId, zoneId, "position_reconcile")
             .catch((e: Error) => console.warn(`[zone ${zoneId}] reconciliation cancelZoneLimits error:`, e.message))
             .finally(() => broadcastZoneUpdate(zoneId));
         } catch {
@@ -3985,6 +4122,7 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
       : z.status === "RISK_FREE" ? "RISK_FREE"
         : z.status === "ARMED" ? "ARMED"
           : "OPEN",
+    createdAtMs: Number(z.createdAt) || 0,
     busy: false,
     trackedPositions: new Map(),
   };
@@ -5853,7 +5991,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
         // in a volatile market, onDealAdded skips re-cascading it — even if the
         // broker has stripped the comment by fill time.
         if (actionType.endsWith("_LIMIT") && data.orderId) {
-          trackCascadeOrder(accountId, data.orderId);
+          trackCascadeOrder(accountId, data.orderId, comment);
           console.log(`[trade] tracked cascade limit orderId=${data.orderId}`);
           const limitDir: "buy" | "sell" | null =
             actionType.includes("BUY") ? "buy" :

@@ -29,6 +29,10 @@ import {
   shouldCancelCascadeLimitsAtTpStage,
   shouldCancelCascadeLimitsForZone,
   shouldAutoCloseZoneAfterPositionExit,
+  isZoneSettling,
+  shouldProtectPendingOrderFromCancel,
+  ZONE_SETTLE_MS,
+  PENDING_ORDER_CANCEL_MIN_AGE_MS,
   sumDealPnlForPositions,
   sumRealizedTradePnlFromDeals,
   sanitizeAutoBeAtTp,
@@ -748,6 +752,19 @@ describe("positionShowsTpLevelApplied", () => {
   it("detects TP1 partial from reduced live volume (25% split)", () => {
     expect(positionShowsTpLevelApplied(0.03, 0.04, 1, { tp1Pct: 25, tp2Pct: 25, tp3Pct: 25 })).toBe(true);
     expect(positionShowsTpLevelApplied(0.04, 0.04, 1, { tp1Pct: 25, tp2Pct: 25, tp3Pct: 25 })).toBe(false);
+  });
+});
+
+describe("ladder placement grace guards", () => {
+  it("isZoneSettling is true for fresh zones", () => {
+    expect(isZoneSettling({ createdAtMs: Date.now() - 5_000 })).toBe(true);
+    expect(isZoneSettling({ createdAtMs: Date.now() - ZONE_SETTLE_MS })).toBe(false);
+  });
+
+  it("shouldProtectPendingOrderFromCancel respects min age", () => {
+    expect(shouldProtectPendingOrderFromCancel(5_000)).toBe(true);
+    expect(shouldProtectPendingOrderFromCancel(PENDING_ORDER_CANCEL_MIN_AGE_MS)).toBe(false);
+    expect(shouldProtectPendingOrderFromCancel(null)).toBe(true);
   });
 });
 
