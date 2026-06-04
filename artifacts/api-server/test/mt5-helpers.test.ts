@@ -597,6 +597,7 @@ describe("disabled TP history", () => {
     expect(dealIndicatesStopLoss({ reason: "DEAL_REASON_SL" })).toBe(true);
     expect(dealIndicatesStopLoss({ reason: "STOP_LOSS" })).toBe(true);
     expect(dealIndicatesStopLoss({ reason: "DEAL_REASON_STOP_OUT" })).toBe(true);
+    expect(dealIndicatesStopLoss({ reason: "DEAL_REASON_SO" })).toBe(true);
     expect(dealIndicatesStopLoss({ comment: "stop loss" })).toBe(true);
     expect(dealIndicatesStopLoss({ reason: "CLIENT" })).toBe(false);
   });

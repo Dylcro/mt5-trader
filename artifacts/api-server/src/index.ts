@@ -122,6 +122,8 @@ async function ensureTables(): Promise<void> {
       ON zone_positions (zone_id, position_id);
     CREATE INDEX IF NOT EXISTS zone_positions_zone_status
       ON zone_positions (zone_id, status);
+    ALTER TABLE zone_positions
+      ADD COLUMN IF NOT EXISTS tp_level SMALLINT;
   `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS notification_prefs (

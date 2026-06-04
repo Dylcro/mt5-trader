@@ -82,7 +82,7 @@ export function countSlHits(zones: Zone[]): number {
 }
 
 export function countRiskFreeSlExits(zones: Zone[]): number {
-  return zones.filter((z) => Boolean(z.riskFreeSlExit)).length;
+  return zones.filter((z) => zonePrimaryOutcome(z) === "RF").length;
 }
 
 /** Enabled TP levels this zone reached (for card pill, e.g. 3/4). */
