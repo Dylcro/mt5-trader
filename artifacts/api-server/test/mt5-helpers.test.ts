@@ -29,6 +29,9 @@ import {
   shouldCancelCascadeLimitsAtTpStage,
   shouldCancelCascadeLimitsForZone,
   shouldAutoCloseZoneAfterPositionExit,
+  computeTpSliceVolume,
+  isLastEnabledTpLevel,
+  CASCADE_LIMIT_GRACE_MS,
   sumDealPnlForPositions,
   sumRealizedTradePnlFromDeals,
   sanitizeAutoBeAtTp,
@@ -785,6 +788,41 @@ describe("cascade limit cancel timing", () => {
       false,
       false,
     )).toBe(true);
+  });
+});
+
+describe("computeTpSliceVolume (zone-keyed cascade lot)", () => {
+  it("uses cascade lot × pct capped by remaining volume", () => {
+    expect(computeTpSliceVolume({
+      cascadeLot: 0.12,
+      tpPct: 25,
+      remainingVol: 0.12,
+      isLastEnabledTp: false,
+    })).toEqual({ closeVol: 0.03, carryOut: 0, action: "close" });
+  });
+
+  it("carries sub-min slice to next enabled TP", () => {
+    expect(computeTpSliceVolume({
+      cascadeLot: 0.02,
+      tpPct: 25,
+      remainingVol: 0.02,
+      isLastEnabledTp: false,
+    })).toEqual({ closeVol: 0, carryOut: 0.005, action: "carry" });
+  });
+
+  it("closes all remaining on last enabled TP when slice too small", () => {
+    expect(computeTpSliceVolume({
+      cascadeLot: 0.02,
+      tpPct: 25,
+      remainingVol: 0.02,
+      isLastEnabledTp: true,
+    })).toEqual({ closeVol: 0.02, carryOut: 0, action: "full_remainder" });
+  });
+
+  it("isLastEnabledTpLevel respects disabled steps", () => {
+    expect(isLastEnabledTpLevel(1, { tp1Enabled: true, tp2Enabled: false, tp3Enabled: false, tp4Enabled: false })).toBe(true);
+    expect(isLastEnabledTpLevel(2, { tp1Enabled: true, tp2Enabled: true, tp3Enabled: false, tp4Enabled: false })).toBe(true);
+    expect(CASCADE_LIMIT_GRACE_MS).toBeGreaterThanOrEqual(45_000);
   });
 });
 

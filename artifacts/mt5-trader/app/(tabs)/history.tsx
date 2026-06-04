@@ -28,6 +28,7 @@ import {
   isTp4LevelEnabled,
   tpPillStyle,
   zoneReachedTpLevel,
+  zonePrimaryOutcome,
   zoneTpLevelsHit,
   type Period,
 } from "@/lib/zoneStats";
@@ -164,9 +165,9 @@ function HistoryCard({ zone }: { zone: Zone }) {
         {([1, 2, 3, 4] as const).map((n) => (
           <TpChip key={n} n={n} zone={zone} />
         ))}
-        <ExitChip label="MANUAL" hit={Boolean(zone.manualClose)} variant="manual" />
-        <ExitChip label="RF" hit={Boolean(zone.riskFreeSlExit)} variant="rf" />
-        <ExitChip label="SL" hit={Boolean(zone.slHit) && !zone.riskFreeSlExit} variant="sl" />
+        <ExitChip label="MANUAL" hit={zonePrimaryOutcome(zone) === "MANUAL"} variant="manual" />
+        <ExitChip label="RF" hit={zonePrimaryOutcome(zone) === "RF"} variant="rf" />
+        <ExitChip label="SL" hit={zonePrimaryOutcome(zone) === "SL"} variant="sl" />
       </View>
     </View>
   );

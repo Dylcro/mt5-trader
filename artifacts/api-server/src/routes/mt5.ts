@@ -2,7 +2,7 @@ import { Router, type IRouter, type Request, type Response, type NextFunction } 
 import jwt from "jsonwebtoken";
 import { createRequire } from "module";
 import { db, pool, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable, cascadeZonesTable, zonePositionsTable, zoneOrdersTable, notificationPrefsTable, usersTable } from "@workspace/db";
-import { and, eq, inArray, isNotNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull } from "drizzle-orm";
 import { JWT_SECRET } from "./auth";
 import { getTradingStatus } from "../lib/platformFlags";
 import { logEvent } from "../logger";
@@ -1353,21 +1353,37 @@ async function placeCascadeLimitFast(
 // order whose orderId we did NOT track is an orphan (the most common cause:
 // a late streaming response that landed on MT5 but our cancel-duplicate failed
 // because the WebSocket was disconnecting). Cancel it.
-const RECONCILE_DELAY_MS = 15_000;
+const RECONCILE_DELAY_MS = 20_000;
+
+/** Zones mid-cascade: orphan sweeper must not cancel their pending limits. */
+const zonesPlacingUntil = new Map<string, number>();
+
+export function markZonePlacing(zoneId: string, ms = CASCADE_LIMIT_GRACE_MS + 15_000): void {
+  zonesPlacingUntil.set(zoneId, Date.now() + ms);
+}
+
+function isZoneStillPlacing(zoneId: string): boolean {
+  const until = zonesPlacingUntil.get(zoneId) ?? 0;
+  if (until <= Date.now()) {
+    zonesPlacingUntil.delete(zoneId);
+    return false;
+  }
+  return true;
+}
 
 function scheduleCascadeReconcile(accountId: string, region: string, token: string): void {
   setTimeout(async () => {
     try {
+      if (!syncReady.has(accountId)) {
+        console.log(`[reconcile ${accountId}] skip orphan sweep — stream not synced yet`);
+        return;
+      }
       const resp = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`, {
         headers: authHeaders(token),
       });
       if (!resp.ok) return;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const orders = (await resp.json()) as any[];
-      // Only treat orders older than 10s as "settled" — anything newer might
-      // belong to a cascade that's currently mid-placement (whose orderIds
-      // haven't yet been added to cascadePlacedOrderIds).
-      const ORPHAN_MIN_AGE_MS = 10_000;
       const nowMs = Date.now();
       const orphans: { id: string; comment: string }[] = [];
       for (const o of orders) {
@@ -1375,10 +1391,12 @@ function scheduleCascadeReconcile(accountId: string, region: string, token: stri
         if (!comment.startsWith("Cascade")) continue;
         const oid = String(o.id ?? o._id ?? "");
         if (!oid) continue;
-        if (cascadePlacedOrderIds.has(oid)) continue; // we know about this one
-        // Skip very fresh orders to avoid eating a concurrent in-flight cascade
+        if (cascadePlacedOrderIds.has(oid)) continue;
+        const zid = parseZoneIdFromComment(comment);
+        if (zid && isZoneStillPlacing(zid)) continue;
+        if (orderMappedToActiveZone(accountId, oid)) continue;
         const orderTimeMs = o.time ? new Date(o.time).getTime() : 0;
-        if (orderTimeMs > 0 && (nowMs - orderTimeMs) < ORPHAN_MIN_AGE_MS) continue;
+        if (orderTimeMs > 0 && (nowMs - orderTimeMs) < CASCADE_LIMIT_GRACE_MS) continue;
         orphans.push({ id: oid, comment });
       }
       if (orphans.length === 0) return;
@@ -1722,6 +1740,53 @@ export function shouldAutoCloseZoneAfterPositionExit(
   if (hasOpenPositionsInDb) return false;
   if (zone.status === "OPEN" && !zone.tp2Hit && hasLivePendingLimits) return false;
   return true;
+}
+
+/** Never cancel fresh cascade limits during placement (brief: ~45–60s grace). */
+export const CASCADE_LIMIT_GRACE_MS = 50_000;
+
+/** Whether `level` is the last TP step enabled on this zone. */
+export function isLastEnabledTpLevel(
+  level: 1 | 2 | 3 | 4,
+  zone: { tp1Enabled: boolean; tp2Enabled: boolean; tp3Enabled: boolean; tp4Enabled: boolean },
+): boolean {
+  if (level === 1) return !zone.tp2Enabled && !zone.tp3Enabled && !zone.tp4Enabled;
+  if (level === 2) return !zone.tp3Enabled && !zone.tp4Enabled;
+  if (level === 3) return !zone.tp4Enabled;
+  return true;
+}
+
+/**
+ * TP partial size from original cascade lot × %, with sub-min-lot carry (hybrid).
+ * slice = cascadeLot × close%; rounded to 0.01; capped by remaining open volume.
+ */
+export function computeTpSliceVolume(opts: {
+  cascadeLot: number;
+  tpPct: number;
+  remainingVol: number;
+  carryIn?: number;
+  isLastEnabledTp: boolean;
+}): { closeVol: number; carryOut: number; action: "close" | "carry" | "full_remainder" } {
+  const carryIn = opts.carryIn ?? 0;
+  const rawUnrounded = opts.cascadeLot * (opts.tpPct / 100) + carryIn;
+  if (rawUnrounded < 0.01) {
+    if (opts.isLastEnabledTp && opts.remainingVol >= 0.01) {
+      return { closeVol: opts.remainingVol, carryOut: 0, action: "full_remainder" };
+    }
+    if (!opts.isLastEnabledTp) {
+      return { closeVol: 0, carryOut: rawUnrounded, action: "carry" };
+    }
+    return { closeVol: 0, carryOut: 0, action: "carry" };
+  }
+  const raw = Math.round(rawUnrounded * 100) / 100;
+  const closeVol = Math.min(raw, opts.remainingVol);
+  if (closeVol < 0.01) {
+    if (opts.isLastEnabledTp && opts.remainingVol >= 0.01) {
+      return { closeVol: opts.remainingVol, carryOut: 0, action: "full_remainder" };
+    }
+    return { closeVol: 0, carryOut: 0, action: "carry" };
+  }
+  return { closeVol, carryOut: 0, action: "close" };
 }
 
 type HistoryDealRow = {
@@ -2197,6 +2262,19 @@ async function finalizeZoneClose(
       manualClose = !sanitized.tp1Hit && !sanitized.tp4Hit;
     }
 
+    const finalTp = computeFinalTpReached({
+      tp1Enabled: baseFlags.tp1Enabled,
+      tp2Enabled: baseFlags.tp2Enabled,
+      tp3Enabled: baseFlags.tp3Enabled,
+      tp4Enabled: baseFlags.tp4Enabled,
+      tp1Hit: sanitized.tp1Hit,
+      tp2Hit: sanitized.tp2Hit,
+      tp3Hit: sanitized.tp3Hit,
+      tp4Hit: sanitized.tp4Hit,
+      tp4Price: row.tp4Price,
+    });
+    if (finalTp >= 1) slHit = false;
+
     await db.update(cascadeZonesTable)
       .set({
         slHit, manualClose, riskFreeSlExit,
@@ -2286,6 +2364,8 @@ interface ZoneState {
   /** Auto SL→BE after this TP partial (1, 2, or 3). Baked in at zone creation. */
   autoBeAtTp: 1 | 2 | 3;
   status: "OPEN" | "RISK_FREE" | "CLOSED" | "ARMED";
+  /** Sub-min-lot slice carry across TP steps (zone-keyed, survives leg closes). */
+  tpCarryLot: number;
   busy: boolean; // debounce: prevent overlapping monitor ticks for this zone
   // In-memory mirror of zone_positions(status=OPEN) for this zone, used as a
   // fallback when the DB query inside evaluateZone fails — prevents transient
@@ -2611,9 +2691,10 @@ function prepareZoneForCascade(
     autoBeAtTp: resolveAutoBeAtTp(sanitizeAutoBeAtTp(tps.autoBeAtTp), {
       tp1: tp1Enabled, tp2: tp2Enabled, tp3: tp3Enabled,
     }),
-    status: "OPEN", busy: false,
+    status: "OPEN", tpCarryLot: 0, busy: false,
     trackedPositions: new Map(),
   };
+  markZonePlacing(zoneId);
   // Do NOT set zoneStates here — the zone is added to the in-memory map only
   // after earlyPersist succeeds in the caller's async block (DB-first ordering).
   pendingZoneAssoc.set(accountId, { zoneId, direction, expiresAt: Date.now() + ZONE_ASSOC_WINDOW_MS });
@@ -2886,6 +2967,26 @@ async function resolveLivePositionsForZoneAction(
     );
   }
   return live;
+}
+
+/** Wrongly CLOSED in DB while MT5 still has legs — reopen so TPs keep firing. */
+async function reopenClosedZoneIfBrokerLegsRemain(
+  token: string,
+  region: string,
+  accountId: string,
+  zoneId: string,
+  st: ZoneState,
+): Promise<boolean> {
+  if (st.status !== "CLOSED") return false;
+  const brokerOpen = await brokerHasOpenLegsForZone(token, region, accountId, zoneId);
+  if (!brokerOpen) return false;
+  await db.update(cascadeZonesTable)
+    .set({ status: "OPEN", closedAt: null, manualClose: false })
+    .where(and(eq(cascadeZonesTable.zoneId, zoneId), eq(cascadeZonesTable.accountId, accountId)));
+  st.status = "OPEN";
+  console.log(`[zone ${zoneId}] reopened CLOSED→OPEN (broker still has ${accountId} legs)`);
+  broadcastZoneUpdate(zoneId);
+  return true;
 }
 
 async function markZonePositionsClosedInDb(zoneId: string, positionIds: string[]): Promise<void> {
@@ -3362,13 +3463,16 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
   // Evaluate OPEN and RISK_FREE zones — Risk Free closes the losing entries
   // and arms a protective SL, but the TP ladder must keep running on the
   // surviving best entry. ARMED = pending limits only (no TP engine yet).
-  // Only CLOSED zones are skipped.
-  if (!st || st.status === "CLOSED") return;
+  if (!st) return;
   if (st.status === "ARMED") return;
   if (st.busy) return;
   st.busy = true;
   try {
     const region = activeRegions.get(st.accountId) ?? knownAccounts.get(st.accountId)?.region ?? DEFAULT_REGION;
+    if (st.status === "CLOSED") {
+      const reopened = await reopenClosedZoneIfBrokerLegsRemain(token, region, st.accountId, zoneId, st);
+      if (!reopened) return;
+    }
     // Fetch this zone's tracked positions from DB (OPEN status only).
     // Resilient tracked-positions lookup: prefer DB (source of truth) but
     // fall back to the in-memory mirror on transient query failures so a DB
@@ -3627,6 +3731,9 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     //   broker SL already; nudging it to BE per position would be a
     //   behaviour change the user didn't ask for in this simpler model).
     const zpsById = new Map(zps.map(z => [z.positionId, z]));
+    const cascadeLot = st.originalVolume > 0 ? st.originalVolume : 0;
+    const lastEnabled = (lvl: 1 | 2 | 3 | 4) => isLastEnabledTpLevel(lvl, st);
+    let levelCarry = st.tpCarryLot;
     const closePartialForLevel = async (
       level: 1 | 2 | 3 | 4,
       positionsSubset: typeof live,
@@ -3645,12 +3752,15 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       // Fire all per-entry closes IN PARALLEL — in a fast market, serially
       // awaiting each close can let later entries slip several pips past the
       // TP price before their close request hits the broker.
+      let closedAny = false;
       const results = await Promise.all(positionsSubset.map(async p => {
         const row = zpsById.get(p.id);
         const origVol = row ? Number(row.volume) : p.volume;
         if (!(origVol > 0)) return true;
         if (level === 4) {
-          return closeZonePosition(token, region, st.accountId, p.id);
+          const ok = await closeZonePosition(token, region, st.accountId, p.id);
+          if (ok) closedAny = true;
+          return ok;
         }
         // skip if this entry already had its partial for this level applied.
         // Exception: small lots where rounding made a prior TP take more than
@@ -3664,14 +3774,33 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
           console.log(`[zone ${zoneId}] TP${level} posId=${p.id} already-applied skip (vol=${p.volume} origVol=${origVol} gate=${(origVol * keepFractionGate).toFixed(4)})`);
           return true;
         }
-        const partial = Math.max(0.01, parseFloat((origVol * (tpPct / 100)).toFixed(2)));
-        const vol = Math.min(partial, p.volume);
-        console.log(`[zone ${zoneId}] TP${level} posId=${p.id} partial close vol=${vol} (origVol=${origVol} tpPct=${tpPct}% currentVol=${p.volume})`);
-        return vol < p.volume
-          ? closeZonePosition(token, region, st.accountId, p.id, vol)
-          : closeZonePosition(token, region, st.accountId, p.id);
+        const lotBase = cascadeLot > 0 ? cascadeLot : origVol;
+        const slice = computeTpSliceVolume({
+          cascadeLot: lotBase,
+          tpPct,
+          remainingVol: p.volume,
+          carryIn: levelCarry,
+          isLastEnabledTp: lastEnabled(level),
+        });
+        if (slice.action === "carry") {
+          levelCarry = slice.carryOut;
+          console.log(`[zone ${zoneId}] TP${level} posId=${p.id} slice<0.01 — carry ${levelCarry} to next enabled TP`);
+          return true;
+        }
+        const vol = slice.closeVol;
+        if (vol < 0.01) {
+          console.warn(`[zone ${zoneId}] TP${level} posId=${p.id} skip — no closable volume (remain=${p.volume})`);
+          return false;
+        }
+        console.log(`[zone ${zoneId}] TP${level} posId=${p.id} partial close vol=${vol} (cascadeLot=${lotBase} tpPct=${tpPct}% currentVol=${p.volume} action=${slice.action})`);
+        const ok = vol < p.volume
+          ? await closeZonePosition(token, region, st.accountId, p.id, vol)
+          : await closeZonePosition(token, region, st.accountId, p.id);
+        if (ok) closedAny = true;
+        return ok;
       }));
-      return results.every(Boolean);
+      st.tpCarryLot = levelCarry;
+      return closedAny && results.every(Boolean);
     };
 
     // Per-position TP evaluation — zone fires as one, but each position tracks
@@ -3954,6 +4083,7 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
       : z.status === "RISK_FREE" ? "RISK_FREE"
         : z.status === "ARMED" ? "ARMED"
           : "OPEN",
+    tpCarryLot: 0,
     busy: false,
     trackedPositions: new Map(),
   };
@@ -4054,8 +4184,48 @@ export async function loadZoneState(): Promise<void> {
       setZoneLimitOrder(o.accountId, o.orderId, o.zoneId);
     }
     if (orders.length > 0) console.log(`[zone] hydrated ${orders.length} zone limit-order link(s) from db (per-account)`);
+    void backfillClosedZoneClassifications(40);
   } catch (e) {
     console.error("[zone] hydrate error:", (e as Error).message);
+  }
+}
+
+/** Recompute slHit / deal-based flags on legacy CLOSED rows (History totals + win rate). */
+async function backfillClosedZoneClassifications(budget = 40): Promise<void> {
+  try {
+    const rows = await db.select().from(cascadeZonesTable)
+      .where(eq(cascadeZonesTable.status, "CLOSED"))
+      .orderBy(desc(cascadeZonesTable.closedAt))
+      .limit(budget);
+    let n = 0;
+    for (const row of rows) {
+      const tp1Enabled = (row as { tp1Enabled?: boolean }).tp1Enabled ?? (Number(row.tp1Pct ?? 25) > 0);
+      const tp2Enabled = (row as { tp2Enabled?: boolean }).tp2Enabled ?? (Number(row.tp2Pct ?? 25) > 0);
+      const tp3Enabled = (row as { tp3Enabled?: boolean }).tp3Enabled ?? (Number(row.tp3Pct ?? 25) > 0);
+      const tp4Enabled = (row as { tp4Enabled?: boolean }).tp4Enabled ?? (Number(row.tp4Pct ?? 25) > 0);
+      const finalTp = computeFinalTpReached({
+        tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+        tp1Hit: Boolean(row.tp1Hit),
+        tp2Hit: Boolean(row.tp2Hit),
+        tp3Hit: Boolean(row.tp3Hit),
+        tp4Hit: Boolean(row.tp4Hit),
+        tp4Price: row.tp4Price,
+      });
+      if (finalTp >= 1 && row.slHit) {
+        await db.update(cascadeZonesTable)
+          .set({ slHit: false })
+          .where(eq(cascadeZonesTable.zoneId, row.zoneId));
+      }
+      try {
+        await settleZoneClosedPnl(row.accountId, row.zoneId);
+        n += 1;
+      } catch (e) {
+        console.warn(`[backfill] settle ${row.zoneId}:`, (e as Error).message);
+      }
+    }
+    if (n > 0) console.log(`[backfill] reclassified ${n} closed zone(s)`);
+  } catch (e) {
+    console.warn("[backfill] closed-zone classification failed:", (e as Error).message);
   }
 }
 
@@ -4559,7 +4729,14 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     const st = await loadZone(zoneId);
-    if (!st || st.accountId !== accountId || st.status === "CLOSED") {
+    if (!st || st.accountId !== accountId) {
+      res.status(404).json({ error: "Zone not found" });
+      return;
+    }
+    if (st.status === "CLOSED") {
+      await reopenClosedZoneIfBrokerLegsRemain(token, region, accountId, zoneId, st);
+    }
+    if (st.status === "CLOSED") {
       res.status(404).json({ error: "Zone not found" });
       return;
     }
@@ -5893,6 +6070,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
                   }
                 } catch { /* keep best-known anchor */ }
               })();
+              scheduleCascadeReconcile(accountId, region, token);
             }
           }
         }
