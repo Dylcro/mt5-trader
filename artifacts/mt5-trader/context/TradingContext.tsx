@@ -1330,12 +1330,30 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           } else {
             failed++;
             errors.push(`Market: ${marketResult.message}`);
-            // Market failed — cancel any limits that succeeded to avoid dangling orders
-            const toCancel = limitResults.filter((r) => r.success && r.orderId).map((r) => r.orderId!);
-            if (toCancel.length > 0) {
-              void Promise.all(toCancel.map((id) =>
-                authFetch(`${API_BASE}/mt5/account/${accountId}/cancel-order/${id}?region=${region}`, { method: "POST" })
-              ));
+            await new Promise((r) => setTimeout(r, 1500));
+            let anchorActuallyOpen = true;
+            try {
+              const posRes = await authFetch(`${API_BASE}/mt5/account/${accountId}/positions?region=${region}`);
+              if (posRes.ok) {
+                const positions = (await posRes.json()) as Array<Record<string, unknown>>;
+                anchorActuallyOpen = Array.isArray(positions) && positions.some((p) => {
+                  const t = String(p.type ?? "");
+                  const dirMatch = params.direction === "buy" ? t.includes("BUY") : t.includes("SELL");
+                  return dirMatch && Math.abs(Number(p.volume ?? 0) - params.volume) < 1e-6;
+                });
+              }
+            } catch {
+              anchorActuallyOpen = true;
+            }
+            if (!anchorActuallyOpen) {
+              const toCancel = limitResults.filter((r) => r.success && r.orderId).map((r) => r.orderId!);
+              if (toCancel.length > 0) {
+                void Promise.all(toCancel.map((id) =>
+                  authFetch(`${API_BASE}/mt5/account/${accountId}/cancel-order/${id}?region=${region}`, { method: "POST" })
+                ));
+              }
+            } else {
+              console.log("[cascade] market reported failure but an anchor is open — false negative; keeping limits");
             }
           }
 

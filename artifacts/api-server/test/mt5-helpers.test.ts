@@ -572,6 +572,9 @@ describe("zone isolation — comment tagging", () => {
     expect(positionBelongsToZone({ magic: magicA }, zoneB)).toBe(false);
     expect(positionBelongsToZone({ comment: buildCascadeComment(zoneA, 1, 4) }, zoneA)).toBe(true);
     expect(positionBelongsToZone({ comment: buildCascadeComment(zoneA, 1, 4) }, zoneB)).toBe(false);
+    const commentA = buildCascadeComment(zoneA, 1, 4);
+    expect(positionBelongsToZone({ magic: magicB, comment: commentA }, zoneA)).toBe(true);
+    expect(positionBelongsToZone({ magic: magicB, comment: commentA }, zoneB)).toBe(false);
   });
 });
 

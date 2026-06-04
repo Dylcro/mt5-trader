@@ -70,6 +70,22 @@ function zoneTradeQuery(region?: string): string {
   return `?region=${encodeURIComponent(r)}`;
 }
 
+/** One-way latch so TP pills never revert after a pullback (server or thin SSE). */
+function withLatchedHits(
+  z: Zone,
+  latch: Map<string, { tp1: boolean; tp2: boolean; tp3: boolean; tp4: boolean }>,
+): Zone {
+  const prev = latch.get(z.zoneId) ?? { tp1: false, tp2: false, tp3: false, tp4: false };
+  const next = {
+    tp1: prev.tp1 || Boolean(z.tp1Hit),
+    tp2: prev.tp2 || Boolean(z.tp2Hit),
+    tp3: prev.tp3 || Boolean(z.tp3Hit),
+    tp4: prev.tp4 || Boolean(z.tp4Hit),
+  };
+  latch.set(z.zoneId, next);
+  return { ...z, tp1Hit: next.tp1, tp2Hit: next.tp2, tp3Hit: next.tp3, tp4Hit: next.tp4 };
+}
+
 export function useZones(accountId: string, options: UseZonesOptions = {}) {
   const { includeClosed = false, pollIntervalMs = 5_000, sseConnected = false, region } = options;
   // SSE zone_update events are the primary source of zone changes.
@@ -80,6 +96,19 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const inFlight = useRef(false);
+  const hitLatch = useRef<Map<string, { tp1: boolean; tp2: boolean; tp3: boolean; tp4: boolean }>>(new Map());
+
+  const applyZonesFromApi = useCallback((data: unknown) => {
+    const list = Array.isArray(data) ? (data as Zone[]) : [];
+    const latched = list.map((z) => enrichZoneDisplayFields(withLatchedHits(z, hitLatch.current)));
+    if (!includeClosed) {
+      const ids = new Set(latched.map((z) => z.zoneId));
+      for (const id of hitLatch.current.keys()) {
+        if (!ids.has(id)) hitLatch.current.delete(id);
+      }
+    }
+    return latched;
+  }, [includeClosed]);
 
   const refresh = useCallback(async () => {
     if (!API_BASE || !accountId || inFlight.current) return;
@@ -91,15 +120,15 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
         setError(`HTTP ${res.status}`);
         return;
       }
-      const data = (await res.json()) as Zone[];
-      setZones(Array.isArray(data) ? data.map(enrichZoneDisplayFields) : []);
+      const data = await res.json();
+      setZones(applyZonesFromApi(data));
       setError(null);
     } catch (e) {
       setError((e as Error).message);
     } finally {
       inFlight.current = false;
     }
-  }, [accountId, includeClosed]);
+  }, [accountId, includeClosed, applyZonesFromApi]);
 
   useEffect(() => {
     if (!API_BASE || !accountId) {
@@ -128,16 +157,17 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
             if (!has) return prev;
             return prev.map((z) =>
               z.zoneId === update.zoneId
-                ? enrichZoneDisplayFields({ ...z, ...update, status: "CLOSED", closedAt })
+                ? enrichZoneDisplayFields(withLatchedHits({ ...z, ...update, status: "CLOSED", closedAt }, hitLatch.current))
                 : z,
             );
           });
+          hitLatch.current.delete(update.zoneId!);
           return;
         }
         setZones((prev) =>
           prev.map((z) => {
             if (z.zoneId !== update.zoneId) return z;
-            return enrichZoneDisplayFields({ ...z, ...update });
+            return enrichZoneDisplayFields(withLatchedHits({ ...z, ...update }, hitLatch.current));
           }),
         );
       } else if (type === "deal" || type === "pending_order") {
