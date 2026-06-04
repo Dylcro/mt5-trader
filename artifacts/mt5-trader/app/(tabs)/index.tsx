@@ -21,6 +21,7 @@ import Colors from "@/constants/colors";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import { useTrading } from "@/context/TradingContext";
+import { authFetch } from "@/lib/authFetch";
 import { inferCascadeDirectionFromTrigger } from "@/lib/cascadeAtPrice";
 import { buildCascadeLevels, useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
@@ -403,6 +404,7 @@ export default function TradeScreen() {
   // Per-cascade watcher entry — each cascade gets its own entry so they never interfere
   type WatcherEntry = {
     id: string; // unique per cascade placement
+    zoneId: string;
     entryPrice: number;
     direction: "buy" | "sell";
     pipsTarget: number;
@@ -461,80 +463,30 @@ export default function TradeScreen() {
           const accId = accountIdRef.current;
           const base = apiBaseRef.current;
           const rgn = regionRef.current;
-
-          // Fetch ALL fresh pending orders and cancel every limit of matching direction.
-          // This is the most reliable approach — avoids fragile ID/price matching
-          // that can fail when REST placement doesn't echo back orderId or broker
-          // normalises prices.
-          const expectedType = snapshot.direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT";
-          const idSet = new Set<string>();
-
-          if (accId && base) {
-            try {
-              const res = await fetch(`${base}/mt5/account/${accId}/orders?region=${rgn}`);
-              if (res.ok) {
-                const raw = await res.json();
-                const freshOrders: Array<Record<string, unknown>> = Array.isArray(raw)
-                  ? raw as Array<Record<string, unknown>>
-                  : Array.isArray((raw as Record<string, unknown>).orders)
-                    ? (raw as { orders: Array<Record<string, unknown>> }).orders
-                    : [];
-
-                for (const ord of freshOrders) {
-                  const ordId = String(ord.id ?? ord.orderId ?? "");
-                  const ordType = String(ord.type ?? "");
-                  if (!ordId) continue;
-                  // Cancel all pending limits of matching direction
-                  if (ordType === expectedType || (ordType.includes("LIMIT") && ordType.includes(snapshot.direction === "buy" ? "BUY" : "SELL"))) {
-                    idSet.add(ordId);
-                  }
-                }
-                console.log(`[tp-watcher id=${snapshot.id}] fresh fetch: ${freshOrders.length} total orders, ${idSet.size} ${expectedType} to cancel`);
-              } else {
-                console.log(`[tp-watcher id=${snapshot.id}] orders fetch failed: ${res.status}`);
-              }
-            } catch (fetchErr) {
-              console.log(`[tp-watcher id=${snapshot.id}] orders fetch error: ${String(fetchErr)}`);
-            }
+          if (!accId || !base || !snapshot.zoneId) {
+            showToast(`+${actualPips}pip reached — couldn't resolve zone to cancel`, "error");
+            return;
           }
-
-          const ordersToCancel = Array.from(idSet);
-          console.log(`[tp-watcher id=${snapshot.id}] cancelling ids: ${ordersToCancel.join(",")}`);
-
-          let cancelled = 0;
-          let failed = 0;
-          if (ordersToCancel.length > 0 && accId && base) {
-            // Cancel directly via fetch — no TradingContext status guard
-            const results = await Promise.all(
-              ordersToCancel.map(async (ordId) => {
-                try {
-                  const r = await fetch(
-                    `${base}/mt5/account/${accId}/order/${ordId}?region=${rgn}`,
-                    { method: "DELETE" }
-                  );
-                  const d = await r.json() as { success?: boolean; message?: string };
-                  console.log(`[tp-watcher] cancel ordId=${ordId} ok=${String(r.ok)} success=${String(d.success)} msg=${d.message ?? ""}`);
-                  return d.success !== false && r.ok;
-                } catch (e) {
-                  console.log(`[tp-watcher] cancel ordId=${ordId} error: ${String(e)}`);
-                  return false;
-                }
-              })
-            );
-            cancelled = results.filter(Boolean).length;
-            failed = results.length - cancelled;
-            void refreshPendingOrders();
-          }
-
-          void Haptics.notificationAsync(
-            cancelled > 0 ? Haptics.NotificationFeedbackType.Success : Haptics.NotificationFeedbackType.Error
+          const r = await authFetch(
+            `${base}/mt5/account/${accId}/zones/${encodeURIComponent(snapshot.zoneId)}/cancel-pending?region=${rgn}`,
+            { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
           );
-          if (ordersToCancel.length === 0) {
-            showToast(`+${actualPips}pip reached — no pending limits found`, "error");
-          } else if (failed === 0) {
-            showToast(`+${actualPips}pip — ${cancelled} limit${cancelled !== 1 ? "s" : ""} cancelled`, "success", true);
+          const d = (await r.json().catch(() => ({}))) as { ok?: boolean; cancelledCount?: number };
+          void refreshPendingOrders();
+          const n = d.cancelledCount ?? 0;
+          void Haptics.notificationAsync(
+            r.ok ? Haptics.NotificationFeedbackType.Success : Haptics.NotificationFeedbackType.Error,
+          );
+          if (r.ok) {
+            showToast(
+              n > 0
+                ? `+${actualPips}pip — ${n} limit${n !== 1 ? "s" : ""} cancelled`
+                : `+${actualPips}pip — no pending limits left`,
+              "success",
+              n > 0,
+            );
           } else {
-            showToast(`+${actualPips}pip — ${cancelled} cancelled, ${failed} failed`, cancelled > 0 ? "success" : "error");
+            showToast(`+${actualPips}pip — cancel failed`, "error");
           }
         } catch (err) {
           console.log(`[tp-watcher id=${snapshot.id}] unexpected error: ${String(err)}`);
@@ -659,6 +611,7 @@ export default function TradeScreen() {
           const tpTrigger = dir === "buy" ? trigger + cs.takeProfitPips * 0.10 : trigger - cs.takeProfitPips * 0.10;
           tpWatchersRef.current.push({
             id: cascadeId,
+            zoneId: result.zoneId ?? "",
             entryPrice: trigger,
             direction: dir,
             pipsTarget: cs.takeProfitPips,
@@ -762,6 +715,7 @@ export default function TradeScreen() {
           console.log(`[tp-watcher id=${cascadeId}] arming +${cs.takeProfitPips}pip dir=${dir} entry(bid)=${watcherEntryPrice} trigger=${tpTrigger} posId=${result.marketPositionId}`);
           tpWatchersRef.current.push({
             id: cascadeId,
+            zoneId: result.zoneId ?? "",
             entryPrice: watcherEntryPrice,
             direction: dir,
             pipsTarget: cs.takeProfitPips,

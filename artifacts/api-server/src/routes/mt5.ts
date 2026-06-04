@@ -589,21 +589,25 @@ async function mergeZoneHitsFromPositions(
   tp2Hit = sanitized.tp2Hit;
   tp3Hit = sanitized.tp3Hit;
   tp4Hit = sanitized.tp4Hit;
-  if (tp1Hit !== row.tp1Hit || tp2Hit !== row.tp2Hit || tp3Hit !== row.tp3Hit || tp4Hit !== row.tp4Hit) {
+  const persistTp1 = Boolean(row.tp1Hit) || tp1Hit;
+  const persistTp2 = Boolean(row.tp2Hit) || tp2Hit;
+  const persistTp3 = Boolean(row.tp3Hit) || tp3Hit;
+  const persistTp4 = Boolean(row.tp4Hit) || tp4Hit;
+  if (persistTp1 !== row.tp1Hit || persistTp2 !== row.tp2Hit || persistTp3 !== row.tp3Hit || persistTp4 !== row.tp4Hit) {
     await db.update(cascadeZonesTable)
-      .set({ tp1Hit, tp2Hit, tp3Hit, tp4Hit })
+      .set({ tp1Hit: persistTp1, tp2Hit: persistTp2, tp3Hit: persistTp3, tp4Hit: persistTp4 })
       .where(eq(cascadeZonesTable.zoneId, zoneId))
       .catch((e: Error) => console.warn(`[zone ${zoneId}] hit-flag sync failed:`, e.message));
     const st = zoneStates.get(zoneId);
     if (st) {
-      st.tp1Hit = tp1Hit;
-      st.tp2Hit = tp2Hit;
-      st.tp3Hit = tp3Hit;
-      st.tp4Hit = tp4Hit;
+      st.tp1Hit = persistTp1;
+      st.tp2Hit = persistTp2;
+      st.tp3Hit = persistTp3;
+      st.tp4Hit = persistTp4;
     }
   }
   return {
-    tp1Hit, tp2Hit, tp3Hit, tp4Hit, positionCount: open.length,
+    tp1Hit: persistTp1, tp2Hit: persistTp2, tp3Hit: persistTp3, tp4Hit: persistTp4, positionCount: open.length,
     tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
   };
 }
@@ -927,9 +931,8 @@ function makeDealListener(accountId: string) {
       if (deal.orderId && cascadePlacedOrderIds.has(String(deal.orderId))) {
         let zoneId = getZoneLimitOrder(accountId, String(deal.orderId));
         // Backstop when in-memory mapping is missing: (1) DB by orderId,
-        // (2) deal comment Cascade|zoneId|leg/total, (3) pendingZoneAssoc
-        // with matching direction within ZONE_ASSOC_WINDOW_MS. No "oldest zone"
-        // heuristic — that steals fills across parallel zones.
+        // (2) deal comment Cascade|zoneId|leg/total. No direction/pending guess —
+        // that steals fills across parallel same-direction zones.
         if (!zoneId && deal.positionId) {
           try {
             const dbRow = await db.select({ zoneId: zoneOrdersTable.zoneId })
@@ -951,21 +954,6 @@ function makeDealListener(accountId: string) {
             zoneId = commentZone;
             setZoneLimitOrder(accountId, String(deal.orderId), zoneId);
             console.log(`[zone ${zoneId}] backstop-recovered from deal comment orderId=${deal.orderId}`);
-          }
-        }
-        if (!zoneId && deal.positionId) {
-          const direction: "buy" | "sell" | null =
-            deal.type === "DEAL_TYPE_BUY" ? "buy" :
-            deal.type === "DEAL_TYPE_SELL" ? "sell" : null;
-          const pending = resolvePendingZoneAssoc(accountId, direction);
-          if (pending) {
-            zoneId = pending.zoneId;
-            setZoneLimitOrder(accountId, String(deal.orderId), zoneId);
-            void db.insert(zoneOrdersTable)
-              .values({ zoneId, orderId: String(deal.orderId), createdAt: Date.now() })
-              .onConflictDoNothing()
-              .catch((e: Error) => console.warn(`[zone ${zoneId}] pending-assoc persist orderId=${deal.orderId} failed:`, e.message));
-            console.log(`[zone ${zoneId}] backstop-recovered from pending assoc orderId=${deal.orderId} posId=${deal.positionId} dir=${direction}`);
           }
         }
         if (zoneId && deal.positionId) {
@@ -1395,6 +1383,10 @@ function scheduleCascadeReconcile(accountId: string, region: string, token: stri
         const zid = parseZoneIdFromComment(comment);
         if (zid && isZoneStillPlacing(zid)) continue;
         if (orderMappedToActiveZone(accountId, oid)) continue;
+        if (zid) {
+          const z = zoneStates.get(zid);
+          if (z && z.status !== "CLOSED") continue;
+        }
         const orderTimeMs = o.time ? new Date(o.time).getTime() : 0;
         if (orderTimeMs > 0 && (nowMs - orderTimeMs) < CASCADE_LIMIT_GRACE_MS) continue;
         orphans.push({ id: oid, comment });
@@ -1676,10 +1668,12 @@ export function positionBelongsToZone(
   p: { magic?: number; comment?: string },
   zoneId: string,
 ): boolean {
-  const expectedMagic = zoneMagicNumber(zoneId);
-  const magic = Number(p.magic);
-  if (Number.isFinite(magic) && magic === expectedMagic) return true;
-  return commentBelongsToZone(p.comment, zoneId);
+  if (commentBelongsToZone(p.comment, zoneId)) return true;
+  if (parseZoneIdFromComment(p.comment) == null) {
+    const magic = Number(p.magic);
+    if (Number.isFinite(magic) && magic === zoneMagicNumber(zoneId)) return true;
+  }
+  return false;
 }
 
 /** True when evaluateZone can run TP/BE logic (anchor or absolute TP prices set). */
@@ -2743,23 +2737,25 @@ async function persistPreparedZone(
   // after this promise resolves successfully. Swallowing errors here was the
   // root cause of zones entering memory without a DB row (restart-unsafe).
   const now = Date.now();
-  await db.insert(cascadeZonesTable).values({
-    zoneId: state.zoneId, accountId: state.accountId, userId: userId ?? null,
-    direction: state.direction, anchorPrice: state.anchorPrice,
-    tp1Price: state.tp1Price, tp2Price: state.tp2Price,
-    tp3Price: state.tp3Price, tp4Price: state.tp4Price,
-    tp1Pct: state.tp1Pct, tp2Pct: state.tp2Pct, tp3Pct: state.tp3Pct, tp4Pct: state.tp4Pct,
-    tp1Enabled: state.tp1Enabled, tp2Enabled: state.tp2Enabled, tp3Enabled: state.tp3Enabled, tp4Enabled: state.tp4Enabled,
-    originalVolume: state.originalVolume,
-    cashoutPips: state.cashoutPips, cashoutDone: false,
-    tp1Hit: state.tp1Hit, tp2Hit: state.tp2Hit, tp3Hit: state.tp3Hit, tp4Hit: state.tp4Hit,
-    autoBeAtTp: state.autoBeAtTp,
-    status: "OPEN", createdAt: now,
-  }).onConflictDoNothing();
-  await db.insert(zonePositionsTable).values({
-    zoneId: state.zoneId, positionId, entryPrice: state.anchorPrice, volume,
-    status: "OPEN", createdAt: now,
-  }).onConflictDoNothing();
+  await withDbRetry(`persistZone ${state.zoneId}`, () =>
+    db.insert(cascadeZonesTable).values({
+      zoneId: state.zoneId, accountId: state.accountId, userId: userId ?? null,
+      direction: state.direction, anchorPrice: state.anchorPrice,
+      tp1Price: state.tp1Price, tp2Price: state.tp2Price,
+      tp3Price: state.tp3Price, tp4Price: state.tp4Price,
+      tp1Pct: state.tp1Pct, tp2Pct: state.tp2Pct, tp3Pct: state.tp3Pct, tp4Pct: state.tp4Pct,
+      tp1Enabled: state.tp1Enabled, tp2Enabled: state.tp2Enabled, tp3Enabled: state.tp3Enabled, tp4Enabled: state.tp4Enabled,
+      originalVolume: state.originalVolume,
+      cashoutPips: state.cashoutPips, cashoutDone: false,
+      tp1Hit: state.tp1Hit, tp2Hit: state.tp2Hit, tp3Hit: state.tp3Hit, tp4Hit: state.tp4Hit,
+      autoBeAtTp: state.autoBeAtTp,
+      status: "OPEN", createdAt: now,
+    }).onConflictDoNothing());
+  await withDbRetry(`persistZonePos ${state.zoneId}`, () =>
+    db.insert(zonePositionsTable).values({
+      zoneId: state.zoneId, positionId, entryPrice: state.anchorPrice, volume,
+      status: "OPEN", createdAt: now,
+    }).onConflictDoNothing());
   // Seed the in-memory cache for the anchor leg so a DB blip immediately
   // after zone creation can't blind evaluateZone to the market entry.
   state.trackedPositions.set(positionId, { volume, entryPrice: state.anchorPrice, tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false });
@@ -3132,17 +3128,13 @@ async function markZonePositionClosed(
         cancelZoneLimits(tkn, rgn, accountId, zoneId)
           .catch((e: Error) => console.warn(`[zone ${zoneId}] cancelZoneLimits error:`, e.message))
           .finally(() => {
-            // Broadcast regardless of cancellation success/failure so the client
-            // always re-fetches and sees the fresh (closed) state.
             broadcastToAccount(accountId, "deal", { type: "position_changed" });
-            // Use a direct zone_update broadcast (not broadcastZoneUpdate) so it
-            // fires even when zoneStates entry is absent after a server restart.
-            broadcastToAccount(accountId, "zone_update", { zoneId, status: "CLOSED", closedAt });
+            broadcastZoneUpdate(zoneId);
           });
       } catch {
         console.warn(`[zone ${zoneId}] could not cancel limits after external close — token unavailable`);
         broadcastToAccount(accountId, "deal", { type: "position_changed" });
-        broadcastToAccount(accountId, "zone_update", { zoneId, status: "CLOSED", closedAt });
+        broadcastZoneUpdate(zoneId);
       }
     }
   } catch (e) {
@@ -3291,7 +3283,9 @@ async function fetchOpenPositions(token: string, region: string, accountId: stri
   const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/positions`, {
     headers: authHeaders(token),
   });
-  if (!r.ok) return [];
+  if (!r.ok) {
+    throw new Error(`fetchOpenPositions ${r.status} for ${accountId}`);
+  }
   const arr = await r.json() as Array<Record<string, unknown>>;
   return arr.map((p) => ({
     id: String(p.id ?? p._id ?? ""),
@@ -3382,7 +3376,7 @@ async function fetchSymbolPrice(
   const ticks = tickStore.get(accountId);
   if (ticks && ticks.length > 0) {
     const t = ticks[ticks.length - 1]!;
-    return { bid: t.bid, ask: t.ask };
+    if (Date.now() - t.time <= 10_000) return { bid: t.bid, ask: t.ask };
   }
   return null;
 }
@@ -5927,6 +5921,9 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
     const success = TRADE_SUCCESS_CODES.has(code);
     const errorMessage = success ? undefined : (TRADE_ERROR_MESSAGES[code] ?? data.message ?? `Trade failed (code ${code})`);
     if (!success) console.log(`[trade] FAILED action=${body.actionType} code=${code} msg="${errorMessage}"`);
+    if (_isAppMarketCascade && !success) {
+      scheduleCascadeReconcile(accountId, region, token);
+    }
     logEvent(success ? "trade.ok" : "trade.fail", {
       accountId,
       action: _tradeActionType,

@@ -115,7 +115,7 @@ interface TradingContextValue {
   disconnect: () => Promise<void>;
   reconnectFromServer: () => Promise<void>;
   placeTrade: (params: PlaceTradeParams) => Promise<{ success: boolean; message: string }>;
-  placeCascadeOrders: (params: CascadeOrderParams) => Promise<{ success: boolean; placed: number; failed: number; message: string; marketPositionId?: string; limitOrderIds?: string[] }>;
+  placeCascadeOrders: (params: CascadeOrderParams) => Promise<{ success: boolean; placed: number; failed: number; message: string; marketPositionId?: string; limitOrderIds?: string[]; zoneId?: string }>;
   /** @-price cascade: ARMED zone + pending limits at ladder (Settings cascade). */
   placeArmedCascadeAtPrice: (params: ArmedCascadeParams) => Promise<{ success: boolean; placed: number; failed: number; message: string; zoneId?: string; limitOrderIds?: string[] }>;
   closePosition: (positionId: string) => Promise<{ success: boolean; message: string }>;
@@ -1251,7 +1251,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   );
 
   const placeCascadeOrders = useCallback(
-    async (params: CascadeOrderParams): Promise<{ success: boolean; placed: number; failed: number; message: string; marketPositionId?: string; limitOrderIds?: string[] }> => {
+    async (params: CascadeOrderParams): Promise<{ success: boolean; placed: number; failed: number; message: string; marketPositionId?: string; limitOrderIds?: string[]; zoneId?: string }> => {
       if (status !== "connected") return { success: false, placed: 0, failed: 0, message: "Not connected" };
       if (!connectionWarm) {
         await wakeConnection();
@@ -1330,12 +1330,30 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           } else {
             failed++;
             errors.push(`Market: ${marketResult.message}`);
-            // Market failed — cancel any limits that succeeded to avoid dangling orders
-            const toCancel = limitResults.filter((r) => r.success && r.orderId).map((r) => r.orderId!);
-            if (toCancel.length > 0) {
-              void Promise.all(toCancel.map((id) =>
-                authFetch(`${API_BASE}/mt5/account/${accountId}/cancel-order/${id}?region=${region}`, { method: "POST" })
-              ));
+            await new Promise((r) => setTimeout(r, 1500));
+            let anchorActuallyOpen = true;
+            try {
+              const posRes = await authFetch(`${API_BASE}/mt5/account/${accountId}/positions?region=${region}`);
+              if (posRes.ok) {
+                const positions = (await posRes.json()) as Array<Record<string, unknown>>;
+                anchorActuallyOpen = Array.isArray(positions) && positions.some((p) => {
+                  const t = String(p.type ?? "");
+                  const dirMatch = params.direction === "buy" ? t.includes("BUY") : t.includes("SELL");
+                  return dirMatch && Math.abs(Number(p.volume ?? 0) - params.volume) < 1e-6;
+                });
+              }
+            } catch {
+              anchorActuallyOpen = true;
+            }
+            if (!anchorActuallyOpen) {
+              const toCancel = limitResults.filter((r) => r.success && r.orderId).map((r) => r.orderId!);
+              if (toCancel.length > 0) {
+                void Promise.all(toCancel.map((id) =>
+                  authFetch(`${API_BASE}/mt5/account/${accountId}/cancel-order/${id}?region=${region}`, { method: "POST" })
+                ));
+              }
+            } else {
+              console.log("[cascade] market reported failure but an anchor is open — false negative; keeping limits");
             }
           }
 
@@ -1357,12 +1375,12 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       void Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
 
       if (placed === 0) {
-        return { success: false, placed, failed, message: errors[0] ?? "All orders failed to place" };
+        return { success: false, placed, failed, message: errors[0] ?? "All orders failed to place", zoneId };
       }
       if (failed > 0) {
-        return { success: true, placed, failed, message: `${placed}/${total} placed. Failed: ${errors.join("; ")}`, marketPositionId, limitOrderIds };
+        return { success: true, placed, failed, message: `${placed}/${total} placed. Failed: ${errors.join("; ")}`, marketPositionId, limitOrderIds, zoneId };
       }
-      return { success: true, placed, failed, message: `${placed} orders placed — 1 market + ${params.limitEntries.length} limit`, marketPositionId, limitOrderIds };
+      return { success: true, placed, failed, message: `${placed} orders placed — 1 market + ${params.limitEntries.length} limit`, marketPositionId, limitOrderIds, zoneId };
     },
     [status, connectionWarm, wakeConnection, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, accountId, region]
   );
