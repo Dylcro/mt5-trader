@@ -830,20 +830,21 @@ describe("computeTpSliceVolume (zone-keyed cascade lot)", () => {
 });
 
 describe("auto break-even at TP setting", () => {
-  it("sanitizes autoBeAtTp to 1|2|3", () => {
-    expect(sanitizeAutoBeAtTp(1)).toBe(1);
+  it("sanitizes autoBeAtTp — legacy 1 maps to 2, never BE at TP1", () => {
+    expect(sanitizeAutoBeAtTp(1)).toBe(2);
     expect(sanitizeAutoBeAtTp("3")).toBe(3);
     expect(sanitizeAutoBeAtTp("x")).toBe(2);
   });
 
   it("resolveAutoBeAtTp falls back when chosen TP is disabled", () => {
     expect(resolveAutoBeAtTp(1, { tp1: false, tp2: true, tp3: true })).toBe(2);
-    expect(resolveAutoBeAtTp(3, { tp1: true, tp2: true, tp3: false })).toBe(1);
+    expect(resolveAutoBeAtTp(3, { tp1: true, tp2: true, tp3: false })).toBe(2);
   });
 
-  it("isAutoBeTriggerSatisfied follows configured level", () => {
-    expect(isAutoBeTriggerSatisfied({ autoBeAtTp: 1, tp1Hit: true, tp2Hit: false, tp3Hit: false })).toBe(true);
+  it("isAutoBeTriggerSatisfied never fires on TP1 alone", () => {
+    expect(isAutoBeTriggerSatisfied({ autoBeAtTp: 1, tp1Hit: true, tp2Hit: false, tp3Hit: false })).toBe(false);
     expect(isAutoBeTriggerSatisfied({ autoBeAtTp: 2, tp1Hit: true, tp2Hit: false, tp3Hit: false })).toBe(false);
+    expect(isAutoBeTriggerSatisfied({ autoBeAtTp: 2, tp1Hit: true, tp2Hit: true, tp3Hit: false })).toBe(true);
     expect(isAutoBeTriggerSatisfied({ autoBeAtTp: 3, tp1Hit: true, tp2Hit: true, tp3Hit: true })).toBe(true);
   });
 });

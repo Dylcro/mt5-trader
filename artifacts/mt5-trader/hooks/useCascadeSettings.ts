@@ -154,7 +154,7 @@ function mergeServerConfig(local: CascadeSettings, raw: Record<string, unknown>)
     tp3Pips: pickNum("tp3Pips", local.tp3Pips),
     tp4Pips: pickNum("tp4Pips", local.tp4Pips),
     riskFreePips: VALID_RISK_FREE_PIPS.includes(riskFree) ? riskFree : local.riskFreePips,
-    autoBeAtTp: autoBe === 1 || autoBe === 2 || autoBe === 3 ? (autoBe as 1 | 2 | 3) : local.autoBeAtTp,
+    autoBeAtTp: autoBe === 3 ? 3 : autoBe === 1 || autoBe === 2 ? 2 : local.autoBeAtTp,
     tp1Pct: pickNum("tp1Pct", local.tp1Pct),
     tp2Pct: pickNum("tp2Pct", local.tp2Pct),
     tp3Pct: pickNum("tp3Pct", local.tp3Pct),
@@ -246,7 +246,9 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
           })(),
           autoBeAtTp: (() => {
             const n = autoBe != null ? parseInt(autoBe, 10) : DEFAULTS.autoBeAtTp;
-            return n === 1 || n === 2 || n === 3 ? (n as 1 | 2 | 3) : DEFAULTS.autoBeAtTp;
+            if (n === 3) return 3 as const;
+            if (n === 1 || n === 2) return 2 as const;
+            return DEFAULTS.autoBeAtTp;
           })(),
           tp1Pct: tp1Pct != null ? parseFloat(tp1Pct) : DEFAULTS.tp1Pct,
           tp2Pct: tp2Pct != null ? parseFloat(tp2Pct) : DEFAULTS.tp2Pct,
