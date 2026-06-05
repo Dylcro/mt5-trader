@@ -115,13 +115,12 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
   const applyZonesFromApi = useCallback((data: unknown) => {
     const list = Array.isArray(data) ? (data as Zone[]) : [];
     const latched = list.map((z) => enrichZoneDisplayFields(withLatchedHits(z, hitLatch.current)));
-    if (!includeClosed) {
-      const ids = new Set(latched.map((z) => z.zoneId));
-      for (const id of hitLatch.current.keys()) {
-        if (!ids.has(id)) hitLatch.current.delete(id);
-      }
+    const filtered = includeClosed ? latched : latched.filter((z) => z.status !== "CLOSED");
+    const ids = new Set(filtered.map((z) => z.zoneId));
+    for (const id of hitLatch.current.keys()) {
+      if (!ids.has(id)) hitLatch.current.delete(id);
     }
-    return latched;
+    return filtered;
   }, [includeClosed]);
 
   const refresh = useCallback(async () => {
@@ -167,13 +166,10 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
         if (update.status === "CLOSED") {
           setZones((prev) => {
             const closedAt = update.closedAt ?? Date.now();
-            const has = prev.some((z) => z.zoneId === update.zoneId);
-            if (!has) return prev;
-            return prev.map((z) =>
-              z.zoneId === update.zoneId
-                ? enrichZoneDisplayFields(withLatchedHits({ ...z, ...update, status: "CLOSED", closedAt }, hitLatch.current))
-                : z,
-            );
+            const merged = { ...prev.find((z) => z.zoneId === update.zoneId), ...update, status: "CLOSED" as const, closedAt };
+            if (!merged.zoneId) return prev;
+            const without = prev.filter((z) => z.zoneId !== update.zoneId);
+            return [...without, enrichZoneDisplayFields(withLatchedHits(merged as Zone, hitLatch.current))];
           });
           hitLatch.current.delete(update.zoneId!);
           return;

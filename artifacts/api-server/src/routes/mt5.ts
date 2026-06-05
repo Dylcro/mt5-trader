@@ -3273,6 +3273,12 @@ async function handleClosePartial(
   if (st.status === "CLOSED" || st.status === "ARMED") {
     return { ok: false, message: "Zone not active" };
   }
+  if (body.tpLevel != null && body.tpLevel >= 1 && body.tpLevel <= 3) {
+    const hitKey = `tp${body.tpLevel}Hit` as "tp1Hit" | "tp2Hit" | "tp3Hit";
+    if (st[hitKey]) {
+      return { ok: false, message: `TP${body.tpLevel} already banked` };
+    }
+  }
   const legs = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
   if (legs.length === 0) return { ok: false, message: "No open positions" };
 
@@ -3316,53 +3322,6 @@ async function handleClosePartial(
         .set({ [hitKey]: true })
         .where(eq(cascadeZonesTable.zoneId, zoneId))
         .catch(() => {});
-      broadcastZoneUpdate(zoneId);
-    }
-  }
-
-  const tick = tickStore.get(accountId)?.at(-1);
-  if (st && tick) {
-    const exitPrice = st.direction === "buy" ? tick.bid : tick.ask;
-    const tpUpdates: Partial<Record<"tp1Hit" | "tp2Hit" | "tp3Hit" | "tp4Hit", boolean>> = {};
-    const runnerUpdates: Partial<Record<"runner1Hit" | "runner2Hit" | "runner3Hit", boolean>> = {};
-
-    for (const lvl of [1, 2, 3] as const) {
-      const tpPrice = st[`tp${lvl}Price`];
-      const enabled = st[`tp${lvl}Enabled`] !== false;
-      const hitKey = `tp${lvl}Hit` as const;
-      if (!enabled || tpPrice == null || st[hitKey]) continue;
-      const qualifies = st.direction === "buy"
-        ? exitPrice >= tpPrice - TP_BUFFER
-        : exitPrice <= tpPrice + TP_BUFFER;
-      if (qualifies) { st[hitKey] = true; tpUpdates[hitKey] = true; }
-    }
-
-    if (!st.tp4Hit) {
-      const tp3Price = st.tp3Price;
-      if (tp3Price) {
-        const aboveTp3 = st.direction === "buy"
-          ? exitPrice >= tp3Price - TP_BUFFER
-          : exitPrice <= tp3Price + TP_BUFFER;
-        if (aboveTp3) { st.tp4Hit = true; tpUpdates.tp4Hit = true; }
-      }
-    }
-
-    if (st.runnerActive) {
-      for (const n of [1, 2, 3] as const) {
-        const rPrice = st[`runner${n}Price`] as number | null | undefined;
-        const hitKey = `runner${n}Hit` as const;
-        if (!rPrice || st[hitKey]) continue;
-        const qualifies = st.direction === "buy"
-          ? exitPrice >= rPrice - TP_BUFFER
-          : exitPrice <= rPrice + TP_BUFFER;
-        if (qualifies) { st[hitKey] = true; runnerUpdates[hitKey] = true; }
-      }
-    }
-
-    const allUpdates = { ...tpUpdates, ...runnerUpdates };
-    if (Object.keys(allUpdates).length > 0) {
-      await db.update(cascadeZonesTable).set(allUpdates)
-        .where(eq(cascadeZonesTable.zoneId, zoneId)).catch(() => {});
       broadcastZoneUpdate(zoneId);
     }
   }
@@ -3703,15 +3662,15 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
   // and arms a protective SL, but the TP ladder must keep running on the
   // surviving best entry. ARMED = pending limits only (no TP engine yet).
   if (!st) return;
+  if (st.status === "CLOSED") {
+    zoneStates.delete(zoneId);
+    return;
+  }
   if (st.status === "ARMED") return;
   if (st.busy) return;
   st.busy = true;
   try {
     const region = activeRegions.get(st.accountId) ?? knownAccounts.get(st.accountId)?.region ?? DEFAULT_REGION;
-    if (st.status === "CLOSED") {
-      const reopened = await reopenClosedZoneIfBrokerLegsRemain(token, region, st.accountId, zoneId, st);
-      if (!reopened) return;
-    }
     // Fetch this zone's tracked positions from DB (OPEN status only).
     // Resilient tracked-positions lookup: prefer DB (source of truth) but
     // fall back to the in-memory mirror on transient query failures so a DB
@@ -4811,9 +4770,12 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
       res.status(400).json({ ok: false, message: "At least one runner target required" });
       return;
     }
-    const tp3Price = st.tp3Price;
-    if (tp3Price == null) {
-      res.status(400).json({ ok: false, message: "TP3 price not set" });
+    const tick = tickStore.get(accountId)?.at(-1);
+    const livePx = tick
+      ? (st.direction === "buy" ? tick.ask : tick.bid)
+      : (await fetchSymbolPrice(token, region, accountId, "XAUUSD"))?.[st.direction === "buy" ? "ask" : "bid"] ?? null;
+    if (livePx == null) {
+      res.status(400).json({ ok: false, message: "Price not ready — wait a moment and try again" });
       return;
     }
     for (const t of targets) {
@@ -4821,9 +4783,12 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
         res.status(400).json({ ok: false, message: "Each runner lot must be at least 0.01" });
         return;
       }
-      const validSide = st.direction === "buy" ? t.price > tp3Price : t.price < tp3Price;
-      if (!validSide) {
-        res.status(400).json({ ok: false, message: "Runner prices must be beyond TP3" });
+      if (st.direction === "buy" && t.price <= livePx) {
+        res.status(400).json({ ok: false, message: "Runner price must be above current price" });
+        return;
+      }
+      if (st.direction === "sell" && t.price >= livePx) {
+        res.status(400).json({ ok: false, message: "Runner price must be below current price" });
         return;
       }
     }
@@ -5113,6 +5078,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
       .where(eq(cascadeZonesTable.zoneId, zoneId));
     const wasRiskFree = st.status === "RISK_FREE";
     st.status = "CLOSED";
+    zoneStates.delete(zoneId);
     await finalizeZoneClose(accountId, zoneId, {
       wasRiskFree,
       exitPrice: exitPriceForZoneClose(accountId, st.direction),
