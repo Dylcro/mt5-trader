@@ -393,7 +393,9 @@ export function buildCascadeConfigUpdate(
     riskFreePips: sanitizeRiskFreePips(b.riskFreePips ?? current.riskFreePips),
     autoBeAtTp:   (() => {
       const n = typeof b.autoBeAtTp === "number" ? b.autoBeAtTp : current.autoBeAtTp;
-      return n === 1 || n === 2 || n === 3 ? n : current.autoBeAtTp;
+      if (n === 3) return 3;
+      if (n === 1 || n === 2) return 2;
+      return current.autoBeAtTp === 3 ? 3 : 2;
     })(),
     takeProfitEnabled: pickBool(b.takeProfitEnabled, current.takeProfitEnabled),
     takeProfitPips:    typeof b.takeProfitPips === "number" && b.takeProfitPips > 0
@@ -2438,7 +2440,9 @@ export const ZONE_AUTO_BE_AT_TP_DEFAULT = 2;
 
 export function sanitizeAutoBeAtTp(raw: unknown): 1 | 2 | 3 {
   const n = typeof raw === "number" ? raw : parseInt(String(raw ?? ""), 10);
-  if (n === 1 || n === 2 || n === 3) return n;
+  // Legacy stored value 1 (BE after TP1) is no longer supported — always TP2 minimum.
+  if (n === 3) return 3;
+  if (n === 1 || n === 2) return 2;
   return ZONE_AUTO_BE_AT_TP_DEFAULT;
 }
 
@@ -2447,11 +2451,12 @@ export function resolveAutoBeAtTp(
   requested: 1 | 2 | 3,
   enabled: { tp1: boolean; tp2: boolean; tp3: boolean },
 ): 1 | 2 | 3 {
-  const candidates: (1 | 2 | 3)[] = [requested, 1, 2, 3].filter(
+  const normalized = requested === 1 ? 2 : requested;
+  const candidates: (1 | 2 | 3)[] = [normalized, 2, 3].filter(
     (v, i, a) => a.indexOf(v) === i,
   ) as (1 | 2 | 3)[];
   for (const level of candidates) {
-    if (level === 1 && enabled.tp1) return 1;
+    if (level === 1) continue; // never BE at TP1
     if (level === 2 && enabled.tp2) return 2;
     if (level === 3 && enabled.tp3) return 3;
   }
@@ -2464,9 +2469,9 @@ export function isAutoBeTriggerSatisfied(st: {
   tp2Hit: boolean;
   tp3Hit: boolean;
 }): boolean {
-  if (st.autoBeAtTp === 1) return st.tp1Hit;
-  if (st.autoBeAtTp === 2) return st.tp2Hit;
-  return st.tp3Hit;
+  // Legacy autoBeAtTp===1 zones are treated as TP2 — SL→BE never fires on TP1 alone.
+  if (st.autoBeAtTp === 3) return st.tp3Hit;
+  return st.tp2Hit;
 }
 const ZONE_CASHOUT_PIPS_DEFAULT = 5;   // anchor + 5p covers spread
 const ZONE_MIN_LOT_PER_ENTRY    = 0.01; // broker minimum; lots ≥ 0.04 get 25% partials, smaller lots get a full close at TP1

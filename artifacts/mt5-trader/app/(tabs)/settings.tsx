@@ -945,15 +945,14 @@ export default function SettingsScreen() {
             <PillSelector
               label="Move SL to BE after"
               hint={
-                cs.autoBeAtTp === 1 ? "Earlier protection — right after TP1"
-                : cs.autoBeAtTp === 3 ? "Later — after TP3 partial"
+                cs.autoBeAtTp === 3 ? "Later — after TP3 partial"
                 : "Default — after TP2 partial"
               }
-              options={[1, 2, 3]}
-              value={cs.autoBeAtTp}
-              onChange={(v) => updateSettings({ autoBeAtTp: v as 1 | 2 | 3 })}
+              options={[2, 3]}
+              value={cs.autoBeAtTp === 3 ? 3 : 2}
+              onChange={(v) => updateSettings({ autoBeAtTp: v as 2 | 3 })}
               suffix=""
-              labels={{ 1: "TP1", 2: "TP2", 3: "TP3" }}
+              labels={{ 2: "TP2", 3: "TP3" }}
             />
           </View>
 
