@@ -3464,25 +3464,44 @@ interface LivePosition {
   profit?: number;
 }
 
+const ZONE_ACTION_RETRY_MSG = "Action failed — please retry in a moment";
+
+function respondZoneActionError(res: Response, label: string, err: unknown): void {
+  console.error(`[${label}]`, err);
+  res.status(500).json({ ok: false, error: ZONE_ACTION_RETRY_MSG, message: ZONE_ACTION_RETRY_MSG });
+}
+
 async function fetchOpenPositions(token: string, region: string, accountId: string): Promise<LivePosition[]> {
-  recordApiCall(accountId);
-  const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/positions`, {
-    headers: authHeaders(token),
-  });
-  if (!r.ok) {
-    throw new Error(`fetchOpenPositions ${r.status} for ${accountId}`);
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 1200 * attempt));
+      recordApiCall(accountId);
+      const r = await fetch(
+        `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
+        { headers: authHeaders(token), signal: AbortSignal.timeout(8000) },
+      );
+      if (r.ok) {
+        const arr = await r.json() as Array<Record<string, unknown>>;
+        return arr.map((p) => ({
+          id: String(p.id ?? p._id ?? ""),
+          openPrice: Number(p.openPrice ?? 0),
+          volume: Number(p.volume ?? 0),
+          type: String(p.type ?? ""),
+          symbol: String(p.symbol ?? ""),
+          magic: p.magic != null ? Number(p.magic) : undefined,
+          comment: p.comment != null ? String(p.comment) : undefined,
+          profit: p.profit != null ? Number(p.profit) : undefined,
+        })).filter((p) => p.id);
+      }
+      lastError = new Error(`fetchOpenPositions ${r.status} for ${accountId}`);
+      console.warn(`[positions] attempt ${attempt + 1} failed: ${r.status}`);
+    } catch (err) {
+      lastError = err;
+      console.warn(`[positions] attempt ${attempt + 1} threw:`, err);
+    }
   }
-  const arr = await r.json() as Array<Record<string, unknown>>;
-  return arr.map((p) => ({
-    id: String(p.id ?? p._id ?? ""),
-    openPrice: Number(p.openPrice ?? 0),
-    volume: Number(p.volume ?? 0),
-    type: String(p.type ?? ""),
-    symbol: String(p.symbol ?? ""),
-    magic: p.magic != null ? Number(p.magic) : undefined,
-    comment: p.comment != null ? String(p.comment) : undefined,
-    profit: p.profit != null ? Number(p.profit) : undefined,
-  })).filter(p => p.id);
+  throw lastError;
 }
 
 async function fetchLivePendingOrders(
@@ -3562,7 +3581,7 @@ async function fetchSymbolPrice(
   const ticks = tickStore.get(accountId);
   if (ticks && ticks.length > 0) {
     const t = ticks[ticks.length - 1]!;
-    if (Date.now() - t.time <= 10_000) return { bid: t.bid, ask: t.ask };
+    if (Date.now() - t.time <= 30_000) return { bid: t.bid, ask: t.ask };
   }
   return null;
 }
@@ -4713,7 +4732,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-partial", checkOwner, a
     broadcastToAccount(accountId, "deal", { type: "position_changed" });
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    respondZoneActionError(res, "close-partial", err);
   }
 });
 
@@ -4802,7 +4821,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
     broadcastZoneUpdate(zoneId);
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    respondZoneActionError(res, "activate-runner", err);
   }
 });
 
@@ -4896,7 +4915,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl} (pips=${pips})`);
     res.json({ ok: true, bestPositionId: best.id, sl, pips, closedCount: others.length });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    respondZoneActionError(res, "risk-free", err);
   }
 });
 
@@ -4972,7 +4991,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
       limitsCancelled,
     });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    respondZoneActionError(res, "secure-profits", err);
   }
 });
 
@@ -5059,7 +5078,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
     logEvent("zone.close", { accountId, zoneId, closedCount: live.length, trigger: "user" });
     res.json({ ok: true, closedCount: live.length });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    respondZoneActionError(res, "close-zone", err);
   }
 });
 
@@ -5173,7 +5192,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/cancel-pending", checkOwner, 
     console.log(`[zone ${zoneId}] cancel-pending: user-initiated, cancelled=${cancelledCount}/${pendingBefore}`);
     res.json({ ok: true, cancelledCount, zoneClosed: closed?.status === "CLOSED" });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    respondZoneActionError(res, "cancel-pending", err);
   }
 });
 

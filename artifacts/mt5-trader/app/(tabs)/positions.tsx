@@ -293,8 +293,8 @@ export default function PositionsScreen() {
       }
       try {
         return await run();
-      } catch (e) {
-        return { ok: false, message: (e as Error).message } as T;
+      } catch {
+        return { ok: false, message: "Action failed — please retry in a moment" } as T;
       }
     },
     [ensureSessionForTrade],

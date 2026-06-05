@@ -282,6 +282,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
   /** No price tick for this long → show Tap to sync (not Ready to trade). */
   const PRICE_STALE_MS = 12_000;
+  const TRADE_PRICE_STALE_MS = 30_000;
   const lastPriceAtRef = useRef(0);
 
   const [cascadeNotification, setCascadeNotification] = useState<CascadeNotification | null>(null);
@@ -667,7 +668,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     const isPriceFresh = () =>
       priceRef.current != null
       && lastPriceAtRef.current > 0
-      && Date.now() - lastPriceAtRef.current <= PRICE_STALE_MS;
+      && Date.now() - lastPriceAtRef.current <= TRADE_PRICE_STALE_MS;
     if (isPriceFresh()) {
       return { ready: true };
     }
@@ -677,7 +678,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     }
     return {
       ready: false,
-      message: "Quotes not live yet. Open Trade, tap sync (↻), wait for price, then retry.",
+      message: "Price not ready — wait a moment and try again",
     };
   }, [accountId, status, wakeConnection]);
 
