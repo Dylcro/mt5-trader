@@ -24,6 +24,7 @@ import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
 import { subscribeAccountEvents } from "@/lib/accountEventBus";
 import {
   buildDisplayActiveZones,
+  groupPositionsByZoneId,
   pendingWithoutZone,
   positionsWithoutZone,
 } from "@/lib/zoneDisplay";
@@ -245,6 +246,7 @@ export default function PositionsScreen() {
     positions, pendingOrders, status, accountInfo,
     refreshPositions, refreshPendingOrders, refreshAccountInfo,
     closePosition, cancelOrder, accountId, region, sseConnected, price, ensureSessionForTrade,
+    closeZonePartial, activateRunner,
   } = useTrading();
   const { zones, refresh: refreshZones, riskFree, closeZone, closeAllWorst, cancelZoneOrders } = useZones(accountId, {
     includeClosed: true, pollIntervalMs: 10_000, sseConnected, region,
@@ -253,6 +255,15 @@ export default function PositionsScreen() {
   const displayActiveZones = useMemo(
     () => buildDisplayActiveZones(zones, positions, cs, price, pendingOrders),
     [zones, positions, cs, price, pendingOrders],
+  );
+  const positionsByZone = useMemo(() => groupPositionsByZoneId(positions), [positions]);
+  const normalZones = useMemo(
+    () => displayActiveZones.filter((z) => !z.runnerActive),
+    [displayActiveZones],
+  );
+  const runnerZones = useMemo(
+    () => displayActiveZones.filter((z) => z.runnerActive),
+    [displayActiveZones],
   );
   const displayZoneIds = useMemo(
     () => new Set(displayActiveZones.map((z) => z.zoneId)),
@@ -449,28 +460,86 @@ export default function PositionsScreen() {
           <>
             {displayActiveZones.length > 0 && (
               <>
-                <Text style={styles.sectionLabel}>ACTIVE ZONES  ·  {displayActiveZones.length}</Text>
-                <View style={{ gap: 10, marginBottom: showStandalone || orphanPendingOrders.length > 0 ? 20 : 0 }}>
-                  {displayActiveZones.map((z) => (
-                    <ZoneCard
-                      key={z.zoneId}
-                      zone={z}
-                      onRiskFree={(zoneId, opts) =>
-                        withSessionReady(() => riskFree(zoneId, opts))
-                      }
-                      onCloseAllWorst={(zoneId) =>
-                        withSessionReady(() => closeAllWorst(zoneId))
-                      }
-                      onCloseZone={(zoneId) =>
-                        withSessionReady(() => handleCloseZone(zoneId))
-                      }
-                      onCancelOrders={(zoneId) =>
-                        withSessionReady(() => handleCancelZoneOrders(zoneId))
-                      }
-                      riskFreePips={cs.riskFreePips}
-                    />
-                  ))}
-                </View>
+                {normalZones.length > 0 && (
+                  <>
+                    <Text style={styles.sectionLabel}>ACTIVE ZONES  ·  {normalZones.length}</Text>
+                    <View style={{ gap: 10, marginBottom: runnerZones.length > 0 ? 12 : showStandalone || orphanPendingOrders.length > 0 ? 20 : 0 }}>
+                      {normalZones.map((z) => {
+                        const linked = positionsByZone.get(z.zoneId) ?? [];
+                        const liveVol = linked.reduce((s, p) => s + p.volume, 0);
+                        const floatingPnl = linked.reduce((s, p) => s + p.profit, 0);
+                        return (
+                          <ZoneCard
+                            key={z.zoneId}
+                            zone={z}
+                            liveVolume={liveVol}
+                            floatingPnl={floatingPnl}
+                            onRiskFree={(zoneId, opts) =>
+                              withSessionReady(() => riskFree(zoneId, opts))
+                            }
+                            onCloseAllWorst={(zoneId) =>
+                              withSessionReady(() => closeAllWorst(zoneId))
+                            }
+                            onCloseZone={(zoneId) =>
+                              withSessionReady(() => handleCloseZone(zoneId))
+                            }
+                            onClosePartial={(zoneId, opts) =>
+                              withSessionReady(() => closeZonePartial(zoneId, opts))
+                            }
+                            onActivateRunner={(zoneId, targets) =>
+                              withSessionReady(() => activateRunner(zoneId, targets))
+                            }
+                            onCancelOrders={(zoneId) =>
+                              withSessionReady(() => handleCancelZoneOrders(zoneId))
+                            }
+                            riskFreePips={cs.riskFreePips}
+                          />
+                        );
+                      })}
+                    </View>
+                  </>
+                )}
+                {runnerZones.length > 0 && (
+                  <>
+                    <Text style={[styles.sectionLabel, { marginTop: normalZones.length > 0 ? 4 : 0 }]}>
+                      RUNNER ZONES  ·  {runnerZones.length}
+                    </Text>
+                    <View style={{ gap: 10, marginBottom: showStandalone || orphanPendingOrders.length > 0 ? 20 : 0 }}>
+                      {runnerZones.map((z) => {
+                        const linked = positionsByZone.get(z.zoneId) ?? [];
+                        const liveVol = linked.reduce((s, p) => s + p.volume, 0);
+                        const floatingPnl = linked.reduce((s, p) => s + p.profit, 0);
+                        return (
+                          <ZoneCard
+                            key={z.zoneId}
+                            zone={z}
+                            liveVolume={liveVol}
+                            floatingPnl={floatingPnl}
+                            onRiskFree={(zoneId, opts) =>
+                              withSessionReady(() => riskFree(zoneId, opts))
+                            }
+                            onCloseAllWorst={(zoneId) =>
+                              withSessionReady(() => closeAllWorst(zoneId))
+                            }
+                            onCloseZone={(zoneId) =>
+                              withSessionReady(() => handleCloseZone(zoneId))
+                            }
+                            onClosePartial={(zoneId, opts) =>
+                              withSessionReady(() => closeZonePartial(zoneId, opts))
+                            }
+                            onActivateRunner={(zoneId, targets) =>
+                              withSessionReady(() => activateRunner(zoneId, targets))
+                            }
+                            onCancelOrders={(zoneId) =>
+                              withSessionReady(() => handleCancelZoneOrders(zoneId))
+                            }
+                            riskFreePips={cs.riskFreePips}
+                          />
+                        );
+                      })}
+                    </View>
+                  </>
+                )}
               </>
             )}
             {showStandalone && (() => {

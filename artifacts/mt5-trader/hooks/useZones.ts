@@ -48,6 +48,20 @@ export interface Zone {
   riskFreeSlExit?: boolean;
   positionCount: number;
   originalVolume?: number;
+  tp1Pct?: number;
+  tp2Pct?: number;
+  tp3Pct?: number;
+  tp4Pct?: number;
+  runner1Price?: number | null;
+  runner1Lots?: number | null;
+  runner2Price?: number | null;
+  runner2Lots?: number | null;
+  runner3Price?: number | null;
+  runner3Lots?: number | null;
+  runner1Hit?: boolean;
+  runner2Hit?: boolean;
+  runner3Hit?: boolean;
+  runnerActive?: boolean;
   currentPrice?: number | null;
   nextTp?: 0 | 1 | 2 | 3 | 4;
   nextTpPrice?: number | null;
@@ -301,4 +315,12 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
   }, [accountId, region, refresh]);
 
   return { zones, loading, error, refresh, riskFree, closeZone, closeAllWorst, cancelZoneOrders };
+}
+
+export function sortZonesRunnerLast(zones: Zone[]): Zone[] {
+  return [...zones].sort((a, b) => {
+    if (a.runnerActive && !b.runnerActive) return 1;
+    if (!a.runnerActive && b.runnerActive) return -1;
+    return 0;
+  });
 }

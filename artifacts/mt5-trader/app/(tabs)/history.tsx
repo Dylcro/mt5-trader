@@ -265,7 +265,7 @@ export default function HistoryScreen() {
         <View style={styles.summaryDivider} />
         <SummaryCell label="TP3" value={String(countZonesReachedTp(periodZones, 3))} color={C.gold} />
         <View style={styles.summaryDivider} />
-        <SummaryCell label="TP4" value={String(countZonesReachedTp(periodZones, 4))} color={C.gold} />
+        <SummaryCell label="Runner" value={String(countZonesReachedTp(periodZones, 4))} color={C.gold} />
         <View style={styles.summaryDivider} />
         <SummaryCell label="MANUAL" value={String(countManualCloses(periodZones))} color={C.gold} />
         <View style={styles.summaryDivider} />

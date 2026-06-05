@@ -323,7 +323,7 @@ export default function SettingsScreen() {
       { label: "TP1", enabled: cs.tp1Enabled, pct: parsedSplit.tp1 },
       { label: "TP2", enabled: cs.tp2Enabled, pct: parsedSplit.tp2 },
       { label: "TP3", enabled: cs.tp3Enabled, pct: parsedSplit.tp3 },
-      { label: "TP4", enabled: cs.tp4Enabled, pct: parsedSplit.tp4 },
+      { label: "Runner", enabled: cs.tp4Enabled, pct: parsedSplit.tp4 },
     ]
       .filter((t) => t.enabled && t.pct > 0 && Number.isFinite(parsedCascadeLot) && parsedCascadeLot >= 0.01)
       .map((t) => {
@@ -1037,13 +1037,13 @@ export default function SettingsScreen() {
           <View style={styles.cascadeCard}>
             <View style={styles.cascadeCardHeader}>
               <Feather name="target" size={16} color={C.gold} />
-              <Text style={styles.cascadeCardTitle}>Zone Take Profit</Text>
+              <Text style={styles.cascadeCardTitle}>TP Levels</Text>
               <View style={styles.sourceBadge}>
                 <Text style={styles.sourceBadgeText}>IN-APP</Text>
               </View>
             </View>
             <Text style={styles.cascadeCardDesc}>
-              Set your cascade lot size and configure each TP level. Toggle any TP off to skip it. Each partial close must be at least 0.01 lots — the lot size limits how many TPs you can split between.
+              Set your TP targets and suggested close amounts. You&apos;ll be notified when each level is reached — tap a close button to bank profit.
             </Text>
 
             <View style={styles.cascadeDivider} />
@@ -1075,7 +1075,7 @@ export default function SettingsScreen() {
               { key: "tp1" as const, label: "TP1", placeholder: "20",         enKey: "tp1Enabled" as const },
               { key: "tp2" as const, label: "TP2", placeholder: "60",         enKey: "tp2Enabled" as const },
               { key: "tp3" as const, label: "TP3", placeholder: "100",        enKey: "tp3Enabled" as const },
-              { key: "tp4" as const, label: "TP4", placeholder: "0 = skip",   enKey: "tp4Enabled" as const },
+              { key: "tp4" as const, label: "Runner", placeholder: "0 = skip",   enKey: "tp4Enabled" as const },
             ]).map((tp, idx) => {
               const enabled = cs[tp.enKey];
               return (
@@ -1122,7 +1122,7 @@ export default function SettingsScreen() {
 
                   {/* Close % row */}
                   <View style={[styles.tpSubRow, !enabled && { opacity: 0.35 }]}>
-                    <Text style={[styles.tpSubLabel, { width: 88 }]}>Close %</Text>
+                    <Text style={[styles.tpSubLabel, { width: 88 }]}>Suggest close %</Text>
                     <View style={[styles.tpInputWrap, { flex: 1 }]}>
                       <TextInput
                         style={styles.tpInput}
@@ -1159,7 +1159,7 @@ export default function SettingsScreen() {
               <View style={styles.cascadeWarningBox}>
                 <Feather name="alert-triangle" size={14} color="#f59e0b" />
                 <Text style={styles.cascadeWarningText}>
-                  TP pip distances must be strictly increasing for enabled TPs (TP4 can be 0 to skip).
+                  TP pip distances must be strictly increasing for enabled TPs (Runner can be 0 to skip).
                 </Text>
               </View>
             )}
