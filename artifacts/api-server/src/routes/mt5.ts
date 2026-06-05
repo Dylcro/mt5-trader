@@ -3259,7 +3259,7 @@ export async function ensureMonitorsForActiveZones(): Promise<void> {
 async function handleClosePartial(
   accountId: string,
   zoneId: string,
-  body: { pct?: number; lots?: number },
+  body: { pct?: number; lots?: number; tpLevel?: number },
   token: string,
   region: string,
 ): Promise<{ ok: boolean; message?: string }> {
@@ -3301,6 +3301,18 @@ async function handleClosePartial(
 
   if ((body.pct ?? 0) >= 100 || (body.lots != null && targetLot >= totalVol - 1e-9)) {
     await cancelZoneLimits(token, region, accountId, zoneId);
+  }
+
+  if (body.tpLevel != null && body.tpLevel >= 1 && body.tpLevel <= 3) {
+    const hitKey = `tp${body.tpLevel}Hit` as "tp1Hit" | "tp2Hit" | "tp3Hit";
+    if (!st[hitKey]) {
+      st[hitKey] = true;
+      await db.update(cascadeZonesTable)
+        .set({ [hitKey]: true })
+        .where(eq(cascadeZonesTable.zoneId, zoneId))
+        .catch(() => {});
+      broadcastZoneUpdate(zoneId);
+    }
   }
 
   const tick = tickStore.get(accountId)?.at(-1);
@@ -4721,10 +4733,11 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-partial", checkOwner, a
     await ensureCascadeZoneRunnerColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
-    const body = (req.body ?? {}) as { pct?: unknown; lots?: unknown };
+    const body = (req.body ?? {}) as { pct?: unknown; lots?: unknown; tpLevel?: unknown };
     const pct = typeof body.pct === "number" ? body.pct : undefined;
     const lots = typeof body.lots === "number" ? body.lots : undefined;
-    const result = await handleClosePartial(accountId, zoneId, { pct, lots }, token, region);
+    const tpLevel = typeof body.tpLevel === "number" ? body.tpLevel : undefined;
+    const result = await handleClosePartial(accountId, zoneId, { pct, lots, tpLevel }, token, region);
     if (!result.ok) {
       res.status(result.message === "Zone not found" ? 404 : 409).json(result);
       return;
