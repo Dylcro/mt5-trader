@@ -3610,6 +3610,29 @@ function latestPrice(accountId: string): { bid: number; ask: number } | null {
   return { bid: t.bid, ask: t.ask };
 }
 
+function isQuotesLive(accountId: string): boolean {
+  return syncReady.has(accountId);
+}
+
+function checkPriceAvailableForZoneAction(accountId: string): { ok: true } | { ok: false; message: string } {
+  const cachedTick = tickStore.get(accountId)?.at(-1);
+  const tickIsFresh = cachedTick != null && (Date.now() - cachedTick.time) < 30_000;
+  const priceAvailable = isQuotesLive(accountId) || tickIsFresh;
+  if (!priceAvailable) {
+    return { ok: false, message: "Price not ready — wait a moment and try again" };
+  }
+  return { ok: true };
+}
+
+function rejectIfPriceNotReady(res: Response, accountId: string): boolean {
+  const check = checkPriceAvailableForZoneAction(accountId);
+  if (!check.ok) {
+    res.status(400).json({ ok: false, error: check.message, message: check.message });
+    return true;
+  }
+  return false;
+}
+
 // Sort positions for a zone: worst → best.
 // BUY worst = highest entry; SELL worst = lowest entry.
 function sortZonePositions(positions: LivePosition[], direction: "buy" | "sell"): LivePosition[] {
@@ -4735,6 +4758,7 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
 router.post("/mt5/account/:accountId/zones/:zoneId/close-partial", checkOwner, async (req: Request, res: Response) => {
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
+    if (rejectIfPriceNotReady(res, accountId)) return;
     await ensureCascadeZoneRunnerColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
@@ -4758,6 +4782,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-partial", checkOwner, a
 router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner, async (req: Request, res: Response) => {
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
+    if (rejectIfPriceNotReady(res, accountId)) return;
     await ensureCascadeZoneRunnerColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
@@ -4848,6 +4873,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
 router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async (req: Request, res: Response) => {
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
+    if (rejectIfPriceNotReady(res, accountId)) return;
     await ensureCascadeZoneRfColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
@@ -4943,6 +4969,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
 router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, async (req: Request, res: Response) => {
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
+    if (rejectIfPriceNotReady(res, accountId)) return;
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     const st = await loadZone(zoneId);
@@ -5024,6 +5051,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
 router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (req: Request, res: Response) => {
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
+    if (rejectIfPriceNotReady(res, accountId)) return;
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     // DB-first read via the single loadZone path (cache → DB → hydrate).
@@ -5196,6 +5224,7 @@ router.post("/mt5/account/:accountId/zones/arm", checkOwner, async (req: Request
 router.post("/mt5/account/:accountId/zones/:zoneId/cancel-pending", checkOwner, async (req: Request, res: Response) => {
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
+    if (rejectIfPriceNotReady(res, accountId)) return;
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     const pendingBefore = orderIdsForZone(accountId, zoneId).length;
