@@ -131,6 +131,15 @@ interface TradingContextValue {
   syncSession: (force?: boolean) => Promise<void>;
   /** Fast preflight before zone buttons — skips full wake when price is live. */
   ensureSessionForTrade: () => Promise<{ ready: boolean; message?: string }>;
+  closeZonePartial: (zoneId: string, opts: { pct?: number; lots?: number }) => Promise<{ ok: boolean; message: string }>;
+  activateRunner: (
+    zoneId: string,
+    targets: {
+      r1?: { price: number; lots: number };
+      r2?: { price: number; lots: number };
+      r3?: { price: number; lots: number };
+    },
+  ) => Promise<{ ok: boolean; message: string }>;
 }
 
 export interface PlaceTradeParams {
@@ -1506,6 +1515,66 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     [status, accountId, region, refreshPendingOrders, refreshAccountInfo]
   );
 
+  const closeZonePartial = useCallback(
+    async (zoneId: string, opts: { pct?: number; lots?: number }): Promise<{ ok: boolean; message: string }> => {
+      if (status !== "connected") return { ok: false, message: "Not connected" };
+      if (!connectionWarm) await wakeConnection();
+      try {
+        const r = await authFetch(
+          `${API_BASE}/mt5/account/${accountId}/zones/${encodeURIComponent(zoneId)}/close-partial?region=${region}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(opts),
+          },
+        );
+        const d = await safeJson<{ ok?: boolean; message?: string }>(r);
+        void Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
+        return { ok: r.ok && !!d.ok, message: d.message ?? "" };
+      } catch (err) {
+        return { ok: false, message: err instanceof Error ? err.message : "Failed" };
+      }
+    },
+    [status, connectionWarm, wakeConnection, accountId, region, refreshPositions, refreshPendingOrders, refreshAccountInfo],
+  );
+
+  const activateRunner = useCallback(
+    async (
+      zoneId: string,
+      targets: {
+        r1?: { price: number; lots: number };
+        r2?: { price: number; lots: number };
+        r3?: { price: number; lots: number };
+      },
+    ): Promise<{ ok: boolean; message: string }> => {
+      if (status !== "connected") return { ok: false, message: "Not connected" };
+      if (!connectionWarm) await wakeConnection();
+      try {
+        const r = await authFetch(
+          `${API_BASE}/mt5/account/${accountId}/zones/${encodeURIComponent(zoneId)}/activate-runner?region=${region}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              runner1Price: targets.r1?.price,
+              runner1Lots: targets.r1?.lots,
+              runner2Price: targets.r2?.price,
+              runner2Lots: targets.r2?.lots,
+              runner3Price: targets.r3?.price,
+              runner3Lots: targets.r3?.lots,
+            }),
+          },
+        );
+        const d = await safeJson<{ ok?: boolean; message?: string }>(r);
+        void refreshPositions();
+        return { ok: r.ok && !!d.ok, message: d.message ?? "" };
+      } catch (err) {
+        return { ok: false, message: err instanceof Error ? err.message : "Failed" };
+      }
+    },
+    [status, connectionWarm, wakeConnection, accountId, region, refreshPositions],
+  );
+
   return (
     <TradingContext.Provider
       value={{
@@ -1540,6 +1609,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         connectionWarm,
         syncSession: wakeConnection,
         ensureSessionForTrade,
+        closeZonePartial,
+        activateRunner,
       }}
     >
       {children}

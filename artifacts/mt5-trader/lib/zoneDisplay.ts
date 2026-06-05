@@ -209,7 +209,11 @@ export function buildDisplayActiveZones(
     seen.add(zoneId);
   }
 
-  return out;
+  return out.sort((a, b) => {
+    if (a.runnerActive && !b.runnerActive) return 1;
+    if (!a.runnerActive && b.runnerActive) return -1;
+    return 0;
+  });
 }
 
 export function positionsWithoutZone(positions: Position[], zoneIds: Set<string>): Position[] {

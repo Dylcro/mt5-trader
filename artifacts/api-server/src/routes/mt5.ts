@@ -2,7 +2,7 @@ import { Router, type IRouter, type Request, type Response, type NextFunction } 
 import jwt from "jsonwebtoken";
 import { createRequire } from "module";
 import { db, pool, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable, cascadeZonesTable, zonePositionsTable, zoneOrdersTable, notificationPrefsTable, usersTable } from "@workspace/db";
-import { and, desc, eq, inArray, isNotNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, ne } from "drizzle-orm";
 import { JWT_SECRET } from "./auth";
 import { getTradingStatus } from "../lib/platformFlags";
 import { logEvent } from "../logger";
@@ -134,6 +134,29 @@ export async function ensureCascadeZoneRfColumns(): Promise<void> {
     });
   }
   await cascadeRfColumnsReady;
+}
+
+let cascadeRunnerColumnsReady: Promise<void> | null = null;
+export async function ensureCascadeZoneRunnerColumns(): Promise<void> {
+  if (!cascadeRunnerColumnsReady) {
+    cascadeRunnerColumnsReady = pool.query(`
+      ALTER TABLE cascade_zones
+        ADD COLUMN IF NOT EXISTS runner1_price DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS runner1_lots DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS runner2_price DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS runner2_lots DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS runner3_price DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS runner3_lots DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS runner1_hit BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS runner2_hit BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS runner3_hit BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS runner_active BOOLEAN NOT NULL DEFAULT FALSE;
+    `).then(() => undefined).catch((e) => {
+      cascadeRunnerColumnsReady = null;
+      throw e;
+    });
+  }
+  await cascadeRunnerColumnsReady;
 }
 
 async function upsertStoredAccount(params: {
@@ -668,6 +691,22 @@ function broadcastZoneUpdate(zoneId: string): void {
       manualClose: (dbRow as { manualClose?: boolean } | undefined)?.manualClose ?? false,
       slHit: (dbRow as { slHit?: boolean } | undefined)?.slHit ?? false,
       riskFreeSlExit: (dbRow as { riskFreeSlExit?: boolean } | undefined)?.riskFreeSlExit ?? false,
+      runner1Price: (dbRow as { runner1Price?: number | null } | undefined)?.runner1Price != null
+        ? Number((dbRow as { runner1Price: number }).runner1Price) : st?.runner1Price ?? null,
+      runner1Lots: (dbRow as { runner1Lots?: number | null } | undefined)?.runner1Lots != null
+        ? Number((dbRow as { runner1Lots: number }).runner1Lots) : st?.runner1Lots ?? null,
+      runner2Price: (dbRow as { runner2Price?: number | null } | undefined)?.runner2Price != null
+        ? Number((dbRow as { runner2Price: number }).runner2Price) : st?.runner2Price ?? null,
+      runner2Lots: (dbRow as { runner2Lots?: number | null } | undefined)?.runner2Lots != null
+        ? Number((dbRow as { runner2Lots: number }).runner2Lots) : st?.runner2Lots ?? null,
+      runner3Price: (dbRow as { runner3Price?: number | null } | undefined)?.runner3Price != null
+        ? Number((dbRow as { runner3Price: number }).runner3Price) : st?.runner3Price ?? null,
+      runner3Lots: (dbRow as { runner3Lots?: number | null } | undefined)?.runner3Lots != null
+        ? Number((dbRow as { runner3Lots: number }).runner3Lots) : st?.runner3Lots ?? null,
+      runner1Hit: Boolean((dbRow as { runner1Hit?: boolean } | undefined)?.runner1Hit ?? st?.runner1Hit),
+      runner2Hit: Boolean((dbRow as { runner2Hit?: boolean } | undefined)?.runner2Hit ?? st?.runner2Hit),
+      runner3Hit: Boolean((dbRow as { runner3Hit?: boolean } | undefined)?.runner3Hit ?? st?.runner3Hit),
+      runnerActive: Boolean((dbRow as { runnerActive?: boolean } | undefined)?.runnerActive ?? st?.runnerActive),
     });
   })();
 }
@@ -841,6 +880,7 @@ function handleStreamingTick(accountId: string, price: any): void {
   // the mobile app isn't polling /price (e.g. backgrounded).
   storeTick(accountId, bid, ask);
   lastEventAt.set(accountId, Date.now());
+  lastTickAtByAccount.set(accountId, Date.now());
   broadcastToAccount(accountId, "price", { bid, ask });
   // Trigger evaluateZone for any OPEN zone on this account, throttled.
   let token: string;
@@ -2368,6 +2408,21 @@ interface ZoneState {
   // per-entry volume to compute the 25% slice (a fallback row without volume
   // would silently advance TP flags without actually closing anything).
   trackedPositions: Map<string, { volume: number; entryPrice: number; tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean }>;
+  /** In-memory only — tracks which TP/runner push notifications have fired. */
+  tpNotified?: {
+    tp1: boolean; tp2: boolean; tp3: boolean;
+    runner1: boolean; runner2: boolean; runner3: boolean;
+  };
+  runner1Price?: number | null;
+  runner1Lots?: number | null;
+  runner2Price?: number | null;
+  runner2Lots?: number | null;
+  runner3Price?: number | null;
+  runner3Lots?: number | null;
+  runner1Hit?: boolean;
+  runner2Hit?: boolean;
+  runner3Hit?: boolean;
+  runnerActive?: boolean;
 }
 
 // Signed offset (pips) of the protective SL from the surviving entry:
@@ -2419,6 +2474,10 @@ const ZONE_MIN_LOT_PER_ENTRY    = 0.01; // broker minimum; lots ≥ 0.04 get 25%
 // the partial close. Lets TPs trigger through the broker spread instead of
 // requiring the comparison side to print the exact level.
 const ZONE_TP_TOLERANCE_PIPS    = 4;
+/** Price-point buffer for manual close pill classification (close-partial endpoint). */
+const TP_BUFFER                 = 5.0;
+const MONITOR_KEEPALIVE_MS      = 30_000;
+const lastTickAtByAccount       = new Map<string, number>();
 // Max ticks we'll retry the SL→BE move after TP2 partials are closed.
 // At the 3 s monitor interval (plus streaming tick attempts) this is
 // roughly 15 s of trying; enough to ride out a transient broker burp
@@ -3167,6 +3226,133 @@ async function closeZonePosition(
   return r.ok;
 }
 
+async function resubscribeToTickStream(accountId: string): Promise<void> {
+  const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
+  activeStreams.delete(accountId);
+  activeConnections.delete(accountId);
+  const token = getToken();
+  const userId = knownAccounts.get(accountId)?.userId;
+  await startStreaming(token, accountId, region, userId);
+}
+
+/** Re-start tick stream + zone monitor for every account with non-closed zones. */
+export async function ensureMonitorsForActiveZones(): Promise<void> {
+  try {
+    await ensureCascadeZoneRunnerColumns();
+    const activeZones = await db.select({ accountId: cascadeZonesTable.accountId })
+      .from(cascadeZonesTable)
+      .where(ne(cascadeZonesTable.status, "CLOSED"));
+    const accountIds = [...new Set(activeZones.map((z) => z.accountId))];
+    if (accountIds.length === 0) return;
+    const token = getToken();
+    for (const accountId of accountIds) {
+      const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
+      if (!activeStreams.has(accountId)) {
+        void startStreaming(token, accountId, region, knownAccounts.get(accountId)?.userId);
+      }
+    }
+  } catch (e) {
+    console.warn("[zone-monitor] ensureMonitorsForActiveZones failed:", (e as Error).message);
+  }
+}
+
+async function handleClosePartial(
+  accountId: string,
+  zoneId: string,
+  body: { pct?: number; lots?: number },
+  token: string,
+  region: string,
+): Promise<{ ok: boolean; message?: string }> {
+  const st = await loadZone(zoneId);
+  if (!st || st.accountId !== accountId) return { ok: false, message: "Zone not found" };
+  if (st.status === "CLOSED" || st.status === "ARMED") {
+    return { ok: false, message: "Zone not active" };
+  }
+  const legs = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+  if (legs.length === 0) return { ok: false, message: "No open positions" };
+
+  const totalVol = legs.reduce((s, p) => s + p.volume, 0);
+  const LOT_STEP = 0.01;
+
+  let targetLot: number;
+  if (body.lots != null) {
+    targetLot = Math.min(body.lots, totalVol);
+  } else if (body.pct != null && body.pct >= 100) {
+    targetLot = totalVol;
+  } else {
+    const baseVol = st.originalVolume > 0 ? st.originalVolume : totalVol;
+    targetLot = Math.round((baseVol * (body.pct ?? 25) / 100) / LOT_STEP) * LOT_STEP;
+    if (targetLot < LOT_STEP) return { ok: false, message: "Lot too small" };
+    if (targetLot > totalVol) targetLot = totalVol;
+  }
+
+  const sorted = [...legs].sort((a, b) => b.volume - a.volume);
+  let remaining = targetLot;
+  for (const leg of sorted) {
+    if (remaining <= 0) break;
+    if (leg.volume <= remaining + 1e-9) {
+      await closeZonePosition(token, region, accountId, leg.id);
+      remaining = Math.round((remaining - leg.volume) / LOT_STEP) * LOT_STEP;
+    } else if (remaining >= LOT_STEP) {
+      await closeZonePosition(token, region, accountId, leg.id, remaining);
+      remaining = 0;
+    }
+  }
+
+  if ((body.pct ?? 0) >= 100 || (body.lots != null && targetLot >= totalVol - 1e-9)) {
+    await cancelZoneLimits(token, region, accountId, zoneId);
+  }
+
+  const tick = tickStore.get(accountId)?.at(-1);
+  if (st && tick) {
+    const exitPrice = st.direction === "buy" ? tick.bid : tick.ask;
+    const tpUpdates: Partial<Record<"tp1Hit" | "tp2Hit" | "tp3Hit" | "tp4Hit", boolean>> = {};
+    const runnerUpdates: Partial<Record<"runner1Hit" | "runner2Hit" | "runner3Hit", boolean>> = {};
+
+    for (const lvl of [1, 2, 3] as const) {
+      const tpPrice = st[`tp${lvl}Price`];
+      const enabled = st[`tp${lvl}Enabled`] !== false;
+      const hitKey = `tp${lvl}Hit` as const;
+      if (!enabled || tpPrice == null || st[hitKey]) continue;
+      const qualifies = st.direction === "buy"
+        ? exitPrice >= tpPrice - TP_BUFFER
+        : exitPrice <= tpPrice + TP_BUFFER;
+      if (qualifies) { st[hitKey] = true; tpUpdates[hitKey] = true; }
+    }
+
+    if (!st.tp4Hit) {
+      const tp3Price = st.tp3Price;
+      if (tp3Price) {
+        const aboveTp3 = st.direction === "buy"
+          ? exitPrice >= tp3Price - TP_BUFFER
+          : exitPrice <= tp3Price + TP_BUFFER;
+        if (aboveTp3) { st.tp4Hit = true; tpUpdates.tp4Hit = true; }
+      }
+    }
+
+    if (st.runnerActive) {
+      for (const n of [1, 2, 3] as const) {
+        const rPrice = st[`runner${n}Price`] as number | null | undefined;
+        const hitKey = `runner${n}Hit` as const;
+        if (!rPrice || st[hitKey]) continue;
+        const qualifies = st.direction === "buy"
+          ? exitPrice >= rPrice - TP_BUFFER
+          : exitPrice <= rPrice + TP_BUFFER;
+        if (qualifies) { st[hitKey] = true; runnerUpdates[hitKey] = true; }
+      }
+    }
+
+    const allUpdates = { ...tpUpdates, ...runnerUpdates };
+    if (Object.keys(allUpdates).length > 0) {
+      await db.update(cascadeZonesTable).set(allUpdates)
+        .where(eq(cascadeZonesTable.zoneId, zoneId)).catch(() => {});
+      broadcastZoneUpdate(zoneId);
+    }
+  }
+
+  return { ok: true };
+}
+
 async function modifyZonePositionSl(
   token: string, region: string, accountId: string, positionId: string, sl: number,
 ): Promise<boolean> {
@@ -3715,229 +3901,49 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       }
     }
 
-    // ── TP1-4 applied to EVERY active entry (25% per TP, of each entry's
-    //    own original volume). TP4 is optional — when set, closes whatever's
-    //    left of each entry. Each TP advances only after the previous one
-    //    has fired.
-    //
-    //   TP2 also: cancel any still-unfilled cascade limits. We deliberately
-    //   do NOT re-arm broker SLs at TP2 (each position was placed with a
-    //   broker SL already; nudging it to BE per position would be a
-    //   behaviour change the user didn't ask for in this simpler model).
-    const zpsById = new Map(zps.map(z => [z.positionId, z]));
-    const cascadeLot = st.originalVolume > 0 ? st.originalVolume : 0;
-    const lastEnabled = (lvl: 1 | 2 | 3 | 4) => isLastEnabledTpLevel(lvl, st);
-    let levelCarry = st.tpCarryLot;
-    const closePartialForLevel = async (
-      level: 1 | 2 | 3 | 4,
-      positionsSubset: typeof live,
-    ): Promise<boolean> => {
-      // Resolve this level's close % from the zone's baked-in split config.
-      const tpPct = level === 1 ? st.tp1Pct : level === 2 ? st.tp2Pct : level === 3 ? st.tp3Pct : st.tp4Pct;
-      // Gate: "if position is already at or below the fraction that would remain
-      // AFTER this level fires, the partial was already applied — skip (or close
-      // remainder for small-lot cases where rounding over-took the expected %)."
-      // Formula: remaining_after_level_N = (100 - sum_through_N) / 100.
-      // We subtract tpPct so the gate for TP1 (priorPct=0, tpPct=25) is 0.76,
-      // not 1.01 — a gate of 1.01 is always satisfied and silently skips every
-      // TP1 partial close, logging "TP1 complete" without actually closing.
-      const priorPct = level === 1 ? 0 : level === 2 ? st.tp1Pct : level === 3 ? st.tp1Pct + st.tp2Pct : st.tp1Pct + st.tp2Pct + st.tp3Pct;
-      const keepFractionGate = Math.max(0, (100 - priorPct - tpPct + 1) / 100);
-      // Fire all per-entry closes IN PARALLEL — in a fast market, serially
-      // awaiting each close can let later entries slip several pips past the
-      // TP price before their close request hits the broker.
-      let closedAny = false;
-      const results = await Promise.all(positionsSubset.map(async p => {
-        const row = zpsById.get(p.id);
-        const origVol = row ? Number(row.volume) : p.volume;
-        if (!(origVol > 0)) return true;
-        if (level === 4) {
-          const ok = await closeZonePosition(token, region, st.accountId, p.id);
-          if (ok) closedAny = true;
-          return ok;
-        }
-        // skip if this entry already had its partial for this level applied.
-        // Exception: small lots where rounding made a prior TP take more than
-        // its configured %, so remaining already fell below this level's gate.
-        // Close whatever is left now rather than drifting to a later TP.
-        if (p.volume <= origVol * keepFractionGate) {
-          if (level > 1 && p.volume > 0) {
-            console.log(`[zone ${zoneId}] TP${level} posId=${p.id} small-lot full-close (vol=${p.volume} <= gate=${(origVol * keepFractionGate).toFixed(4)})`);
-            return closeZonePosition(token, region, st.accountId, p.id);
-          }
-          console.log(`[zone ${zoneId}] TP${level} posId=${p.id} already-applied skip (vol=${p.volume} origVol=${origVol} gate=${(origVol * keepFractionGate).toFixed(4)})`);
-          return true;
-        }
-        const lotBase = cascadeLot > 0 ? cascadeLot : origVol;
-        const slice = computeTpSliceVolume({
-          cascadeLot: lotBase,
-          tpPct,
-          remainingVol: p.volume,
-          carryIn: levelCarry,
-          isLastEnabledTp: lastEnabled(level),
-        });
-        if (slice.action === "carry") {
-          levelCarry = slice.carryOut;
-          console.log(`[zone ${zoneId}] TP${level} posId=${p.id} slice<0.01 — carry ${levelCarry} to next enabled TP`);
-          return true;
-        }
-        const vol = slice.closeVol;
-        if (vol < 0.01) {
-          console.warn(`[zone ${zoneId}] TP${level} posId=${p.id} skip — no closable volume (remain=${p.volume})`);
-          return false;
-        }
-        console.log(`[zone ${zoneId}] TP${level} posId=${p.id} partial close vol=${vol} (cascadeLot=${lotBase} tpPct=${tpPct}% currentVol=${p.volume} action=${slice.action})`);
-        const ok = vol < p.volume
-          ? await closeZonePosition(token, region, st.accountId, p.id, vol)
-          : await closeZonePosition(token, region, st.accountId, p.id);
-        if (ok) closedAny = true;
-        return ok;
-      }));
-      st.tpCarryLot = levelCarry;
-      return closedAny && results.every(Boolean);
+    // Manual TP model — no auto partial closes. Push notifications for TP3
+    // (set runners) and runner targets only; user taps buttons in the app for TP1/2/3.
+    const notified = st.tpNotified ?? {
+      tp1: false, tp2: false, tp3: false,
+      runner1: false, runner2: false, runner3: false,
     };
 
-    // Per-position TP evaluation — zone fires as one, but each position tracks
-    // its own stage independently.
-    //
-    // Example: main entry had TP1 applied (pos.tp1Hit=true). Price retraces,
-    // a cascade limit fills (pos.tp1Hit=false). Price returns to TP1:
-    //   → main entry skips (already has tp1Hit) — nothing happens, waits for TP2
-    //   → limit entry takes its TP1 partial close
-    // Price continues to TP2:
-    //   → BOTH entries get TP2 applied together
-    //
-    // All four buckets are computed UPFRONT so a position that gets TP1 in this
-    // tick is not also pulled into the TP2 bucket in the same tick.
-    //
-    // Zone-level tp1Hit/tp2Hit flags mean "at least one position has reached
-    // this level" and gate: near-TP notifications, cancelZoneLimits (first TP2),
-    // SL→BE trigger, and UI progress display.
-    const tp1Satisfied = (p: LivePosition) => {
-      const pos = st.trackedPositions.get(p.id);
-      return !st.tp1Enabled || Boolean(pos?.tp1Hit);
-    };
-    const tp2Satisfied = (p: LivePosition) => {
-      const pos = st.trackedPositions.get(p.id);
-      return !st.tp2Enabled || Boolean(pos?.tp2Hit);
-    };
-    const tp3Satisfied = (p: LivePosition) => {
-      const pos = st.trackedPositions.get(p.id);
-      return !st.tp3Enabled || Boolean(pos?.tp3Hit);
-    };
-    const needTP1 = st.tp1Enabled ? live.filter(p => !st.trackedPositions.get(p.id)?.tp1Hit) : [];
-    const needTP2 = st.tp2Enabled ? live.filter(p => tp1Satisfied(p) && !st.trackedPositions.get(p.id)?.tp2Hit) : [];
-    const needTP3 = st.tp3Enabled ? live.filter(p => tp1Satisfied(p) && tp2Satisfied(p) && !st.trackedPositions.get(p.id)?.tp3Hit) : [];
-    const needTP4 = st.tp4Enabled ? live.filter(p => tp1Satisfied(p) && tp2Satisfied(p) && tp3Satisfied(p) && !st.trackedPositions.get(p.id)?.tp4Hit) : [];
-
-    // TP1 — positions that haven't had their first partial yet
-    const tp1AtPrice = st.tp1Price != null && hit(st.tp1Price);
-    const tp1BrokerApplied = needTP1.filter((p) => {
-      const row = zpsById.get(p.id);
-      const origVol = row ? Number(row.volume) : 0;
-      return positionShowsTpLevelApplied(p.volume, origVol, 1, st);
-    });
-    if (needTP1.length > 0 && st.tp1Price != null && (tp1AtPrice || tp1BrokerApplied.length > 0)) {
-      const trigger = tp1AtPrice ? "price" : "broker-volume";
-      console.log(
-        `[zone ${zoneId}] TP1 trigger (${trigger}) @${cmpPrice} (tp1=${st.tp1Price}) — `
-        + `${needTP1.length}/${live.length} need TP1, ${tp1BrokerApplied.length} already partial on broker`,
-      );
-      const ok = await closePartialForLevel(1, needTP1);
-      if (ok) {
-        const ids = needTP1.map(p => p.id);
-        await db.update(zonePositionsTable).set({ tp1Hit: true })
-          .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
-        for (const p of needTP1) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp1Hit = true; }
-        if (!st.tp1Hit) {
-          await db.update(cascadeZonesTable).set({ tp1Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-          st.tp1Hit = true;
-          zoneNearNotifiedTp.set(zoneId, 0);
-          notifyZoneEvent(zoneId, "hit", 1, 0, st.direction);
+    {
+      const tp3Price = st.tp3Price;
+      const enabled = st.tp3Enabled !== false;
+      const key = "tp3" as keyof typeof notified;
+      if (enabled && tp3Price != null && !notified[key]) {
+        const reached = st.direction === "buy"
+          ? price.bid >= tp3Price
+          : price.ask <= tp3Price;
+        if (reached) {
+          notified[key] = true;
+          st.tpNotified = notified;
+          notifyZoneEvent(st.zoneId, "tp3_runners", 3, 0, st.direction);
         }
-        broadcastZoneUpdate(zoneId);
-        console.log(`[zone ${zoneId}] TP1 complete (${ids.length} position(s))`);
-      } else {
-        console.warn(`[zone ${zoneId}] TP1 partial failure — will retry next tick`);
       }
     }
 
-    // TP2 — positions that have had TP1 but not TP2
-    if (needTP2.length > 0 && st.tp2Price != null && hit(st.tp2Price)) {
-      console.log(`[zone ${zoneId}] TP2 trigger @${cmpPrice} (tp2=${st.tp2Price}) — ${needTP2.length}/${live.length} position(s) need TP2`);
-      const ok = await closePartialForLevel(2, needTP2);
-      if (ok) {
-        const ids = needTP2.map(p => p.id);
-        await db.update(zonePositionsTable).set({ tp2Hit: true })
-          .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
-        for (const p of needTP2) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp2Hit = true; }
-        if (!st.tp2Hit) {
-          // Cancel unfilled cascade limits only after a successful TP2 partial (never on TP1).
-          if (shouldCancelCascadeLimitsAtTpStage(2, st)) {
-            await cancelZoneLimits(token, region, st.accountId, zoneId);
-          }
-          // Advance zone-level flag. Do NOT gate on SL→BE — the sticky-retry
-          // block below handles that; gating here caused the zone to re-enter
-          // every tick when the broker rejected the SL (code 10016).
-          await db.update(cascadeZonesTable).set({ tp2Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-          st.tp2Hit = true;
-          zoneNearNotifiedTp.set(zoneId, 0);
-          notifyZoneEvent(zoneId, "hit", 2, 0, st.direction);
-          console.log(`[zone ${zoneId}] TP2 partial closed + limits cancelled — SL→BE will be attempted next`);
-        } else {
-          console.log(`[zone ${zoneId}] TP2 partial closed for ${ids.length} additional position(s)`);
+    if (st.runnerActive) {
+      for (const n of [1, 2, 3] as const) {
+        const rPrice = st[`runner${n}Price`] as number | null | undefined;
+        const rLots = st[`runner${n}Lots`] as number | undefined;
+        const key = `runner${n}` as keyof typeof notified;
+        if (!rPrice || notified[key] || st[`runner${n}Hit`]) continue;
+        const reached = st.direction === "buy"
+          ? price.bid >= rPrice
+          : price.ask <= rPrice;
+        if (reached) {
+          notified[key] = true;
+          st.tpNotified = notified;
+          notifyZoneEvent(st.zoneId, "runner", n, 0, st.direction, rPrice, rLots ?? undefined);
         }
-        broadcastZoneUpdate(zoneId);
-      } else {
-        console.warn(`[zone ${zoneId}] TP2 partial close failed — will retry next tick`);
       }
     }
 
-    // TP3 — positions that have had TP2 but not TP3
-    if (needTP3.length > 0 && st.tp3Price != null && hit(st.tp3Price)) {
-      console.log(`[zone ${zoneId}] TP3 trigger @${cmpPrice} (tp3=${st.tp3Price}) — ${needTP3.length}/${live.length} position(s) need TP3`);
-      const ok = await closePartialForLevel(3, needTP3);
-      if (ok) {
-        const ids = needTP3.map(p => p.id);
-        await db.update(zonePositionsTable).set({ tp3Hit: true })
-          .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
-        for (const p of needTP3) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp3Hit = true; }
-        if (!st.tp3Hit) {
-          await db.update(cascadeZonesTable).set({ tp3Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-          st.tp3Hit = true;
-          zoneNearNotifiedTp.set(zoneId, 0);
-          notifyZoneEvent(zoneId, "hit", 3, 0, st.direction);
-        }
-        broadcastZoneUpdate(zoneId);
-        console.log(`[zone ${zoneId}] TP3 complete (${ids.length} position(s))`);
-      } else {
-        console.warn(`[zone ${zoneId}] TP3 partial failure — will retry next tick`);
-      }
-    }
+    st.tpNotified = notified;
 
-    // TP4 — optional final exit, positions that have had TP3 but not TP4
-    if (needTP4.length > 0 && st.tp4Price != null && hit(st.tp4Price)) {
-      console.log(`[zone ${zoneId}] TP4 trigger @${cmpPrice} (tp4=${st.tp4Price}) — closing remaining ${needTP4.length} position(s)`);
-      const ok = await closePartialForLevel(4, needTP4);
-      if (ok) {
-        const ids = needTP4.map(p => p.id);
-        await db.update(zonePositionsTable).set({ tp4Hit: true })
-          .where(and(eq(zonePositionsTable.zoneId, zoneId), inArray(zonePositionsTable.positionId, ids)));
-        for (const p of needTP4) { const pos = st.trackedPositions.get(p.id); if (pos) pos.tp4Hit = true; }
-        if (!st.tp4Hit) {
-          await db.update(cascadeZonesTable).set({ tp4Hit: true }).where(eq(cascadeZonesTable.zoneId, zoneId));
-          st.tp4Hit = true;
-          zoneNearNotifiedTp.set(zoneId, 0);
-          notifyZoneEvent(zoneId, "hit", 4, 0, st.direction);
-        }
-        broadcastZoneUpdate(zoneId);
-        console.log(`[zone ${zoneId}] TP4 complete — final exit (${ids.length} position(s))`);
-      } else {
-        console.warn(`[zone ${zoneId}] TP4 close failed — will retry next tick`);
-      }
-    }
-
-    // Sticky SL→BE block, independent of the TP if/else chain above. Runs
+        // Sticky SL→BE block, independent of the TP if/else chain above. Runs
     // every tick once TP2 partials have closed, until either true BE is
     // achieved (tp2SlMoved=true) or we've truly exhausted the attempt budget.
     //
@@ -4009,9 +4015,11 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
 }
 
 let zoneMonitorTimer: NodeJS.Timeout | null = null;
+let zoneKeepaliveTimer: NodeJS.Timeout | null = null;
 let zoneMonitorTick = 0;
 export function startZoneTpMonitor(): void {
   if (zoneMonitorTimer) return;
+  void ensureMonitorsForActiveZones();
   zoneMonitorTimer = setInterval(() => {
     const token = (() => { try { return getToken(); } catch { return null; } })();
     if (!token) return;
@@ -4036,6 +4044,21 @@ export function startZoneTpMonitor(): void {
       if (st.status !== "CLOSED" && st.status !== "ARMED") void evaluateZone(zoneId, token);
     }
   }, 3_000);
+  if (!zoneKeepaliveTimer) {
+    zoneKeepaliveTimer = setInterval(() => {
+      const now = Date.now();
+      for (const [accountId, lastTick] of lastTickAtByAccount.entries()) {
+        if (now - lastTick > MONITOR_KEEPALIVE_MS) {
+          console.warn(`[keepalive] No tick for ${MONITOR_KEEPALIVE_MS}ms on ${accountId} — re-subscribing`);
+          void resubscribeToTickStream(accountId).catch((err) =>
+            console.error("[keepalive] re-subscribe failed:", err),
+          );
+          lastTickAtByAccount.set(accountId, now);
+        }
+      }
+    }, 15_000);
+    zoneKeepaliveTimer.unref?.();
+  }
   console.log("[zone-monitor] started (3 s interval)");
 }
 
@@ -4080,6 +4103,22 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
     tpCarryLot: 0,
     busy: false,
     trackedPositions: new Map(),
+    runner1Price: (z as { runner1Price?: number | null }).runner1Price != null
+      ? Number((z as { runner1Price: number }).runner1Price) : null,
+    runner1Lots: (z as { runner1Lots?: number | null }).runner1Lots != null
+      ? Number((z as { runner1Lots: number }).runner1Lots) : null,
+    runner2Price: (z as { runner2Price?: number | null }).runner2Price != null
+      ? Number((z as { runner2Price: number }).runner2Price) : null,
+    runner2Lots: (z as { runner2Lots?: number | null }).runner2Lots != null
+      ? Number((z as { runner2Lots: number }).runner2Lots) : null,
+    runner3Price: (z as { runner3Price?: number | null }).runner3Price != null
+      ? Number((z as { runner3Price: number }).runner3Price) : null,
+    runner3Lots: (z as { runner3Lots?: number | null }).runner3Lots != null
+      ? Number((z as { runner3Lots: number }).runner3Lots) : null,
+    runner1Hit: Boolean((z as { runner1Hit?: boolean }).runner1Hit),
+    runner2Hit: Boolean((z as { runner2Hit?: boolean }).runner2Hit),
+    runner3Hit: Boolean((z as { runner3Hit?: boolean }).runner3Hit),
+    runnerActive: Boolean((z as { runnerActive?: boolean }).runnerActive),
   };
 }
 
@@ -4133,6 +4172,7 @@ export const _zoneStatesForTest = zoneStates;
 export async function loadZoneState(): Promise<void> {
   try {
     await ensureCascadeZoneRfColumns();
+    await ensureCascadeZoneRunnerColumns();
     // Load both OPEN and RISK_FREE zones — the monitor evaluates both
     // (RISK_FREE zones still need TP progression on the surviving entry).
     const zones = await db.select().from(cascadeZonesTable)
@@ -4322,10 +4362,12 @@ function resolveZoneNotifyUserId(zoneId: string, accountId?: string): string | u
 
 function notifyZoneEvent(
   zoneId: string,
-  kind: "near" | "hit",
+  kind: "near" | "hit" | "tp3_runners" | "runner",
   tp: 1 | 2 | 3 | 4,
   pipsToNextTp: number | null,
   direction: "buy" | "sell",
+  runnerPrice?: number,
+  runnerLots?: number,
 ): void {
   const st = zoneStates.get(zoneId);
   const userId = resolveZoneNotifyUserId(zoneId, st?.accountId);
@@ -4336,16 +4378,28 @@ function notifyZoneEvent(
   const prefs = notificationPrefs.get(userId);
   if (!prefs?.expoPushToken) return;
   if (kind === "near" && !prefs.nearEnabled) return;
-  if (kind === "hit" && !prefs.hitEnabled) return;
+  if ((kind === "hit" || kind === "tp3_runners" || kind === "runner") && !prefs.hitEnabled) return;
   const dir = direction.toUpperCase();
-  const title = kind === "hit"
-    ? `TP${tp} hit (${dir})`
-    : `TP${tp} approaching (${dir})`;
-  const body = kind === "hit"
-    ? `Your ${dir} zone just hit TP${tp}.`
-    : pipsToNextTp != null
-      ? `${pipsToNextTp.toFixed(1)} pips away from TP${tp}.`
-      : `Closing in on TP${tp}.`;
+  let title: string;
+  let body: string;
+  if (kind === "tp3_runners") {
+    title = `TP3 hit (${dir})`;
+    body = "TP3 reached — open app to set your runners 🏃";
+  } else if (kind === "runner") {
+    title = `Runner ${tp} (${dir})`;
+    const px = runnerPrice != null ? runnerPrice.toFixed(2) : "—";
+    const lots = runnerLots != null ? runnerLots.toFixed(2) : "—";
+    body = `🏃 Runner ${tp} reached at ${px} — tap to close ${lots} lots`;
+  } else {
+    title = kind === "hit"
+      ? `TP${tp} hit (${dir})`
+      : `TP${tp} approaching (${dir})`;
+    body = kind === "hit"
+      ? `Your ${dir} zone just hit TP${tp}.`
+      : pipsToNextTp != null
+        ? `${pipsToNextTp.toFixed(1)} pips away from TP${tp}.`
+        : `Closing in on TP${tp}.`;
+  }
   void sendExpoPush(prefs.expoPushToken, title, body, { zoneId, kind, tp });
 }
 
@@ -4482,6 +4536,7 @@ router.get("/mt5/account/:accountId/stream", checkOwner, (req: Request, res: Res
 router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res: Response) => {
   try {
     await ensureCascadeZoneRfColumns();
+    await ensureCascadeZoneRunnerColumns();
     const { accountId } = req.params as { accountId: string };
     const includeClosed = qstr(req.query.includeClosed) === "true";
     const zones = await db.select().from(cascadeZonesTable)
@@ -4604,6 +4659,26 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         })(),
         positionCount,
         originalVolume: row.originalVolume != null ? Number(row.originalVolume) : 0,
+        tp1Pct: Number(row.tp1Pct ?? 25),
+        tp2Pct: Number(row.tp2Pct ?? 25),
+        tp3Pct: Number(row.tp3Pct ?? 25),
+        tp4Pct: Number(row.tp4Pct ?? 25),
+        runner1Price: (row as { runner1Price?: number | null }).runner1Price != null
+          ? Number((row as { runner1Price: number }).runner1Price) : null,
+        runner1Lots: (row as { runner1Lots?: number | null }).runner1Lots != null
+          ? Number((row as { runner1Lots: number }).runner1Lots) : null,
+        runner2Price: (row as { runner2Price?: number | null }).runner2Price != null
+          ? Number((row as { runner2Price: number }).runner2Price) : null,
+        runner2Lots: (row as { runner2Lots?: number | null }).runner2Lots != null
+          ? Number((row as { runner2Lots: number }).runner2Lots) : null,
+        runner3Price: (row as { runner3Price?: number | null }).runner3Price != null
+          ? Number((row as { runner3Price: number }).runner3Price) : null,
+        runner3Lots: (row as { runner3Lots?: number | null }).runner3Lots != null
+          ? Number((row as { runner3Lots: number }).runner3Lots) : null,
+        runner1Hit: Boolean((row as { runner1Hit?: boolean }).runner1Hit),
+        runner2Hit: Boolean((row as { runner2Hit?: boolean }).runner2Hit),
+        runner3Hit: Boolean((row as { runner3Hit?: boolean }).runner3Hit),
+        runnerActive: Boolean((row as { runnerActive?: boolean }).runnerActive),
         currentPrice,
         nextTp,
         nextTpPrice,
@@ -4615,6 +4690,117 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
       }
     }
     res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// POST /api/mt5/account/:accountId/zones/:zoneId/close-partial
+router.post("/mt5/account/:accountId/zones/:zoneId/close-partial", checkOwner, async (req: Request, res: Response) => {
+  const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
+  try {
+    await ensureCascadeZoneRunnerColumns();
+    const token = getToken();
+    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
+    const body = (req.body ?? {}) as { pct?: unknown; lots?: unknown };
+    const pct = typeof body.pct === "number" ? body.pct : undefined;
+    const lots = typeof body.lots === "number" ? body.lots : undefined;
+    const result = await handleClosePartial(accountId, zoneId, { pct, lots }, token, region);
+    if (!result.ok) {
+      res.status(result.message === "Zone not found" ? 404 : 409).json(result);
+      return;
+    }
+    broadcastToAccount(accountId, "deal", { type: "position_changed" });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// POST /api/mt5/account/:accountId/zones/:zoneId/activate-runner
+router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner, async (req: Request, res: Response) => {
+  const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
+  try {
+    await ensureCascadeZoneRunnerColumns();
+    const token = getToken();
+    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
+    const st = await loadZone(zoneId);
+    if (!st || st.accountId !== accountId || st.status === "CLOSED") {
+      res.status(404).json({ ok: false, message: "Zone not found" });
+      return;
+    }
+    const body = (req.body ?? {}) as {
+      runner1Price?: unknown; runner1Lots?: unknown;
+      runner2Price?: unknown; runner2Lots?: unknown;
+      runner3Price?: unknown; runner3Lots?: unknown;
+    };
+    const targets: Array<{ price: number; lots: number }> = [];
+    for (const n of [1, 2, 3] as const) {
+      const px = body[`runner${n}Price`];
+      const lots = body[`runner${n}Lots`];
+      if (px == null && lots == null) continue;
+      if (typeof px !== "number" || typeof lots !== "number") {
+        res.status(400).json({ ok: false, message: `Runner ${n} requires both price and lots` });
+        return;
+      }
+      targets.push({ price: px, lots });
+    }
+    if (targets.length === 0) {
+      res.status(400).json({ ok: false, message: "At least one runner target required" });
+      return;
+    }
+    const tp3Price = st.tp3Price;
+    if (tp3Price == null) {
+      res.status(400).json({ ok: false, message: "TP3 price not set" });
+      return;
+    }
+    for (const t of targets) {
+      if (t.lots < 0.01) {
+        res.status(400).json({ ok: false, message: "Each runner lot must be at least 0.01" });
+        return;
+      }
+      const validSide = st.direction === "buy" ? t.price > tp3Price : t.price < tp3Price;
+      if (!validSide) {
+        res.status(400).json({ ok: false, message: "Runner prices must be beyond TP3" });
+        return;
+      }
+    }
+    const sorted = [...targets].sort((a, b) => st.direction === "buy" ? a.price - b.price : b.price - a.price);
+    for (let i = 1; i < sorted.length; i++) {
+      const prev = sorted[i - 1]!.price;
+      const cur = sorted[i]!.price;
+      if (st.direction === "buy" ? cur <= prev : cur >= prev) {
+        res.status(400).json({ ok: false, message: "Runner prices must be in ascending order (BUY) or descending (SELL)" });
+        return;
+      }
+    }
+    const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+    const totalVol = live.reduce((s, p) => s + p.volume, 0);
+    const totalLots = targets.reduce((s, t) => s + t.lots, 0);
+    if (totalLots > totalVol + 1e-9) {
+      res.status(400).json({ ok: false, message: "Total runner lots exceed open volume" });
+      return;
+    }
+    const update: Record<string, number | boolean | null> = { runnerActive: true };
+    for (const n of [1, 2, 3] as const) {
+      update[`runner${n}Price`] = null;
+      update[`runner${n}Lots`] = null;
+    }
+    targets.forEach((t, idx) => {
+      const n = (idx + 1) as 1 | 2 | 3;
+      update[`runner${n}Price`] = t.price;
+      update[`runner${n}Lots`] = t.lots;
+    });
+    await db.update(cascadeZonesTable).set(update).where(eq(cascadeZonesTable.zoneId, zoneId));
+    st.runnerActive = true;
+    for (const n of [1, 2, 3] as const) {
+      st[`runner${n}Price`] = update[`runner${n}Price`] as number | null;
+      st[`runner${n}Lots`] = update[`runner${n}Lots`] as number | null;
+      st[`runner${n}Hit`] = false;
+    }
+    st.tpNotified = { ...(st.tpNotified ?? { tp1: false, tp2: false, tp3: false, runner1: false, runner2: false, runner3: false }), runner1: false, runner2: false, runner3: false };
+    broadcastZoneUpdate(zoneId);
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }

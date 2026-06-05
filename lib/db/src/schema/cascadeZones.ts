@@ -63,6 +63,16 @@ export const cascadeZonesTable = pgTable("cascade_zones", {
   closedAt:    bigint("closed_at", { mode: "number" }),
   // Realized P&L for the whole zone (profit+commission+swap on all linked positions).
   closedPnl:   doublePrecision("closed_pnl"),
+  runner1Price: doublePrecision("runner1_price"),
+  runner1Lots:  doublePrecision("runner1_lots"),
+  runner2Price: doublePrecision("runner2_price"),
+  runner2Lots:  doublePrecision("runner2_lots"),
+  runner3Price: doublePrecision("runner3_price"),
+  runner3Lots:  doublePrecision("runner3_lots"),
+  runner1Hit:   boolean("runner1_hit").notNull().default(false),
+  runner2Hit:   boolean("runner2_hit").notNull().default(false),
+  runner3Hit:   boolean("runner3_hit").notNull().default(false),
+  runnerActive: boolean("runner_active").notNull().default(false),
 });
 
 export type CascadeZoneRow = typeof cascadeZonesTable.$inferSelect;

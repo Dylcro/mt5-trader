@@ -1040,7 +1040,7 @@ export default function TradeScreen() {
                   <Text style={styles.cascadeSummaryValue}>{cascadeSettings.tp3Pips} pips</Text>
                 </View>
                 <View style={{ flex: 1, minWidth: 120 }}>
-                  <Text style={[styles.cascadeSummaryLabel, { marginBottom: 4 }]}>TP4</Text>
+                  <Text style={[styles.cascadeSummaryLabel, { marginBottom: 4 }]}>Runner</Text>
                   <Text style={styles.cascadeSummaryValue}>
                     {cascadeSettings.tp4Pips > 0 ? `${cascadeSettings.tp4Pips} pips` : "Open"}
                   </Text>
@@ -1048,7 +1048,7 @@ export default function TradeScreen() {
               </View>
               {!tpPipsValid && (
                 <Text style={[styles.sectionHint, { color: C.sell, marginTop: 8 }]}>
-                  TP pip levels must be strictly increasing (TP1 &lt; TP2 &lt; TP3, TP4 either 0 or &gt; TP3). Fix in Settings.
+                  TP pip levels must be strictly increasing (TP1 &lt; TP2 &lt; TP3, Runner either 0 or &gt; TP3). Fix in Settings.
                 </Text>
               )}
               {cascadeLotSize < 0.04 && cascadeLotSize >= 0.01 && (

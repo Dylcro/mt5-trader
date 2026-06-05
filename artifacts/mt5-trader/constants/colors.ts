@@ -36,6 +36,24 @@ export const colors = {
   tint: "#B8922A",
   tabIconDefault: "#9AA5B4",
   tabIconSelected: "#B8922A",
+
+  // Visual spec (zone card redesign)
+  appBg: "#ECEEF5",
+  cardAlt: "#F9FAFB",
+  teal: "#0E7490",
+  tealBg: "rgba(14,116,144,0.08)",
+  tealBdr: "rgba(14,116,144,0.35)",
+  goldProgress: "#FDE68A",
+  greenProgress: "#6EE7B7",
+  specGold: "#C9892E",
+  specGoldBg: "rgba(201,137,46,0.08)",
+  specGoldBdr: "rgba(201,137,46,0.35)",
+  specBuy: "#059669",
+  specBuyBg: "rgba(5,150,105,0.08)",
+  specSell: "#DC2626",
+  specText: "#111827",
+  specMuted: "#6B7280",
+  specBorder: "rgba(0,0,0,0.07)",
 } as const;
 
 export type AppColors = typeof colors;
