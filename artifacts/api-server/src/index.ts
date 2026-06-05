@@ -143,6 +143,8 @@ async function ensureTables(): Promise<void> {
       created_at BIGINT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS zone_orders_zone ON zone_orders (zone_id);
+    ALTER TABLE zone_orders
+      ADD COLUMN IF NOT EXISTS tp_level SMALLINT;
   `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS admin_settings (

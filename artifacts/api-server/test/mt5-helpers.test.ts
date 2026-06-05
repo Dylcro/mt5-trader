@@ -42,8 +42,10 @@ import {
   pickNextLegToTrimForSecureProfits,
   setZoneLimitOrder,
   getZoneLimitOrder,
+  getZoneLimitOrderTpLevel,
   orderIdsForZone,
   deleteZoneLimitOrder,
+  isCascadeMarketAttachSlice,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
@@ -948,6 +950,24 @@ describe("pickNextLegToTrimForSecureProfits (one leg per tap)", () => {
   });
 });
 
+describe("isCascadeMarketAttachSlice", () => {
+  const zoneId = "z_test123";
+
+  it("true for zoneId + tpLevel without TP prices on body", () => {
+    expect(isCascadeMarketAttachSlice(
+      { zoneId, tpLevel: 2, volume: 0.01 },
+      buildCascadeComment(zoneId, 1, 4),
+    )).toBe(true);
+  });
+
+  it("false when TP1–3 prices present (zone-creating leg)", () => {
+    expect(isCascadeMarketAttachSlice(
+      { zoneId, tpLevel: 1, tp1Price: 2610, tp2Price: 2620, tp3Price: 2630, volume: 0.01, cascadeLegLot: 0.04 },
+      buildCascadeComment(zoneId, 1, 4),
+    )).toBe(false);
+  });
+});
+
 describe("zone limit order map (per-account scoping)", () => {
   const acctA = "acct-a";
   const acctB = "acct-b";
@@ -955,9 +975,10 @@ describe("zone limit order map (per-account scoping)", () => {
   const zoneSell = "z_sell";
 
   it("isolates orderId→zoneId by MetaAPI accountId", () => {
-    setZoneLimitOrder(acctA, "ord-1", zoneBuy);
-    setZoneLimitOrder(acctB, "ord-1", zoneSell);
+    setZoneLimitOrder(acctA, "ord-1", zoneBuy, 3);
+    setZoneLimitOrder(acctB, "ord-1", zoneSell, 1);
     expect(getZoneLimitOrder(acctA, "ord-1")).toBe(zoneBuy);
+    expect(getZoneLimitOrderTpLevel(acctA, "ord-1")).toBe(3);
     expect(getZoneLimitOrder(acctB, "ord-1")).toBe(zoneSell);
     expect(orderIdsForZone(acctA, zoneBuy)).toEqual(["ord-1"]);
     expect(orderIdsForZone(acctB, zoneSell)).toEqual(["ord-1"]);

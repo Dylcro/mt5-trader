@@ -96,6 +96,8 @@ export const zoneOrdersTable = pgTable("zone_orders", {
   zoneId:    text("zone_id").notNull(),
   orderId:   text("order_id").notNull().unique(),
   createdAt: bigint("created_at", { mode: "number" }).notNull(),
+  /** Native TP level (1–4) for this pending limit sub-order. */
+  tpLevel:   integer("tp_level"),
 });
 
 export type ZoneOrderRow = typeof zoneOrdersTable.$inferSelect;

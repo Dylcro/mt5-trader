@@ -149,6 +149,19 @@ export async function ensureZonePositionsTpLevelColumn(): Promise<void> {
   await zonePositionsTpLevelReady;
 }
 
+let zoneOrdersTpLevelReady: Promise<void> | null = null;
+export async function ensureZoneOrdersTpLevelColumn(): Promise<void> {
+  if (!zoneOrdersTpLevelReady) {
+    zoneOrdersTpLevelReady = pool.query(`
+      ALTER TABLE zone_orders ADD COLUMN IF NOT EXISTS tp_level SMALLINT;
+    `).then(() => undefined).catch((e) => {
+      zoneOrdersTpLevelReady = null;
+      throw e;
+    });
+  }
+  await zoneOrdersTpLevelReady;
+}
+
 function parseCascadeLeg(comment: string | undefined | null): {
   zoneId: string;
   leg: number;
@@ -164,6 +177,26 @@ function parseTpLevelFromBody(v: unknown): 1 | 2 | 3 | 4 | null {
   const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
   if (n === 1 || n === 2 || n === 3 || n === 4) return n;
   return null;
+}
+
+function pickCascadeTpPrice(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+}
+
+/** Extra anchor market sub-order: zoneId + tpLevel, no per-order TP1–3 prices (zone already created). */
+export function isCascadeMarketAttachSlice(
+  body: Record<string, unknown>,
+  comment?: string | null,
+): boolean {
+  const tpLevel = parseTpLevelFromBody(body.tpLevel);
+  const zoneId =
+    (typeof body.zoneId === "string" ? body.zoneId.trim() : "")
+    || parseZoneIdFromComment(comment ?? "") || "";
+  const hasZoneMeta =
+    pickCascadeTpPrice(body.tp1Price) != null
+    && pickCascadeTpPrice(body.tp2Price) != null
+    && pickCascadeTpPrice(body.tp3Price) != null;
+  return !!(zoneId && tpLevel && !hasZoneMeta);
 }
 
 /** Group live legs by cascade comment leg number (fallback: rounded entry price). */
@@ -1056,10 +1089,24 @@ function makeDealListener(accountId: string) {
           }
         }
         if (zoneId && deal.positionId) {
+          let fillTpLevel = getZoneLimitOrderTpLevel(accountId, String(deal.orderId));
+          if (!fillTpLevel) {
+            try {
+              await ensureZoneOrdersTpLevelColumn();
+              const ordRow = await db.select({ tpLevel: zoneOrdersTable.tpLevel })
+                .from(zoneOrdersTable)
+                .where(eq(zoneOrdersTable.orderId, String(deal.orderId)))
+                .limit(1);
+              fillTpLevel = parseTpLevelFromBody(ordRow[0]?.tpLevel);
+            } catch (e) {
+              console.warn(`[stream ${accountId}] limit fill tpLevel lookup failed orderId=${deal.orderId}:`, (e as Error).message);
+            }
+          }
           void recordZonePositionFill(
             zoneId, String(deal.positionId),
             Number(deal.price ?? deal.openPrice ?? 0),
             Number(deal.volume ?? 0),
+            fillTpLevel,
           );
         } else if (deal.positionId) {
           console.warn(`[stream ${accountId}] cascade fill orderId=${deal.orderId} posId=${deal.positionId} could not be linked to any active zone — position will be orphaned`);
@@ -2678,10 +2725,12 @@ const ZONE_ORPHAN_DRAIN_WINDOW_MS = 30_000;
 
 // In-memory state, hydrated from DB on startup.
 const zoneStates = new Map<string, ZoneState>();          // zoneId → state
-/** Per MetaAPI account: pending limit orderId → owning zoneId (never global across accounts). */
-const zoneLimitOrdersByAccount = new Map<string, Map<string, string>>();
+type ZoneLimitLink = { zoneId: string; tpLevel: 1 | 2 | 3 | 4 | null };
 
-function zoneLimitMap(accountId: string): Map<string, string> {
+/** Per MetaAPI account: pending limit orderId → owning zone + TP slice (never global across accounts). */
+const zoneLimitOrdersByAccount = new Map<string, Map<string, ZoneLimitLink>>();
+
+function zoneLimitMap(accountId: string): Map<string, ZoneLimitLink> {
   let m = zoneLimitOrdersByAccount.get(accountId);
   if (!m) {
     m = new Map();
@@ -2690,13 +2739,19 @@ function zoneLimitMap(accountId: string): Map<string, string> {
   return m;
 }
 
-export function setZoneLimitOrder(accountId: string, orderId: string, zoneId: string): void {
+export function setZoneLimitOrder(
+  accountId: string, orderId: string, zoneId: string, tpLevel?: 1 | 2 | 3 | 4 | null,
+): void {
   if (!orderId) return;
-  zoneLimitMap(accountId).set(orderId, zoneId);
+  zoneLimitMap(accountId).set(orderId, { zoneId, tpLevel: tpLevel ?? null });
 }
 
 export function getZoneLimitOrder(accountId: string, orderId: string): string | undefined {
-  return zoneLimitMap(accountId).get(orderId);
+  return zoneLimitMap(accountId).get(orderId)?.zoneId;
+}
+
+export function getZoneLimitOrderTpLevel(accountId: string, orderId: string): 1 | 2 | 3 | 4 | null {
+  return zoneLimitMap(accountId).get(orderId)?.tpLevel ?? null;
 }
 
 export function deleteZoneLimitOrder(accountId: string, orderId: string): void {
@@ -2705,8 +2760,8 @@ export function deleteZoneLimitOrder(accountId: string, orderId: string): void {
 
 export function orderIdsForZone(accountId: string, zoneId: string): string[] {
   const out: string[] = [];
-  for (const [oid, zid] of zoneLimitMap(accountId).entries()) {
-    if (zid === zoneId) out.push(oid);
+  for (const [oid, link] of zoneLimitMap(accountId).entries()) {
+    if (link.zoneId === zoneId) out.push(oid);
   }
   return out;
 }
@@ -2973,13 +3028,16 @@ async function attachLimitOrderToZone(
   orderId: string,
   comment?: string,
   direction?: "buy" | "sell" | null,
+  tpLevel?: 1 | 2 | 3 | 4 | null,
 ): Promise<void> {
   const zoneFromComment = parseZoneIdFromComment(comment);
   if (zoneFromComment) {
-    setZoneLimitOrder(accountId, orderId, zoneFromComment);
+    setZoneLimitOrder(accountId, orderId, zoneFromComment, tpLevel);
     try {
+      await ensureZoneOrdersTpLevelColumn();
       await db.insert(zoneOrdersTable).values({
         zoneId: zoneFromComment, orderId, createdAt: Date.now(),
+        tpLevel: tpLevel != null ? tpLevel : null,
       }).onConflictDoNothing();
     } catch (e) {
       console.warn(`[zone ${zoneFromComment}] persist order=${orderId} failed:`, (e as Error).message);
@@ -2999,10 +3057,12 @@ async function attachLimitOrderToZone(
     console.log(`[zone ?] buffered cascade limit orderId=${orderId} for account=${accountId} (no zone prepared yet)`);
     return;
   }
-  setZoneLimitOrder(accountId, orderId, pending.zoneId);
+  setZoneLimitOrder(accountId, orderId, pending.zoneId, tpLevel);
   try {
+    await ensureZoneOrdersTpLevelColumn();
     await db.insert(zoneOrdersTable).values({
       zoneId: pending.zoneId, orderId, createdAt: Date.now(),
+      tpLevel: tpLevel != null ? tpLevel : null,
     }).onConflictDoNothing();
   } catch (e) {
     console.warn(`[zone ${pending.zoneId}] persist order=${orderId} failed:`, (e as Error).message);
@@ -4115,15 +4175,17 @@ export async function loadZoneState(): Promise<void> {
     }
     if (zones.length > 0) console.log(`[zone] hydrated ${zones.length} OPEN zone(s) from db`);
     // Rehydrate zone↔limit-order mappings so pre-restart limits still resolve.
+    await ensureZoneOrdersTpLevelColumn();
     const orders = await db.select({
       orderId: zoneOrdersTable.orderId,
       zoneId: zoneOrdersTable.zoneId,
       accountId: cascadeZonesTable.accountId,
+      tpLevel: zoneOrdersTable.tpLevel,
     })
       .from(zoneOrdersTable)
       .innerJoin(cascadeZonesTable, eq(zoneOrdersTable.zoneId, cascadeZonesTable.zoneId));
     for (const o of orders) {
-      setZoneLimitOrder(o.accountId, o.orderId, o.zoneId);
+      setZoneLimitOrder(o.accountId, o.orderId, o.zoneId, parseTpLevelFromBody(o.tpLevel));
     }
     if (orders.length > 0) console.log(`[zone] hydrated ${orders.length} zone limit-order link(s) from db (per-account)`);
     void backfillClosedZoneClassifications(40);
@@ -5765,39 +5827,45 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
       (_tradeComment.startsWith("Cascade") || _tradeComment === "XAUUSD Trader App") &&
       !_tradeActionType.endsWith("_LIMIT");
 
-    // For app-initiated cascade MARKET legs (the trade that creates the zone),
-    // reject up-front when TP prices / lot size are invalid — placing an
-    // untracked cascade trade silently violates the zone-engine spec.
+    // Cascade MARKET: validate zone-creating leg (TP1–3 prices); attach slices
+    // (zoneId + tpLevel only) skip TP price re-validation.
     if (_tradeComment.startsWith("Cascade") && !_tradeActionType.endsWith("_LIMIT")) {
       const direction = _tradeActionType === "ORDER_TYPE_BUY" ? "buy"
         : _tradeActionType === "ORDER_TYPE_SELL" ? "sell" : null;
       if (direction) {
-        const pickP = (v: unknown): number | null =>
-          typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
-        const tp1 = pickP(body.tp1Price);
-        const tp2 = pickP(body.tp2Price);
-        const tp3 = pickP(body.tp3Price);
-        const tp4 = pickP(body.tp4Price);
-        const anchor = Number(body.anchorPrice ?? 0) || 0;
         const vol = Number(body.volume ?? 0) || 0;
-        const cmp = direction === "buy"
-          ? (a: number, b: number) => a > b
-          : (a: number, b: number) => a < b;
-        const tpsOk = tp1 != null && tp2 != null && tp3 != null
-          && (anchor <= 0 || cmp(tp1, anchor))
-          && cmp(tp2, tp1) && cmp(tp3, tp2)
-          && (tp4 == null || cmp(tp4, tp3));
-        if (!tpsOk) {
-          return res.status(400).json({
-            success: false, code: 0,
-            message: `Cascade requires TP1, TP2, TP3 absolute prices in strictly ${direction === "buy" ? "ascending" : "descending"} order on the profitable side of the entry. TP4 optional.`,
-          });
-        }
         if (vol < ZONE_MIN_LOT_PER_ENTRY) {
           return res.status(400).json({
             success: false, code: 0,
-            message: `Cascade lot size must be at least ${ZONE_MIN_LOT_PER_ENTRY} (broker minimum). Lots ≥ 0.04 get 25% partial closes at each TP; smaller lots will fully close at TP1.`,
+            message: `Cascade lot size must be at least ${ZONE_MIN_LOT_PER_ENTRY} (broker minimum).`,
           });
+        }
+        if (!isCascadeMarketAttachSlice(body, _tradeComment)) {
+          const tp1 = pickCascadeTpPrice(body.tp1Price);
+          const tp2 = pickCascadeTpPrice(body.tp2Price);
+          const tp3 = pickCascadeTpPrice(body.tp3Price);
+          const tp4 = pickCascadeTpPrice(body.tp4Price);
+          const anchor = Number(body.anchorPrice ?? 0) || 0;
+          const cmp = direction === "buy"
+            ? (a: number, b: number) => a > b
+            : (a: number, b: number) => a < b;
+          const tpsOk = tp1 != null && tp2 != null && tp3 != null
+            && (anchor <= 0 || cmp(tp1, anchor))
+            && cmp(tp2, tp1) && cmp(tp3, tp2)
+            && (tp4 == null || cmp(tp4, tp3));
+          if (!tpsOk) {
+            return res.status(400).json({
+              success: false, code: 0,
+              message: `Cascade requires TP1, TP2, TP3 absolute prices in strictly ${direction === "buy" ? "ascending" : "descending"} order on the profitable side of the entry. TP4 optional.`,
+            });
+          }
+          const legLot = Number(body.cascadeLegLot ?? vol) || vol;
+          if (legLot < ZONE_MIN_LOT_PER_ENTRY) {
+            return res.status(400).json({
+              success: false, code: 0,
+              message: `Cascade leg lot must be at least ${ZONE_MIN_LOT_PER_ENTRY} (broker minimum).`,
+            });
+          }
         }
       }
     }
@@ -5900,7 +5968,8 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
           const limitDir: "buy" | "sell" | null =
             actionType.includes("BUY") ? "buy" :
             actionType.includes("SELL") ? "sell" : null;
-          void attachLimitOrderToZone(accountId, data.orderId, comment, limitDir);
+          const limitTpLevel = parseTpLevelFromBody((req.body as Record<string, unknown>).tpLevel);
+          void attachLimitOrderToZone(accountId, data.orderId, comment, limitDir, limitTpLevel);
         }
         // Market order placed by the app: mark its positionId immediately so the
         // hasBeenCascaded guard blocks it even if the comment is later stripped.
@@ -5952,7 +6021,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
             const hasZoneMeta = tp1Price != null && tp2Price != null && tp3Price != null;
             const cascadeLegLot = Number(rawBody.cascadeLegLot ?? volume) || volume;
 
-            if (!hasZoneMeta && attachZoneId && tpLevel) {
+            if (isCascadeMarketAttachSlice(rawBody, comment) || (!hasZoneMeta && attachZoneId && tpLevel)) {
               const tick = latestPrice(accountId);
               const entry = anchorHint > 0 ? anchorHint : (tick ? (direction === "buy" ? tick.ask : tick.bid) : 0);
               void recordZonePositionFill(attachZoneId, positionId, entry, volume, tpLevel);
