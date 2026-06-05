@@ -68,8 +68,10 @@ function PipelineTrack({
   const prices = [zone.anchorPrice, ...tps.map((t) => t.price), ...(tp4Viz != null ? [tp4Viz] : [])];
   const vizMin = Math.min(...prices) - 5;
   const vizMax = Math.max(...prices) + 5;
-  const toPos = (p: number) =>
-    Math.min(Math.max(((p - vizMin) / (vizMax - vizMin)) * 100, 0), 100);
+  const toPos = (p: number) => {
+    const raw = Math.min(Math.max(((p - vizMin) / (vizMax - vizMin)) * 100, 0), 100);
+    return zone.direction === "sell" ? 100 - raw : raw;
+  };
 
   const nextTpIdx = tps.findIndex((t) => !t.hit);
   const nextTp = nextTpIdx >= 0 ? tps[nextTpIdx] : null;
@@ -78,7 +80,9 @@ function PipelineTrack({
   const nextPrice = allTpHit ? tp4Viz : nextTp?.price ?? null;
   const progressPct =
     nextPrice != null && prevPrice != null
-      ? Math.min(Math.max(((currentPrice - prevPrice) / (nextPrice - prevPrice)) * 100, 0), 100)
+      ? zone.direction === "buy"
+        ? Math.min(Math.max(((currentPrice - prevPrice) / (nextPrice - prevPrice)) * 100, 0), 100)
+        : Math.min(Math.max(((prevPrice - currentPrice) / (prevPrice - nextPrice)) * 100, 0), 100)
       : 100;
   const atLevel = nextPrice != null && (
     zone.direction === "buy"
@@ -116,6 +120,7 @@ function PipelineTrack({
           <Animated.View
             style={[
               styles.pipeFill,
+              zone.direction === "sell" && { left: undefined, right: 0 },
               {
                 width: fillAnim.interpolate({
                   inputRange: [0, 100],
@@ -304,7 +309,7 @@ function RunnerSetupPanel({
         {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.runnerActivateText}>Activate Runner 🏃</Text>}
       </Pressable>
       <Pressable style={styles.runnerSkipBtn} onPress={onSkipClose} disabled={busy}>
-        <Text style={styles.runnerSkipText}>Skip — Close zone</Text>
+        <Text style={styles.runnerSkipText}>Skip for now</Text>
       </Pressable>
     </View>
   );
@@ -320,7 +325,7 @@ interface ZoneCardProps {
   ) => Promise<{ ok: boolean; message?: string }>;
   onCloseAllWorst?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
   onCloseZone?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
-  onClosePartial?: (zoneId: string, opts: { pct?: number; lots?: number }) => Promise<{ ok: boolean; message?: string }>;
+  onClosePartial?: (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number }) => Promise<{ ok: boolean; message?: string }>;
   onActivateRunner?: (
     zoneId: string,
     targets: {
@@ -356,6 +361,13 @@ export default function ZoneCard({
   const [closeBusy, setCloseBusy] = useState(false);
   const [delBusy, setDelBusy] = useState(false);
   const [runnerBusy, setRunnerBusy] = useState(false);
+  const [showRunnerPanel, setShowRunnerPanel] = useState(false);
+
+  useEffect(() => {
+    if (zone.tp3Hit && !zone.runnerActive) {
+      setShowRunnerPanel(true);
+    }
+  }, [zone.tp3Hit, zone.runnerActive]);
 
   const origVol = zone.originalVolume ?? liveVolume ?? 0;
   const vol = liveVolume ?? origVol;
@@ -385,9 +397,6 @@ export default function ZoneCard({
     return null;
   }, [runnerActive, zone, cmp, isBuy, historical]);
 
-  const showRunnerPanel =
-    !historical && zone.tp3Hit && !runnerActive && zone.status !== "CLOSED";
-
   const runners = ([1, 2, 3] as const)
     .map((n) => ({
       n,
@@ -403,7 +412,7 @@ export default function ZoneCard({
     if (!onClosePartial || tpBusy != null) return;
     setTpBusy(level);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    const result = await onClosePartial(zone.zoneId, { pct });
+    const result = await onClosePartial(zone.zoneId, { pct, tpLevel: level });
     setTpBusy(null);
     if (result.ok) {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -429,7 +438,9 @@ export default function ZoneCard({
   const canCloseAllWorst = showCloseAllWorst && zone.positionCount >= 2;
   const canCloseZone = !historical && zone.status !== "CLOSED" && zone.positionCount >= 1 && !!onCloseZone;
   const canCancelOrders = !historical && zone.status !== "CLOSED" && !!onCancelOrders;
-  const showActionRow = !showRunnerPanel && (canRiskFree || showCloseAllWorst || canCancelOrders);
+  const runnerPanelOpen =
+    !historical && showRunnerPanel && zone.tp3Hit && !runnerActive && zone.status !== "CLOSED";
+  const showActionRow = !runnerPanelOpen && (canRiskFree || showCloseAllWorst || canCancelOrders);
 
   if (historical) {
     return (
@@ -529,7 +540,7 @@ export default function ZoneCard({
 
       <PipelineTrack zone={zone} currentPrice={cmp} />
 
-      {!runnerActive && !showRunnerPanel && (
+      {!runnerActive && !runnerPanelOpen && (
         <View style={styles.tpBtnRow}>
           {([1, 2, 3] as const).map((level) => {
             const hit = Boolean(zone[`tp${level}Hit`]);
@@ -554,27 +565,30 @@ export default function ZoneCard({
               </Pressable>
             );
           })}
-          <Pressable
-            style={[styles.tpBtn, styles.tpBtnManual, { opacity: 0.85 }]}
-            onPress={() => void runCloseZone()}
-            disabled={!canCloseZone || actionBusy}
-          >
-            <Text style={styles.tpBtnSub}>RUNNER</Text>
-            <Text style={styles.tpBtnManualText}>manual</Text>
-          </Pressable>
+          {zone.tp3Hit && (
+            <Pressable
+              style={[styles.tpBtn, styles.tpBtnManual, { opacity: 0.85 }]}
+              onPress={() => setShowRunnerPanel(true)}
+              disabled={actionBusy}
+            >
+              <Text style={styles.tpBtnSub}>RUNNER</Text>
+              <Text style={styles.tpBtnManualText}>set up</Text>
+            </Pressable>
+          )}
         </View>
       )}
 
-      {showRunnerPanel && onActivateRunner && (
+      {runnerPanelOpen && onActivateRunner && (
         <RunnerSetupPanel
           zone={zone}
           remaining={vol}
           busy={runnerBusy}
-          onSkipClose={() => void runCloseZone()}
+          onSkipClose={() => setShowRunnerPanel(false)}
           onActivate={async (targets) => {
             setRunnerBusy(true);
             const result = await onActivateRunner(zone.zoneId, targets);
             setRunnerBusy(false);
+            if (result.ok) setShowRunnerPanel(false);
             return result;
           }}
         />

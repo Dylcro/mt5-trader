@@ -131,7 +131,7 @@ interface TradingContextValue {
   syncSession: (force?: boolean) => Promise<void>;
   /** Fast preflight before zone buttons — skips full wake when price is live. */
   ensureSessionForTrade: () => Promise<{ ready: boolean; message?: string }>;
-  closeZonePartial: (zoneId: string, opts: { pct?: number; lots?: number }) => Promise<{ ok: boolean; message: string }>;
+  closeZonePartial: (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number }) => Promise<{ ok: boolean; message: string }>;
   activateRunner: (
     zoneId: string,
     targets: {
@@ -1517,7 +1517,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   );
 
   const closeZonePartial = useCallback(
-    async (zoneId: string, opts: { pct?: number; lots?: number }): Promise<{ ok: boolean; message: string }> => {
+    async (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number }): Promise<{ ok: boolean; message: string }> => {
       if (status !== "connected") return { ok: false, message: "Not connected" };
       if (!connectionWarm) await wakeConnection();
       try {
