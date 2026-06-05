@@ -115,13 +115,13 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
   const applyZonesFromApi = useCallback((data: unknown) => {
     const list = Array.isArray(data) ? (data as Zone[]) : [];
     const latched = list.map((z) => enrichZoneDisplayFields(withLatchedHits(z, hitLatch.current)));
-    if (!includeClosed) {
-      const ids = new Set(latched.map((z) => z.zoneId));
-      for (const id of hitLatch.current.keys()) {
-        if (!ids.has(id)) hitLatch.current.delete(id);
-      }
+    // Zones stay visible until status === CLOSED — never drop because anchor leg disappeared.
+    const filtered = includeClosed ? latched : latched.filter((z) => z.status !== "CLOSED");
+    const ids = new Set(filtered.map((z) => z.zoneId));
+    for (const id of hitLatch.current.keys()) {
+      if (!ids.has(id)) hitLatch.current.delete(id);
     }
-    return latched;
+    return filtered;
   }, [includeClosed]);
 
   const refresh = useCallback(async () => {

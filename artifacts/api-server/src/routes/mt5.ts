@@ -3090,6 +3090,7 @@ async function markZonePositionClosed(
   accountId: string,
   positionId: string,
   exitDeal?: unknown,
+  options: { intentionalFullClose?: boolean } = {},
 ): Promise<void> {
   try {
     // Join through cascade_zones so we only act on rows belonging to *this*
@@ -3141,35 +3142,35 @@ async function markZonePositionClosed(
       .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
     );
     if (openInZone.length === 0) {
+      const brokerStillOpen = await zoneHasLiveTrackedPositionsOnBroker(token, region, accountId, zoneId);
+      if (brokerStillOpen) {
+        console.log(`[markClosed] zone ${zoneId} DB empty but broker still has open legs — zone stays active`);
+        broadcastZoneUpdate(zoneId);
+        broadcastToAccount(accountId, "deal", { type: "position_changed" });
+        return;
+      }
+      if (!options.intentionalFullClose) {
+        console.log(`[markClosed] zone ${zoneId} last tracked leg closed — zone stays active until Close Zone`);
+        broadcastZoneUpdate(zoneId);
+        broadcastToAccount(accountId, "deal", { type: "position_changed" });
+        return;
+      }
       const zoneMetaRows = await withDbRetry(`markClosed.zoneMeta zone=${zoneId}`, () => db
-        .select({ status: cascadeZonesTable.status, tp2Hit: cascadeZonesTable.tp2Hit })
+        .select({ status: cascadeZonesTable.status })
         .from(cascadeZonesTable)
         .where(eq(cascadeZonesTable.zoneId, zoneId))
         .limit(1)
       ).catch(() => []);
-      const zoneMeta = zoneMetaRows[0];
-      const zoneStatus = st?.status ?? zoneMeta?.status ?? "CLOSED";
-      const tp2Hit = st?.tp2Hit ?? Boolean(zoneMeta?.tp2Hit);
-      const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, accountId, zoneId);
-      const brokerStillOpen = await zoneHasLiveTrackedPositionsOnBroker(token, region, accountId, zoneId);
-      if (brokerStillOpen) {
-        console.log(`[markClosed] zone ${zoneId} DB empty but broker still has open legs — skip auto-close`);
-        return;
-      }
-      if (!shouldAutoCloseZoneAfterPositionExit(
-        { status: zoneStatus, tp2Hit },
-        false,
-        pendingLeft,
-      )) {
-        console.log(`[markClosed] zone ${zoneId} pre-TP2 with ${pendingLeft ? "live" : "no"} pending limits — skip auto-close`);
-        return;
-      }
+      const zoneStatus = st?.status ?? zoneMetaRows[0]?.status ?? "CLOSED";
       const closedAt = Date.now();
       await withDbRetry(`markClosed.zoneClose zone=${zoneId}`, () => db.update(cascadeZonesTable)
         .set({ status: "CLOSED", closedAt })
         .where(eq(cascadeZonesTable.zoneId, zoneId))
       );
-      if (st) st.status = "CLOSED";
+      if (st) {
+        st.status = "CLOSED";
+        zoneStates.delete(zoneId);
+      }
       const exitPx = exitPriceFromDeal(exitDeal);
       const dir = (st?.direction ?? "buy") as "buy" | "sell";
       await finalizeZoneClose(accountId, zoneId, {
@@ -3180,12 +3181,6 @@ async function markZonePositionClosed(
       });
       void settleZoneClosedPnl(accountId, zoneId);
       logEvent("zone.close", { accountId, zoneId, trigger: "position.closed" });
-      // Cancel any outstanding cascade limit orders — when the user manually
-      // closes all positions in MT5 the limits are NOT auto-cancelled by the
-      // broker, so we must cancel them explicitly now that the zone is done.
-      // Broadcast position_changed + zone_update AFTER cancellation so the
-      // client refreshes only once limits are gone from MT5 (prevents the
-      // brief window where standalone pending orders flash on screen).
       try {
         const tkn = getToken();
         const rgn = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
@@ -3196,7 +3191,6 @@ async function markZonePositionClosed(
             broadcastZoneUpdate(zoneId);
           });
       } catch {
-        console.warn(`[zone ${zoneId}] could not cancel limits after external close — token unavailable`);
         broadcastToAccount(accountId, "deal", { type: "position_changed" });
         broadcastZoneUpdate(zoneId);
       }
@@ -3869,12 +3863,21 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, st.accountId, zoneId);
         const brokerStillOpen = await zoneHasLiveTrackedPositionsOnBroker(token, region, st.accountId, zoneId);
         if (brokerStillOpen) {
-          console.log(`[zone ${zoneId}] reconcile: broker still has open legs — skip zone close`);
+          console.log(`[zone ${zoneId}] reconcile: broker still has open legs — zone stays active`);
           return;
         }
-        if (!shouldAutoCloseZoneAfterPositionExit(st, false, pendingLeft)) {
-          console.log(`[zone ${zoneId}] reconcile: pre-TP2 pending limits remain — skip zone close`);
+        const closedLegRows = await withDbRetry(`evalZone.closedHistory zone=${zoneId}`,
+          () => db.select().from(zonePositionsTable)
+            .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "CLOSED")))
+        ).catch(() => null);
+        const hasHistory = (closedLegRows?.length ?? 0) > 0;
+        const hasNoPending = !pendingLeft;
+        if (!hasNoPending) {
+          console.log(`[zone ${zoneId}] reconcile: pending limits remain — zone stays active`);
           return;
+        }
+        if (!hasHistory) {
+          console.log(`[zone ${zoneId}] reconcile: no fill history — closing unfilled/cancelled zone`);
         }
         const closedAt = Date.now();
         await withDbRetry(`evalZone.reconcileZoneClose zone=${zoneId}`,
@@ -3884,6 +3887,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         ).catch(() => {/* logged inside withDbRetry */});
         const wasRiskFree = st.status === "RISK_FREE";
         st.status = "CLOSED";
+        zoneStates.delete(zoneId);
         await finalizeZoneClose(st.accountId, zoneId, await buildCloseFinalizeOptsForZone(
           st.accountId, zoneId, { wasRiskFree, direction: st.direction },
         ));
