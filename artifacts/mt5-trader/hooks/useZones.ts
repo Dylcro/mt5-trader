@@ -167,13 +167,10 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
         if (update.status === "CLOSED") {
           setZones((prev) => {
             const closedAt = update.closedAt ?? Date.now();
-            const has = prev.some((z) => z.zoneId === update.zoneId);
-            if (!has) return prev;
-            return prev.map((z) =>
-              z.zoneId === update.zoneId
-                ? enrichZoneDisplayFields(withLatchedHits({ ...z, ...update, status: "CLOSED", closedAt }, hitLatch.current))
-                : z,
-            );
+            const merged = { ...prev.find((z) => z.zoneId === update.zoneId), ...update, status: "CLOSED" as const, closedAt };
+            if (!merged.zoneId) return prev;
+            const without = prev.filter((z) => z.zoneId !== update.zoneId);
+            return [...without, enrichZoneDisplayFields(withLatchedHits(merged as Zone, hitLatch.current))];
           });
           hitLatch.current.delete(update.zoneId!);
           return;

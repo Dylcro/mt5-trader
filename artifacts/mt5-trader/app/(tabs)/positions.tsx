@@ -318,6 +318,15 @@ export default function PositionsScreen() {
     [closeZone, refreshPendingOrders, refreshZones],
   );
 
+  const handleClosePartial = useCallback(
+    async (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number }) => {
+      const result = await closeZonePartial(zoneId, opts);
+      if (result.ok) void refreshZones();
+      return result;
+    },
+    [closeZonePartial, refreshZones],
+  );
+
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
     await Promise.all([
@@ -484,7 +493,7 @@ export default function PositionsScreen() {
                               withSessionReady(() => handleCloseZone(zoneId))
                             }
                             onClosePartial={(zoneId, opts) =>
-                              withSessionReady(() => closeZonePartial(zoneId, opts))
+                              withSessionReady(() => handleClosePartial(zoneId, opts))
                             }
                             onActivateRunner={(zoneId, targets) =>
                               withSessionReady(() => activateRunner(zoneId, targets))
@@ -525,7 +534,7 @@ export default function PositionsScreen() {
                               withSessionReady(() => handleCloseZone(zoneId))
                             }
                             onClosePartial={(zoneId, opts) =>
-                              withSessionReady(() => closeZonePartial(zoneId, opts))
+                              withSessionReady(() => handleClosePartial(zoneId, opts))
                             }
                             onActivateRunner={(zoneId, targets) =>
                               withSessionReady(() => activateRunner(zoneId, targets))

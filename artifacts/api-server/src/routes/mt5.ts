@@ -3273,6 +3273,12 @@ async function handleClosePartial(
   if (st.status === "CLOSED" || st.status === "ARMED") {
     return { ok: false, message: "Zone not active" };
   }
+  if (body.tpLevel != null && body.tpLevel >= 1 && body.tpLevel <= 3) {
+    const hitKey = `tp${body.tpLevel}Hit` as "tp1Hit" | "tp2Hit" | "tp3Hit";
+    if (st[hitKey]) {
+      return { ok: false, message: `TP${body.tpLevel} already banked` };
+    }
+  }
   const legs = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
   if (legs.length === 0) return { ok: false, message: "No open positions" };
 
@@ -3703,15 +3709,15 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
   // and arms a protective SL, but the TP ladder must keep running on the
   // surviving best entry. ARMED = pending limits only (no TP engine yet).
   if (!st) return;
+  if (st.status === "CLOSED") {
+    zoneStates.delete(zoneId);
+    return;
+  }
   if (st.status === "ARMED") return;
   if (st.busy) return;
   st.busy = true;
   try {
     const region = activeRegions.get(st.accountId) ?? knownAccounts.get(st.accountId)?.region ?? DEFAULT_REGION;
-    if (st.status === "CLOSED") {
-      const reopened = await reopenClosedZoneIfBrokerLegsRemain(token, region, st.accountId, zoneId, st);
-      if (!reopened) return;
-    }
     // Fetch this zone's tracked positions from DB (OPEN status only).
     // Resilient tracked-positions lookup: prefer DB (source of truth) but
     // fall back to the in-memory mirror on transient query failures so a DB
@@ -4811,9 +4817,12 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
       res.status(400).json({ ok: false, message: "At least one runner target required" });
       return;
     }
-    const tp3Price = st.tp3Price;
-    if (tp3Price == null) {
-      res.status(400).json({ ok: false, message: "TP3 price not set" });
+    const tick = tickStore.get(accountId)?.at(-1);
+    const livePx = tick
+      ? (st.direction === "buy" ? tick.ask : tick.bid)
+      : (await fetchSymbolPrice(token, region, accountId, "XAUUSD"))?.[st.direction === "buy" ? "ask" : "bid"] ?? null;
+    if (livePx == null) {
+      res.status(400).json({ ok: false, message: "Price not ready — wait a moment and try again" });
       return;
     }
     for (const t of targets) {
@@ -4821,9 +4830,12 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
         res.status(400).json({ ok: false, message: "Each runner lot must be at least 0.01" });
         return;
       }
-      const validSide = st.direction === "buy" ? t.price > tp3Price : t.price < tp3Price;
-      if (!validSide) {
-        res.status(400).json({ ok: false, message: "Runner prices must be beyond TP3" });
+      if (st.direction === "buy" && t.price <= livePx) {
+        res.status(400).json({ ok: false, message: "Runner price must be above current price" });
+        return;
+      }
+      if (st.direction === "sell" && t.price >= livePx) {
+        res.status(400).json({ ok: false, message: "Runner price must be below current price" });
         return;
       }
     }
@@ -5014,18 +5026,12 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
       return;
     }
     const remaining = live.length - 1;
-    // Same as a normal TP2 hit: wipe unfilled cascade limits once the zone has reached TP2.
-    // Pre-TP2, pending limits stay so the ladder can still fill.
-    let limitsCancelled = false;
-    if (shouldCancelCascadeLimitsForZone(st)) {
-      await cancelZoneLimits(token, region, accountId, zoneId);
-      limitsCancelled = true;
-    }
+    await new Promise((r) => setTimeout(r, 800));
     broadcastZoneUpdate(zoneId);
     broadcastToAccount(accountId, "deal", { type: "position_changed" });
     console.log(
       `[zone ${zoneId}] secure-profits: kept posId=${best.id} @${best.openPrice} `
-      + `closed posId=${toClose.id} @${toClose.openPrice} remaining=${remaining} limitsCancelled=${limitsCancelled}`,
+      + `closed posId=${toClose.id} @${toClose.openPrice} remaining=${remaining}`,
     );
     res.json({
       ok: true,
@@ -5033,7 +5039,6 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
       closedPositionId: toClose.id,
       closedCount: 1,
       positionCount: remaining,
-      limitsCancelled,
     });
   } catch (err) {
     respondZoneActionError(res, "secure-profits", err);
@@ -5113,6 +5118,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
       .where(eq(cascadeZonesTable.zoneId, zoneId));
     const wasRiskFree = st.status === "RISK_FREE";
     st.status = "CLOSED";
+    zoneStates.delete(zoneId);
     await finalizeZoneClose(accountId, zoneId, {
       wasRiskFree,
       exitPrice: exitPriceForZoneClose(accountId, st.direction),
