@@ -362,6 +362,13 @@ export default function ZoneCard({
   const [delBusy, setDelBusy] = useState(false);
   const [runnerBusy, setRunnerBusy] = useState(false);
   const [showRunnerPanel, setShowRunnerPanel] = useState(false);
+  const [optimisticTpHits, setOptimisticTpHits] = useState<Partial<Record<1 | 2 | 3, boolean>>>({});
+
+  useEffect(() => {
+    setOptimisticTpHits({});
+  }, [zone.zoneId, zone.tp1Hit, zone.tp2Hit, zone.tp3Hit]);
+
+  const tpHit = (level: 1 | 2 | 3) => Boolean(zone[`tp${level}Hit`] || optimisticTpHits[level]);
 
   useEffect(() => {
     if (zone.tp3Hit && !zone.runnerActive) {
@@ -377,7 +384,7 @@ export default function ZoneCard({
   const tp2Lot = computeTpLot(origVol, zone.tp2Pct ?? cs.tp2Pct);
   const tp3Lot = computeTpLot(origVol, zone.tp3Pct ?? cs.tp3Pct);
 
-  const nextTpIdx = !zone.tp1Hit ? 1 : !zone.tp2Hit ? 2 : !zone.tp3Hit ? 3 : 0;
+  const nextTpIdx = !tpHit(1) ? 1 : !tpHit(2) ? 2 : !tpHit(3) ? 3 : 0;
 
   const showTp3Notif =
     !historical &&
@@ -409,12 +416,13 @@ export default function ZoneCard({
   const nextRunnerN = runners.find((r) => !r.hit)?.n;
 
   const runClosePartial = async (level: 1 | 2 | 3, pct: number) => {
-    if (!onClosePartial || tpBusy != null) return;
+    if (!onClosePartial || tpBusy != null || tpHit(level)) return;
     setTpBusy(level);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     const result = await onClosePartial(zone.zoneId, { pct, tpLevel: level });
     setTpBusy(null);
     if (result.ok) {
+      setOptimisticTpHits((prev) => ({ ...prev, [level]: true }));
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     } else {
       Alert.alert("Close failed", result.message ?? "Try again");
@@ -543,7 +551,7 @@ export default function ZoneCard({
       {!runnerActive && !runnerPanelOpen && (
         <View style={styles.tpBtnRow}>
           {([1, 2, 3] as const).map((level) => {
-            const hit = Boolean(zone[`tp${level}Hit`]);
+            const hit = tpHit(level);
             const isNext = nextTpIdx === level;
             const lot = level === 1 ? tp1Lot : level === 2 ? tp2Lot : tp3Lot;
             const pct = level === 1 ? (zone.tp1Pct ?? cs.tp1Pct) : level === 2 ? (zone.tp2Pct ?? cs.tp2Pct) : (zone.tp3Pct ?? cs.tp3Pct);
@@ -565,7 +573,7 @@ export default function ZoneCard({
               </Pressable>
             );
           })}
-          {zone.tp3Hit && (
+          {tpHit(3) && (
             <Pressable
               style={[styles.tpBtn, styles.tpBtnManual, { opacity: 0.85 }]}
               onPress={() => setShowRunnerPanel(true)}

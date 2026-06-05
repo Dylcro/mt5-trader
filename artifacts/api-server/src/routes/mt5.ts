@@ -3273,6 +3273,12 @@ async function handleClosePartial(
   if (st.status === "CLOSED" || st.status === "ARMED") {
     return { ok: false, message: "Zone not active" };
   }
+  if (body.tpLevel != null && body.tpLevel >= 1 && body.tpLevel <= 3) {
+    const hitKey = `tp${body.tpLevel}Hit` as "tp1Hit" | "tp2Hit" | "tp3Hit";
+    if (st[hitKey]) {
+      return { ok: false, message: `TP${body.tpLevel} already banked` };
+    }
+  }
   const legs = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
   if (legs.length === 0) return { ok: false, message: "No open positions" };
 
