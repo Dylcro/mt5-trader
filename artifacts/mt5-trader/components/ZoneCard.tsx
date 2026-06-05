@@ -1,9 +1,11 @@
 import { Feather } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  Animated,
+  Easing,
   Platform,
   Pressable,
   StyleSheet,
@@ -84,7 +86,24 @@ function PipelineTrack({
       : currentPrice <= nextPrice + 0.5
   );
 
-  const fillWidth = trackWidth * toPos(currentPrice) / 100;
+  const fillPct = toPos(currentPrice);
+  const fillAnim = useRef(new Animated.Value(fillPct)).current;
+  const progAnim = useRef(new Animated.Value(progressPct)).current;
+
+  useEffect(() => {
+    Animated.timing(fillAnim, {
+      toValue: fillPct,
+      duration: 150,
+      easing: Easing.out(Easing.quad),
+      useNativeDriver: false,
+    }).start();
+    Animated.timing(progAnim, {
+      toValue: progressPct,
+      duration: 150,
+      easing: Easing.out(Easing.quad),
+      useNativeDriver: false,
+    }).start();
+  }, [fillPct, progressPct, fillAnim, progAnim]);
 
   return (
     <View style={{ marginBottom: 12 }}>
@@ -94,11 +113,15 @@ function PipelineTrack({
       >
         <View style={[styles.pipeTrack, { width: trackWidth || "100%" }]} />
         {trackWidth > 0 && (
-          <View
+          <Animated.View
             style={[
               styles.pipeFill,
               {
-                width: fillWidth,
+                width: fillAnim.interpolate({
+                  inputRange: [0, 100],
+                  outputRange: ["0%", "100%"],
+                  extrapolate: "clamp",
+                }),
                 backgroundColor: atLevel ? C.greenProgress : C.goldProgress,
               },
             ]}
@@ -157,11 +180,15 @@ function PipelineTrack({
             </Text>
           </View>
           <View style={styles.progressTrack}>
-            <View
+            <Animated.View
               style={[
                 styles.progressFill,
                 {
-                  width: `${progressPct}%`,
+                  width: progAnim.interpolate({
+                    inputRange: [0, 100],
+                    outputRange: ["0%", "100%"],
+                    extrapolate: "clamp",
+                  }),
                   backgroundColor: atLevel ? C.greenProgress : C.goldProgress,
                 },
               ]}
