@@ -335,10 +335,7 @@ interface ZoneCardProps {
   zone: Zone;
   liveVolume?: number;
   floatingPnl?: number;
-  onRiskFree?: (
-    zoneId: string,
-    opts?: { riskFreePips?: number },
-  ) => Promise<{ ok: boolean; message?: string }>;
+  onSafe?: (zoneId: string) => Promise<{ ok: boolean; message?: string }>;
   onCloseAllWorst?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
   onCloseZone?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
   onClosePartial?: (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number }) => Promise<{ ok: boolean; message?: string }>;
@@ -351,7 +348,6 @@ interface ZoneCardProps {
     },
   ) => Promise<{ ok: boolean; message?: string }>;
   onCancelOrders?: (zoneId: string) => Promise<{ ok: boolean; message?: string; cancelledCount?: number }>;
-  riskFreePips?: number;
   historical?: boolean;
 }
 
@@ -359,13 +355,12 @@ export default function ZoneCard({
   zone,
   liveVolume,
   floatingPnl,
-  onRiskFree,
+  onSafe,
   onCloseAllWorst,
   onCloseZone,
   onClosePartial,
   onActivateRunner,
   onCancelOrders,
-  riskFreePips,
   historical = false,
 }: ZoneCardProps) {
   const { settings: cs } = useCascadeSettings();
@@ -456,15 +451,15 @@ export default function ZoneCard({
 
   const actionBusy = busy || worstBusy || closeBusy || delBusy || runnerBusy || tpBusy != null;
 
-  const canRiskFree =
-    !historical && (zone.status === "OPEN" || zone.status === "RISK_FREE") && zone.positionCount >= 1 && !!onRiskFree;
+  const canSafe =
+    !historical && (zone.status === "OPEN" || zone.status === "RISK_FREE") && zone.positionCount >= 1 && !!onSafe;
   const showCloseAllWorst = !historical && zone.status !== "CLOSED" && zone.status !== "ARMED" && !!onCloseAllWorst;
   const canCloseAllWorst = showCloseAllWorst && zone.positionCount >= 2;
   const canCloseZone = !historical && zone.status !== "CLOSED" && zone.positionCount >= 1 && !!onCloseZone;
   const canCancelOrders = !historical && zone.status !== "CLOSED" && !!onCancelOrders;
   const runnerPanelOpen =
     !historical && showRunnerPanel && zone.tp3Hit && !runnerActive && zone.status !== "CLOSED";
-  const showActionRow = !runnerPanelOpen && (canRiskFree || showCloseAllWorst || canCancelOrders);
+  const showActionRow = !runnerPanelOpen && (canSafe || showCloseAllWorst || canCancelOrders);
 
   if (historical) {
     return (
@@ -659,21 +654,20 @@ export default function ZoneCard({
 
       {showActionRow && (
         <View style={styles.actionRow}>
-          {canRiskFree && (
+          {canSafe && (
             <Pressable
               style={styles.rfBtn}
               onPress={async () => {
-                if (!onRiskFree || busy) return;
+                if (!onSafe || busy) return;
                 setBusy(true);
-                const opts = riskFreePips !== undefined ? { riskFreePips } : {};
-                const result = await onRiskFree(zone.zoneId, opts);
+                const result = await onSafe(zone.zoneId);
                 setBusy(false);
-                if (!result.ok) Alert.alert("Risk free failed", result.message ?? "Try again");
+                if (!result.ok) Alert.alert("Safe failed", result.message ?? "Try again");
               }}
               disabled={actionBusy}
             >
               <Feather name="shield" size={12} color={C.specGold} />
-              <Text style={styles.rfBtnText}>Risk Free</Text>
+              <Text style={styles.rfBtnText}>Safe</Text>
             </Pressable>
           )}
           {showCloseAllWorst && (

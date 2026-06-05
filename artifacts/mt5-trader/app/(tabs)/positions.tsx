@@ -248,7 +248,7 @@ export default function PositionsScreen() {
     closePosition, cancelOrder, accountId, region, sseConnected, price, ensureSessionForTrade,
     closeZonePartial, activateRunner,
   } = useTrading();
-  const { zones, refresh: refreshZones, riskFree, closeZone, closeAllWorst, cancelZoneOrders } = useZones(accountId, {
+  const { zones, refresh: refreshZones, safe, closeZone, closeAllWorst, cancelZoneOrders } = useZones(accountId, {
     includeClosed: true, pollIntervalMs: 10_000, sseConnected, region,
   });
   const { settings: cs } = useCascadeSettings();
@@ -483,8 +483,8 @@ export default function PositionsScreen() {
                             zone={z}
                             liveVolume={liveVol}
                             floatingPnl={floatingPnl}
-                            onRiskFree={(zoneId, opts) =>
-                              withSessionReady(() => riskFree(zoneId, opts))
+                            onSafe={(zoneId) =>
+                              withSessionReady(() => safe(zoneId))
                             }
                             onCloseAllWorst={(zoneId) =>
                               withSessionReady(() => closeAllWorst(zoneId))
@@ -501,7 +501,6 @@ export default function PositionsScreen() {
                             onCancelOrders={(zoneId) =>
                               withSessionReady(() => handleCancelZoneOrders(zoneId))
                             }
-                            riskFreePips={cs.riskFreePips}
                           />
                         );
                       })}
@@ -524,8 +523,8 @@ export default function PositionsScreen() {
                             zone={z}
                             liveVolume={liveVol}
                             floatingPnl={floatingPnl}
-                            onRiskFree={(zoneId, opts) =>
-                              withSessionReady(() => riskFree(zoneId, opts))
+                            onSafe={(zoneId) =>
+                              withSessionReady(() => safe(zoneId))
                             }
                             onCloseAllWorst={(zoneId) =>
                               withSessionReady(() => closeAllWorst(zoneId))
@@ -542,7 +541,6 @@ export default function PositionsScreen() {
                             onCancelOrders={(zoneId) =>
                               withSessionReady(() => handleCancelZoneOrders(zoneId))
                             }
-                            riskFreePips={cs.riskFreePips}
                           />
                         );
                       })}

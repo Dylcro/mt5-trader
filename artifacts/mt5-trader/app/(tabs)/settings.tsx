@@ -226,12 +226,6 @@ export default function SettingsScreen() {
     tp4: String(cs.tp4Pips),
   });
   const [tpSaveState, setTpSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
-  // Risk-free SL setting: signed pips (-30..+30, step 5). Negative = drawdown
-  // protection, positive = profit lock, 0 = exact break-even. Stored locally
-  // and passed in the risk-free POST body per zone.
-  const [rfDraft, setRfDraft] = useState<number>(cs.riskFreePips);
-  const [rfSaveState, setRfSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
-  useEffect(() => { setRfDraft(cs.riskFreePips); }, [cs.riskFreePips]);
 
   useFocusEffect(
     useCallback(() => {
@@ -241,7 +235,6 @@ export default function SettingsScreen() {
       return () => clearInterval(id);
     }, [status, accountId, syncSession]),
   );
-  const rfDirty = rfDraft !== cs.riskFreePips;
   useEffect(() => {
     setTpDraft({
       tp1: String(cs.tp1Pips),
@@ -954,82 +947,6 @@ export default function SettingsScreen() {
               suffix=""
               labels={{ 2: "TP2", 3: "TP3" }}
             />
-          </View>
-
-          {/* Risk Free SL placement — signed pip offset from the surviving entry. */}
-          <View style={styles.cascadeCard}>
-            <View style={styles.cascadeCardHeader}>
-              <Feather name="shield" size={16} color={C.gold} />
-              <Text style={styles.cascadeCardTitle}>Risk Free SL</Text>
-              <View style={styles.sourceBadge}>
-                <Text style={styles.sourceBadgeText}>IN-APP</Text>
-              </View>
-            </View>
-            <Text style={styles.cascadeCardDesc}>
-              Where to place the protective stop when you tap Risk Free on a zone.
-            </Text>
-
-            <View style={styles.cascadeDivider} />
-
-            <PillSelector
-              label="SL offset from entry"
-              hint={
-                rfDraft < 0 ? `${Math.abs(rfDraft)} pips of drawdown protection`
-                : rfDraft > 0 ? `Locks in ${rfDraft} pips of profit`
-                : "Break-even — SL exactly at entry"
-              }
-              options={[-30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30]}
-              value={rfDraft}
-              onChange={(v) => {
-                setRfDraft(v);
-                if (rfSaveState !== "idle") setRfSaveState("idle");
-              }}
-              suffix=""
-              labels={{
-                [-30]: "-30", [-25]: "-25", [-20]: "-20", [-15]: "-15",
-                [-10]: "-10", [-5]: "-5", 0: "0",
-                5: "+5", 10: "+10", 15: "+15", 20: "+20", 25: "+25", 30: "+30",
-              }}
-            />
-
-            <Pressable
-              style={({ pressed }) => [
-                styles.saveBtn,
-                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
-                (!rfDirty || rfSaveState === "saving") && { opacity: 0.5 },
-              ]}
-              disabled={!rfDirty || rfSaveState === "saving"}
-              onPress={async () => {
-                void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                setRfSaveState("saving");
-                try {
-                  updateSettings({ riskFreePips: rfDraft });
-                  setRfSaveState("saved");
-                  void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-                  setTimeout(() => setRfSaveState("idle"), 2500);
-                } catch {
-                  setRfSaveState("error");
-                  void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-                  setTimeout(() => setRfSaveState("idle"), 3000);
-                }
-              }}
-            >
-              {rfSaveState === "saving" ? (
-                <ActivityIndicator size="small" color="#000" />
-              ) : (
-                <Feather
-                  name={rfSaveState === "saved" ? "check" : rfSaveState === "error" ? "alert-circle" : "save"}
-                  size={15}
-                  color={rfSaveState === "error" ? C.sell : "#000"}
-                />
-              )}
-              <Text style={[styles.saveBtnText, rfSaveState === "error" && { color: C.sell }]}>
-                {rfSaveState === "saving" ? "Saving…"
-                  : rfSaveState === "saved" ? "Risk Free SL Saved"
-                  : rfSaveState === "error" ? "Save failed"
-                  : "Save Risk Free SL"}
-              </Text>
-            </Pressable>
           </View>
 
           {/* Merged Zone Take Profit card — lot size + per-TP pip/% + on/off */}

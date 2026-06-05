@@ -4833,6 +4833,39 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
   }
 });
 
+// POST /api/mt5/account/:accountId/zones/:zoneId/safe
+// Cancel unfilled limits; move each open leg's SL to entry ± 0.5 (5 pips on XAUUSD).
+router.post("/mt5/account/:accountId/zones/:zoneId/safe", checkOwner, async (req: Request, res: Response) => {
+  const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
+  try {
+    if (rejectIfPriceNotReady(res, accountId)) return;
+    const token = getToken();
+    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
+    const st = await loadZone(zoneId);
+    if (!st || st.accountId !== accountId || st.status === "CLOSED") {
+      res.status(404).json({ ok: false, error: "Zone not found", message: "Zone not found" });
+      return;
+    }
+    if (st.status === "ARMED") {
+      res.status(409).json({ ok: false, error: "Zone not active yet", message: "Zone not active yet — wait for the first order to fill" });
+      return;
+    }
+    await cancelZoneLimits(token, region, accountId, zoneId);
+    const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+    const SAFE_BUFFER = 0.5;
+    for (const leg of live) {
+      const newSl = st.direction === "buy"
+        ? leg.openPrice + SAFE_BUFFER
+        : leg.openPrice - SAFE_BUFFER;
+      await modifyZonePositionSl(token, region, accountId, leg.id, newSl);
+    }
+    broadcastZoneUpdate(zoneId);
+    res.json({ ok: true });
+  } catch (err) {
+    respondZoneActionError(res, "safe", err);
+  }
+});
+
 // POST /api/mt5/account/:accountId/zones/:zoneId/risk-free
 // Close all but the best entry; set best entry's SL 10 pips beyond entry (favourable).
 router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async (req: Request, res: Response) => {
@@ -4954,16 +4987,15 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
       return;
     }
     const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
-    if (live.length < 2) {
-      res.json({ ok: true, closedCount: 0, skipped: true, positionCount: live.length });
+    if (live.length <= 1) {
+      res.status(409).json({ ok: false, message: "Only one position left — nothing to secure" });
       return;
     }
-    const best = pickBestZonePositionForCloseWorst(live, st.direction);
-    const toClose = pickNextLegToTrimForSecureProfits(live, best, st.direction);
-    if (!toClose) {
-      res.json({ ok: true, closedCount: 0, skipped: true, positionCount: live.length });
-      return;
-    }
+    const sorted = [...live].sort((a, b) =>
+      st.direction === "buy" ? a.openPrice - b.openPrice : b.openPrice - a.openPrice,
+    );
+    const best = sorted[0]!;
+    const toClose = sorted[sorted.length - 1]!;
     const { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, [toClose]);
     if (!failed.includes(toClose.id)) st.trackedPositions.delete(toClose.id);
     if (failed.length > 0) {
@@ -4979,18 +5011,12 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
       return;
     }
     const remaining = live.length - 1;
-    // Same as a normal TP2 hit: wipe unfilled cascade limits once the zone has reached TP2.
-    // Pre-TP2, pending limits stay so the ladder can still fill.
-    let limitsCancelled = false;
-    if (shouldCancelCascadeLimitsForZone(st)) {
-      await cancelZoneLimits(token, region, accountId, zoneId);
-      limitsCancelled = true;
-    }
+    await new Promise((r) => setTimeout(r, 800));
     broadcastZoneUpdate(zoneId);
     broadcastToAccount(accountId, "deal", { type: "position_changed" });
     console.log(
       `[zone ${zoneId}] secure-profits: kept posId=${best.id} @${best.openPrice} `
-      + `closed posId=${toClose.id} @${toClose.openPrice} remaining=${remaining} limitsCancelled=${limitsCancelled}`,
+      + `closed posId=${toClose.id} @${toClose.openPrice} remaining=${remaining}`,
     );
     res.json({
       ok: true,
@@ -4998,7 +5024,6 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
       closedPositionId: toClose.id,
       closedCount: 1,
       positionCount: remaining,
-      limitsCancelled,
     });
   } catch (err) {
     respondZoneActionError(res, "secure-profits", err);
