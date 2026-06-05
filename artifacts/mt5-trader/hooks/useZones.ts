@@ -187,21 +187,14 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     });
   }, [accountId, refresh]);
 
-  const riskFree = useCallback(async (
+  const safe = useCallback(async (
     zoneId: string,
-    opts: { riskFreePips?: number } = {},
   ): Promise<{ ok: boolean; message?: string }> => {
     if (!API_BASE || !accountId) return { ok: false, message: "No account" };
     try {
-      const body: Record<string, unknown> = {};
-      if (opts.riskFreePips !== undefined) body.riskFreePips = opts.riskFreePips;
       const res = await authFetchWithTimeout(
-        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/risk-free${zoneTradeQuery(region)}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        },
+        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/safe${zoneTradeQuery(region)}`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
       );
       const data = await res.json().catch(() => ({})) as { ok?: boolean; message?: string; error?: string };
       void refresh();
@@ -311,7 +304,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     }
   }, [accountId, region, refresh]);
 
-  return { zones, loading, error, refresh, riskFree, closeZone, closeAllWorst, cancelZoneOrders };
+  return { zones, loading, error, refresh, safe, closeZone, closeAllWorst, cancelZoneOrders };
 }
 
 export function sortZonesRunnerLast(zones: Zone[]): Zone[] {
