@@ -72,7 +72,7 @@ Database layer using Drizzle ORM with PostgreSQL. Exports a Drizzle client insta
 - `drizzle.config.ts` — Drizzle Kit config (requires `DATABASE_URL`, automatically provided by Replit)
 - Exports: `.` (pool, db, schema), `./schema` (schema only)
 
-Production migrations are handled by Replit when publishing. In development, we just use `pnpm --filter @workspace/db run push`, and we fallback to `pnpm --filter @workspace/db run push-force`.
+**Do not use `drizzle-kit push` on Replit production.** Schema is applied at api-server boot via `ensureTables` (`ADD COLUMN IF NOT EXISTS` only). Replit may still show a Database migration prompt on Publish — **always cancel/skip** if it contains any `DROP`. `pnpm --filter @workspace/db run push` only previews the diff and blocks destructive SQL; use `push-apply` manually in dev only when the preview is additive.
 
 ### `lib/api-spec` (`@workspace/api-spec`)
 
