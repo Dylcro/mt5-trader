@@ -77,7 +77,6 @@ export default function DashboardScreen() {
     refreshAccountInfo,
     refreshPrice,
     sseConnected,
-    syncSession,
   } = useTrading();
   const { settings: cascadeSettings } = useCascadeSettings();
   const { zones, refresh, loading } = useZones(accountId, {
@@ -93,7 +92,6 @@ export default function DashboardScreen() {
     useCallback(() => {
       if (status !== "connected" || !accountId) return;
       const sync = () => void Promise.all([
-        syncSession(),
         refresh(),
         refreshPositions(),
         refreshPendingOrders(),
@@ -101,7 +99,7 @@ export default function DashboardScreen() {
       sync();
       const id = setInterval(sync, 10_000);
       return () => clearInterval(id);
-    }, [status, accountId, syncSession, refresh, refreshPositions, refreshPendingOrders]),
+    }, [status, accountId, refresh, refreshPositions, refreshPendingOrders]),
   );
 
   const displayActiveZones = useMemo(
