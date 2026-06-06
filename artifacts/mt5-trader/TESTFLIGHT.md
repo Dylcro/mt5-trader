@@ -5,7 +5,7 @@
 - **Apple Developer Program** (paid) — [developer.apple.com](https://developer.apple.com)
 - **App Store Connect** access with the same Apple ID
 - **EAS CLI** logged in (`eas whoami` → should show `dylcro`)
-- API live at `https://meta-trader-link.replit.app` (Replit published on `main` — includes PR #21 trading fixes as of merge `1cc26d4`)
+- API live at `https://workspaceapi-server-production-4768.up.railway.app` (Replit published on `main` — includes PR #21 trading fixes as of merge `1cc26d4`)
 
 Bundle ID (already in the project): **`com.xauusdtrader.app`**
 
@@ -20,7 +20,7 @@ Bundle ID (already in the project): **`com.xauusdtrader.app`**
 5. SKU: e.g. `xauusd-trader`
 6. Save — note the **Apple ID** of the app (numeric, e.g. `1234567890`) for submit later
 
-Fill privacy URL: `https://meta-trader-link.replit.app/privacy`
+Fill privacy URL: `https://workspaceapi-server-production-4768.up.railway.app/privacy`
 
 ---
 
@@ -39,7 +39,7 @@ eas build --platform ios --profile production
 - First time: EAS may ask you to sign in to **Apple** and will create distribution cert + provisioning.
 - Wait until status is **finished** in [expo.dev builds](https://expo.dev/accounts/dylcro/projects/mt5-trader/builds).
 
-This build includes `EXPO_PUBLIC_API_URL=https://meta-trader-link.replit.app/api` (live API).
+This build includes `EXPO_PUBLIC_API_URL=https://workspaceapi-server-production-4768.up.railway.app/api` (live API).
 
 ---
 
@@ -106,7 +106,7 @@ They do **not** need Developer Mode.
 | Build fails signing | `eas credentials --platform ios` → production profile |
 | Submit can’t find app | Create app in ASC with exact bundle `com.xauusdtrader.app` |
 | Testers don’t see build | Build must be “Ready to Test”; external group needs Beta Review |
-| App can’t connect API | Replit published; check `curl https://meta-trader-link.replit.app/api/system/status` |
+| App can’t connect API | Replit published; check `curl https://workspaceapi-server-production-4768.up.railway.app/api/system/status` |
 | Old UI on TestFlight | New **production** build after merging latest `main` |
 
 ---

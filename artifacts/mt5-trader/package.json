@@ -5,7 +5,7 @@
   "main": "expo-router/entry",
   "scripts": {
     "dev": "fuser -k $PORT/tcp 2>/dev/null; sleep 1; EXPO_PACKAGER_PROXY_URL=https://$REPLIT_EXPO_DEV_DOMAIN EXPO_PUBLIC_DOMAIN=$REPLIT_DEV_DOMAIN EXPO_PUBLIC_API_URL=https://$REPLIT_DEV_DOMAIN/api EXPO_PUBLIC_REPL_ID=$REPL_ID REACT_NATIVE_PACKAGER_HOSTNAME=$REPLIT_DEV_DOMAIN pnpm exec expo start --localhost --port $PORT --non-interactive",
-    "build": "EXPO_PUBLIC_API_URL=https://meta-trader-link.replit.app/api EXPO_PUBLIC_DOMAIN=meta-trader-link.replit.app pnpm exec expo export --platform web --output-dir dist --clear && node scripts/build.js",
+    "build": "EXPO_PUBLIC_API_URL=https://workspaceapi-server-production-4768.up.railway.app/api EXPO_PUBLIC_DOMAIN=workspaceapi-server-production-4768.up.railway.app pnpm exec expo export --platform web --output-dir dist --clear && node scripts/build.js",
     "serve": "node server/serve.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "ios:preview": "eas build --platform ios --profile preview --non-interactive"

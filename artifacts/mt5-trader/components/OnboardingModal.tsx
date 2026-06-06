@@ -43,7 +43,7 @@ export default function OnboardingModal({
   onSignIn,
   onCreateAccount,
   initialInviteCode = "",
-  termsUrl = "https://meta-trader-link.replit.app/terms",
+  termsUrl = "https://workspaceapi-server-production-4768.up.railway.app/terms",
 }: Props) {
   const [step, setStep] = useState(0);
 

@@ -22,7 +22,7 @@ app.use(helmet({ contentSecurityPolicy: false }));
 
 // ── CORS — only allow the production domain and local dev ────────────────────
 const ALLOWED_ORIGINS: (string | RegExp)[] = [
-  "https://meta-trader-link.replit.app",
+  "https://workspaceapi-server-production-4768.up.railway.app",
   /^https:\/\/.*\.replit\.dev$/,
   /^https:\/\/.*\.up\.railway\.app$/,
   /^https:\/\/.*\.expo\.dev$/,

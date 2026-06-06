@@ -52,7 +52,7 @@
       [
         "expo-router",
         {
-          "origin": "https://meta-trader-link.replit.app/"
+          "origin": "https://workspaceapi-server-production-4768.up.railway.app/"
         }
       ],
       "expo-font",
@@ -79,7 +79,7 @@
       "reactCompiler": true
     },
     "extra": {
-      "privacyPolicyUrl": "https://meta-trader-link.replit.app/privacy",
+      "privacyPolicyUrl": "https://workspaceapi-server-production-4768.up.railway.app/privacy",
       "eas": {
         "projectId": "75a8d989-e5ce-4c47-b55e-50977b95fca7"
       }
