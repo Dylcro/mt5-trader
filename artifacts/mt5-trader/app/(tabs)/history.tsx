@@ -1,5 +1,5 @@
 import { Feather } from "@expo/vector-icons";
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useMemo, useState } from "react";
 import {
   ActivityIndicator,
   RefreshControl,
@@ -9,7 +9,6 @@ import {
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { useFocusEffect } from "expo-router";
 
 import PeriodToggle from "@/components/PeriodToggle";
 import Colors from "@/constants/colors";
@@ -176,7 +175,7 @@ function HistoryCard({ zone }: { zone: Zone }) {
 export default function HistoryScreen() {
   const insets = useSafeAreaInsets();
   const { formatMoney } = useDisplayCurrency();
-  const { accountId, region, sseConnected, status, syncSession } = useTrading();
+  const { accountId, region, sseConnected } = useTrading();
   const { zones, loading, error, refresh } = useZones(accountId, {
     includeClosed: true,
     pollIntervalMs: 30_000,
@@ -185,15 +184,6 @@ export default function HistoryScreen() {
   const [period, setPeriod] = useState<Period>("today");
   const [refreshing, setRefreshing] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
-
-  useFocusEffect(
-    useCallback(() => {
-      if (status !== "connected" || !accountId) return;
-      void syncSession();
-      const id = setInterval(() => void syncSession(), 10_000);
-      return () => clearInterval(id);
-    }, [status, accountId, syncSession]),
-  );
 
   const periodZones = useMemo(
     () => filterClosedZonesByPeriod(zones, period),

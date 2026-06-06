@@ -416,7 +416,7 @@ export default function PositionsScreen() {
     });
   }, [accountId, refreshPendingOrders]);
 
-  // Light poll while focused — no syncSession (full wake) here; it blocked zone buttons.
+  // Light poll while focused — refresh fetches only, no session wake pings.
   useFocusEffect(
     useCallback(() => {
       if (status !== "connected" || !accountId) return;
