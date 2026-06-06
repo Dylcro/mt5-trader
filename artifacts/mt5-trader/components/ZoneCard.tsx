@@ -373,13 +373,6 @@ export default function ZoneCard({
   const [delBusy, setDelBusy] = useState(false);
   const [runnerBusy, setRunnerBusy] = useState(false);
   const [showRunnerPanel, setShowRunnerPanel] = useState(false);
-  const [optimisticTpHits, setOptimisticTpHits] = useState<Partial<Record<1 | 2 | 3, boolean>>>({});
-
-  useEffect(() => {
-    setOptimisticTpHits({});
-  }, [zone.zoneId, zone.tp1Hit, zone.tp2Hit, zone.tp3Hit]);
-
-  const tpHit = (level: 1 | 2 | 3) => Boolean(zone[`tp${level}Hit`] || optimisticTpHits[level]);
 
   useEffect(() => {
     if (zone.tp3Hit && !zone.runnerActive) {
@@ -390,12 +383,6 @@ export default function ZoneCard({
   const origVol = zone.originalVolume ?? liveVolume ?? 0;
   const vol = liveVolume ?? origVol;
   const cmp = zone.currentPrice ?? zone.anchorPrice;
-
-  const tp1Lot = computeTpLot(origVol, zone.tp1Pct ?? cs.tp1Pct);
-  const tp2Lot = computeTpLot(origVol, zone.tp2Pct ?? cs.tp2Pct);
-  const tp3Lot = computeTpLot(origVol, zone.tp3Pct ?? cs.tp3Pct);
-
-  const nextTpIdx = !tpHit(1) ? 1 : !tpHit(2) ? 2 : !tpHit(3) ? 3 : 0;
 
   const showTp3Notif =
     !historical &&
@@ -425,20 +412,6 @@ export default function ZoneCard({
     .filter((r) => r.price != null && r.lots != null);
 
   const nextRunnerN = runners.find((r) => !r.hit)?.n;
-
-  const runClosePartial = async (level: 1 | 2 | 3, pct: number) => {
-    if (!onClosePartial || tpBusy != null || tpHit(level)) return;
-    setTpBusy(level);
-    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    const result = await onClosePartial(zone.zoneId, { pct, tpLevel: level });
-    setTpBusy(null);
-    if (result.ok) {
-      setOptimisticTpHits((prev) => ({ ...prev, [level]: true }));
-      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    } else {
-      Alert.alert("Close failed", result.message ?? "Try again");
-    }
-  };
 
   const runCloseZone = async () => {
     if (!onCloseZone || closeBusy) return;
@@ -558,44 +531,6 @@ export default function ZoneCard({
       )}
 
       <PipelineTrack zone={zone} currentPrice={cmp} />
-
-      {!runnerActive && !runnerPanelOpen && (
-        <View style={styles.tpBtnRow}>
-          {([1, 2, 3] as const).map((level) => {
-            const hit = tpHit(level);
-            const isNext = !hit && nextTpIdx === level;
-            const lot = level === 1 ? tp1Lot : level === 2 ? tp2Lot : tp3Lot;
-            const pct = level === 1 ? (zone.tp1Pct ?? cs.tp1Pct) : level === 2 ? (zone.tp2Pct ?? cs.tp2Pct) : (zone.tp3Pct ?? cs.tp3Pct);
-            const disabled = hit || lot == null || !onClosePartial;
-            return (
-              <Pressable
-                key={level}
-                style={[styles.tpBtn, hit && styles.tpBtnDone, isNext && styles.tpBtnNext, disabled && hit && { opacity: 0.85 }]}
-                disabled={disabled || tpBusy != null}
-                onPress={() => void runClosePartial(level, pct)}
-              >
-                <Text style={[styles.tpBtnSub, hit && { color: C.specMuted }, isNext && { color: C.specGold }]}>
-                  {hit ? "✓ Done" : `TP${level}`}
-                </Text>
-                <Text style={[styles.tpBtnMain, hit && { color: C.specMuted }]}>
-                  {lot != null ? lot.toFixed(2) : "—"}
-                </Text>
-                {tpBusy === level && <ActivityIndicator size="small" color={C.specGold} style={{ marginTop: 4 }} />}
-              </Pressable>
-            );
-          })}
-          {tpHit(3) && (
-            <Pressable
-              style={[styles.tpBtn, styles.tpBtnManual, { opacity: 0.85 }]}
-              onPress={() => setShowRunnerPanel(true)}
-              disabled={actionBusy}
-            >
-              <Text style={styles.tpBtnSub}>RUNNER</Text>
-              <Text style={styles.tpBtnManualText}>set up</Text>
-            </Pressable>
-          )}
-        </View>
-      )}
 
       {runnerPanelOpen && onActivateRunner && (
         <RunnerSetupPanel
