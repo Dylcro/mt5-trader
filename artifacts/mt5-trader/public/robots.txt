@@ -5,4 +5,4 @@ Disallow: /(auth)/
 Disallow: /sign-in
 Disallow: /sign-up
 
-Sitemap: https://meta-trader-link.replit.app/sitemap.xml
+Sitemap: https://workspaceapi-server-production-4768.up.railway.app/sitemap.xml

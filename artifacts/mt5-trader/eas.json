@@ -11,7 +11,7 @@
         "simulator": true
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://meta-trader-link.replit.app/api",
+        "EXPO_PUBLIC_API_URL": "https://workspaceapi-server-production-4768.up.railway.app/api",
         "npm_config_user_agent": "pnpm/10.0.0"
       }
     },
@@ -25,7 +25,7 @@
         "buildType": "apk"
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://meta-trader-link.replit.app/api",
+        "EXPO_PUBLIC_API_URL": "https://workspaceapi-server-production-4768.up.railway.app/api",
         "npm_config_user_agent": "pnpm/10.0.0"
       }
     },
@@ -40,7 +40,7 @@
         "credentialsSource": "remote"
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://meta-trader-link.replit.app/api",
+        "EXPO_PUBLIC_API_URL": "https://workspaceapi-server-production-4768.up.railway.app/api",
         "npm_config_user_agent": "pnpm/10.0.0"
       }
     }

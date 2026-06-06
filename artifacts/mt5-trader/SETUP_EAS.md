@@ -145,9 +145,9 @@ All three build profiles (`development`, `preview`, `production`) automatically 
 
 | Variable | Value |
 |---|---|
-| `EXPO_PUBLIC_API_URL` | `https://meta-trader-link.replit.app/api` |
+| `EXPO_PUBLIC_API_URL` | `https://workspaceapi-server-production-4768.up.railway.app/api` |
 | `EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY` | from EAS secret `CLERK_PUBLISHABLE_KEY` |
-| `EXPO_PUBLIC_CLERK_PROXY_URL` | `https://meta-trader-link.replit.app/api/__clerk` |
+| `EXPO_PUBLIC_CLERK_PROXY_URL` | `https://workspaceapi-server-production-4768.up.railway.app/api/__clerk` |
 
 The production binary will always target the live deployed API — never the Replit
 dev preview server.
@@ -157,7 +157,7 @@ dev preview server.
 ## Privacy Policy
 
 A Privacy Policy is live at:
-**https://meta-trader-link.replit.app/privacy**
+**https://workspaceapi-server-production-4768.up.railway.app/privacy**
 
 Both Apple and Google require a privacy policy URL for financial apps. Use this URL
 when submitting to both stores.

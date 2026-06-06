@@ -20,11 +20,11 @@ export default function Root({ children }: PropsWithChildren) {
         <meta name="application-name" content="XAUUSD Trader" />
         <meta name="theme-color" content="#C9A84C" />
         <meta name="robots" content="index, follow" />
-        <link rel="canonical" href="https://meta-trader-link.replit.app/" />
+        <link rel="canonical" href="https://workspaceapi-server-production-4768.up.railway.app/" />
         <meta property="og:type" content="website" />
         <meta property="og:title" content={TITLE} />
         <meta property="og:description" content={DESCRIPTION} />
-        <meta property="og:url" content="https://meta-trader-link.replit.app/" />
+        <meta property="og:url" content="https://workspaceapi-server-production-4768.up.railway.app/" />
         <meta property="og:site_name" content="XAUUSD Trader" />
         <meta name="twitter:card" content="summary" />
         <meta name="twitter:title" content={TITLE} />

@@ -281,8 +281,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const [connectionWarm, setConnectionWarm] = useState(false);
 
   /** No price tick for this long → show Tap to sync (not Ready to trade). */
-  const PRICE_STALE_MS = 12_000;
-  const TRADE_PRICE_STALE_MS = 30_000;
+  const PRICE_STALE_MS = 25_000;
+  const TRADE_PRICE_STALE_MS = 45_000;
   const lastPriceAtRef = useRef(0);
 
   const [cascadeNotification, setCascadeNotification] = useState<CascadeNotification | null>(null);
@@ -322,7 +322,6 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       }
       const stale = Date.now() - lastPriceAtRef.current > PRICE_STALE_MS;
       setPriceStale(stale);
-      if (stale) setConnectionWarm(false);
     }, 2_000);
     return () => clearInterval(id);
   }, [status]);
@@ -637,8 +636,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
   const wakeConnection = useCallback(async (force = false) => {
     if (!accountId || status !== "connected") return;
-    if (!force && connectionWarmRef.current && priceRef.current) return;
-    setConnectionWarm(false);
+    const priceFresh = () =>
+      priceRef.current != null
+      && lastPriceAtRef.current > 0
+      && Date.now() - lastPriceAtRef.current <= PRICE_STALE_MS;
+    if (!force && priceFresh()) return;
     const r = regionRef.current;
     try {
       await authFetch(`${API_BASE}/healthz`);
@@ -745,12 +747,17 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       const prev = appStateRef.current;
       appStateRef.current = next;
       if (prev.match(/inactive|background/) && next === "active") {
-        wakeConnectionRef.current();
+        if (
+          !priceRef.current
+          || lastPriceAtRef.current === 0
+          || Date.now() - lastPriceAtRef.current > PRICE_STALE_MS
+        ) {
+          wakeConnectionRef.current();
+        }
         startHeartbeat();
       }
       if (next.match(/inactive|background/)) {
         stopHeartbeat();
-        setConnectionWarm(false);
         setPriceStale(true);
       }
     };
@@ -809,7 +816,17 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
     // When the app returns to foreground (mobile) or tab becomes visible (web),
     // immediately skip any pending backoff sleep and reconnect.
-    const onForeground = () => { retryDelay = 2_000; wakeNow(); wakeConnectionRef.current(); };
+    const onForeground = () => {
+      retryDelay = 2_000;
+      wakeNow();
+      if (
+        !priceRef.current
+        || lastPriceAtRef.current === 0
+        || Date.now() - lastPriceAtRef.current > PRICE_STALE_MS
+      ) {
+        wakeConnectionRef.current();
+      }
+    };
     const appStateSub = AppState.addEventListener("change", state => {
       if (state === "active") onForeground();
     });
@@ -1249,9 +1266,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const placeTrade = useCallback(
     async (params: PlaceTradeParams): Promise<{ success: boolean; message: string }> => {
       if (status !== "connected") return { success: false, message: "Not connected" };
-      if (!connectionWarm) {
-        await wakeConnection();
-      }
+      const session = await ensureSessionForTrade();
+      if (!session.ready) return { success: false, message: session.message ?? "Price not ready" };
       try {
         const result = await submitOrderRaw(params);
         // Refresh in background — don't block the success toast
@@ -1263,14 +1279,15 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         return { success: false, message: err instanceof Error ? err.message : "Trade failed" };
       }
     },
-    [status, connectionWarm, wakeConnection, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo]
+    [status, ensureSessionForTrade, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo]
   );
 
   const placeCascadeOrders = useCallback(
     async (params: CascadeOrderParams): Promise<{ success: boolean; placed: number; failed: number; message: string; marketPositionId?: string; limitOrderIds?: string[]; zoneId?: string }> => {
       if (status !== "connected") return { success: false, placed: 0, failed: 0, message: "Not connected" };
-      if (!connectionWarm) {
-        await wakeConnection();
+      const session = await ensureSessionForTrade();
+      if (!session.ready) {
+        return { success: false, placed: 0, failed: 0, message: session.message ?? "Price not ready" };
       }
       let placed = 0;
       let failed = 0;
@@ -1398,13 +1415,16 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       }
       return { success: true, placed, failed, message: `${placed} orders placed — 1 market + ${params.limitEntries.length} limit`, marketPositionId, limitOrderIds, zoneId };
     },
-    [status, connectionWarm, wakeConnection, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, accountId, region]
+    [status, ensureSessionForTrade, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, accountId, region]
   );
 
   const placeArmedCascadeAtPrice = useCallback(
     async (params: ArmedCascadeParams): Promise<{ success: boolean; placed: number; failed: number; message: string; zoneId?: string; limitOrderIds?: string[] }> => {
       if (status !== "connected") return { success: false, placed: 0, failed: 0, message: "Not connected" };
-      if (!connectionWarm) await wakeConnection();
+      const session = await ensureSessionForTrade();
+      if (!session.ready) {
+        return { success: false, placed: 0, failed: 0, message: session.message ?? "Price not ready" };
+      }
       const zoneId = params.zoneId ?? newCascadeZoneId();
       const limitPrices = [params.anchorPrice, ...params.limitEntries];
       const total = limitPrices.length;
@@ -1477,7 +1497,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         return { success: false, placed: 0, failed: total, message: err instanceof Error ? err.message : "Arm failed" };
       }
     },
-    [status, connectionWarm, wakeConnection, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, accountId, region],
+    [status, ensureSessionForTrade, submitOrderRaw, refreshPositions, refreshPendingOrders, refreshAccountInfo, accountId, region],
   );
 
   const closePosition = useCallback(
@@ -1525,7 +1545,6 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const closeZonePartial = useCallback(
     async (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number; runnerN?: number }): Promise<{ ok: boolean; message: string }> => {
       if (status !== "connected") return { ok: false, message: "Not connected" };
-      if (!connectionWarm) await wakeConnection();
       try {
         const r = await authFetch(
           `${API_BASE}/mt5/account/${accountId}/zones/${encodeURIComponent(zoneId)}/close-partial?region=${region}`,
@@ -1542,7 +1561,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         return { ok: false, message: err instanceof Error ? err.message : "Failed" };
       }
     },
-    [status, connectionWarm, wakeConnection, accountId, region, refreshPositions, refreshPendingOrders, refreshAccountInfo],
+    [status, accountId, region, refreshPositions, refreshPendingOrders, refreshAccountInfo],
   );
 
   const activateRunner = useCallback(
@@ -1555,7 +1574,6 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       },
     ): Promise<{ ok: boolean; message: string }> => {
       if (status !== "connected") return { ok: false, message: "Not connected" };
-      if (!connectionWarm) await wakeConnection();
       try {
         const r = await authFetch(
           `${API_BASE}/mt5/account/${accountId}/zones/${encodeURIComponent(zoneId)}/activate-runner?region=${region}`,
@@ -1579,7 +1597,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         return { ok: false, message: err instanceof Error ? err.message : "Failed" };
       }
     },
-    [status, connectionWarm, wakeConnection, accountId, region, refreshPositions],
+    [status, accountId, region, refreshPositions],
   );
 
   return (

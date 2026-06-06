@@ -37,7 +37,6 @@ type SyncUiVariant = "ready" | "sync" | "wait" | "connect";
 function resolveSyncUi(
   status: "connected" | "connecting" | "disconnected" | string,
   syncReady: boolean,
-  connectionWarm: boolean,
   hasPrice: boolean,
   priceError: boolean,
   priceStale: boolean,
@@ -48,11 +47,8 @@ function resolveSyncUi(
   if (status === "connecting") {
     return { variant: "wait", actionLabel: "Connecting…", statusLabel: "CONNECTING" };
   }
-  if (status === "connected" && !connectionWarm) {
-    return { variant: "wait", actionLabel: "Syncing…", statusLabel: "SYNCING" };
-  }
   if (status === "connected" && !hasPrice) {
-    return { variant: "wait", actionLabel: "Syncing…", statusLabel: "FETCHING" };
+    return { variant: "wait", actionLabel: "Fetching price…", statusLabel: "FETCHING" };
   }
   if (priceError || priceStale) {
     return { variant: "sync", actionLabel: "Tap to sync", statusLabel: "STALE" };
@@ -323,16 +319,15 @@ function TradeToast({ toast, insetTop }: { toast: ToastState; insetTop: number }
 export default function TradeScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { status, price, priceError, priceStale, accountInfo, placeCascadeOrders, placeArmedCascadeAtPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, connectionWarm, syncSession } = useTrading();
+  const { status, price, priceError, priceStale, accountInfo, placeCascadeOrders, placeArmedCascadeAtPrice, connect, accountId, apiBase, region, cancelOrder, pendingOrders, refreshPendingOrders, positions, closePosition, syncSession } = useTrading();
 
   const syncReady =
     status === "connected" &&
-    connectionWarm &&
     price != null &&
     !priceError &&
     !priceStale;
 
-  const syncUi = resolveSyncUi(status, syncReady, connectionWarm, price != null, priceError, priceStale);
+  const syncUi = resolveSyncUi(status, syncReady, price != null, priceError, priceStale);
 
   const handleHeaderSync = useCallback(() => {
     if (status === "disconnected") void connect();
@@ -433,8 +428,9 @@ export default function TradeScreen() {
   useFocusEffect(
     useCallback(() => {
       if (status !== "connected") return;
-      void syncSession(true);
-    }, [status, syncSession]),
+      // Only refresh when quotes are missing or stale — not on every tab switch.
+      if (!price || priceError || priceStale) void syncSession(false);
+    }, [status, syncSession, price, priceError, priceStale]),
   );
 
   const tpWatchersRef = useRef<WatcherEntry[]>([]); // take-profit queue

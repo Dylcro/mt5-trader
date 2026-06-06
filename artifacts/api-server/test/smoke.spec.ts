@@ -30,7 +30,7 @@
  *        verify zone status CLOSED with closedAt + 0 open positions
  *
  * Run:
- *   SMOKE_BASE_URL=https://meta-trader-link.replit.app \
+ *   SMOKE_BASE_URL=https://workspaceapi-server-production-4768.up.railway.app \
  *   ADMIN_KEY=... \
  *   DEMO_MT5_LOGIN=... DEMO_MT5_PASSWORD=... DEMO_MT5_SERVER=... \
  *     pnpm --filter @workspace/api-server run smoke

@@ -5,7 +5,7 @@
  * without actually running the full cascade scenario.
  *
  * Required deploy-time secrets:
- *   SMOKE_BASE_URL    — deployed server URL (e.g. https://meta-trader-link.replit.app)
+ *   SMOKE_BASE_URL    — deployed server URL (e.g. https://workspaceapi-server-production-4768.up.railway.app)
  *   ADMIN_KEY         — admin API key (guards /api/admin/status)
  *   DEMO_MT5_LOGIN    — MetaAPI demo account login number
  *   DEMO_MT5_PASSWORD — MetaAPI demo account password
@@ -15,7 +15,7 @@ export default function globalSetup(): void {
   const missing: string[] = [];
 
   if (!process.env.SMOKE_BASE_URL?.startsWith("http")) {
-    missing.push("SMOKE_BASE_URL=https://meta-trader-link.replit.app");
+    missing.push("SMOKE_BASE_URL=https://workspaceapi-server-production-4768.up.railway.app");
   }
   if (!process.env.ADMIN_KEY) {
     missing.push("ADMIN_KEY=<your admin key>");
