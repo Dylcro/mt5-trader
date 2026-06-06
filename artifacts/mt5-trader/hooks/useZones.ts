@@ -62,6 +62,9 @@ export interface Zone {
   runner2Hit?: boolean;
   runner3Hit?: boolean;
   runnerActive?: boolean;
+  runner1Notified?: boolean;
+  runner2Notified?: boolean;
+  runner3Notified?: boolean;
   currentPrice?: number | null;
   nextTp?: 0 | 1 | 2 | 3 | 4;
   nextTpPrice?: number | null;
@@ -180,20 +183,27 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
             return enrichZoneDisplayFields(withLatchedHits({ ...z, ...update }, hitLatch.current));
           }),
         );
+      } else if (type === "runner_alert") {
+        // Handled by positions screen banner — no zone list patch needed here.
       } else if (type === "deal" || type === "pending_order") {
         void refresh();
       }
     });
   }, [accountId, refresh]);
 
-  const safe = useCallback(async (
+  const riskFree = useCallback(async (
     zoneId: string,
+    opts?: { riskFreePips?: number },
   ): Promise<{ ok: boolean; message?: string }> => {
     if (!API_BASE || !accountId) return { ok: false, message: "No account" };
     try {
       const res = await authFetchWithTimeout(
-        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/safe${zoneTradeQuery(region)}`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/risk-free${zoneTradeQuery(region)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(opts?.riskFreePips != null ? { riskFreePips: opts.riskFreePips } : {}),
+        },
       );
       const data = await res.json().catch(() => ({})) as { ok?: boolean; message?: string; error?: string };
       void refresh();
@@ -303,7 +313,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     }
   }, [accountId, region, refresh]);
 
-  return { zones, loading, error, refresh, safe, closeZone, closeAllWorst, cancelZoneOrders };
+  return { zones, loading, error, refresh, riskFree, closeZone, closeAllWorst, cancelZoneOrders };
 }
 
 export function sortZonesRunnerLast(zones: Zone[]): Zone[] {

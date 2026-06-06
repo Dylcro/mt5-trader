@@ -14,7 +14,7 @@ export function useNotificationDeepLink(): void {
       const zoneId = (data as { zoneId?: unknown } | null)?.zoneId;
       try {
         router.push(typeof zoneId === "string" && zoneId
-          ? { pathname: "/positions", params: { zoneId } }
+          ? { pathname: "/positions", params: { zoneId, highlightZone: zoneId } }
           : "/positions");
       } catch {
         // Router may not be mounted yet on cold-start; the response listener

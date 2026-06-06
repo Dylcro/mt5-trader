@@ -131,7 +131,7 @@ interface TradingContextValue {
   syncSession: (force?: boolean) => Promise<void>;
   /** Fast preflight before zone buttons — skips full wake when price is live. */
   ensureSessionForTrade: () => Promise<{ ready: boolean; message?: string }>;
-  closeZonePartial: (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number }) => Promise<{ ok: boolean; message: string }>;
+  closeZonePartial: (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number; runnerN?: number }) => Promise<{ ok: boolean; message: string }>;
   activateRunner: (
     zoneId: string,
     targets: {
@@ -339,7 +339,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     onDeal: () => void;
     onPendingOrder: () => void;
     onZoneUpdate: (data: unknown) => void;
-  }>({ onDeal: () => {}, onPendingOrder: () => {}, onZoneUpdate: () => {} });
+    onRunnerAlert: (data: unknown) => void;
+  }>({ onDeal: () => {}, onPendingOrder: () => {}, onZoneUpdate: () => {}, onRunnerAlert: () => {} });
 
   const clearCascadeNotification = useCallback(() => setCascadeNotification(null), []);
 
@@ -564,6 +565,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     },
     onZoneUpdate: (data: unknown) => {
       emitAccountEvent(accountId, "zone_update", data);
+    },
+    onRunnerAlert: (data: unknown) => {
+      emitAccountEvent(accountId, "runner_alert", data);
     },
   };
 
@@ -872,6 +876,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
                       sseHandlersRef.current.onPendingOrder();
                     } else if (curEvent === "zone_update") {
                       sseHandlersRef.current.onZoneUpdate(data);
+                    } else if (curEvent === "runner_alert") {
+                      sseHandlersRef.current.onRunnerAlert(data);
                     }
                   } catch { /* ignore parse errors */ }
                   curEvent = "";
@@ -1517,7 +1523,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   );
 
   const closeZonePartial = useCallback(
-    async (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number }): Promise<{ ok: boolean; message: string }> => {
+    async (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number; runnerN?: number }): Promise<{ ok: boolean; message: string }> => {
       if (status !== "connected") return { ok: false, message: "Not connected" };
       if (!connectionWarm) await wakeConnection();
       try {

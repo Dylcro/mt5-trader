@@ -1,4 +1,4 @@
-import { pgTable, serial, text, bigint, boolean, doublePrecision } from "drizzle-orm/pg-core";
+import { pgTable, serial, text, bigint, boolean, doublePrecision, integer } from "drizzle-orm/pg-core";
 
 export const cascadeZonesTable = pgTable("cascade_zones", {
   id:          serial("id").primaryKey(),
@@ -48,6 +48,8 @@ export const cascadeZonesTable = pgTable("cascade_zones", {
   wentRiskFree: boolean("went_risk_free").notNull().default(false),
   /** SL on the risk-free survivor — History RF, not SL. */
   riskFreeSlExit: boolean("risk_free_sl_exit").notNull().default(false),
+  /** Signed pip offset for Risk Free SL, baked in at zone creation (-30..+30). */
+  riskFreeOffset: integer("risk_free_offset").notNull().default(0),
   // When TP2 fires but price has retraced through the entry, true BE
   // (SL = openPrice) would be rejected by the broker (SL below current ask
   // for a SELL would close the position instantly). We instead apply a

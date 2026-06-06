@@ -1,6 +1,6 @@
 import { Feather } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -12,7 +12,7 @@ import {
   Text,
   View,
 } from "react-native";
-import { useFocusEffect } from "expo-router";
+import { useFocusEffect, useLocalSearchParams } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import Colors from "@/constants/colors";
@@ -242,13 +242,28 @@ function PendingOrderCard({ order, onCancel }: { order: PendingOrder; onCancel: 
 export default function PositionsScreen() {
   const insets = useSafeAreaInsets();
   const { formatMoney } = useDisplayCurrency();
+  const { zoneId: highlightZoneParam, highlightZone } = useLocalSearchParams<{ zoneId?: string; highlightZone?: string }>();
+  const highlightTarget = (typeof highlightZone === "string" && highlightZone)
+    || (typeof highlightZoneParam === "string" && highlightZoneParam)
+    || null;
+  const scrollViewRef = useRef<ScrollView>(null);
+  const zoneRefs = useRef(new Map<string, View>());
+  const [flashZone, setFlashZone] = useState<string | null>(null);
+  const [runnerAlert, setRunnerAlert] = useState<{
+    zoneId: string;
+    runnerN: number;
+    price?: number;
+    lots?: number;
+    anchor?: number;
+    direction?: string;
+  } | null>(null);
   const {
     positions, pendingOrders, status, accountInfo,
     refreshPositions, refreshPendingOrders, refreshAccountInfo,
     closePosition, cancelOrder, accountId, region, sseConnected, price, ensureSessionForTrade,
     closeZonePartial, activateRunner,
   } = useTrading();
-  const { zones, refresh: refreshZones, safe, closeZone, closeAllWorst, cancelZoneOrders } = useZones(accountId, {
+  const { zones, refresh: refreshZones, riskFree, closeZone, closeAllWorst, cancelZoneOrders } = useZones(accountId, {
     includeClosed: true, pollIntervalMs: 10_000, sseConnected, region,
   });
   const { settings: cs } = useCascadeSettings();
@@ -256,6 +271,36 @@ export default function PositionsScreen() {
     () => buildDisplayActiveZones(zones, positions, cs, price, pendingOrders),
     [zones, positions, cs, price, pendingOrders],
   );
+
+  const scrollToZone = useCallback((zoneId: string) => {
+    const ref = zoneRefs.current.get(zoneId);
+    const scrollRef = scrollViewRef.current;
+    if (!ref || !scrollRef) return;
+    ref.measureLayout(
+      scrollRef.getInnerViewNode?.() ?? scrollRef as unknown as number,
+      (_x, y) => {
+        scrollRef.scrollTo({ y: Math.max(0, y - 20), animated: true });
+      },
+      () => {},
+    );
+  }, []);
+
+  useEffect(() => {
+    if (!highlightTarget) return;
+    const t = setTimeout(() => {
+      scrollToZone(highlightTarget);
+      setFlashZone(highlightTarget);
+      setTimeout(() => setFlashZone(null), 2000);
+    }, 300);
+    return () => clearTimeout(t);
+  }, [highlightTarget, scrollToZone, displayActiveZones.length]);
+
+  useEffect(() => {
+    if (!runnerAlert) return;
+    const id = setTimeout(() => setRunnerAlert(null), 30_000);
+    return () => clearTimeout(id);
+  }, [runnerAlert]);
+
   const positionsByZone = useMemo(() => groupPositionsByZoneId(positions), [positions]);
   const normalZones = useMemo(
     () => displayActiveZones.filter((z) => !z.runnerActive),
@@ -319,12 +364,21 @@ export default function PositionsScreen() {
   );
 
   const handleClosePartial = useCallback(
-    async (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number }) => {
+    async (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number; runnerN?: number }) => {
       const result = await closeZonePartial(zoneId, opts);
       if (result.ok) void refreshZones();
       return result;
     },
     [closeZonePartial, refreshZones],
+  );
+
+  const handleRiskFree = useCallback(
+    async (zoneId: string) => {
+      const result = await riskFree(zoneId, { riskFreePips: cs.riskFreePips });
+      if (result.ok) void refreshZones();
+      return result;
+    },
+    [riskFree, cs.riskFreePips, refreshZones],
   );
 
   const handleRefresh = useCallback(async () => {
@@ -337,8 +391,28 @@ export default function PositionsScreen() {
 
   useEffect(() => {
     if (!accountId) return;
-    return subscribeAccountEvents(accountId, (type) => {
+    return subscribeAccountEvents(accountId, (type, data) => {
       if (type === "pending_order") void refreshPendingOrders();
+      if (type === "runner_alert") {
+        const d = data as {
+          zoneId?: string;
+          runnerN?: number;
+          price?: number;
+          lots?: number;
+          anchor?: number;
+          direction?: string;
+        };
+        if (d.zoneId && d.runnerN) {
+          setRunnerAlert({
+            zoneId: d.zoneId,
+            runnerN: d.runnerN,
+            price: d.price,
+            lots: d.lots,
+            anchor: d.anchor,
+            direction: d.direction,
+          });
+        }
+      }
     });
   }, [accountId, refreshPendingOrders]);
 
@@ -404,6 +478,46 @@ export default function PositionsScreen() {
     setCancellingAll(false);
   }, [cancellingAll, orphanPendingOrders, cancelOrder]);
 
+  const renderZoneCard = (z: typeof displayActiveZones[number]) => {
+    const linked = positionsByZone.get(z.zoneId) ?? [];
+    const liveVol = linked.reduce((s, p) => s + p.volume, 0);
+    const floatingPnl = linked.reduce((s, p) => s + p.profit, 0);
+    return (
+      <View
+        key={z.zoneId}
+        ref={(el) => {
+          if (el) zoneRefs.current.set(z.zoneId, el);
+        }}
+        collapsable={false}
+      >
+        <ZoneCard
+          zone={z}
+          liveVolume={liveVol}
+          floatingPnl={floatingPnl}
+          flash={flashZone === z.zoneId}
+          onRiskFree={(zoneId) =>
+            withSessionReady(() => handleRiskFree(zoneId))
+          }
+          onCloseAllWorst={(zoneId) =>
+            withSessionReady(() => closeAllWorst(zoneId))
+          }
+          onCloseZone={(zoneId) =>
+            withSessionReady(() => handleCloseZone(zoneId))
+          }
+          onClosePartial={(zoneId, opts) =>
+            withSessionReady(() => handleClosePartial(zoneId, opts))
+          }
+          onActivateRunner={(zoneId, targets) =>
+            withSessionReady(() => activateRunner(zoneId, targets))
+          }
+          onCancelOrders={(zoneId) =>
+            withSessionReady(() => handleCancelZoneOrders(zoneId))
+          }
+        />
+      </View>
+    );
+  };
+
   const totalPL =
     accountInfo != null
       ? accountInfo.equity - accountInfo.balance
@@ -442,7 +556,34 @@ export default function PositionsScreen() {
         </View>
       )}
 
+      {runnerAlert && (
+        <Pressable
+          onPress={() => {
+            setFlashZone(runnerAlert.zoneId);
+            scrollToZone(runnerAlert.zoneId);
+            setRunnerAlert(null);
+          }}
+          style={styles.runnerBanner}
+        >
+          <Text style={{ fontSize: 20 }}>🏃</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.runnerBannerTitle}>
+              Runner {runnerAlert.runnerN} hit —{" "}
+              {(runnerAlert.direction ?? "buy").toUpperCase()}{" "}
+              {runnerAlert.anchor != null ? formatPrice(runnerAlert.anchor) : "—"}
+            </Text>
+            <Text style={styles.runnerBannerSub}>
+              Tap to go to zone · close {(runnerAlert.lots ?? 0).toFixed(2)} lots
+            </Text>
+          </View>
+          <Pressable onPress={() => setRunnerAlert(null)} hitSlop={12}>
+            <Text style={styles.runnerBannerDismiss}>✕</Text>
+          </Pressable>
+        </Pressable>
+      )}
+
       <ScrollView
+        ref={scrollViewRef}
         contentContainerStyle={[styles.scroll, { paddingBottom: insets.bottom + 100 }]}
         showsVerticalScrollIndicator={false}
         refreshControl={
@@ -473,37 +614,7 @@ export default function PositionsScreen() {
                   <>
                     <Text style={styles.sectionLabel}>ACTIVE ZONES  ·  {normalZones.length}</Text>
                     <View style={{ gap: 10, marginBottom: runnerZones.length > 0 ? 12 : showStandalone || orphanPendingOrders.length > 0 ? 20 : 0 }}>
-                      {normalZones.map((z) => {
-                        const linked = positionsByZone.get(z.zoneId) ?? [];
-                        const liveVol = linked.reduce((s, p) => s + p.volume, 0);
-                        const floatingPnl = linked.reduce((s, p) => s + p.profit, 0);
-                        return (
-                          <ZoneCard
-                            key={z.zoneId}
-                            zone={z}
-                            liveVolume={liveVol}
-                            floatingPnl={floatingPnl}
-                            onSafe={(zoneId) =>
-                              withSessionReady(() => safe(zoneId))
-                            }
-                            onCloseAllWorst={(zoneId) =>
-                              withSessionReady(() => closeAllWorst(zoneId))
-                            }
-                            onCloseZone={(zoneId) =>
-                              withSessionReady(() => handleCloseZone(zoneId))
-                            }
-                            onClosePartial={(zoneId, opts) =>
-                              withSessionReady(() => handleClosePartial(zoneId, opts))
-                            }
-                            onActivateRunner={(zoneId, targets) =>
-                              withSessionReady(() => activateRunner(zoneId, targets))
-                            }
-                            onCancelOrders={(zoneId) =>
-                              withSessionReady(() => handleCancelZoneOrders(zoneId))
-                            }
-                          />
-                        );
-                      })}
+                      {normalZones.map((z) => renderZoneCard(z))}
                     </View>
                   </>
                 )}
@@ -513,37 +624,7 @@ export default function PositionsScreen() {
                       RUNNER ZONES  ·  {runnerZones.length}
                     </Text>
                     <View style={{ gap: 10, marginBottom: showStandalone || orphanPendingOrders.length > 0 ? 20 : 0 }}>
-                      {runnerZones.map((z) => {
-                        const linked = positionsByZone.get(z.zoneId) ?? [];
-                        const liveVol = linked.reduce((s, p) => s + p.volume, 0);
-                        const floatingPnl = linked.reduce((s, p) => s + p.profit, 0);
-                        return (
-                          <ZoneCard
-                            key={z.zoneId}
-                            zone={z}
-                            liveVolume={liveVol}
-                            floatingPnl={floatingPnl}
-                            onSafe={(zoneId) =>
-                              withSessionReady(() => safe(zoneId))
-                            }
-                            onCloseAllWorst={(zoneId) =>
-                              withSessionReady(() => closeAllWorst(zoneId))
-                            }
-                            onCloseZone={(zoneId) =>
-                              withSessionReady(() => handleCloseZone(zoneId))
-                            }
-                            onClosePartial={(zoneId, opts) =>
-                              withSessionReady(() => handleClosePartial(zoneId, opts))
-                            }
-                            onActivateRunner={(zoneId, targets) =>
-                              withSessionReady(() => activateRunner(zoneId, targets))
-                            }
-                            onCancelOrders={(zoneId) =>
-                              withSessionReady(() => handleCancelZoneOrders(zoneId))
-                            }
-                          />
-                        );
-                      })}
+                      {runnerZones.map((z) => renderZoneCard(z))}
                     </View>
                   </>
                 )}
@@ -717,6 +798,31 @@ const styles = StyleSheet.create({
   plBannerValue: {
     fontSize: 24,
     fontFamily: "Inter_700Bold",
+  },
+  runnerBanner: {
+    backgroundColor: "#0E7490",
+    marginHorizontal: 16,
+    marginBottom: 8,
+    borderRadius: 12,
+    padding: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  runnerBannerTitle: {
+    fontSize: 13,
+    fontFamily: "Inter_700Bold",
+    color: "#fff",
+  },
+  runnerBannerSub: {
+    fontSize: 12,
+    fontFamily: "Inter_400Regular",
+    color: "rgba(255,255,255,0.75)",
+    marginTop: 2,
+  },
+  runnerBannerDismiss: {
+    color: "rgba(255,255,255,0.5)",
+    fontSize: 18,
   },
   syncRow: {
     flexDirection: "row",
