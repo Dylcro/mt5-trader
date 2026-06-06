@@ -127,7 +127,8 @@ export async function ensureCascadeZoneRfColumns(): Promise<void> {
     cascadeRfColumnsReady = pool.query(`
       ALTER TABLE cascade_zones
         ADD COLUMN IF NOT EXISTS went_risk_free BOOLEAN NOT NULL DEFAULT FALSE,
-        ADD COLUMN IF NOT EXISTS risk_free_sl_exit BOOLEAN NOT NULL DEFAULT FALSE;
+        ADD COLUMN IF NOT EXISTS risk_free_sl_exit BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS risk_free_offset INTEGER NOT NULL DEFAULT 0;
     `).then(() => undefined).catch((e) => {
       cascadeRfColumnsReady = null;
       throw e;
@@ -709,6 +710,9 @@ function broadcastZoneUpdate(zoneId: string): void {
       runner2Hit: Boolean((dbRow as { runner2Hit?: boolean } | undefined)?.runner2Hit ?? st?.runner2Hit),
       runner3Hit: Boolean((dbRow as { runner3Hit?: boolean } | undefined)?.runner3Hit ?? st?.runner3Hit),
       runnerActive: Boolean((dbRow as { runnerActive?: boolean } | undefined)?.runnerActive ?? st?.runnerActive),
+      runner1Notified: Boolean(st?.tpNotified?.runner1),
+      runner2Notified: Boolean(st?.tpNotified?.runner2),
+      runner3Notified: Boolean(st?.tpNotified?.runner3),
     });
   })();
 }
@@ -2425,6 +2429,8 @@ interface ZoneState {
   runner2Hit?: boolean;
   runner3Hit?: boolean;
   runnerActive?: boolean;
+  /** Signed pip offset for Risk Free SL (-30..+30), stored at zone creation. */
+  riskFreeOffset?: number;
   highestPriceSeen?: number;
   lowestPriceSeen?: number;
   tp1PassedAt?: number;
@@ -2733,6 +2739,7 @@ function prepareZoneForCascade(
   originalVolume: number,
   explicitZoneId?: string,
   anchorPriceHint = 0,
+  riskFreeOffset = 0,
 ): ZoneState {
   void userId;
   const zoneId = explicitZoneId && /^z_[a-z0-9_]+$/i.test(explicitZoneId) ? explicitZoneId : newZoneId();
@@ -2756,6 +2763,7 @@ function prepareZoneForCascade(
     }),
     status: "OPEN", tpCarryLot: 0, busy: false,
     trackedPositions: new Map(),
+    riskFreeOffset: sanitizeRiskFreePips(riskFreeOffset),
   };
   markZonePlacing(zoneId);
   // Do NOT set zoneStates here — the zone is added to the in-memory map only
@@ -2818,8 +2826,9 @@ async function persistPreparedZone(
       cashoutPips: state.cashoutPips, cashoutDone: false,
       tp1Hit: state.tp1Hit, tp2Hit: state.tp2Hit, tp3Hit: state.tp3Hit, tp4Hit: state.tp4Hit,
       autoBeAtTp: state.autoBeAtTp,
+      riskFreeOffset: state.riskFreeOffset ?? 0,
       status: "OPEN", createdAt: now,
-    }).onConflictDoNothing());
+    } as typeof cascadeZonesTable.$inferInsert).onConflictDoNothing());
   await withDbRetry(`persistZonePos ${state.zoneId}`, () =>
     db.insert(zonePositionsTable).values({
       zoneId: state.zoneId, positionId, entryPrice: state.anchorPrice, volume,
@@ -2846,8 +2855,9 @@ async function persistArmedZone(state: ZoneState, userId: string | undefined): P
     cashoutPips: state.cashoutPips, cashoutDone: false,
     tp1Hit: state.tp1Hit, tp2Hit: state.tp2Hit, tp3Hit: state.tp3Hit, tp4Hit: state.tp4Hit,
     autoBeAtTp: state.autoBeAtTp,
+    riskFreeOffset: state.riskFreeOffset ?? 0,
     status: "ARMED", createdAt: now,
-  }).onConflictDoNothing();
+  } as typeof cascadeZonesTable.$inferInsert).onConflictDoNothing();
   if (userId) zoneIdToUserId.set(state.zoneId, userId);
   logEvent("zone.arm", { accountId: state.accountId, zoneId: state.zoneId, direction: state.direction, anchorPrice: state.anchorPrice });
 }
@@ -3263,7 +3273,7 @@ export async function ensureMonitorsForActiveZones(): Promise<void> {
 async function handleClosePartial(
   accountId: string,
   zoneId: string,
-  body: { pct?: number; lots?: number; tpLevel?: number },
+  body: { pct?: number; lots?: number; tpLevel?: number; runnerN?: number },
   token: string,
   region: string,
 ): Promise<{ ok: boolean; message?: string }> {
@@ -3305,6 +3315,33 @@ async function handleClosePartial(
 
   if ((body.pct ?? 0) >= 100 || (body.lots != null && targetLot >= totalVol - 1e-9)) {
     await cancelZoneLimits(token, region, accountId, zoneId);
+  }
+
+  const stAfter = zoneStates.get(zoneId) ?? st;
+  if (body.tpLevel != null && body.tpLevel >= 1 && body.tpLevel <= 3) {
+    const hitKey = `tp${body.tpLevel}Hit` as "tp1Hit" | "tp2Hit" | "tp3Hit";
+    if (stAfter && !stAfter[hitKey]) {
+      stAfter[hitKey] = true;
+      await db.update(cascadeZonesTable)
+        .set({ [hitKey]: true })
+        .where(eq(cascadeZonesTable.zoneId, zoneId))
+        .catch(() => {});
+      broadcastZoneUpdate(zoneId);
+      if (body.tpLevel === 3) {
+        notifyZoneEvent(zoneId, "tp3_runners", 3, 0, stAfter.direction);
+      }
+    }
+  }
+  if (body.runnerN != null && body.runnerN >= 1 && body.runnerN <= 3 && stAfter?.runnerActive) {
+    const hitKey = `runner${body.runnerN}Hit` as "runner1Hit" | "runner2Hit" | "runner3Hit";
+    if (stAfter && !stAfter[hitKey]) {
+      stAfter[hitKey] = true;
+      await db.update(cascadeZonesTable)
+        .set({ [hitKey]: true })
+        .where(eq(cascadeZonesTable.zoneId, zoneId))
+        .catch(() => {});
+      broadcastZoneUpdate(zoneId);
+    }
   }
 
   return { ok: true };
@@ -4009,6 +4046,14 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
           notified[key] = true;
           st.tpNotified = notified;
           notifyZoneEvent(st.zoneId, "runner", n, 0, st.direction, rPrice, rLots ?? undefined);
+          broadcastToAccount(st.accountId, "runner_alert", {
+            zoneId: st.zoneId,
+            runnerN: n,
+            price: rPrice,
+            lots: rLots ?? null,
+            anchor: st.anchorPrice,
+            direction: st.direction,
+          });
         }
       }
     }
@@ -4191,6 +4236,7 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
     runner2Hit: Boolean((z as { runner2Hit?: boolean }).runner2Hit),
     runner3Hit: Boolean((z as { runner3Hit?: boolean }).runner3Hit),
     runnerActive: Boolean((z as { runnerActive?: boolean }).runnerActive),
+    riskFreeOffset: sanitizeRiskFreePips((z as { riskFreeOffset?: number }).riskFreeOffset ?? 0),
   };
 }
 
@@ -4452,16 +4498,21 @@ function notifyZoneEvent(
   if (kind === "near" && !prefs.nearEnabled) return;
   if ((kind === "hit" || kind === "tp3_runners" || kind === "runner") && !prefs.hitEnabled) return;
   const dir = direction.toUpperCase();
+  const anchor = st?.anchorPrice;
+  const anchorFmt = anchor != null ? anchor.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "—";
   let title: string;
   let body: string;
+  let data: Record<string, unknown>;
   if (kind === "tp3_runners") {
-    title = `TP3 hit (${dir})`;
-    body = "TP3 reached — open app to set your runners 🏃";
+    title = `⚡ TP3 hit — ${dir} ${anchorFmt}`;
+    body = "Open app to set your runners";
+    data = { type: "tp3_complete", zoneId, direction, anchor: anchor ?? null };
   } else if (kind === "runner") {
-    title = `Runner ${tp} (${dir})`;
+    title = `🏃 Runner ${tp} hit — ${dir} ${anchorFmt}`;
     const px = runnerPrice != null ? runnerPrice.toFixed(2) : "—";
     const lots = runnerLots != null ? runnerLots.toFixed(2) : "—";
-    body = `🏃 Runner ${tp} reached at ${px} — tap to close ${lots} lots`;
+    body = `Tap to close ${lots} lots`;
+    data = { type: "runner_hit", zoneId, runnerN: tp, direction, anchor: anchor ?? null };
   } else {
     title = kind === "hit"
       ? `TP${tp} hit (${dir})`
@@ -4471,8 +4522,9 @@ function notifyZoneEvent(
       : pipsToNextTp != null
         ? `${pipsToNextTp.toFixed(1)} pips away from TP${tp}.`
         : `Closing in on TP${tp}.`;
+    data = { zoneId, kind, tp };
   }
-  void sendExpoPush(prefs.expoPushToken, title, body, { zoneId, kind, tp });
+  void sendExpoPush(prefs.expoPushToken, title, body, data);
 }
 
 // ── Notification prefs routes ────────────────────────────────────────────────
@@ -4751,6 +4803,9 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         runner2Hit: Boolean((row as { runner2Hit?: boolean }).runner2Hit),
         runner3Hit: Boolean((row as { runner3Hit?: boolean }).runner3Hit),
         runnerActive: Boolean((row as { runnerActive?: boolean }).runnerActive),
+        runner1Notified: Boolean(zoneStates.get(row.zoneId)?.tpNotified?.runner1),
+        runner2Notified: Boolean(zoneStates.get(row.zoneId)?.tpNotified?.runner2),
+        runner3Notified: Boolean(zoneStates.get(row.zoneId)?.tpNotified?.runner3),
         currentPrice,
         nextTp,
         nextTpPrice,
@@ -4775,11 +4830,12 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-partial", checkOwner, a
     await ensureCascadeZoneRunnerColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
-    const body = (req.body ?? {}) as { pct?: unknown; lots?: unknown; tpLevel?: unknown };
+    const body = (req.body ?? {}) as { pct?: unknown; lots?: unknown; tpLevel?: unknown; runnerN?: unknown };
     const pct = typeof body.pct === "number" ? body.pct : undefined;
     const lots = typeof body.lots === "number" ? body.lots : undefined;
     const tpLevel = typeof body.tpLevel === "number" ? body.tpLevel : undefined;
-    const result = await handleClosePartial(accountId, zoneId, { pct, lots, tpLevel }, token, region);
+    const runnerN = typeof body.runnerN === "number" ? body.runnerN : undefined;
+    const result = await handleClosePartial(accountId, zoneId, { pct, lots, tpLevel, runnerN }, token, region);
     if (!result.ok) {
       res.status(result.message === "Zone not found" ? 404 : 409).json(result);
       return;
@@ -4862,6 +4918,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
       res.status(400).json({ ok: false, message: "Total runner lots exceed open volume" });
       return;
     }
+    const updateMode = Boolean(st.runnerActive);
     const update: Record<string, number | boolean | null> = { runnerActive: true };
     for (const n of [1, 2, 3] as const) {
       update[`runner${n}Price`] = null;
@@ -4872,14 +4929,35 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
       update[`runner${n}Price`] = t.price;
       update[`runner${n}Lots`] = t.lots;
     });
+    for (const n of [1, 2, 3] as const) {
+      if (!updateMode || update[`runner${n}Price`] != null) {
+        update[`runner${n}Hit`] = false;
+      }
+    }
     await db.update(cascadeZonesTable).set(update).where(eq(cascadeZonesTable.zoneId, zoneId));
     st.runnerActive = true;
     for (const n of [1, 2, 3] as const) {
       st[`runner${n}Price`] = update[`runner${n}Price`] as number | null;
       st[`runner${n}Lots`] = update[`runner${n}Lots`] as number | null;
-      st[`runner${n}Hit`] = false;
+      if (!updateMode || update[`runner${n}Price`] != null) {
+        st[`runner${n}Hit`] = false;
+      }
     }
-    st.tpNotified = { ...(st.tpNotified ?? { tp1: false, tp2: false, tp3: false, runner1: false, runner2: false, runner3: false }), runner1: false, runner2: false, runner3: false };
+    const tpNotified = {
+      ...(st.tpNotified ?? { tp1: false, tp2: false, tp3: false, runner1: false, runner2: false, runner3: false }),
+    };
+    if (updateMode) {
+      for (const n of [1, 2, 3] as const) {
+        if (update[`runner${n}Price`] != null) {
+          tpNotified[`runner${n}`] = false;
+        }
+      }
+    } else {
+      tpNotified.runner1 = false;
+      tpNotified.runner2 = false;
+      tpNotified.runner3 = false;
+    }
+    st.tpNotified = tpNotified;
     broadcastZoneUpdate(zoneId);
     res.json({ ok: true });
   } catch (err) {
@@ -4887,41 +4965,8 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
   }
 });
 
-// POST /api/mt5/account/:accountId/zones/:zoneId/safe
-// Cancel unfilled limits; move each open leg's SL to entry ± 0.5 (5 pips on XAUUSD).
-router.post("/mt5/account/:accountId/zones/:zoneId/safe", checkOwner, async (req: Request, res: Response) => {
-  const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
-  try {
-    if (rejectIfPriceNotReady(res, accountId)) return;
-    const token = getToken();
-    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
-    const st = await loadZone(zoneId);
-    if (!st || st.accountId !== accountId || st.status === "CLOSED") {
-      res.status(404).json({ ok: false, error: "Zone not found", message: "Zone not found" });
-      return;
-    }
-    if (st.status === "ARMED") {
-      res.status(409).json({ ok: false, error: "Zone not active yet", message: "Zone not active yet — wait for the first order to fill" });
-      return;
-    }
-    await cancelZoneLimits(token, region, accountId, zoneId);
-    const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
-    const SAFE_BUFFER = 0.5;
-    for (const leg of live) {
-      const newSl = st.direction === "buy"
-        ? leg.openPrice + SAFE_BUFFER
-        : leg.openPrice - SAFE_BUFFER;
-      await modifyZonePositionSl(token, region, accountId, leg.id, newSl);
-    }
-    broadcastZoneUpdate(zoneId);
-    res.json({ ok: true });
-  } catch (err) {
-    respondZoneActionError(res, "safe", err);
-  }
-});
-
 // POST /api/mt5/account/:accountId/zones/:zoneId/risk-free
-// Close all but the best entry; set best entry's SL 10 pips beyond entry (favourable).
+// Close all but the best entry; move best entry's SL by signed pip offset.
 router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async (req: Request, res: Response) => {
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
@@ -4929,8 +4974,6 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     await ensureCascadeZoneRfColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
-    // DB-first read: loadZone checks cache first, then hydrates from DB on miss.
-    // DB errors propagate as 500; CLOSED zones and missing zones are 404.
     const st = await loadZone(zoneId);
     if (!st || st.accountId !== accountId || st.status === "CLOSED") { res.status(404).json({ error: "Zone not found" }); return; }
     if (st.status === "ARMED") {
@@ -4941,16 +4984,13 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     if (live.length === 0) {
       res.status(409).json({ error: "No open positions in this zone" }); return;
     }
-    // Same "best" leg as Secure Profits (floating P&L when available, else entry ladder).
-    // Mismatch here caused RF to close the leg SP had just kept when both were tapped.
-    const best = pickBestZonePositionForCloseWorst(live, st.direction);
-    const others = live.filter((p) => p.id !== best.id);
-    // Close every "other" position in parallel — serial closes were the main
-    // cause of Risk Free taking ~1s × N positions. MetaAPI's REST trade
-    // endpoint accepts concurrent POSITION_CLOSE_ID for distinct positions.
-    // Each item is wrapped in try/catch so a single network throw cannot
-    // short-circuit Promise.all and turn a partial-success into a 500 — the
-    // caller relies on `failedPositionIds` to know what to retry.
+    const sorted = [...live].sort((a, b) =>
+      st.direction === "buy"
+        ? a.openPrice - b.openPrice
+        : b.openPrice - a.openPrice,
+    );
+    const best = sorted[0]!;
+    const others = sorted.slice(1);
     const closeResults = await Promise.all(
       others.map(async (p) => {
         try {
@@ -4962,20 +5002,13 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       }),
     );
     const failed: string[] = closeResults.filter((r) => !r.ok).map((r) => r.id);
-    // "Risk free" (misnomer — kept because the user calls it that): move SL
-    // by a SIGNED pip offset from the best entry. Client passes `riskFreePips`
-    // in the body (-30..+30, step 5). Negative = drawdown protection (small
-    // loss if reversed); positive = profit lock (tighter exit); 0 = exactly
-    // at entry. Falls back to ZONE_RISK_FREE_PIPS when omitted. See
-    // computeRiskFreeSl for direction math.
     const body = (req.body ?? {}) as { riskFreePips?: unknown };
     const pips = body.riskFreePips !== undefined
       ? sanitizeRiskFreePips(body.riskFreePips)
-      : ZONE_RISK_FREE_PIPS;
+      : (st.riskFreeOffset ?? ZONE_RISK_FREE_PIPS);
     const sl = computeRiskFreeSl(st.direction, best.openPrice, pips);
     const slOk = await modifyZonePositionSl(token, region, accountId, best.id, sl);
     if (failed.length > 0 || !slOk) {
-      // Don't flip status — caller can retry. Surface what's still broken.
       console.warn(`[zone ${zoneId}] risk-free partial: failedCloses=${failed.length} slOk=${slOk}`);
       res.status(207).json({
         ok: false,
@@ -4983,7 +5016,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
         sl, slOk,
         closedCount: others.length - failed.length,
         failedPositionIds: failed,
-        message: "Some operations failed — zone NOT marked risk-free. Retry to clear remaining issues.",
+        message: "Some operations failed. Retry to clear remaining issues.",
       });
       return;
     }
@@ -4998,14 +5031,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
         .catch((e: Error) => console.warn(`[zone ${zoneId}] risk-free mark closed ${r.id}:`, e.message));
       st.trackedPositions.delete(r.id);
     }
-    // Wipe unfilled cascade limits only after a successful risk-free — same
-    // contract as TP2 / close-zone. Doing this before success left zones OPEN
-    // with no limits and no RISK_FREE status when SL/close partially failed.
     await cancelZoneLimits(token, region, accountId, zoneId);
-    await db.update(cascadeZonesTable)
-      .set({ status: "RISK_FREE", wentRiskFree: true })
-      .where(eq(cascadeZonesTable.zoneId, zoneId));
-    st.status = "RISK_FREE";
     broadcastZoneUpdate(zoneId);
     broadcastToAccount(accountId, "deal", { type: "position_changed" });
     console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl} (pips=${pips})`);
@@ -5232,6 +5258,7 @@ router.post("/mt5/account/:accountId/zones/arm", checkOwner, async (req: Request
     const tp4Pct = pickPct(raw.tp4Pct, 25);
     const clientZoneId = typeof raw.zoneId === "string" ? raw.zoneId.trim() : "";
     const uId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
+    const rfOffset = getCascadeConfig(accountId, uId).riskFreePips;
     const zoneState = prepareZoneForCascade(
       accountId, direction, uId,
       {
@@ -5242,6 +5269,7 @@ router.post("/mt5/account/:accountId/zones/arm", checkOwner, async (req: Request
       volume,
       clientZoneId || undefined,
       anchorPrice,
+      rfOffset,
     );
     zoneState.status = "ARMED";
     zoneState.anchorPrice = anchorPrice;
@@ -6313,6 +6341,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
                 volume,
                 clientZoneId || parseZoneIdFromComment(comment) || undefined,
                 anchorHint,
+                getCascadeConfig(accountId, uId).riskFreePips,
               );
               // Seed best-known anchor from caller-provided value / cached tick.
               const tick = latestPrice(accountId);

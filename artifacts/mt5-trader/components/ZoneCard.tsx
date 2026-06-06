@@ -15,7 +15,6 @@ import {
 } from "react-native";
 
 import Colors from "@/constants/colors";
-import { useCascadeSettings } from "@/hooks/useCascadeSettings";
 import type { Zone } from "@/hooks/useZones";
 
 const C = Colors.dark;
@@ -37,6 +36,66 @@ function formatClosedAt(ms: number): string {
   if (sameDay) return `today ${time}`;
   const date = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
   return `${date} ${time}`;
+}
+
+function roundLot(v: number): number {
+  return Math.round(v / LOT_STEP) * LOT_STEP;
+}
+
+type TpAction = {
+  label: string;
+  sub: string;
+  call: () => void;
+} | null;
+
+function getNextTpAction(
+  zone: Zone,
+  onClosePartial: ((zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number; runnerN?: number }) => Promise<{ ok: boolean; message?: string }>) | undefined,
+  setShowRunnerPanel: (v: boolean) => void,
+): TpAction {
+  const origVol = zone.originalVolume ?? 0;
+  const tp1Lots = roundLot(origVol * (zone.tp1Pct ?? 25) / 100);
+  const tp2Lots = roundLot(origVol * (zone.tp2Pct ?? 25) / 100);
+  const tp3Lots = roundLot(origVol * (zone.tp3Pct ?? 25) / 100);
+
+  if (!zone.tp1Hit) {
+    return {
+      label: "Take TP1",
+      sub: `${tp1Lots.toFixed(2)} lots`,
+      call: () => { void onClosePartial?.(zone.zoneId, { pct: zone.tp1Pct ?? 25, tpLevel: 1 }); },
+    };
+  }
+  if (!zone.tp2Hit) {
+    return {
+      label: "Take TP2",
+      sub: `${tp2Lots.toFixed(2)} lots`,
+      call: () => { void onClosePartial?.(zone.zoneId, { pct: zone.tp2Pct ?? 25, tpLevel: 2 }); },
+    };
+  }
+  if (!zone.tp3Hit) {
+    return {
+      label: "Take TP3",
+      sub: `${tp3Lots.toFixed(2)} lots`,
+      call: () => { void onClosePartial?.(zone.zoneId, { pct: zone.tp3Pct ?? 25, tpLevel: 3 }); },
+    };
+  }
+  if (!zone.runnerActive) {
+    return {
+      label: "Set Runners",
+      sub: "open panel",
+      call: () => setShowRunnerPanel(true),
+    };
+  }
+  for (const n of [1, 2, 3] as const) {
+    if (!zone[`runner${n}Hit`] && zone[`runner${n}Price`]) {
+      return {
+        label: `Bank R${n}`,
+        sub: `${(zone[`runner${n}Lots`] ?? 0).toFixed(2)} lots`,
+        call: () => { void onClosePartial?.(zone.zoneId, { lots: zone[`runner${n}Lots`] ?? undefined, runnerN: n }); },
+      };
+    }
+  }
+  return null;
 }
 
 function computeTpLot(originalVol: number, tpPct: number): number | null {
@@ -219,6 +278,8 @@ function RunnerSetupPanel({
   onActivate,
   onSkipClose,
   busy,
+  editMode = false,
+  initialTargets,
 }: {
   zone: Zone;
   remaining: number;
@@ -230,10 +291,25 @@ function RunnerSetupPanel({
   }) => Promise<{ ok: boolean; message?: string }>;
   onSkipClose: () => void;
   busy: boolean;
+  editMode?: boolean;
+  initialTargets?: {
+    r1?: { price: number; lots: number };
+    r2?: { price: number; lots: number };
+    r3?: { price: number; lots: number };
+  };
 }) {
-  const [r1, setR1] = useState({ price: "", lots: "" });
-  const [r2, setR2] = useState({ price: "", lots: "" });
-  const [r3, setR3] = useState({ price: "", lots: "" });
+  const [r1, setR1] = useState({
+    price: initialTargets?.r1 ? String(initialTargets.r1.price) : "",
+    lots: initialTargets?.r1 ? String(initialTargets.r1.lots) : "",
+  });
+  const [r2, setR2] = useState({
+    price: initialTargets?.r2 ? String(initialTargets.r2.price) : "",
+    lots: initialTargets?.r2 ? String(initialTargets.r2.lots) : "",
+  });
+  const [r3, setR3] = useState({
+    price: initialTargets?.r3 ? String(initialTargets.r3.price) : "",
+    lots: initialTargets?.r3 ? String(initialTargets.r3.lots) : "",
+  });
 
   const filledPrices = [r1, r2, r3].filter((r) => r.price.trim().length > 0);
   const autoLot =
@@ -280,7 +356,9 @@ function RunnerSetupPanel({
   return (
     <View style={styles.runnerPanel}>
       <View style={styles.runnerPanelHeader}>
-        <Text style={styles.runnerPanelTitle}>🏃 Set runner targets</Text>
+        <Text style={styles.runnerPanelTitle}>
+          {editMode ? "🏃 Update runner targets" : "🏃 Set runner targets"}
+        </Text>
         <Text style={styles.runnerRemaining}>Remaining: {remaining.toFixed(2)} lots</Text>
       </View>
       {rows.map(({ n, s, set }) => (
@@ -322,7 +400,11 @@ function RunnerSetupPanel({
           if (!result.ok) Alert.alert("Activate failed", result.message ?? "Try again");
         }}
       >
-        {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.runnerActivateText}>Activate Runner 🏃</Text>}
+        {busy ? <ActivityIndicator color="#fff" /> : (
+          <Text style={styles.runnerActivateText}>
+            {editMode ? "Update Runners 🏃" : "Activate Runner 🏃"}
+          </Text>
+        )}
       </Pressable>
       <Pressable style={styles.runnerSkipBtn} onPress={onSkipClose} disabled={busy}>
         <Text style={styles.runnerSkipText}>Skip for now</Text>
@@ -335,10 +417,11 @@ interface ZoneCardProps {
   zone: Zone;
   liveVolume?: number;
   floatingPnl?: number;
-  onSafe?: (zoneId: string) => Promise<{ ok: boolean; message?: string }>;
+  flash?: boolean;
+  onRiskFree?: (zoneId: string) => Promise<{ ok: boolean; message?: string }>;
   onCloseAllWorst?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
   onCloseZone?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
-  onClosePartial?: (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number }) => Promise<{ ok: boolean; message?: string }>;
+  onClosePartial?: (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number; runnerN?: number }) => Promise<{ ok: boolean; message?: string }>;
   onActivateRunner?: (
     zoneId: string,
     targets: {
@@ -355,7 +438,8 @@ export default function ZoneCard({
   zone,
   liveVolume,
   floatingPnl,
-  onSafe,
+  flash = false,
+  onRiskFree,
   onCloseAllWorst,
   onCloseZone,
   onClosePartial,
@@ -363,16 +447,41 @@ export default function ZoneCard({
   onCancelOrders,
   historical = false,
 }: ZoneCardProps) {
-  const { settings: cs } = useCascadeSettings();
   const isBuy = zone.direction === "buy";
   const runnerActive = Boolean(zone.runnerActive);
   const [busy, setBusy] = useState(false);
+  const [takeTpBusy, setTakeTpBusy] = useState(false);
   const [tpBusy, setTpBusy] = useState<number | null>(null);
   const [worstBusy, setWorstBusy] = useState(false);
   const [closeBusy, setCloseBusy] = useState(false);
   const [delBusy, setDelBusy] = useState(false);
   const [runnerBusy, setRunnerBusy] = useState(false);
   const [showRunnerPanel, setShowRunnerPanel] = useState(false);
+  const [showEditRunners, setShowEditRunners] = useState(false);
+  const flashAnim = useRef(new Animated.Value(flash ? 1 : 0)).current;
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    if (!flash) return;
+    flashAnim.setValue(1);
+    Animated.timing(flashAnim, {
+      toValue: 0,
+      duration: 2000,
+      easing: Easing.out(Easing.quad),
+      useNativeDriver: false,
+    }).start();
+  }, [flash, flashAnim]);
+
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, { toValue: 0.3, duration: 600, useNativeDriver: true }),
+        Animated.timing(pulseAnim, { toValue: 1, duration: 600, useNativeDriver: true }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [pulseAnim]);
 
   useEffect(() => {
     if (zone.tp3Hit && !zone.runnerActive) {
@@ -422,17 +531,32 @@ export default function ZoneCard({
     if (!result.ok) Alert.alert("Couldn't close zone", result.message ?? "Try again");
   };
 
-  const actionBusy = busy || worstBusy || closeBusy || delBusy || runnerBusy || tpBusy != null;
+  const actionBusy = busy || worstBusy || closeBusy || delBusy || runnerBusy || tpBusy != null || takeTpBusy;
 
-  const canSafe =
-    !historical && (zone.status === "OPEN" || zone.status === "RISK_FREE") && zone.positionCount >= 1 && !!onSafe;
+  const nextTpAction = useMemo(
+    () => getNextTpAction(zone, onClosePartial, setShowRunnerPanel),
+    [zone, onClosePartial],
+  );
+
+  const canRiskFree =
+    !historical && (zone.status === "OPEN" || zone.status === "RISK_FREE") && zone.positionCount >= 1 && !!onRiskFree;
   const showCloseAllWorst = !historical && zone.status !== "CLOSED" && zone.status !== "ARMED" && !!onCloseAllWorst;
   const canCloseAllWorst = showCloseAllWorst && zone.positionCount >= 2;
   const canCloseZone = !historical && zone.status !== "CLOSED" && zone.positionCount >= 1 && !!onCloseZone;
   const canCancelOrders = !historical && zone.status !== "CLOSED" && !!onCancelOrders;
   const runnerPanelOpen =
     !historical && showRunnerPanel && zone.tp3Hit && !runnerActive && zone.status !== "CLOSED";
-  const showActionRow = !runnerPanelOpen && (canSafe || showCloseAllWorst || canCancelOrders);
+  const editRunnerPanelOpen = !historical && showEditRunners && runnerActive && zone.status !== "CLOSED";
+  const hasUnhitRunners = runners.some((r) => !r.hit);
+  const showActionRow = !runnerPanelOpen && !editRunnerPanelOpen && (canRiskFree || showCloseAllWorst || canCancelOrders);
+  const runnerInitialTargets = {
+    r1: zone.runner1Price != null && zone.runner1Lots != null
+      ? { price: zone.runner1Price, lots: zone.runner1Lots } : undefined,
+    r2: zone.runner2Price != null && zone.runner2Lots != null
+      ? { price: zone.runner2Price, lots: zone.runner2Lots } : undefined,
+    r3: zone.runner3Price != null && zone.runner3Lots != null
+      ? { price: zone.runner3Price, lots: zone.runner3Lots } : undefined,
+  };
 
   if (historical) {
     return (
@@ -465,8 +589,28 @@ export default function ZoneCard({
     );
   }
 
+  const flashBorderColor = flashAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [runnerActive ? C.tealBdr : C.specBorder, C.specGold],
+  });
+  const flashShadowOpacity = flashAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0.09, 0.7],
+  });
+
   return (
-    <View style={[styles.card, runnerActive && styles.cardRunner]}>
+    <Animated.View
+      style={[
+        styles.card,
+        runnerActive && styles.cardRunner,
+        flash && {
+          borderColor: flashBorderColor,
+          shadowColor: C.specGold,
+          shadowOpacity: flashShadowOpacity,
+          shadowRadius: 16,
+        },
+      ]}
+    >
       <View style={styles.topRow}>
         <View style={styles.leftGroup}>
           <View style={[styles.dirPill, isBuy ? styles.dirPillBuy : styles.dirPillSell]}>
@@ -549,12 +693,42 @@ export default function ZoneCard({
         />
       )}
 
+      {editRunnerPanelOpen && onActivateRunner && (
+        <RunnerSetupPanel
+          zone={zone}
+          remaining={vol}
+          currentMarketPrice={cmp}
+          busy={runnerBusy}
+          editMode
+          initialTargets={runnerInitialTargets}
+          onSkipClose={() => setShowEditRunners(false)}
+          onActivate={async (targets) => {
+            setRunnerBusy(true);
+            const result = await onActivateRunner(zone.zoneId, targets);
+            setRunnerBusy(false);
+            if (result.ok) setShowEditRunners(false);
+            return result;
+          }}
+        />
+      )}
+
+      {runnerActive && hasUnhitRunners && !editRunnerPanelOpen && onActivateRunner && (
+        <Pressable
+          style={styles.editRunnersBtn}
+          onPress={() => setShowEditRunners(true)}
+          disabled={actionBusy}
+        >
+          <Text style={styles.editRunnersText}>Edit Runners</Text>
+        </Pressable>
+      )}
+
       {runnerActive && runners.length > 0 && (
         <View style={{ marginBottom: 8 }}>
           <Text style={styles.runnerSectionLabel}>RUNNER TARGETS · push notification when each is hit</Text>
           <View style={styles.tpBtnRow}>
             {runners.map((r) => {
               const isNext = !r.hit && r.n === nextRunnerN;
+              const notified = Boolean(zone[`runner${r.n}Notified`]);
               return (
                 <Pressable
                   key={r.n}
@@ -568,11 +742,16 @@ export default function ZoneCard({
                   disabled={r.hit || !onClosePartial || tpBusy != null}
                   onPress={async () => {
                     setTpBusy(r.n);
-                    const result = await onClosePartial!(zone.zoneId, { lots: r.lots! });
+                    const result = await onClosePartial!(zone.zoneId, { lots: r.lots!, runnerN: r.n });
                     setTpBusy(null);
                     if (!result.ok) Alert.alert("Close failed", result.message ?? "Try again");
                   }}
                 >
+                  {notified && !r.hit && (
+                    <Animated.View
+                      style={[styles.runnerPulseDot, { opacity: pulseAnim }]}
+                    />
+                  )}
                   <Text style={[styles.tpBtnSub, (r.hit || isNext) && { color: r.hit ? C.specGold : C.teal }]}>
                     {r.hit ? "✓ HIT" : `R${r.n}`}
                   </Text>
@@ -587,22 +766,38 @@ export default function ZoneCard({
         </View>
       )}
 
+      {nextTpAction && !runnerPanelOpen && !editRunnerPanelOpen && (
+        <Pressable
+          style={[styles.takeTpBtn, takeTpBusy && { opacity: 0.6 }]}
+          disabled={actionBusy}
+          onPress={async () => {
+            setTakeTpBusy(true);
+            await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+            nextTpAction.call();
+            setTakeTpBusy(false);
+          }}
+        >
+          <Text style={styles.takeTpLabel}>{nextTpAction.label}</Text>
+          <Text style={styles.takeTpSub}>{nextTpAction.sub}</Text>
+        </Pressable>
+      )}
+
       {showActionRow && (
         <View style={styles.actionRow}>
-          {canSafe && (
+          {canRiskFree && (
             <Pressable
               style={styles.rfBtn}
               onPress={async () => {
-                if (!onSafe || busy) return;
+                if (!onRiskFree || busy) return;
                 setBusy(true);
-                const result = await onSafe(zone.zoneId);
+                const result = await onRiskFree(zone.zoneId);
                 setBusy(false);
-                if (!result.ok) Alert.alert("Safe failed", result.message ?? "Try again");
+                if (!result.ok) Alert.alert("Risk Free failed", result.message ?? "Try again");
               }}
               disabled={actionBusy}
             >
               <Feather name="shield" size={12} color={C.specGold} />
-              <Text style={styles.rfBtnText}>Safe</Text>
+              <Text style={styles.rfBtnText}>Risk Free</Text>
             </Pressable>
           )}
           {showCloseAllWorst && (
@@ -637,7 +832,7 @@ export default function ZoneCard({
           )}
         </View>
       )}
-    </View>
+    </Animated.View>
   );
 }
 
@@ -842,6 +1037,51 @@ const styles = StyleSheet.create({
     borderBottomColor: C.tealBdr,
   },
   actionRow: { flexDirection: "row", gap: 8 },
+  takeTpBtn: {
+    width: "100%",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 12,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    borderColor: C.specGold,
+    backgroundColor: C.specGoldBg,
+    gap: 2,
+  },
+  takeTpLabel: {
+    fontSize: 15,
+    fontFamily: "Inter_700Bold",
+    color: C.specGold,
+  },
+  takeTpSub: {
+    fontSize: 11,
+    fontFamily: "Inter_500Medium",
+    color: C.specGold,
+    opacity: 0.85,
+  },
+  editRunnersBtn: {
+    paddingVertical: 9,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: C.tealBdr,
+    backgroundColor: C.tealBg,
+    alignItems: "center",
+    marginBottom: 4,
+  },
+  editRunnersText: {
+    fontSize: 12,
+    fontFamily: "Inter_700Bold",
+    color: C.teal,
+  },
+  runnerPulseDot: {
+    position: "absolute",
+    top: -4,
+    right: -4,
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: C.specGold,
+  },
   rfBtn: {
     flex: 1,
     flexDirection: "row",
