@@ -2425,6 +2425,11 @@ interface ZoneState {
   runner2Hit?: boolean;
   runner3Hit?: boolean;
   runnerActive?: boolean;
+  highestPriceSeen?: number;
+  lowestPriceSeen?: number;
+  tp1PassedAt?: number;
+  tp2PassedAt?: number;
+  tp3PassedAt?: number;
 }
 
 // Signed offset (pips) of the protective SL from the surviving entry:
@@ -3267,12 +3272,6 @@ async function handleClosePartial(
   if (st.status === "CLOSED" || st.status === "ARMED") {
     return { ok: false, message: "Zone not active" };
   }
-  if (body.tpLevel != null && body.tpLevel >= 1 && body.tpLevel <= 3) {
-    const hitKey = `tp${body.tpLevel}Hit` as "tp1Hit" | "tp2Hit" | "tp3Hit";
-    if (st[hitKey]) {
-      return { ok: false, message: `TP${body.tpLevel} already banked` };
-    }
-  }
   const legs = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
   if (legs.length === 0) return { ok: false, message: "No open positions" };
 
@@ -3306,18 +3305,6 @@ async function handleClosePartial(
 
   if ((body.pct ?? 0) >= 100 || (body.lots != null && targetLot >= totalVol - 1e-9)) {
     await cancelZoneLimits(token, region, accountId, zoneId);
-  }
-
-  if (body.tpLevel != null && body.tpLevel >= 1 && body.tpLevel <= 3) {
-    const hitKey = `tp${body.tpLevel}Hit` as "tp1Hit" | "tp2Hit" | "tp3Hit";
-    if (!st[hitKey]) {
-      st[hitKey] = true;
-      await db.update(cascadeZonesTable)
-        .set({ [hitKey]: true })
-        .where(eq(cascadeZonesTable.zoneId, zoneId))
-        .catch(() => {});
-      broadcastZoneUpdate(zoneId);
-    }
   }
 
   return { ok: true };
@@ -3923,28 +3910,91 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       }
     }
 
-    // Manual TP model — no auto partial closes. Push notifications for TP3
-    // (set runners) and runner targets only; user taps buttons in the app for TP1/2/3.
+    // High water mark — track best price seen so buffered auto-TP can fire on retraces.
+    if (st.direction === "buy") {
+      if (!st.highestPriceSeen || price.bid > st.highestPriceSeen) {
+        st.highestPriceSeen = price.bid;
+      }
+    } else {
+      if (!st.lowestPriceSeen || price.ask < st.lowestPriceSeen) {
+        st.lowestPriceSeen = price.ask;
+      }
+    }
+    for (const lvl of [1, 2, 3] as const) {
+      if (st[`tp${lvl}Hit`] || st[`tp${lvl}PassedAt`]) continue;
+      const tpPrice = st[`tp${lvl}Price`];
+      if (tpPrice == null) continue;
+      const crossed = st.direction === "buy"
+        ? (st.highestPriceSeen ?? 0) >= tpPrice
+        : (st.lowestPriceSeen ?? Infinity) <= tpPrice;
+      if (crossed) st[`tp${lvl}PassedAt`] = Date.now();
+    }
+
+    const AUTO_TP_BUFFER = 0.30;
+    const AUTO_TP_BUFFER_WINDOW_MS = 15_000;
+    for (const lvl of [1, 2, 3] as const) {
+      if (st[`tp${lvl}Hit`]) continue;
+      const tpPrice = st[`tp${lvl}Price`];
+      const tpPct = st[`tp${lvl}Pct`] ?? 25;
+      const enabled = st[`tp${lvl}Enabled`] !== false;
+      const passedAt = st[`tp${lvl}PassedAt`];
+      if (tpPrice == null || !enabled) continue;
+
+      const atLevel = st.direction === "buy"
+        ? price.bid >= tpPrice
+        : price.ask <= tpPrice;
+      const withinWindow = passedAt != null && (Date.now() - passedAt) < AUTO_TP_BUFFER_WINDOW_MS;
+      const withinBuffer = st.direction === "buy"
+        ? price.bid >= tpPrice - AUTO_TP_BUFFER
+        : price.ask <= tpPrice + AUTO_TP_BUFFER;
+      const bufferedClose = withinWindow && withinBuffer;
+      if (!atLevel && !bufferedClose) continue;
+
+      try {
+        const autoLive = live.filter((p) => positionBelongsToZone(p, zoneId) || trackedIds.has(p.id));
+        if (autoLive.length === 0) continue;
+
+        const totalVol = autoLive.reduce((s, p) => s + p.volume, 0);
+        const LOT_STEP = 0.01;
+        const baseVol = st.originalVolume > 0 ? st.originalVolume : totalVol;
+        const targetLots = Math.round((baseVol * tpPct / 100) / LOT_STEP) * LOT_STEP;
+        const closeLots = Math.min(Math.max(targetLots, LOT_STEP), totalVol);
+
+        const sortedLegs = [...autoLive].sort((a, b) => b.volume - a.volume);
+        let remaining = closeLots;
+        for (const leg of sortedLegs) {
+          if (remaining <= 0) break;
+          if (leg.volume <= remaining + 1e-9) {
+            await closeZonePosition(token, region, st.accountId, leg.id);
+            remaining = Math.round((remaining - leg.volume) / LOT_STEP) * LOT_STEP;
+          } else if (remaining >= LOT_STEP) {
+            await closeZonePosition(token, region, st.accountId, leg.id, remaining);
+            remaining = 0;
+          }
+        }
+
+        const hitKey = `tp${lvl}Hit` as const;
+        st[hitKey] = true;
+        st[`tp${lvl}PassedAt`] = undefined;
+        await db.update(cascadeZonesTable)
+          .set({ [hitKey]: true })
+          .where(eq(cascadeZonesTable.zoneId, zoneId))
+          .catch(() => {});
+        broadcastZoneUpdate(zoneId);
+
+        if (lvl === 3) {
+          notifyZoneEvent(zoneId, "tp3_runners", 3, 0, st.direction);
+        }
+        console.log(`[auto-tp] zone ${zoneId} TP${lvl} closed ${closeLots} lots`);
+      } catch (err) {
+        console.error(`[auto-tp] TP${lvl} close failed for ${zoneId}:`, err);
+      }
+    }
+
     const notified = st.tpNotified ?? {
       tp1: false, tp2: false, tp3: false,
       runner1: false, runner2: false, runner3: false,
     };
-
-    {
-      const tp3Price = st.tp3Price;
-      const enabled = st.tp3Enabled !== false;
-      const key = "tp3" as keyof typeof notified;
-      if (enabled && tp3Price != null && !notified[key]) {
-        const reached = st.direction === "buy"
-          ? price.bid >= tp3Price
-          : price.ask <= tp3Price;
-        if (reached) {
-          notified[key] = true;
-          st.tpNotified = notified;
-          notifyZoneEvent(st.zoneId, "tp3_runners", 3, 0, st.direction);
-        }
-      }
-    }
 
     if (st.runnerActive) {
       for (const n of [1, 2, 3] as const) {
