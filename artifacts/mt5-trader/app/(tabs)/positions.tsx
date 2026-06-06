@@ -248,7 +248,7 @@ export default function PositionsScreen() {
     closePosition, cancelOrder, accountId, region, sseConnected, price, ensureSessionForTrade,
     closeZonePartial, activateRunner,
   } = useTrading();
-  const { zones, refresh: refreshZones, riskFree, closeZone, closeAllWorst, cancelZoneOrders } = useZones(accountId, {
+  const { zones, refresh: refreshZones, safe, closeZone, closeAllWorst, cancelZoneOrders } = useZones(accountId, {
     includeClosed: true, pollIntervalMs: 10_000, sseConnected, region,
   });
   const { settings: cs } = useCascadeSettings();
@@ -316,6 +316,15 @@ export default function PositionsScreen() {
       return result;
     },
     [closeZone, refreshPendingOrders, refreshZones],
+  );
+
+  const handleClosePartial = useCallback(
+    async (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number }) => {
+      const result = await closeZonePartial(zoneId, opts);
+      if (result.ok) void refreshZones();
+      return result;
+    },
+    [closeZonePartial, refreshZones],
   );
 
   const handleRefresh = useCallback(async () => {
@@ -474,8 +483,8 @@ export default function PositionsScreen() {
                             zone={z}
                             liveVolume={liveVol}
                             floatingPnl={floatingPnl}
-                            onRiskFree={(zoneId, opts) =>
-                              withSessionReady(() => riskFree(zoneId, opts))
+                            onSafe={(zoneId) =>
+                              withSessionReady(() => safe(zoneId))
                             }
                             onCloseAllWorst={(zoneId) =>
                               withSessionReady(() => closeAllWorst(zoneId))
@@ -484,7 +493,7 @@ export default function PositionsScreen() {
                               withSessionReady(() => handleCloseZone(zoneId))
                             }
                             onClosePartial={(zoneId, opts) =>
-                              withSessionReady(() => closeZonePartial(zoneId, opts))
+                              withSessionReady(() => handleClosePartial(zoneId, opts))
                             }
                             onActivateRunner={(zoneId, targets) =>
                               withSessionReady(() => activateRunner(zoneId, targets))
@@ -492,7 +501,6 @@ export default function PositionsScreen() {
                             onCancelOrders={(zoneId) =>
                               withSessionReady(() => handleCancelZoneOrders(zoneId))
                             }
-                            riskFreePips={cs.riskFreePips}
                           />
                         );
                       })}
@@ -515,8 +523,8 @@ export default function PositionsScreen() {
                             zone={z}
                             liveVolume={liveVol}
                             floatingPnl={floatingPnl}
-                            onRiskFree={(zoneId, opts) =>
-                              withSessionReady(() => riskFree(zoneId, opts))
+                            onSafe={(zoneId) =>
+                              withSessionReady(() => safe(zoneId))
                             }
                             onCloseAllWorst={(zoneId) =>
                               withSessionReady(() => closeAllWorst(zoneId))
@@ -525,7 +533,7 @@ export default function PositionsScreen() {
                               withSessionReady(() => handleCloseZone(zoneId))
                             }
                             onClosePartial={(zoneId, opts) =>
-                              withSessionReady(() => closeZonePartial(zoneId, opts))
+                              withSessionReady(() => handleClosePartial(zoneId, opts))
                             }
                             onActivateRunner={(zoneId, targets) =>
                               withSessionReady(() => activateRunner(zoneId, targets))
@@ -533,7 +541,6 @@ export default function PositionsScreen() {
                             onCancelOrders={(zoneId) =>
                               withSessionReady(() => handleCancelZoneOrders(zoneId))
                             }
-                            riskFreePips={cs.riskFreePips}
                           />
                         );
                       })}

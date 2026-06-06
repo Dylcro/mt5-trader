@@ -3090,6 +3090,7 @@ async function markZonePositionClosed(
   accountId: string,
   positionId: string,
   exitDeal?: unknown,
+  options: { intentionalFullClose?: boolean } = {},
 ): Promise<void> {
   try {
     // Join through cascade_zones so we only act on rows belonging to *this*
@@ -3141,35 +3142,35 @@ async function markZonePositionClosed(
       .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
     );
     if (openInZone.length === 0) {
+      const brokerStillOpen = await zoneHasLiveTrackedPositionsOnBroker(token, region, accountId, zoneId);
+      if (brokerStillOpen) {
+        console.log(`[markClosed] zone ${zoneId} DB empty but broker still has open legs — zone stays active`);
+        broadcastZoneUpdate(zoneId);
+        broadcastToAccount(accountId, "deal", { type: "position_changed" });
+        return;
+      }
+      if (!options.intentionalFullClose) {
+        console.log(`[markClosed] zone ${zoneId} last tracked leg closed — zone stays active until Close Zone`);
+        broadcastZoneUpdate(zoneId);
+        broadcastToAccount(accountId, "deal", { type: "position_changed" });
+        return;
+      }
       const zoneMetaRows = await withDbRetry(`markClosed.zoneMeta zone=${zoneId}`, () => db
-        .select({ status: cascadeZonesTable.status, tp2Hit: cascadeZonesTable.tp2Hit })
+        .select({ status: cascadeZonesTable.status })
         .from(cascadeZonesTable)
         .where(eq(cascadeZonesTable.zoneId, zoneId))
         .limit(1)
       ).catch(() => []);
-      const zoneMeta = zoneMetaRows[0];
-      const zoneStatus = st?.status ?? zoneMeta?.status ?? "CLOSED";
-      const tp2Hit = st?.tp2Hit ?? Boolean(zoneMeta?.tp2Hit);
-      const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, accountId, zoneId);
-      const brokerStillOpen = await zoneHasLiveTrackedPositionsOnBroker(token, region, accountId, zoneId);
-      if (brokerStillOpen) {
-        console.log(`[markClosed] zone ${zoneId} DB empty but broker still has open legs — skip auto-close`);
-        return;
-      }
-      if (!shouldAutoCloseZoneAfterPositionExit(
-        { status: zoneStatus, tp2Hit },
-        false,
-        pendingLeft,
-      )) {
-        console.log(`[markClosed] zone ${zoneId} pre-TP2 with ${pendingLeft ? "live" : "no"} pending limits — skip auto-close`);
-        return;
-      }
+      const zoneStatus = st?.status ?? zoneMetaRows[0]?.status ?? "CLOSED";
       const closedAt = Date.now();
       await withDbRetry(`markClosed.zoneClose zone=${zoneId}`, () => db.update(cascadeZonesTable)
         .set({ status: "CLOSED", closedAt })
         .where(eq(cascadeZonesTable.zoneId, zoneId))
       );
-      if (st) st.status = "CLOSED";
+      if (st) {
+        st.status = "CLOSED";
+        zoneStates.delete(zoneId);
+      }
       const exitPx = exitPriceFromDeal(exitDeal);
       const dir = (st?.direction ?? "buy") as "buy" | "sell";
       await finalizeZoneClose(accountId, zoneId, {
@@ -3180,12 +3181,6 @@ async function markZonePositionClosed(
       });
       void settleZoneClosedPnl(accountId, zoneId);
       logEvent("zone.close", { accountId, zoneId, trigger: "position.closed" });
-      // Cancel any outstanding cascade limit orders — when the user manually
-      // closes all positions in MT5 the limits are NOT auto-cancelled by the
-      // broker, so we must cancel them explicitly now that the zone is done.
-      // Broadcast position_changed + zone_update AFTER cancellation so the
-      // client refreshes only once limits are gone from MT5 (prevents the
-      // brief window where standalone pending orders flash on screen).
       try {
         const tkn = getToken();
         const rgn = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
@@ -3196,7 +3191,6 @@ async function markZonePositionClosed(
             broadcastZoneUpdate(zoneId);
           });
       } catch {
-        console.warn(`[zone ${zoneId}] could not cancel limits after external close — token unavailable`);
         broadcastToAccount(accountId, "deal", { type: "position_changed" });
         broadcastZoneUpdate(zoneId);
       }
@@ -3273,6 +3267,12 @@ async function handleClosePartial(
   if (st.status === "CLOSED" || st.status === "ARMED") {
     return { ok: false, message: "Zone not active" };
   }
+  if (body.tpLevel != null && body.tpLevel >= 1 && body.tpLevel <= 3) {
+    const hitKey = `tp${body.tpLevel}Hit` as "tp1Hit" | "tp2Hit" | "tp3Hit";
+    if (st[hitKey]) {
+      return { ok: false, message: `TP${body.tpLevel} already banked` };
+    }
+  }
   const legs = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
   if (legs.length === 0) return { ok: false, message: "No open positions" };
 
@@ -3316,53 +3316,6 @@ async function handleClosePartial(
         .set({ [hitKey]: true })
         .where(eq(cascadeZonesTable.zoneId, zoneId))
         .catch(() => {});
-      broadcastZoneUpdate(zoneId);
-    }
-  }
-
-  const tick = tickStore.get(accountId)?.at(-1);
-  if (st && tick) {
-    const exitPrice = st.direction === "buy" ? tick.bid : tick.ask;
-    const tpUpdates: Partial<Record<"tp1Hit" | "tp2Hit" | "tp3Hit" | "tp4Hit", boolean>> = {};
-    const runnerUpdates: Partial<Record<"runner1Hit" | "runner2Hit" | "runner3Hit", boolean>> = {};
-
-    for (const lvl of [1, 2, 3] as const) {
-      const tpPrice = st[`tp${lvl}Price`];
-      const enabled = st[`tp${lvl}Enabled`] !== false;
-      const hitKey = `tp${lvl}Hit` as const;
-      if (!enabled || tpPrice == null || st[hitKey]) continue;
-      const qualifies = st.direction === "buy"
-        ? exitPrice >= tpPrice - TP_BUFFER
-        : exitPrice <= tpPrice + TP_BUFFER;
-      if (qualifies) { st[hitKey] = true; tpUpdates[hitKey] = true; }
-    }
-
-    if (!st.tp4Hit) {
-      const tp3Price = st.tp3Price;
-      if (tp3Price) {
-        const aboveTp3 = st.direction === "buy"
-          ? exitPrice >= tp3Price - TP_BUFFER
-          : exitPrice <= tp3Price + TP_BUFFER;
-        if (aboveTp3) { st.tp4Hit = true; tpUpdates.tp4Hit = true; }
-      }
-    }
-
-    if (st.runnerActive) {
-      for (const n of [1, 2, 3] as const) {
-        const rPrice = st[`runner${n}Price`] as number | null | undefined;
-        const hitKey = `runner${n}Hit` as const;
-        if (!rPrice || st[hitKey]) continue;
-        const qualifies = st.direction === "buy"
-          ? exitPrice >= rPrice - TP_BUFFER
-          : exitPrice <= rPrice + TP_BUFFER;
-        if (qualifies) { st[hitKey] = true; runnerUpdates[hitKey] = true; }
-      }
-    }
-
-    const allUpdates = { ...tpUpdates, ...runnerUpdates };
-    if (Object.keys(allUpdates).length > 0) {
-      await db.update(cascadeZonesTable).set(allUpdates)
-        .where(eq(cascadeZonesTable.zoneId, zoneId)).catch(() => {});
       broadcastZoneUpdate(zoneId);
     }
   }
@@ -3610,6 +3563,29 @@ function latestPrice(accountId: string): { bid: number; ask: number } | null {
   return { bid: t.bid, ask: t.ask };
 }
 
+function isQuotesLive(accountId: string): boolean {
+  return syncReady.has(accountId);
+}
+
+function checkPriceAvailableForZoneAction(accountId: string): { ok: true } | { ok: false; message: string } {
+  const cachedTick = tickStore.get(accountId)?.at(-1);
+  const tickIsFresh = cachedTick != null && (Date.now() - cachedTick.time) < 30_000;
+  const priceAvailable = isQuotesLive(accountId) || tickIsFresh;
+  if (!priceAvailable) {
+    return { ok: false, message: "Price not ready — wait a moment and try again" };
+  }
+  return { ok: true };
+}
+
+function rejectIfPriceNotReady(res: Response, accountId: string): boolean {
+  const check = checkPriceAvailableForZoneAction(accountId);
+  if (!check.ok) {
+    res.status(400).json({ ok: false, error: check.message, message: check.message });
+    return true;
+  }
+  return false;
+}
+
 // Sort positions for a zone: worst → best.
 // BUY worst = highest entry; SELL worst = lowest entry.
 function sortZonePositions(positions: LivePosition[], direction: "buy" | "sell"): LivePosition[] {
@@ -3680,15 +3656,15 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
   // and arms a protective SL, but the TP ladder must keep running on the
   // surviving best entry. ARMED = pending limits only (no TP engine yet).
   if (!st) return;
+  if (st.status === "CLOSED") {
+    zoneStates.delete(zoneId);
+    return;
+  }
   if (st.status === "ARMED") return;
   if (st.busy) return;
   st.busy = true;
   try {
     const region = activeRegions.get(st.accountId) ?? knownAccounts.get(st.accountId)?.region ?? DEFAULT_REGION;
-    if (st.status === "CLOSED") {
-      const reopened = await reopenClosedZoneIfBrokerLegsRemain(token, region, st.accountId, zoneId, st);
-      if (!reopened) return;
-    }
     // Fetch this zone's tracked positions from DB (OPEN status only).
     // Resilient tracked-positions lookup: prefer DB (source of truth) but
     // fall back to the in-memory mirror on transient query failures so a DB
@@ -3840,12 +3816,21 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, st.accountId, zoneId);
         const brokerStillOpen = await zoneHasLiveTrackedPositionsOnBroker(token, region, st.accountId, zoneId);
         if (brokerStillOpen) {
-          console.log(`[zone ${zoneId}] reconcile: broker still has open legs — skip zone close`);
+          console.log(`[zone ${zoneId}] reconcile: broker still has open legs — zone stays active`);
           return;
         }
-        if (!shouldAutoCloseZoneAfterPositionExit(st, false, pendingLeft)) {
-          console.log(`[zone ${zoneId}] reconcile: pre-TP2 pending limits remain — skip zone close`);
+        const closedLegRows = await withDbRetry(`evalZone.closedHistory zone=${zoneId}`,
+          () => db.select().from(zonePositionsTable)
+            .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "CLOSED")))
+        ).catch(() => null);
+        const hasHistory = (closedLegRows?.length ?? 0) > 0;
+        const hasNoPending = !pendingLeft;
+        if (!hasNoPending) {
+          console.log(`[zone ${zoneId}] reconcile: pending limits remain — zone stays active`);
           return;
+        }
+        if (!hasHistory) {
+          console.log(`[zone ${zoneId}] reconcile: no fill history — closing unfilled/cancelled zone`);
         }
         const closedAt = Date.now();
         await withDbRetry(`evalZone.reconcileZoneClose zone=${zoneId}`,
@@ -3855,6 +3840,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         ).catch(() => {/* logged inside withDbRetry */});
         const wasRiskFree = st.status === "RISK_FREE";
         st.status = "CLOSED";
+        zoneStates.delete(zoneId);
         await finalizeZoneClose(st.accountId, zoneId, await buildCloseFinalizeOptsForZone(
           st.accountId, zoneId, { wasRiskFree, direction: st.direction },
         ));
@@ -4735,6 +4721,7 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
 router.post("/mt5/account/:accountId/zones/:zoneId/close-partial", checkOwner, async (req: Request, res: Response) => {
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
+    if (rejectIfPriceNotReady(res, accountId)) return;
     await ensureCascadeZoneRunnerColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
@@ -4758,6 +4745,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-partial", checkOwner, a
 router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner, async (req: Request, res: Response) => {
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
+    if (rejectIfPriceNotReady(res, accountId)) return;
     await ensureCascadeZoneRunnerColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
@@ -4786,9 +4774,12 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
       res.status(400).json({ ok: false, message: "At least one runner target required" });
       return;
     }
-    const tp3Price = st.tp3Price;
-    if (tp3Price == null) {
-      res.status(400).json({ ok: false, message: "TP3 price not set" });
+    const tick = tickStore.get(accountId)?.at(-1);
+    const livePx = tick
+      ? (st.direction === "buy" ? tick.ask : tick.bid)
+      : (await fetchSymbolPrice(token, region, accountId, "XAUUSD"))?.[st.direction === "buy" ? "ask" : "bid"] ?? null;
+    if (livePx == null) {
+      res.status(400).json({ ok: false, message: "Price not ready — wait a moment and try again" });
       return;
     }
     for (const t of targets) {
@@ -4796,9 +4787,12 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
         res.status(400).json({ ok: false, message: "Each runner lot must be at least 0.01" });
         return;
       }
-      const validSide = st.direction === "buy" ? t.price > tp3Price : t.price < tp3Price;
-      if (!validSide) {
-        res.status(400).json({ ok: false, message: "Runner prices must be beyond TP3" });
+      if (st.direction === "buy" && t.price <= livePx) {
+        res.status(400).json({ ok: false, message: "Runner price must be above current price" });
+        return;
+      }
+      if (st.direction === "sell" && t.price >= livePx) {
+        res.status(400).json({ ok: false, message: "Runner price must be below current price" });
         return;
       }
     }
@@ -4843,11 +4837,45 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
   }
 });
 
+// POST /api/mt5/account/:accountId/zones/:zoneId/safe
+// Cancel unfilled limits; move each open leg's SL to entry ± 0.5 (5 pips on XAUUSD).
+router.post("/mt5/account/:accountId/zones/:zoneId/safe", checkOwner, async (req: Request, res: Response) => {
+  const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
+  try {
+    if (rejectIfPriceNotReady(res, accountId)) return;
+    const token = getToken();
+    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
+    const st = await loadZone(zoneId);
+    if (!st || st.accountId !== accountId || st.status === "CLOSED") {
+      res.status(404).json({ ok: false, error: "Zone not found", message: "Zone not found" });
+      return;
+    }
+    if (st.status === "ARMED") {
+      res.status(409).json({ ok: false, error: "Zone not active yet", message: "Zone not active yet — wait for the first order to fill" });
+      return;
+    }
+    await cancelZoneLimits(token, region, accountId, zoneId);
+    const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+    const SAFE_BUFFER = 0.5;
+    for (const leg of live) {
+      const newSl = st.direction === "buy"
+        ? leg.openPrice + SAFE_BUFFER
+        : leg.openPrice - SAFE_BUFFER;
+      await modifyZonePositionSl(token, region, accountId, leg.id, newSl);
+    }
+    broadcastZoneUpdate(zoneId);
+    res.json({ ok: true });
+  } catch (err) {
+    respondZoneActionError(res, "safe", err);
+  }
+});
+
 // POST /api/mt5/account/:accountId/zones/:zoneId/risk-free
 // Close all but the best entry; set best entry's SL 10 pips beyond entry (favourable).
 router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async (req: Request, res: Response) => {
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
+    if (rejectIfPriceNotReady(res, accountId)) return;
     await ensureCascadeZoneRfColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
@@ -4943,6 +4971,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
 router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, async (req: Request, res: Response) => {
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
+    if (rejectIfPriceNotReady(res, accountId)) return;
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     const st = await loadZone(zoneId);
@@ -4962,16 +4991,15 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
       return;
     }
     const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
-    if (live.length < 2) {
-      res.json({ ok: true, closedCount: 0, skipped: true, positionCount: live.length });
+    if (live.length <= 1) {
+      res.status(409).json({ ok: false, message: "Only one position left — nothing to secure" });
       return;
     }
-    const best = pickBestZonePositionForCloseWorst(live, st.direction);
-    const toClose = pickNextLegToTrimForSecureProfits(live, best, st.direction);
-    if (!toClose) {
-      res.json({ ok: true, closedCount: 0, skipped: true, positionCount: live.length });
-      return;
-    }
+    const sorted = [...live].sort((a, b) =>
+      st.direction === "buy" ? a.openPrice - b.openPrice : b.openPrice - a.openPrice,
+    );
+    const best = sorted[0]!;
+    const toClose = sorted[sorted.length - 1]!;
     const { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, [toClose]);
     if (!failed.includes(toClose.id)) st.trackedPositions.delete(toClose.id);
     if (failed.length > 0) {
@@ -4987,18 +5015,12 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
       return;
     }
     const remaining = live.length - 1;
-    // Same as a normal TP2 hit: wipe unfilled cascade limits once the zone has reached TP2.
-    // Pre-TP2, pending limits stay so the ladder can still fill.
-    let limitsCancelled = false;
-    if (shouldCancelCascadeLimitsForZone(st)) {
-      await cancelZoneLimits(token, region, accountId, zoneId);
-      limitsCancelled = true;
-    }
+    await new Promise((r) => setTimeout(r, 800));
     broadcastZoneUpdate(zoneId);
     broadcastToAccount(accountId, "deal", { type: "position_changed" });
     console.log(
       `[zone ${zoneId}] secure-profits: kept posId=${best.id} @${best.openPrice} `
-      + `closed posId=${toClose.id} @${toClose.openPrice} remaining=${remaining} limitsCancelled=${limitsCancelled}`,
+      + `closed posId=${toClose.id} @${toClose.openPrice} remaining=${remaining}`,
     );
     res.json({
       ok: true,
@@ -5006,7 +5028,6 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
       closedPositionId: toClose.id,
       closedCount: 1,
       positionCount: remaining,
-      limitsCancelled,
     });
   } catch (err) {
     respondZoneActionError(res, "secure-profits", err);
@@ -5024,6 +5045,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
 router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (req: Request, res: Response) => {
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
+    if (rejectIfPriceNotReady(res, accountId)) return;
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     // DB-first read via the single loadZone path (cache → DB → hydrate).
@@ -5085,6 +5107,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
       .where(eq(cascadeZonesTable.zoneId, zoneId));
     const wasRiskFree = st.status === "RISK_FREE";
     st.status = "CLOSED";
+    zoneStates.delete(zoneId);
     await finalizeZoneClose(accountId, zoneId, {
       wasRiskFree,
       exitPrice: exitPriceForZoneClose(accountId, st.direction),
@@ -5196,6 +5219,7 @@ router.post("/mt5/account/:accountId/zones/arm", checkOwner, async (req: Request
 router.post("/mt5/account/:accountId/zones/:zoneId/cancel-pending", checkOwner, async (req: Request, res: Response) => {
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
+    if (rejectIfPriceNotReady(res, accountId)) return;
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     const pendingBefore = orderIdsForZone(accountId, zoneId).length;

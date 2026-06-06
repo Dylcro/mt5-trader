@@ -115,13 +115,12 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
   const applyZonesFromApi = useCallback((data: unknown) => {
     const list = Array.isArray(data) ? (data as Zone[]) : [];
     const latched = list.map((z) => enrichZoneDisplayFields(withLatchedHits(z, hitLatch.current)));
-    if (!includeClosed) {
-      const ids = new Set(latched.map((z) => z.zoneId));
-      for (const id of hitLatch.current.keys()) {
-        if (!ids.has(id)) hitLatch.current.delete(id);
-      }
+    const filtered = includeClosed ? latched : latched.filter((z) => z.status !== "CLOSED");
+    const ids = new Set(filtered.map((z) => z.zoneId));
+    for (const id of hitLatch.current.keys()) {
+      if (!ids.has(id)) hitLatch.current.delete(id);
     }
-    return latched;
+    return filtered;
   }, [includeClosed]);
 
   const refresh = useCallback(async () => {
@@ -167,13 +166,10 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
         if (update.status === "CLOSED") {
           setZones((prev) => {
             const closedAt = update.closedAt ?? Date.now();
-            const has = prev.some((z) => z.zoneId === update.zoneId);
-            if (!has) return prev;
-            return prev.map((z) =>
-              z.zoneId === update.zoneId
-                ? enrichZoneDisplayFields(withLatchedHits({ ...z, ...update, status: "CLOSED", closedAt }, hitLatch.current))
-                : z,
-            );
+            const merged = { ...prev.find((z) => z.zoneId === update.zoneId), ...update, status: "CLOSED" as const, closedAt };
+            if (!merged.zoneId) return prev;
+            const without = prev.filter((z) => z.zoneId !== update.zoneId);
+            return [...without, enrichZoneDisplayFields(withLatchedHits(merged as Zone, hitLatch.current))];
           });
           hitLatch.current.delete(update.zoneId!);
           return;
@@ -190,21 +186,14 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     });
   }, [accountId, refresh]);
 
-  const riskFree = useCallback(async (
+  const safe = useCallback(async (
     zoneId: string,
-    opts: { riskFreePips?: number } = {},
   ): Promise<{ ok: boolean; message?: string }> => {
     if (!API_BASE || !accountId) return { ok: false, message: "No account" };
     try {
-      const body: Record<string, unknown> = {};
-      if (opts.riskFreePips !== undefined) body.riskFreePips = opts.riskFreePips;
       const res = await authFetchWithTimeout(
-        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/risk-free${zoneTradeQuery(region)}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        },
+        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones/${encodeURIComponent(zoneId)}/safe${zoneTradeQuery(region)}`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
       );
       const data = await res.json().catch(() => ({})) as { ok?: boolean; message?: string; error?: string };
       void refresh();
@@ -314,7 +303,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     }
   }, [accountId, region, refresh]);
 
-  return { zones, loading, error, refresh, riskFree, closeZone, closeAllWorst, cancelZoneOrders };
+  return { zones, loading, error, refresh, safe, closeZone, closeAllWorst, cancelZoneOrders };
 }
 
 export function sortZonesRunnerLast(zones: Zone[]): Zone[] {

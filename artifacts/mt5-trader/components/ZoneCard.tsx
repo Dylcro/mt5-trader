@@ -65,9 +65,16 @@ function PipelineTrack({
       : zone.tp3Price - 10
     : null;
 
-  const prices = [zone.anchorPrice, ...tps.map((t) => t.price), ...(tp4Viz != null ? [tp4Viz] : [])];
-  const vizMin = Math.min(...prices) - 5;
-  const vizMax = Math.max(...prices) + 5;
+  const allPrices = [
+    zone.anchorPrice,
+    ...tps.map((t) => t.price),
+    ...(tp4Viz != null ? [tp4Viz] : []),
+  ].filter((p): p is number => p != null);
+  const priceMin = Math.min(...allPrices);
+  const priceMax = Math.max(...allPrices);
+  const buf = (priceMax - priceMin) * 0.18;
+  const vizMin = priceMin - buf;
+  const vizMax = priceMax + buf;
   const toPos = (p: number) => {
     const raw = Math.min(Math.max(((p - vizMin) / (vizMax - vizMin)) * 100, 0), 100);
     return zone.direction === "sell" ? 100 - raw : raw;
@@ -208,12 +215,14 @@ function PipelineTrack({
 function RunnerSetupPanel({
   zone,
   remaining,
+  currentMarketPrice,
   onActivate,
   onSkipClose,
   busy,
 }: {
   zone: Zone;
   remaining: number;
+  currentMarketPrice: number;
   onActivate: (targets: {
     r1?: { price: number; lots: number };
     r2?: { price: number; lots: number };
@@ -242,7 +251,14 @@ function RunnerSetupPanel({
     (parseFloat(r1.lots) || (r1.price ? autoLot : 0)) +
     (parseFloat(r2.lots) || (r2.price ? autoLot : 0)) +
     (parseFloat(r3.lots) || (r3.price ? autoLot : 0));
-  const ok = total <= remaining + 0.001 && total >= LOT_STEP && filledPrices.length > 0;
+  const pricesValid = filledPrices.every((r) => {
+    const enteredPrice = parseFloat(r.price);
+    if (!Number.isFinite(enteredPrice)) return false;
+    return zone.direction === "buy"
+      ? enteredPrice > currentMarketPrice
+      : enteredPrice < currentMarketPrice;
+  });
+  const ok = total <= remaining + 0.001 && total >= LOT_STEP && filledPrices.length > 0 && pricesValid;
 
   const buildTargets = () => {
     const targets: {
@@ -319,10 +335,7 @@ interface ZoneCardProps {
   zone: Zone;
   liveVolume?: number;
   floatingPnl?: number;
-  onRiskFree?: (
-    zoneId: string,
-    opts?: { riskFreePips?: number },
-  ) => Promise<{ ok: boolean; message?: string }>;
+  onSafe?: (zoneId: string) => Promise<{ ok: boolean; message?: string }>;
   onCloseAllWorst?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
   onCloseZone?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
   onClosePartial?: (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number }) => Promise<{ ok: boolean; message?: string }>;
@@ -335,7 +348,6 @@ interface ZoneCardProps {
     },
   ) => Promise<{ ok: boolean; message?: string }>;
   onCancelOrders?: (zoneId: string) => Promise<{ ok: boolean; message?: string; cancelledCount?: number }>;
-  riskFreePips?: number;
   historical?: boolean;
 }
 
@@ -343,13 +355,12 @@ export default function ZoneCard({
   zone,
   liveVolume,
   floatingPnl,
-  onRiskFree,
+  onSafe,
   onCloseAllWorst,
   onCloseZone,
   onClosePartial,
   onActivateRunner,
   onCancelOrders,
-  riskFreePips,
   historical = false,
 }: ZoneCardProps) {
   const { settings: cs } = useCascadeSettings();
@@ -362,6 +373,13 @@ export default function ZoneCard({
   const [delBusy, setDelBusy] = useState(false);
   const [runnerBusy, setRunnerBusy] = useState(false);
   const [showRunnerPanel, setShowRunnerPanel] = useState(false);
+  const [optimisticTpHits, setOptimisticTpHits] = useState<Partial<Record<1 | 2 | 3, boolean>>>({});
+
+  useEffect(() => {
+    setOptimisticTpHits({});
+  }, [zone.zoneId, zone.tp1Hit, zone.tp2Hit, zone.tp3Hit]);
+
+  const tpHit = (level: 1 | 2 | 3) => Boolean(zone[`tp${level}Hit`] || optimisticTpHits[level]);
 
   useEffect(() => {
     if (zone.tp3Hit && !zone.runnerActive) {
@@ -377,7 +395,7 @@ export default function ZoneCard({
   const tp2Lot = computeTpLot(origVol, zone.tp2Pct ?? cs.tp2Pct);
   const tp3Lot = computeTpLot(origVol, zone.tp3Pct ?? cs.tp3Pct);
 
-  const nextTpIdx = !zone.tp1Hit ? 1 : !zone.tp2Hit ? 2 : !zone.tp3Hit ? 3 : 0;
+  const nextTpIdx = !tpHit(1) ? 1 : !tpHit(2) ? 2 : !tpHit(3) ? 3 : 0;
 
   const showTp3Notif =
     !historical &&
@@ -409,12 +427,13 @@ export default function ZoneCard({
   const nextRunnerN = runners.find((r) => !r.hit)?.n;
 
   const runClosePartial = async (level: 1 | 2 | 3, pct: number) => {
-    if (!onClosePartial || tpBusy != null) return;
+    if (!onClosePartial || tpBusy != null || tpHit(level)) return;
     setTpBusy(level);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     const result = await onClosePartial(zone.zoneId, { pct, tpLevel: level });
     setTpBusy(null);
     if (result.ok) {
+      setOptimisticTpHits((prev) => ({ ...prev, [level]: true }));
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     } else {
       Alert.alert("Close failed", result.message ?? "Try again");
@@ -432,15 +451,15 @@ export default function ZoneCard({
 
   const actionBusy = busy || worstBusy || closeBusy || delBusy || runnerBusy || tpBusy != null;
 
-  const canRiskFree =
-    !historical && (zone.status === "OPEN" || zone.status === "RISK_FREE") && zone.positionCount >= 1 && !!onRiskFree;
+  const canSafe =
+    !historical && (zone.status === "OPEN" || zone.status === "RISK_FREE") && zone.positionCount >= 1 && !!onSafe;
   const showCloseAllWorst = !historical && zone.status !== "CLOSED" && zone.status !== "ARMED" && !!onCloseAllWorst;
   const canCloseAllWorst = showCloseAllWorst && zone.positionCount >= 2;
   const canCloseZone = !historical && zone.status !== "CLOSED" && zone.positionCount >= 1 && !!onCloseZone;
   const canCancelOrders = !historical && zone.status !== "CLOSED" && !!onCancelOrders;
   const runnerPanelOpen =
     !historical && showRunnerPanel && zone.tp3Hit && !runnerActive && zone.status !== "CLOSED";
-  const showActionRow = !runnerPanelOpen && (canRiskFree || showCloseAllWorst || canCancelOrders);
+  const showActionRow = !runnerPanelOpen && (canSafe || showCloseAllWorst || canCancelOrders);
 
   if (historical) {
     return (
@@ -543,29 +562,29 @@ export default function ZoneCard({
       {!runnerActive && !runnerPanelOpen && (
         <View style={styles.tpBtnRow}>
           {([1, 2, 3] as const).map((level) => {
-            const hit = Boolean(zone[`tp${level}Hit`]);
-            const isNext = nextTpIdx === level;
+            const hit = tpHit(level);
+            const isNext = !hit && nextTpIdx === level;
             const lot = level === 1 ? tp1Lot : level === 2 ? tp2Lot : tp3Lot;
             const pct = level === 1 ? (zone.tp1Pct ?? cs.tp1Pct) : level === 2 ? (zone.tp2Pct ?? cs.tp2Pct) : (zone.tp3Pct ?? cs.tp3Pct);
             const disabled = hit || lot == null || !onClosePartial;
             return (
               <Pressable
                 key={level}
-                style={[styles.tpBtn, hit && styles.tpBtnHit, isNext && styles.tpBtnNext, disabled && hit && { opacity: 0.75 }]}
+                style={[styles.tpBtn, hit && styles.tpBtnDone, isNext && styles.tpBtnNext, disabled && hit && { opacity: 0.85 }]}
                 disabled={disabled || tpBusy != null}
                 onPress={() => void runClosePartial(level, pct)}
               >
-                <Text style={[styles.tpBtnSub, (hit || isNext) && { color: C.specGold }]}>
-                  {hit ? "✓ HIT" : `TP${level}`}
+                <Text style={[styles.tpBtnSub, hit && { color: C.specMuted }, isNext && { color: C.specGold }]}>
+                  {hit ? "✓ Done" : `TP${level}`}
                 </Text>
-                <Text style={[styles.tpBtnMain, hit && { color: C.specGold }]}>
+                <Text style={[styles.tpBtnMain, hit && { color: C.specMuted }]}>
                   {lot != null ? lot.toFixed(2) : "—"}
                 </Text>
                 {tpBusy === level && <ActivityIndicator size="small" color={C.specGold} style={{ marginTop: 4 }} />}
               </Pressable>
             );
           })}
-          {zone.tp3Hit && (
+          {tpHit(3) && (
             <Pressable
               style={[styles.tpBtn, styles.tpBtnManual, { opacity: 0.85 }]}
               onPress={() => setShowRunnerPanel(true)}
@@ -582,6 +601,7 @@ export default function ZoneCard({
         <RunnerSetupPanel
           zone={zone}
           remaining={vol}
+          currentMarketPrice={cmp}
           busy={runnerBusy}
           onSkipClose={() => setShowRunnerPanel(false)}
           onActivate={async (targets) => {
@@ -634,21 +654,20 @@ export default function ZoneCard({
 
       {showActionRow && (
         <View style={styles.actionRow}>
-          {canRiskFree && (
+          {canSafe && (
             <Pressable
               style={styles.rfBtn}
               onPress={async () => {
-                if (!onRiskFree || busy) return;
+                if (!onSafe || busy) return;
                 setBusy(true);
-                const opts = riskFreePips !== undefined ? { riskFreePips } : {};
-                const result = await onRiskFree(zone.zoneId, opts);
+                const result = await onSafe(zone.zoneId);
                 setBusy(false);
-                if (!result.ok) Alert.alert("Risk free failed", result.message ?? "Try again");
+                if (!result.ok) Alert.alert("Safe failed", result.message ?? "Try again");
               }}
               disabled={actionBusy}
             >
               <Feather name="shield" size={12} color={C.specGold} />
-              <Text style={styles.rfBtnText}>Risk Free</Text>
+              <Text style={styles.rfBtnText}>Safe</Text>
             </Pressable>
           )}
           {showCloseAllWorst && (
@@ -827,6 +846,7 @@ const styles = StyleSheet.create({
     backgroundColor: C.cardAlt,
   },
   tpBtnHit: { borderColor: C.specGoldBdr, backgroundColor: C.specGoldBg },
+  tpBtnDone: { borderColor: "#D1D5DB", backgroundColor: "#F3F4F6" },
   tpBtnNext: { borderColor: C.specGoldBdr, backgroundColor: "rgba(201,137,46,0.05)" },
   tpBtnManual: { borderStyle: "dashed" },
   tpBtnRunner: { borderStyle: "dashed" },
