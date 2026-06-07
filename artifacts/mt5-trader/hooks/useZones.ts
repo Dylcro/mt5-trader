@@ -116,14 +116,14 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
   const hitLatch = useRef<Map<string, { tp1: boolean; tp2: boolean; tp3: boolean; tp4: boolean }>>(new Map());
 
   const mergeZoneList = useCallback((prev: Zone[], incoming: Zone[]): Zone[] => {
-    const byId = new Map(prev.map((z) => [z.zoneId, z]));
-    for (const z of incoming) {
-      const existing = byId.get(z.zoneId);
-      byId.set(z.zoneId, existing
-        ? enrichZoneDisplayFields(withLatchedHits({ ...existing, ...z }, hitLatch.current))
-        : enrichZoneDisplayFields(withLatchedHits(z, hitLatch.current)));
-    }
-    const merged = Array.from(byId.values());
+    const prevById = new Map(prev.map((z) => [z.zoneId, z]));
+    const merged = incoming.map((z) => {
+      const existing = prevById.get(z.zoneId);
+      return enrichZoneDisplayFields(withLatchedHits(
+        existing ? { ...existing, ...z } : z,
+        hitLatch.current,
+      ));
+    });
     const filtered = includeClosed ? merged : merged.filter((z) => z.status !== "CLOSED");
     const ids = new Set(filtered.map((z) => z.zoneId));
     for (const id of hitLatch.current.keys()) {
@@ -167,6 +167,30 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     const id = setInterval(() => void refresh(), effectivePollMs);
     return () => clearInterval(id);
   }, [accountId, effectivePollMs, refresh]);
+
+  // Prune zones the server no longer reports (e.g. closed externally in MT5).
+  useEffect(() => {
+    if (!API_BASE || !accountId) return;
+    const prune = async () => {
+      try {
+        const qs = includeClosed ? "?includeClosed=true" : "";
+        const res = await authFetch(`${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones${qs}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const list = Array.isArray(data) ? (data as Zone[]) : [];
+        const activeIds = new Set(list.map((z) => z.zoneId));
+        setZones((prev) => {
+          const pruned = prev.filter((z) => activeIds.has(z.zoneId));
+          for (const id of hitLatch.current.keys()) {
+            if (!activeIds.has(id)) hitLatch.current.delete(id);
+          }
+          return pruned.length === prev.length ? prev : pruned;
+        });
+      } catch { /* non-fatal */ }
+    };
+    const id = setInterval(() => void prune(), 20_000);
+    return () => clearInterval(id);
+  }, [accountId, includeClosed]);
 
   // Subscribe to SSE-driven zone events via the module-level accountEventBus.
   // zone_update → patch the matching zone in-place for instant TP/status changes.
