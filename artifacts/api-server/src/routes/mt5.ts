@@ -967,7 +967,19 @@ function makeDealListener(accountId: string) {
       // re-checks live positions via REST before marking the row CLOSED.
       if (deal?.entryType === "DEAL_ENTRY_OUT") {
         const posId = String(deal.positionId ?? "");
-        if (posId) void markZonePositionClosed(accountId, posId, deal);
+        if (posId) {
+          void markZonePositionClosed(accountId, posId, deal).then(async () => {
+            try {
+              const tkn = getToken();
+              const rgn = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
+              for (const [zoneId, st] of zoneStates.entries()) {
+                if (st.accountId === accountId && st.status !== "CLOSED") {
+                  await reconcileZoneFromBroker(accountId, zoneId, tkn, rgn, "deal_exit");
+                }
+              }
+            } catch { /* token unavailable */ }
+          });
+        }
         broadcastToAccount(accountId, "deal", { type: "position_changed" });
         // MetaAPI REST has eventual consistency — the first broadcast above races
         // the cache. A second broadcast ~1500ms later ensures the client re-fetches
@@ -1076,6 +1088,24 @@ function makeDealListener(accountId: string) {
       const oid = String(order?.id ?? order?._id ?? "");
       markOrderCompleted(accountId, oid);
       broadcastToAccount(accountId, "pending_order", {});
+    },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    async onPositionRemoved(_instanceIndex: string, position: any): Promise<void> {
+      lastEventAt.set(accountId, Date.now());
+      const posId = String(position?.id ?? position?.positionId ?? "");
+      if (!posId) return;
+      void markZonePositionClosed(accountId, posId, position).then(async () => {
+        try {
+          const tkn = getToken();
+          const rgn = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
+          for (const [zoneId, st] of zoneStates.entries()) {
+            if (st.accountId === accountId && st.status !== "CLOSED") {
+              await reconcileZoneFromBroker(accountId, zoneId, tkn, rgn, "position_removed");
+            }
+          }
+        } catch { /* token unavailable */ }
+      });
+      broadcastToAccount(accountId, "deal", { type: "position_changed" });
     },
   };
 
@@ -3224,8 +3254,7 @@ async function markZonePositionClosed(
         return;
       }
       if (!options.intentionalFullClose) {
-        console.log(`[markClosed] zone ${zoneId} last tracked leg closed — zone stays active until Close Zone`);
-        broadcastZoneUpdate(zoneId);
+        await reconcileZoneFromBroker(accountId, zoneId, token, region, "position_closed_external");
         broadcastToAccount(accountId, "deal", { type: "position_changed" });
         return;
       }
@@ -3653,7 +3682,56 @@ async function zoneHasLivePendingCascadeLimits(
 async function zoneHasLiveTrackedPositionsOnBroker(
   token: string, region: string, accountId: string, zoneId: string,
 ): Promise<boolean> {
-  return brokerHasOpenLegsForZone(token, region, accountId, zoneId);
+  const [live, orders] = await Promise.all([
+    fetchOpenPositions(token, region, accountId),
+    fetchLivePendingOrders(token, region, accountId),
+  ]);
+  if (live.some((p) => positionBelongsToZone(p, zoneId))) return true;
+  const expectedMagic = zoneMagicNumber(zoneId);
+  return orders.some((o) => {
+    if (getZoneLimitOrder(accountId, o.id) === zoneId) return true;
+    if (o.magic != null && o.magic === expectedMagic) return true;
+    return commentBelongsToZone(o.comment, zoneId);
+  });
+}
+
+/** Close zone when MT5 has no open legs or pending limits for it (manual MT5 close, etc.). */
+async function reconcileZoneFromBroker(
+  accountId: string,
+  zoneId: string,
+  token: string,
+  region: string,
+  trigger = "broker_reconcile",
+): Promise<void> {
+  const st = zoneStates.get(zoneId) ?? await loadZone(zoneId);
+  if (!st || st.accountId !== accountId || st.status === "CLOSED") return;
+  if (!syncReady.has(accountId)) return;
+
+  const stillOnBroker = await zoneHasLiveTrackedPositionsOnBroker(token, region, accountId, zoneId);
+  if (stillOnBroker) return;
+
+  console.log(`[reconcile] ${zoneId} — no positions or orders in MT5, marking CLOSED`);
+  const closedAt = Date.now();
+  await withDbRetry(`reconcile.close zone=${zoneId}`,
+    () => db.update(cascadeZonesTable)
+      .set({ status: "CLOSED", closedAt })
+      .where(eq(cascadeZonesTable.zoneId, zoneId)),
+  ).catch(() => {/* logged inside withDbRetry */});
+  const wasRiskFree = st.status === "RISK_FREE";
+  st.status = "CLOSED";
+  zoneStates.delete(zoneId);
+  await finalizeZoneClose(accountId, zoneId, await buildCloseFinalizeOptsForZone(
+    accountId, zoneId, { wasRiskFree, direction: st.direction },
+  ));
+  void settleZoneClosedPnl(accountId, zoneId);
+  logEvent("zone.close", { accountId, zoneId, trigger });
+  try {
+    cancelZoneLimits(token, region, accountId, zoneId)
+      .catch((e: Error) => console.warn(`[zone ${zoneId}] reconcile cancelZoneLimits:`, e.message))
+      .finally(() => broadcastZoneUpdate(zoneId));
+  } catch {
+    broadcastZoneUpdate(zoneId);
+  }
 }
 
 // Live bid/ask straight from MetaAPI — independent of tickStore (which only
@@ -3869,15 +3947,6 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
             console.log(`[zone ${zoneId}] empty tracked rows but defer zone close (pre-TP2 policy)`);
             return;
           }
-          const closedLegRows = await withDbRetry(`evalZone.emptyHistory zone=${zoneId}`,
-            () => db.select().from(zonePositionsTable)
-              .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "CLOSED")))
-          ).catch(() => null);
-          const hasHistory = (closedLegRows?.length ?? 0) > 0;
-          if (!hasHistory) {
-            console.log(`[zone ${zoneId}] empty tracked rows, no fill history — zone stays active`);
-            return;
-          }
           const closedAt = Date.now();
           await withDbRetry(`evalZone.emptyClose zone=${zoneId}`,
             () => db.update(cascadeZonesTable)
@@ -3950,18 +4019,9 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
           console.log(`[zone ${zoneId}] reconcile: broker still has open legs — zone stays active`);
           return;
         }
-        const closedLegRows = await withDbRetry(`evalZone.closedHistory zone=${zoneId}`,
-          () => db.select().from(zonePositionsTable)
-            .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "CLOSED")))
-        ).catch(() => null);
-        const hasHistory = (closedLegRows?.length ?? 0) > 0;
         const hasNoPending = !pendingLeft;
         if (!hasNoPending) {
           console.log(`[zone ${zoneId}] reconcile: pending limits remain — zone stays active`);
-          return;
-        }
-        if (!hasHistory) {
-          console.log(`[zone ${zoneId}] reconcile: no fill history — zone stays active`);
           return;
         }
         const closedAt = Date.now();
@@ -4254,11 +4314,26 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
 }
 
 let zoneMonitorTimer: NodeJS.Timeout | null = null;
+let zoneReconcileTimer: NodeJS.Timeout | null = null;
 let zoneKeepaliveTimer: NodeJS.Timeout | null = null;
 let zoneMonitorTick = 0;
 export function startZoneTpMonitor(): void {
   if (zoneMonitorTimer) return;
   void ensureMonitorsForActiveZones();
+  if (!zoneReconcileTimer) {
+    zoneReconcileTimer = setInterval(() => {
+      const token = (() => { try { return getToken(); } catch { return null; } })();
+      if (!token) return;
+      for (const [zoneId, st] of zoneStates.entries()) {
+        if (st.status === "CLOSED") continue;
+        const region = activeRegions.get(st.accountId) ?? knownAccounts.get(st.accountId)?.region ?? DEFAULT_REGION;
+        void reconcileZoneFromBroker(st.accountId, zoneId, token, region, "periodic_reconcile")
+          .catch((err) => console.error(`[reconcile] ${zoneId}:`, (err as Error).message));
+      }
+    }, 15_000);
+    zoneReconcileTimer.unref?.();
+    console.log("[zone-reconcile] started (15 s interval)");
+  }
   zoneMonitorTimer = setInterval(() => {
     const token = (() => { try { return getToken(); } catch { return null; } })();
     if (!token) return;

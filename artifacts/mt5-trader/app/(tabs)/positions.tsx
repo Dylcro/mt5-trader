@@ -31,6 +31,19 @@ import {
 
 const C = Colors.dark;
 
+function SectionHeader({ label, count, color }: { label: string; count: number; color: string }) {
+  return (
+    <View style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingVertical: 8 }}>
+      <Text style={{ fontSize: 11, fontFamily: "Inter_700Bold", color, letterSpacing: 1.2 }}>
+        {label}
+      </Text>
+      <View style={{ backgroundColor: `${color}22`, borderRadius: 100, paddingHorizontal: 8, paddingVertical: 2 }}>
+        <Text style={{ fontSize: 11, fontFamily: "Inter_700Bold", color }}>{count}</Text>
+      </View>
+    </View>
+  );
+}
+
 function formatPrice(n: number) {
   return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
@@ -612,7 +625,7 @@ export default function PositionsScreen() {
               <>
                 {normalZones.length > 0 && (
                   <>
-                    <Text style={styles.sectionLabel}>ACTIVE ZONES  ·  {normalZones.length}</Text>
+                    <SectionHeader label="ACTIVE" count={normalZones.length} color="#059669" />
                     <View style={{ gap: 10, marginBottom: runnerZones.length > 0 ? 12 : showStandalone || orphanPendingOrders.length > 0 ? 20 : 0 }}>
                       {normalZones.map((z) => renderZoneCard(z))}
                     </View>
@@ -620,9 +633,8 @@ export default function PositionsScreen() {
                 )}
                 {runnerZones.length > 0 && (
                   <>
-                    <Text style={[styles.sectionLabel, { marginTop: normalZones.length > 0 ? 4 : 0 }]}>
-                      RUNNER ZONES  ·  {runnerZones.length}
-                    </Text>
+                    {normalZones.length > 0 && <View style={styles.sectionDivider} />}
+                    <SectionHeader label="RUNNERS" count={runnerZones.length} color="#0E7490" />
                     <View style={{ gap: 10, marginBottom: showStandalone || orphanPendingOrders.length > 0 ? 20 : 0 }}>
                       {runnerZones.map((z) => renderZoneCard(z))}
                     </View>
@@ -985,6 +997,12 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_700Bold",
     color: C.textMuted,
     letterSpacing: 1.2,
+  },
+  sectionDivider: {
+    marginHorizontal: 16,
+    marginVertical: 8,
+    height: 1,
+    backgroundColor: "rgba(14,116,144,0.2)",
   },
   cancelAllBtn: {
     flexDirection: "row",
