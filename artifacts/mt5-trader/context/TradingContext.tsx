@@ -129,7 +129,7 @@ interface TradingContextValue {
   syncSession: (force?: boolean) => Promise<void>;
   /** Fast preflight before zone buttons — refreshes price when stale. */
   ensureSessionForTrade: () => Promise<{ ready: boolean; message?: string }>;
-  closeZonePartial: (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number; runnerN?: number }) => Promise<{ ok: boolean; message: string }>;
+  closeZonePartial: (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number; runnerN?: number; emergency?: boolean }) => Promise<{ ok: boolean; message: string }>;
   activateRunner: (
     zoneId: string,
     targets: {
@@ -1528,7 +1528,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   );
 
   const closeZonePartial = useCallback(
-    async (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number; runnerN?: number }): Promise<{ ok: boolean; message: string }> => {
+    async (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number; runnerN?: number; emergency?: boolean }): Promise<{ ok: boolean; message: string }> => {
       if (status !== "connected") return { ok: false, message: "Not connected" };
       try {
         const r = await authFetch(
