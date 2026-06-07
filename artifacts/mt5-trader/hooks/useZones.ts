@@ -115,16 +115,27 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
   const inFlight = useRef(false);
   const hitLatch = useRef<Map<string, { tp1: boolean; tp2: boolean; tp3: boolean; tp4: boolean }>>(new Map());
 
-  const applyZonesFromApi = useCallback((data: unknown) => {
-    const list = Array.isArray(data) ? (data as Zone[]) : [];
-    const latched = list.map((z) => enrichZoneDisplayFields(withLatchedHits(z, hitLatch.current)));
-    const filtered = includeClosed ? latched : latched.filter((z) => z.status !== "CLOSED");
+  const mergeZoneList = useCallback((prev: Zone[], incoming: Zone[]): Zone[] => {
+    const byId = new Map(prev.map((z) => [z.zoneId, z]));
+    for (const z of incoming) {
+      const existing = byId.get(z.zoneId);
+      byId.set(z.zoneId, existing
+        ? enrichZoneDisplayFields(withLatchedHits({ ...existing, ...z }, hitLatch.current))
+        : enrichZoneDisplayFields(withLatchedHits(z, hitLatch.current)));
+    }
+    const merged = Array.from(byId.values());
+    const filtered = includeClosed ? merged : merged.filter((z) => z.status !== "CLOSED");
     const ids = new Set(filtered.map((z) => z.zoneId));
     for (const id of hitLatch.current.keys()) {
       if (!ids.has(id)) hitLatch.current.delete(id);
     }
     return filtered;
   }, [includeClosed]);
+
+  const applyZonesFromApi = useCallback((data: unknown, prev: Zone[] = []) => {
+    const list = Array.isArray(data) ? (data as Zone[]) : [];
+    return mergeZoneList(prev, list);
+  }, [mergeZoneList]);
 
   const refresh = useCallback(async () => {
     if (!API_BASE || !accountId || inFlight.current) return;
@@ -137,7 +148,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
         return;
       }
       const data = await res.json();
-      setZones(applyZonesFromApi(data));
+      setZones((prev) => applyZonesFromApi(data, prev));
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -167,29 +178,42 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
         const update = data as Partial<Zone> & { zoneId?: string };
         if (!update.zoneId) return;
         if (update.status === "CLOSED") {
-          setZones((prev) => {
-            const closedAt = update.closedAt ?? Date.now();
-            const merged = { ...prev.find((z) => z.zoneId === update.zoneId), ...update, status: "CLOSED" as const, closedAt };
-            if (!merged.zoneId) return prev;
-            const without = prev.filter((z) => z.zoneId !== update.zoneId);
-            return [...without, enrichZoneDisplayFields(withLatchedHits(merged as Zone, hitLatch.current))];
-          });
           hitLatch.current.delete(update.zoneId!);
+          if (includeClosed) {
+            setZones((prev) => {
+              const existing = prev.find((z) => z.zoneId === update.zoneId);
+              const merged = {
+                ...existing,
+                ...update,
+                status: "CLOSED" as const,
+                closedAt: update.closedAt ?? existing?.closedAt ?? Date.now(),
+              } as Zone;
+              if (!merged.zoneId) return prev;
+              const without = prev.filter((z) => z.zoneId !== update.zoneId);
+              return [...without, enrichZoneDisplayFields(withLatchedHits(merged, hitLatch.current))];
+            });
+          } else {
+            setZones((prev) => prev.filter((z) => z.zoneId !== update.zoneId));
+          }
           return;
         }
-        setZones((prev) =>
-          prev.map((z) => {
-            if (z.zoneId !== update.zoneId) return z;
-            return enrichZoneDisplayFields(withLatchedHits({ ...z, ...update }, hitLatch.current));
-          }),
-        );
+        setZones((prev) => {
+          const existing = prev.find((z) => z.zoneId === update.zoneId);
+          if (existing) {
+            return prev.map((z) => {
+              if (z.zoneId !== update.zoneId) return z;
+              return enrichZoneDisplayFields(withLatchedHits({ ...z, ...update }, hitLatch.current));
+            });
+          }
+          return [...prev, enrichZoneDisplayFields(withLatchedHits(update as Zone, hitLatch.current))];
+        });
       } else if (type === "runner_alert") {
         // Handled by positions screen banner — no zone list patch needed here.
       } else if (type === "deal" || type === "pending_order") {
         void refresh();
       }
     });
-  }, [accountId, refresh]);
+  }, [accountId, refresh, includeClosed]);
 
   const riskFree = useCallback(async (
     zoneId: string,
@@ -296,15 +320,6 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
       };
       void refresh();
       if (res.ok && data.ok) {
-        if (data.zoneClosed) {
-          setZones((prev) =>
-            prev.map((z) =>
-              z.zoneId === zoneId
-                ? { ...z, status: "CLOSED" as const, closedAt: z.closedAt ?? Date.now() }
-                : z,
-            ),
-          );
-        }
         return { ok: true, cancelledCount: data.cancelledCount };
       }
       return { ok: false, message: data.message ?? data.error ?? `HTTP ${res.status}` };

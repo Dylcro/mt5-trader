@@ -675,9 +675,25 @@ function broadcastZoneUpdate(zoneId: string): void {
       tp1Hit: merged.tp1Hit, tp2Hit: merged.tp2Hit, tp3Hit: merged.tp3Hit, tp4Hit: merged.tp4Hit,
       tp4Price,
     });
+    const dir = (dbRow?.direction ?? st?.direction ?? "buy") as "buy" | "sell";
+    const anchor = Number(dbRow?.anchorPrice ?? st?.anchorPrice ?? 0);
+    const tp1Price = dbRow?.tp1Price != null ? Number(dbRow.tp1Price) : st?.tp1Price ?? null;
+    const tp2Price = dbRow?.tp2Price != null ? Number(dbRow.tp2Price) : st?.tp2Price ?? null;
+    const tp3Price = dbRow?.tp3Price != null ? Number(dbRow.tp3Price) : st?.tp3Price ?? null;
     broadcastToAccount(accountId, "zone_update", {
       zoneId,
+      direction: dir,
+      anchorPrice: anchor,
+      tp1Price, tp2Price, tp3Price, tp4Price,
       status: st?.status ?? String(dbRow!.status),
+      createdAt: Number(dbRow?.createdAt ?? 0),
+      closedAt: dbRow?.closedAt != null ? Number(dbRow.closedAt) : null,
+      originalVolume: Number(dbRow?.originalVolume ?? st?.originalVolume ?? 0),
+      tp1Pct: Number(dbRow?.tp1Pct ?? st?.tp1Pct ?? 25),
+      tp2Pct: Number(dbRow?.tp2Pct ?? st?.tp2Pct ?? 25),
+      tp3Pct: Number(dbRow?.tp3Pct ?? st?.tp3Pct ?? 25),
+      tp4Pct: Number(dbRow?.tp4Pct ?? st?.tp4Pct ?? 25),
+      cashoutDone: Boolean(dbRow?.cashoutDone ?? false),
       tp1Hit: merged.tp1Hit,
       tp2Hit: merged.tp2Hit,
       tp3Hit: merged.tp3Hit,
@@ -694,22 +710,16 @@ function broadcastZoneUpdate(zoneId: string): void {
       manualClose: (dbRow as { manualClose?: boolean } | undefined)?.manualClose ?? false,
       slHit: (dbRow as { slHit?: boolean } | undefined)?.slHit ?? false,
       riskFreeSlExit: (dbRow as { riskFreeSlExit?: boolean } | undefined)?.riskFreeSlExit ?? false,
-      runner1Price: (dbRow as { runner1Price?: number | null } | undefined)?.runner1Price != null
-        ? Number((dbRow as { runner1Price: number }).runner1Price) : st?.runner1Price ?? null,
-      runner1Lots: (dbRow as { runner1Lots?: number | null } | undefined)?.runner1Lots != null
-        ? Number((dbRow as { runner1Lots: number }).runner1Lots) : st?.runner1Lots ?? null,
-      runner2Price: (dbRow as { runner2Price?: number | null } | undefined)?.runner2Price != null
-        ? Number((dbRow as { runner2Price: number }).runner2Price) : st?.runner2Price ?? null,
-      runner2Lots: (dbRow as { runner2Lots?: number | null } | undefined)?.runner2Lots != null
-        ? Number((dbRow as { runner2Lots: number }).runner2Lots) : st?.runner2Lots ?? null,
-      runner3Price: (dbRow as { runner3Price?: number | null } | undefined)?.runner3Price != null
-        ? Number((dbRow as { runner3Price: number }).runner3Price) : st?.runner3Price ?? null,
-      runner3Lots: (dbRow as { runner3Lots?: number | null } | undefined)?.runner3Lots != null
-        ? Number((dbRow as { runner3Lots: number }).runner3Lots) : st?.runner3Lots ?? null,
-      runner1Hit: Boolean((dbRow as { runner1Hit?: boolean } | undefined)?.runner1Hit ?? st?.runner1Hit),
-      runner2Hit: Boolean((dbRow as { runner2Hit?: boolean } | undefined)?.runner2Hit ?? st?.runner2Hit),
-      runner3Hit: Boolean((dbRow as { runner3Hit?: boolean } | undefined)?.runner3Hit ?? st?.runner3Hit),
-      runnerActive: Boolean((dbRow as { runnerActive?: boolean } | undefined)?.runnerActive ?? st?.runnerActive),
+      runner1Price: dbRow?.runner1Price != null ? Number(dbRow.runner1Price) : st?.runner1Price ?? null,
+      runner1Lots: dbRow?.runner1Lots != null ? Number(dbRow.runner1Lots) : st?.runner1Lots ?? null,
+      runner2Price: dbRow?.runner2Price != null ? Number(dbRow.runner2Price) : st?.runner2Price ?? null,
+      runner2Lots: dbRow?.runner2Lots != null ? Number(dbRow.runner2Lots) : st?.runner2Lots ?? null,
+      runner3Price: dbRow?.runner3Price != null ? Number(dbRow.runner3Price) : st?.runner3Price ?? null,
+      runner3Lots: dbRow?.runner3Lots != null ? Number(dbRow.runner3Lots) : st?.runner3Lots ?? null,
+      runner1Hit: Boolean(dbRow?.runner1Hit ?? st?.runner1Hit),
+      runner2Hit: Boolean(dbRow?.runner2Hit ?? st?.runner2Hit),
+      runner3Hit: Boolean(dbRow?.runner3Hit ?? st?.runner3Hit),
+      runnerActive: Boolean(dbRow?.runnerActive ?? st?.runnerActive),
       runner1Notified: Boolean(st?.tpNotified?.runner1),
       runner2Notified: Boolean(st?.tpNotified?.runner2),
       runner3Notified: Boolean(st?.tpNotified?.runner3),
@@ -1338,6 +1348,69 @@ async function tradeViaConnection(conn: any, body: Record<string, unknown>): Pro
   return { numericCode: resp?.numericCode ?? 0, message: resp?.message, orderId: resp?.orderId, positionId: resp?.positionId };
 }
 
+function isPricePassedError(code: number, message?: string): boolean {
+  const msg = (message ?? "").toLowerCase();
+  return code === 10006 || code === 10014 || code === 10020 || code === 10021
+    || msg.includes("invalid") || msg.includes("price")
+    || msg.includes("off quotes") || msg.includes("trade disabled");
+}
+
+type TradeExecResult = {
+  code: number;
+  data: { numericCode?: number; message?: string; orderId?: string; positionId?: string };
+  httpStatus: number;
+};
+
+async function executeTradeRequest(
+  conn: unknown | undefined,
+  region: string,
+  accountId: string,
+  token: string,
+  body: Record<string, unknown>,
+): Promise<TradeExecResult> {
+  const runOnce = async (reqBody: Record<string, unknown>): Promise<TradeExecResult> => {
+    let code: number;
+    let data: TradeExecResult["data"];
+    let httpStatus = 200;
+    if (conn) {
+      try {
+        const sdkResp = await tradeViaConnection(conn, reqBody);
+        code = sdkResp.numericCode;
+        data = sdkResp;
+      } catch (sdkErr) {
+        const tradeRes = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
+          method: "POST", headers: authHeaders(token), body: JSON.stringify(reqBody),
+        });
+        httpStatus = tradeRes.ok ? 200 : tradeRes.status;
+        data = await tradeRes.json() as TradeExecResult["data"];
+        code = data.numericCode ?? 0;
+      }
+    } else {
+      const tradeRes = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
+        method: "POST", headers: authHeaders(token), body: JSON.stringify(reqBody),
+      });
+      httpStatus = tradeRes.ok ? 200 : tradeRes.status;
+      data = await tradeRes.json() as TradeExecResult["data"];
+      code = data.numericCode ?? 0;
+    }
+    return { code, data, httpStatus };
+  };
+
+  const actionType = String(body.actionType ?? "");
+  const isLimit = actionType.endsWith("_LIMIT");
+  let result = await runOnce(body);
+  if (!TRADE_SUCCESS_CODES.has(result.code) && isLimit && isPricePassedError(result.code, result.data.message)) {
+    const marketType = actionType === "ORDER_TYPE_BUY_LIMIT" ? "ORDER_TYPE_BUY"
+      : actionType === "ORDER_TYPE_SELL_LIMIT" ? "ORDER_TYPE_SELL" : null;
+    if (marketType) {
+      console.log(`[cascade] limit at ${String(body.openPrice)} passed through, placing market`);
+      const { openPrice: _omit, ...rest } = body;
+      result = await runOnce({ ...rest, actionType: marketType });
+    }
+  }
+  return result;
+}
+
 // Place a cascade limit order.
 // Picks ONE channel and commits to it — never fires both in parallel:
 //   - If a streaming SDK connection exists → streaming only (with 30 s safety bound).
@@ -1360,26 +1433,12 @@ async function placeCascadeLimitFast(
 ): Promise<string | undefined> {
   if (!conn) {
     console.warn(`[auto-cascade] no streaming connection for limit ${limitNum}/${total} — using REST (single-channel, no duplicate risk)`);
-    const resp = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
-      method: "POST",
-      headers: authHeaders(token),
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) {
-      const txt = await resp.text().catch(() => "");
-      throw new Error(`REST trade ${resp.status}: ${txt.slice(0, 200)}`);
-    }
-    const data = await resp.json() as { orderId?: string };
-    return data.orderId;
   }
-  // Streaming path — safety bound so a wedged SDK call cannot hang the cascade loop.
-  const result = await Promise.race([
-    tradeViaConnection(conn, body),
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`streaming trade hung >${STREAMING_CASCADE_TIMEOUT_MS}ms — limit ${limitNum}/${total} skipped`)), STREAMING_CASCADE_TIMEOUT_MS)
-    ),
-  ]);
-  return result.orderId;
+  const result = await executeTradeRequest(conn, region, accountId, token, body);
+  if (!TRADE_SUCCESS_CODES.has(result.code)) {
+    throw new Error(userFacingTradeMessage(result.code, result.data.message));
+  }
+  return result.data.orderId;
 }
 
 // ── Post-cascade orphan sweeper ─────────────────────────────────────────────
@@ -3235,9 +3294,11 @@ async function closeZonePosition(
   const body: Record<string, unknown> = volume !== undefined && volume > 0
     ? { actionType: "POSITION_PARTIAL", positionId, volume }
     : { actionType: "POSITION_CLOSE_ID", positionId };
-  const r = await tradeAction(token, region, accountId, body);
-  if (!r.ok) console.warn(`[zone] close posId=${positionId} vol=${volume ?? "full"} failed code=${r.code} msg="${r.message ?? ""}"`);
-  return r.ok;
+  return closeWithRetry(async () => {
+    const r = await tradeAction(token, region, accountId, body);
+    if (!r.ok) console.warn(`[zone] close posId=${positionId} vol=${volume ?? "full"} failed code=${r.code} msg="${r.message ?? ""}"`);
+    return r.ok;
+  });
 }
 
 async function resubscribeToTickStream(accountId: string): Promise<void> {
@@ -3459,10 +3520,54 @@ interface LivePosition {
 }
 
 const ZONE_ACTION_RETRY_MSG = "Action failed — please retry in a moment";
+const MARKET_BUSY_MSG = "Market busy — please try again in a moment";
+const CLOSE_COOLDOWN_MS = 1500;
+const zoneCloseCooldown = new Map<string, number>();
+
+function isRateLimitError(err: unknown): boolean {
+  const e = err as { status?: number; message?: string; code?: number };
+  const msg = String(e?.message ?? "").toLowerCase();
+  return e?.status === 429 || e?.code === 10024
+    || msg.includes("too many") || msg.includes("rate limit");
+}
+
+function userFacingTradeMessage(code: number, raw?: string): string {
+  if (code === 10024 || (raw ?? "").toLowerCase().includes("too many")) {
+    return MARKET_BUSY_MSG;
+  }
+  return TRADE_ERROR_MESSAGES[code] ?? raw ?? `Trade failed (code ${code})`;
+}
+
+async function closeWithRetry(fn: () => Promise<boolean>, retries = 2): Promise<boolean> {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const ok = await fn();
+      if (ok) return true;
+      if (i < retries) await sleep(1000 * (i + 1));
+    } catch (err) {
+      if (isRateLimitError(err) && i < retries) {
+        await sleep(1000 * (i + 1));
+        continue;
+      }
+      throw err;
+    }
+  }
+  return false;
+}
+
+function isCloseAllowed(zoneId: string): boolean {
+  const last = zoneCloseCooldown.get(zoneId) ?? 0;
+  return Date.now() - last >= CLOSE_COOLDOWN_MS;
+}
+
+function markCloseAttempt(zoneId: string): void {
+  zoneCloseCooldown.set(zoneId, Date.now());
+}
 
 function respondZoneActionError(res: Response, label: string, err: unknown): void {
   console.error(`[${label}]`, err);
-  res.status(500).json({ ok: false, error: ZONE_ACTION_RETRY_MSG, message: ZONE_ACTION_RETRY_MSG });
+  const msg = isRateLimitError(err) ? MARKET_BUSY_MSG : ZONE_ACTION_RETRY_MSG;
+  res.status(isRateLimitError(err) ? 429 : 500).json({ ok: false, error: msg, message: msg });
 }
 
 async function fetchOpenPositions(token: string, region: string, accountId: string): Promise<LivePosition[]> {
@@ -3667,19 +3772,12 @@ export function pickNextLegToTrimForSecureProfits(
 }
 
 async function evaluateZone(zoneId: string, token: string): Promise<void> {
-  // loadZone is the single read path: cache-first, DB hydration on miss.
-  // DB errors are caught here so a transient failure just skips this tick.
-  let st: ZoneState | null;
-  try {
-    st = await loadZone(zoneId);
-  } catch (e) {
-    console.warn(`[zone ${zoneId}] loadZone error, skipping tick: ${(e as Error).message}`);
-    return;
-  }
+  if (!zoneStates.has(zoneId)) return;
+  const st = zoneStates.get(zoneId);
+  if (!st) return;
   // Evaluate OPEN and RISK_FREE zones — Risk Free closes the losing entries
   // and arms a protective SL, but the TP ladder must keep running on the
   // surviving best entry. ARMED = pending limits only (no TP engine yet).
-  if (!st) return;
   if (st.status === "CLOSED") {
     zoneStates.delete(zoneId);
     return;
@@ -3771,6 +3869,15 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
             console.log(`[zone ${zoneId}] empty tracked rows but defer zone close (pre-TP2 policy)`);
             return;
           }
+          const closedLegRows = await withDbRetry(`evalZone.emptyHistory zone=${zoneId}`,
+            () => db.select().from(zonePositionsTable)
+              .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "CLOSED")))
+          ).catch(() => null);
+          const hasHistory = (closedLegRows?.length ?? 0) > 0;
+          if (!hasHistory) {
+            console.log(`[zone ${zoneId}] empty tracked rows, no fill history — zone stays active`);
+            return;
+          }
           const closedAt = Date.now();
           await withDbRetry(`evalZone.emptyClose zone=${zoneId}`,
             () => db.update(cascadeZonesTable)
@@ -3854,7 +3961,8 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
           return;
         }
         if (!hasHistory) {
-          console.log(`[zone ${zoneId}] reconcile: no fill history — closing unfilled/cancelled zone`);
+          console.log(`[zone ${zoneId}] reconcile: no fill history — zone stays active`);
+          return;
         }
         const closedAt = Date.now();
         await withDbRetry(`evalZone.reconcileZoneClose zone=${zoneId}`,
@@ -4018,6 +4126,20 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
           .where(eq(cascadeZonesTable.zoneId, zoneId))
           .catch(() => {});
         broadcastZoneUpdate(zoneId);
+
+        if (lvl === 2) {
+          try {
+            await cancelZoneLimits(token, region, st.accountId, zoneId);
+            const remaining = await fetchOpenPositions(token, region, st.accountId);
+            const legs = remaining.filter((p) => positionBelongsToZone(p, zoneId) || trackedIds.has(p.id));
+            for (const leg of legs) {
+              await modifyZonePositionSl(token, region, st.accountId, leg.id, leg.openPrice);
+            }
+            console.log(`[tp2] SL moved to break even, limits cancelled for ${zoneId}`);
+          } catch (err) {
+            console.error(`[tp2] break even / cancel failed:`, err);
+          }
+        }
 
         if (lvl === 3) {
           notifyZoneEvent(zoneId, "tp3_runners", 3, 0, st.direction);
@@ -4294,7 +4416,7 @@ export async function loadZoneState(): Promise<void> {
     // Load both OPEN and RISK_FREE zones — the monitor evaluates both
     // (RISK_FREE zones still need TP progression on the surviving entry).
     const zones = await db.select().from(cascadeZonesTable)
-      .where(inArray(cascadeZonesTable.status, ["OPEN", "RISK_FREE", "ARMED"]));
+      .where(ne(cascadeZonesTable.status, "CLOSED"));
     for (const z of zones) {
       zoneStates.set(z.zoneId, rowToZoneState(z));
       if (z.userId) zoneIdToUserId.set(z.zoneId, z.userId);
@@ -4830,11 +4952,19 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-partial", checkOwner, a
     await ensureCascadeZoneRunnerColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
-    const body = (req.body ?? {}) as { pct?: unknown; lots?: unknown; tpLevel?: unknown; runnerN?: unknown };
+    const body = (req.body ?? {}) as { pct?: unknown; lots?: unknown; tpLevel?: unknown; runnerN?: unknown; emergency?: unknown };
     const pct = typeof body.pct === "number" ? body.pct : undefined;
     const lots = typeof body.lots === "number" ? body.lots : undefined;
     const tpLevel = typeof body.tpLevel === "number" ? body.tpLevel : undefined;
     const runnerN = typeof body.runnerN === "number" ? body.runnerN : undefined;
+    const emergency = body.emergency === true;
+    if (!emergency && tpLevel == null) {
+      if (!isCloseAllowed(zoneId)) {
+        res.status(429).json({ ok: false, message: MARKET_BUSY_MSG });
+        return;
+      }
+      markCloseAttempt(zoneId);
+    }
     const result = await handleClosePartial(accountId, zoneId, { pct, lots, tpLevel, runnerN }, token, region);
     if (!result.ok) {
       res.status(result.message === "Zone not found" ? 404 : 409).json(result);
@@ -5126,8 +5256,34 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     // DB-first read via the single loadZone path (cache → DB → hydrate).
     // DB errors bubble up to the surrounding try/catch and return 500.
-    const st = await loadZone(zoneId);
-    if (!st || st.accountId !== accountId) { res.status(404).json({ error: "Zone not found" }); return; }
+    let st = await loadZone(zoneId);
+    if (!st || st.accountId !== accountId) {
+      const liveOrphans = await fetchOpenPositions(token, region, accountId);
+      const orphans = liveOrphans.filter((p) => positionBelongsToZone(p, zoneId));
+      if (orphans.length > 0) {
+        const { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, orphans);
+        if (failed.length > 0) {
+          res.status(207).json({
+            ok: false,
+            closedCount: orphans.length - failed.length,
+            failedPositionIds: failed,
+            message: "Recovered some orphaned positions — retry to clear the rest.",
+          });
+          return;
+        }
+        broadcastToAccount(accountId, "deal", { type: "position_changed" });
+        res.json({ ok: true, closedCount: orphans.length, message: "Recovered and closed orphaned positions" });
+        return;
+      }
+      res.status(404).json({ error: "Zone not found" });
+      return;
+    }
+
+    if (!isCloseAllowed(zoneId)) {
+      res.status(429).json({ ok: false, message: MARKET_BUSY_MSG });
+      return;
+    }
+    markCloseAttempt(zoneId);
 
     await cancelZoneLimits(token, region, accountId, zoneId);
 
@@ -5300,17 +5456,17 @@ router.post("/mt5/account/:accountId/zones/:zoneId/cancel-pending", checkOwner, 
     if (rejectIfPriceNotReady(res, accountId)) return;
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
+    if (!zoneStates.has(zoneId)) {
+      await loadZone(zoneId);
+    }
     const pendingBefore = orderIdsForZone(accountId, zoneId).length;
     await cancelZoneLimits(token, region, accountId, zoneId);
     const pendingAfter = orderIdsForZone(accountId, zoneId).length;
     const cancelledCount = Math.max(0, pendingBefore - pendingAfter);
-    await closeArmedZoneIfDisarmed(accountId, zoneId, token, region, { force: true });
     broadcastToAccount(accountId, "pending_order", {});
     broadcastZoneUpdate(zoneId);
-    const closed = (await db.select({ status: cascadeZonesTable.status }).from(cascadeZonesTable)
-      .where(eq(cascadeZonesTable.zoneId, zoneId)).limit(1))[0];
     console.log(`[zone ${zoneId}] cancel-pending: user-initiated, cancelled=${cancelledCount}/${pendingBefore}`);
-    res.json({ ok: true, cancelledCount, zoneClosed: closed?.status === "CLOSED" });
+    res.json({ ok: true, cancelledCount });
   } catch (err) {
     respondZoneActionError(res, "cancel-pending", err);
   }
@@ -6183,35 +6339,11 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
     }
 
     const conn = activeConnections.get(accountId);
-    if (conn) {
-      try {
-        const sdkResp = await tradeViaConnection(conn, body);
-        code = sdkResp.numericCode;
-        data = sdkResp;
-        console.log(`[trade/sdk] accountId=${accountId} action=${body.actionType} code=${code}`);
-      } catch (sdkErr) {
-        // SDK path failed (connection dropped, method error, etc.) — try REST
-        console.log(`[trade/sdk→rest] SDK trade failed (${(sdkErr as Error).message}), falling back to REST`);
-        const tradeRes = await fetch(
-          `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
-          { method: "POST", headers: authHeaders(token), body: JSON.stringify(body) }
-        );
-        httpStatus = tradeRes.ok ? 200 : tradeRes.status;
-        data = await tradeRes.json() as typeof data;
-        code = data.numericCode ?? 0;
-        console.log(`[trade/rest-fallback] accountId=${accountId} action=${body.actionType} code=${code}`);
-      }
-    } else {
-      // No streaming connection established yet — use REST directly
-      const tradeRes = await fetch(
-        `${clientBase(region)}/users/current/accounts/${accountId}/trade`,
-        { method: "POST", headers: authHeaders(token), body: JSON.stringify(body) }
-      );
-      httpStatus = tradeRes.ok ? 200 : tradeRes.status;
-      data = await tradeRes.json() as typeof data;
-      code = data.numericCode ?? 0;
-      console.log(`[trade/rest] accountId=${accountId} action=${body.actionType} code=${code}`);
-    }
+    const tradeResult = await executeTradeRequest(conn, region, accountId, token, body);
+    code = tradeResult.code;
+    data = tradeResult.data;
+    httpStatus = tradeResult.httpStatus;
+    console.log(`[trade] accountId=${accountId} action=${body.actionType} code=${code}`);
 
     // ── Dead-account detection ───────────────────────────────────────────────
     // If MetaAPI says the account no longer exists (deleted/orphaned on their
@@ -6244,7 +6376,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
     }
 
     const success = TRADE_SUCCESS_CODES.has(code);
-    const errorMessage = success ? undefined : (TRADE_ERROR_MESSAGES[code] ?? data.message ?? `Trade failed (code ${code})`);
+    const errorMessage = success ? undefined : userFacingTradeMessage(code, data.message);
     if (!success) console.log(`[trade] FAILED action=${body.actionType} code=${code} msg="${errorMessage}"`);
     if (_isAppMarketCascade && !success) {
       scheduleCascadeReconcile(accountId, region, token);

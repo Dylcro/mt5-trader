@@ -20,12 +20,20 @@ export const authLimiter: RateLimitRequestHandler = rateLimit({
   skip: isLocalhost,
 });
 
+function isZoneOrTradeRoute(req: import("express").Request): boolean {
+  const p = req.originalUrl ?? req.path ?? "";
+  return p.includes("/mt5/account/") && (
+    p.includes("/zones/") || p.includes("/trade")
+  );
+}
+
 export const apiLimiter: RateLimitRequestHandler = rateLimit({
   windowMs: 60 * 1000,
   max: 300,
-  message: { error: "Too many requests. Please slow down." },
+  message: { error: "Market busy — please try again in a moment" },
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => isLocalhost(req) || isZoneOrTradeRoute(req),
 });
 
 export async function resetAuthLockouts(): Promise<{ ok: boolean; method: string; error?: string }> {
