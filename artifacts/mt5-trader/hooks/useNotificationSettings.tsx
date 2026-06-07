@@ -2,7 +2,7 @@ import * as Device from "expo-device";
 import * as Notifications from "expo-notifications";
 import Constants from "expo-constants";
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import { Platform } from "react-native";
+import { AppState, Platform } from "react-native";
 
 import { getAuthToken } from "@/lib/authToken";
 
@@ -95,13 +95,13 @@ export function NotificationSettingsProvider({ children }: { children: React.Rea
   >("unknown");
   const lastTokenSent = useRef<string | null>(null);
 
-  const syncPushTokenIfNeeded = useCallback(async (enabled: NotificationPrefs) => {
+  const syncPushTokenIfNeeded = useCallback(async (enabled: NotificationPrefs, force = false) => {
     if (!API_BASE) return;
-    if (!enabled.nearEnabled && !enabled.hitEnabled) return;
     const reg = await registerForPushTokenAsync();
     setPermissionStatus(reg.status);
     if (!reg.token) return;
-    if (lastTokenSent.current === reg.token) return;
+    if (!force && !enabled.nearEnabled && !enabled.hitEnabled) return;
+    if (!force && lastTokenSent.current === reg.token) return;
     lastTokenSent.current = reg.token;
     try {
       await authFetch(`${API_BASE}/mt5/notifications/prefs`, {
@@ -113,6 +113,20 @@ export function NotificationSettingsProvider({ children }: { children: React.Rea
     }
   }, []);
 
+  const refreshPrefs = useCallback(async () => {
+    if (!API_BASE) return;
+    try {
+      const res = await authFetch(`${API_BASE}/mt5/notifications/prefs`);
+      if (!res.ok) return;
+      const data = (await res.json()) as NotificationPrefs;
+      const merged = { ...DEFAULTS, ...data };
+      setPrefs(merged);
+      await syncPushTokenIfNeeded(merged, true);
+    } catch {
+      // ignored — defaults stay
+    }
+  }, [syncPushTokenIfNeeded]);
+
   // Initial load — fetch server prefs (auth-gated). Silently no-ops when
   // unauthenticated; settings screen re-loads after sign-in.
   useEffect(() => {
@@ -120,21 +134,21 @@ export function NotificationSettingsProvider({ children }: { children: React.Rea
     (async () => {
       if (!API_BASE) { setLoading(false); return; }
       try {
-        const res = await authFetch(`${API_BASE}/mt5/notifications/prefs`);
-        if (res.ok) {
-          const data = (await res.json()) as NotificationPrefs;
-          const merged = { ...DEFAULTS, ...data };
-          if (!cancelled) setPrefs(merged);
-          if (!cancelled) await syncPushTokenIfNeeded(merged);
-        }
-      } catch {
-        // ignored — defaults stay
+        await refreshPrefs();
       } finally {
         if (!cancelled) setLoading(false);
       }
     })();
     return () => { cancelled = true; };
-  }, [syncPushTokenIfNeeded]);
+  }, [refreshPrefs]);
+
+  // Re-register push token when app returns to foreground (iOS can rotate tokens).
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (state) => {
+      if (state === "active") void refreshPrefs();
+    });
+    return () => sub.remove();
+  }, [refreshPrefs]);
 
   const updatePrefs = useCallback<NotificationSettingsContextValue["updatePrefs"]>(async (next) => {
     if (!API_BASE) return { ok: false, message: "API not configured" };

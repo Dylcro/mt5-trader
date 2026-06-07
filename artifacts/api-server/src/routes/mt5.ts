@@ -4675,7 +4675,47 @@ function resolveZoneNotifyUserId(zoneId: string, accountId?: string): string | u
   return undefined;
 }
 
-function notifyZoneEvent(
+async function resolveZoneNotifyUserIdAsync(zoneId: string, accountId?: string): Promise<string | undefined> {
+  const immediate = resolveZoneNotifyUserId(zoneId, accountId);
+  if (immediate) return immediate;
+  try {
+    const [row] = await db.select({ userId: cascadeZonesTable.userId })
+      .from(cascadeZonesTable)
+      .where(eq(cascadeZonesTable.zoneId, zoneId))
+      .limit(1);
+    if (row?.userId) {
+      zoneIdToUserId.set(zoneId, row.userId);
+      return row.userId;
+    }
+  } catch (e) {
+    console.warn(`[notif] userId DB lookup failed for zone ${zoneId}:`, (e as Error).message);
+  }
+  return undefined;
+}
+
+async function loadPrefsForUser(userId: string): Promise<NotificationPrefs | null> {
+  const cached = notificationPrefs.get(userId);
+  if (cached) return cached;
+  try {
+    const [row] = await db.select().from(notificationPrefsTable)
+      .where(eq(notificationPrefsTable.userId, userId))
+      .limit(1);
+    if (!row) return null;
+    const prefs: NotificationPrefs = {
+      nearEnabled: row.nearEnabled,
+      hitEnabled: row.hitEnabled,
+      thresholdPips: row.thresholdPips,
+      expoPushToken: row.expoPushToken,
+    };
+    notificationPrefs.set(userId, prefs);
+    return prefs;
+  } catch (e) {
+    console.warn(`[notif] prefs DB lookup failed for user ${userId}:`, (e as Error).message);
+    return null;
+  }
+}
+
+async function notifyZoneEvent(
   zoneId: string,
   kind: "near" | "hit" | "tp3_runners" | "runner",
   tp: 1 | 2 | 3 | 4,
@@ -4683,17 +4723,23 @@ function notifyZoneEvent(
   direction: "buy" | "sell",
   runnerPrice?: number,
   runnerLots?: number,
-): void {
+): Promise<void> {
   const st = zoneStates.get(zoneId);
-  const userId = resolveZoneNotifyUserId(zoneId, st?.accountId);
+  const userId = await resolveZoneNotifyUserIdAsync(zoneId, st?.accountId);
   if (!userId) {
     console.warn(`[notif] no userId for zone ${zoneId} — skipping ${kind} TP${tp}`);
     return;
   }
-  const prefs = notificationPrefs.get(userId);
-  if (!prefs?.expoPushToken) return;
+  const prefs = await loadPrefsForUser(userId);
+  if (!prefs?.expoPushToken) {
+    console.warn(`[notif] no push token for user ${userId} — skipping ${kind} TP${tp} zone ${zoneId}`);
+    return;
+  }
   if (kind === "near" && !prefs.nearEnabled) return;
-  if ((kind === "hit" || kind === "tp3_runners" || kind === "runner") && !prefs.hitEnabled) return;
+  // TP3 runner activation is critical — send whenever a device token exists.
+  if (kind === "hit" || kind === "runner") {
+    if (!prefs.hitEnabled) return;
+  }
   const dir = direction.toUpperCase();
   const anchor = st?.anchorPrice;
   const anchorFmt = anchor != null ? anchor.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "—";
@@ -4721,7 +4767,8 @@ function notifyZoneEvent(
         : `Closing in on TP${tp}.`;
     data = { zoneId, kind, tp };
   }
-  void sendExpoPush(prefs.expoPushToken, title, body, data);
+  await sendExpoPush(prefs.expoPushToken, title, body, data);
+  console.log(`[notif] sent ${kind} TP${tp} push to user ${userId} zone ${zoneId}`);
 }
 
 // ── Notification prefs routes ────────────────────────────────────────────────

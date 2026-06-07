@@ -655,7 +655,7 @@ export default function SettingsScreen() {
               <Text style={styles.cascadeCardTitle}>TP Alerts</Text>
             </View>
             <Text style={styles.cascadeCardDesc}>
-              Get a push notification when an active zone is about to hit its next take-profit, or when it actually hits. Works while the app is closed.
+              Push alerts work while the app is closed. Allow notifications when iOS asks — TP3 runner alerts always push once permission is granted.
             </Text>
 
             <View style={styles.cascadeDivider} />
