@@ -58,6 +58,71 @@ export function enrichZoneDisplayFields(zone: Zone): Zone {
   };
 }
 
+export const PIPELINE_DOT_POSITIONS = {
+  sl: 5,
+  tp1: 25,
+  tp2: 50,
+  tp3: 75,
+  runner: 93,
+} as const;
+
+export type PipelineTpStep = {
+  level: 1 | 2 | 3;
+  price: number;
+  hit: boolean;
+  dotPos: number;
+};
+
+/** Enabled TP ladder steps for the zone gold-bar pipeline (skips disabled levels). */
+export function pipelineEnabledTps(
+  zone: Pick<Zone, "tp1Price" | "tp2Price" | "tp3Price" | "tp1Hit" | "tp2Hit" | "tp3Hit" | "tp1Enabled" | "tp2Enabled" | "tp3Enabled">,
+): PipelineTpStep[] {
+  const defs = [
+    { level: 1 as const, price: zone.tp1Price, hit: Boolean(zone.tp1Hit), enabled: zone.tp1Enabled !== false, dotPos: PIPELINE_DOT_POSITIONS.tp1 },
+    { level: 2 as const, price: zone.tp2Price, hit: Boolean(zone.tp2Hit), enabled: zone.tp2Enabled !== false, dotPos: PIPELINE_DOT_POSITIONS.tp2 },
+    { level: 3 as const, price: zone.tp3Price, hit: Boolean(zone.tp3Hit), enabled: zone.tp3Enabled !== false, dotPos: PIPELINE_DOT_POSITIONS.tp3 },
+  ];
+  return defs.filter((d) => d.enabled && d.price != null) as PipelineTpStep[];
+}
+
+/** Fill width (0–100) on the fixed SL→runner track between last hit dot and next target. */
+export function pipelineBarFill(steps: PipelineTpStep[], progressPct: number): number {
+  const lastHit = steps.reduce((best, s, i) => (s.hit ? i : best), -1);
+  const basePos = lastHit >= 0 ? steps[lastHit]!.dotPos : PIPELINE_DOT_POSITIONS.sl;
+  const nextIdx = steps.findIndex((s) => !s.hit);
+  const nextPos = nextIdx >= 0 ? steps[nextIdx]!.dotPos : PIPELINE_DOT_POSITIONS.runner;
+  return basePos + (nextPos - basePos) * progressPct / 100;
+}
+
+export function pipelineSegmentProgress(
+  zone: Pick<Zone, "direction" | "anchorPrice">,
+  steps: PipelineTpStep[],
+  currentPrice: number,
+): {
+  progressPct: number;
+  nextStep: PipelineTpStep | null;
+  prevPrice: number;
+  nextPrice: number | null;
+  allHit: boolean;
+} {
+  const nextIdx = steps.findIndex((s) => !s.hit);
+  const allHit = steps.length > 0 && steps.every((s) => s.hit);
+  const nextStep = nextIdx >= 0 ? steps[nextIdx]! : null;
+  const prevPrice = nextIdx > 0
+    ? steps[nextIdx - 1]!.price
+    : nextIdx === 0
+      ? zone.anchorPrice
+      : steps.at(-1)?.price ?? zone.anchorPrice;
+  const nextPrice = allHit ? null : nextStep?.price ?? null;
+  let progressPct = 100;
+  if (nextPrice != null) {
+    progressPct = zone.direction === "buy"
+      ? Math.min(Math.max(((currentPrice - prevPrice) / (nextPrice - prevPrice)) * 100, 0), 100)
+      : Math.min(Math.max(((prevPrice - currentPrice) / (prevPrice - nextPrice)) * 100, 0), 100);
+  }
+  return { progressPct, nextStep, prevPrice, nextPrice, allHit };
+}
+
 function prevTpPriceForProgress(zone: Zone, nextTp: number, tps: (number | null)[]): number {
   for (let i = nextTp - 2; i >= 0; i--) {
     if (i === 0 && zone.tp1Enabled === false) continue;
