@@ -26,7 +26,7 @@ import Colors from "@/constants/colors";
 import { useTrading } from "@/context/TradingContext";
 import { useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
-import { useHapticSettings } from "@/hooks/useHapticSettings";
+import { triggerAppHaptic, useHapticSettings } from "@/hooks/useHapticSettings";
 import { useNotificationSettings } from "@/hooks/useNotificationSettings";
 
 const C = Colors.dark;
@@ -618,6 +618,8 @@ export default function SettingsScreen() {
                 value={hapticEnabled}
                 onValueChange={(v) => {
                   setHapticEnabled(v);
+                  if (v) void triggerAppHaptic(true, "success");
+                  else void triggerAppHaptic(true, "selection");
                 }}
                 trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
                 thumbColor={hapticEnabled ? C.gold : C.textMuted}

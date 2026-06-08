@@ -39,6 +39,7 @@ import {
   isAutoBeTriggerSatisfied,
   pickBestZonePositionByFloatingPnl,
   pickBestZonePositionForCloseWorst,
+  pickBestEntryLadderPosition,
   pickNextLegToTrimForSecureProfits,
   setZoneLimitOrder,
   getZoneLimitOrder,
@@ -1037,6 +1038,19 @@ describe("pickNextLegToTrimForSecureProfits (one leg per tap)", () => {
     ];
     const best = leg("anchor", 3030);
     expect(pickNextLegToTrimForSecureProfits(positions, best, "sell")?.id).toBe("l1");
+  });
+
+  it("BUY cascade: keeps deepest limit, closes 5569 then anchor 5570", () => {
+    const positions = [
+      leg("anchor", 5570),
+      leg("l1", 5569),
+      leg("l2", 5568),
+    ];
+    const best = pickBestEntryLadderPosition(positions, "buy");
+    expect(best.id).toBe("l2");
+    expect(pickNextLegToTrimForSecureProfits(positions, best, "buy")?.id).toBe("l1");
+    const afterL1 = [leg("anchor", 5570), leg("l2", 5568)];
+    expect(pickNextLegToTrimForSecureProfits(afterL1, best, "buy")?.id).toBe("anchor");
   });
 });
 
