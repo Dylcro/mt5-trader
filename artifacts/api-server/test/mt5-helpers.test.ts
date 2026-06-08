@@ -332,6 +332,11 @@ describe("evaluateMt5AutoCascadeSkip (MT5 one-click guards)", () => {
     expect(evaluateMt5AutoCascadeSkip({ ...base, symbol: "EURUSD" })).toBe("symbol");
   });
 
+  it("accepts broker gold symbol variants", () => {
+    expect(evaluateMt5AutoCascadeSkip({ ...base, symbol: "XAUUSD+" })).toBeNull();
+    expect(evaluateMt5AutoCascadeSkip({ ...base, symbol: "GOLD" })).toBeNull();
+  });
+
   it("skips cascade-tagged comments", () => {
     expect(evaluateMt5AutoCascadeSkip({ ...base, comment: "Cascade|z_abc|2/4" })).toBe("zone_tag");
     expect(evaluateMt5AutoCascadeSkip({ ...base, comment: "Cascade 1/4" })).toBe("cascade_comment");
