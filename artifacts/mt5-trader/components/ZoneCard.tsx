@@ -1,5 +1,4 @@
 import { Feather } from "@expo/vector-icons";
-import * as Haptics from "expo-haptics";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -15,11 +14,16 @@ import {
 } from "react-native";
 
 import Colors from "@/constants/colors";
+import { triggerAppHaptic, useHapticSettings } from "@/hooks/useHapticSettings";
 import type { Zone } from "@/hooks/useZones";
 
 const C = Colors.dark;
 const TP_BUFFER = 5.0;
 const LOT_STEP = 0.01;
+
+function btnPressed(pressed: boolean) {
+  return pressed ? { opacity: 0.72, transform: [{ scale: 0.97 }] } : null;
+}
 
 function formatPrice(n: number) {
   return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -306,7 +310,12 @@ function RunnerAutoChip({
 }) {
   return (
     <Pressable
-      style={[styles.runnerAutoChip, active && styles.runnerAutoChipOn, disabled && { opacity: 0.5 }]}
+      style={({ pressed }) => [
+        styles.runnerAutoChip,
+        active && styles.runnerAutoChipOn,
+        disabled && { opacity: 0.5 },
+        btnPressed(pressed),
+      ]}
       onPress={onPress}
       disabled={disabled}
     >
@@ -359,9 +368,9 @@ function RunnerSetupPanel({
     price: initialTargets?.r3 ? String(initialTargets.r3.price) : "",
     lots: initialTargets?.r3 ? String(initialTargets.r3.lots) : "",
   });
-  const [r1Auto, setR1Auto] = useState(Boolean(initialAutos?.r1Auto));
-  const [r2Auto, setR2Auto] = useState(Boolean(initialAutos?.r2Auto));
-  const [r3Auto, setR3Auto] = useState(Boolean(initialAutos?.r3Auto));
+  const [r1Auto, setR1Auto] = useState(initialAutos?.r1Auto ?? true);
+  const [r2Auto, setR2Auto] = useState(initialAutos?.r2Auto ?? true);
+  const [r3Auto, setR3Auto] = useState(initialAutos?.r3Auto ?? true);
 
   const filledPrices = [r1, r2, r3].filter((r) => r.price.trim().length > 0);
   const autoLot =
@@ -424,6 +433,7 @@ function RunnerSetupPanel({
               onChangeText={(v) => {
                 const price = v.replace(/[^0-9.]/g, "");
                 set({ ...s, price, lots: s.lots || (price ? autoLot.toFixed(2) : "") });
+                if (price.trim()) setAuto(true);
               }}
               keyboardType="decimal-pad"
               placeholderTextColor={C.specMuted}
@@ -449,7 +459,11 @@ function RunnerSetupPanel({
         Total: {total.toFixed(2)} lots {ok ? "✓" : "✗"}
       </Text>
       <Pressable
-        style={[styles.runnerActivateBtn, (!ok || busy) && { backgroundColor: "#9CA3AF" }]}
+        style={({ pressed }) => [
+          styles.runnerActivateBtn,
+          (!ok || busy) && { backgroundColor: "#9CA3AF" },
+          btnPressed(pressed),
+        ]}
         disabled={!ok || busy}
         onPress={async () => {
           const result = await onActivate(buildTargets(), { r1Auto, r2Auto, r3Auto });
@@ -462,7 +476,11 @@ function RunnerSetupPanel({
           </Text>
         )}
       </Pressable>
-      <Pressable style={styles.runnerSkipBtn} onPress={onSkipClose} disabled={busy}>
+      <Pressable
+        style={({ pressed }) => [styles.runnerSkipBtn, btnPressed(pressed)]}
+        onPress={onSkipClose}
+        disabled={busy}
+      >
         <Text style={styles.runnerSkipText}>Skip for now</Text>
       </Pressable>
     </View>
@@ -506,6 +524,7 @@ export default function ZoneCard({
   onCancelOrders,
   historical = false,
 }: ZoneCardProps) {
+  const { hapticEnabled } = useHapticSettings();
   const isBuy = zone.direction === "buy";
   const runnerActive = Boolean(zone.runnerActive);
   const [busy, setBusy] = useState(false);
@@ -552,11 +571,7 @@ export default function ZoneCard({
   const vol = liveVolume ?? origVol;
   const cmp = zone.currentPrice ?? zone.anchorPrice;
 
-  const showTp3Notif =
-    !historical &&
-    !zone.tp3Hit &&
-    zone.tp3Price != null &&
-    (isBuy ? cmp >= zone.tp3Price - TP_BUFFER : cmp <= zone.tp3Price + TP_BUFFER);
+  const showTp3Notif = !historical && zone.tp3Hit && !runnerActive;
 
   const runnerNotif = useMemo(() => {
     if (!runnerActive || historical) return null;
@@ -584,7 +599,7 @@ export default function ZoneCard({
   const runCloseZone = async () => {
     if (!onCloseZone || closeBusy) return;
     setCloseBusy(true);
-    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    await triggerAppHaptic(hapticEnabled, "heavy");
     const result = await onCloseZone(zone.zoneId);
     setCloseBusy(false);
     if (!result.ok) Alert.alert("Couldn't close zone", result.message ?? "Try again");
@@ -688,7 +703,11 @@ export default function ZoneCard({
         </View>
         <View style={styles.topRight}>
           {canCloseZone && (
-            <Pressable style={styles.closeZoneTopBtn} onPress={() => void runCloseZone()} disabled={actionBusy}>
+            <Pressable
+              style={({ pressed }) => [styles.closeZoneTopBtn, btnPressed(pressed)]}
+              onPress={() => void runCloseZone()}
+              disabled={actionBusy}
+            >
               {closeBusy ? (
                 <ActivityIndicator size="small" color={C.specSell} />
               ) : (
@@ -779,7 +798,7 @@ export default function ZoneCard({
 
       {runnerActive && hasUnhitRunners && !editRunnerPanelOpen && onActivateRunner && (
         <Pressable
-          style={styles.editRunnersBtn}
+          style={({ pressed }) => [styles.editRunnersBtn, btnPressed(pressed)]}
           onPress={() => setShowEditRunners(true)}
           disabled={actionBusy}
         >
@@ -808,10 +827,11 @@ export default function ZoneCard({
                   ]}
                 >
                   <Pressable
-                    style={{ alignItems: "center", flex: 1 }}
+                    style={({ pressed }) => [{ alignItems: "center", flex: 1 }, btnPressed(pressed)]}
                     disabled={r.hit || !onClosePartial || tpBusy != null}
                     onPress={async () => {
                       setTpBusy(r.n);
+                      await triggerAppHaptic(hapticEnabled, "medium");
                       const result = await onClosePartial!(zone.zoneId, { lots: r.lots!, runnerN: r.n });
                       setTpBusy(null);
                       if (!result.ok) Alert.alert("Close failed", result.message ?? "Try again");
@@ -850,11 +870,11 @@ export default function ZoneCard({
 
       {nextTpAction && !runnerPanelOpen && !editRunnerPanelOpen && (
         <Pressable
-          style={[styles.takeTpBtn, takeTpBusy && { opacity: 0.6 }]}
+          style={({ pressed }) => [styles.takeTpBtn, takeTpBusy && { opacity: 0.6 }, btnPressed(pressed)]}
           disabled={actionBusy}
           onPress={async () => {
             setTakeTpBusy(true);
-            await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+            await triggerAppHaptic(hapticEnabled, "medium");
             nextTpAction.call();
             setTakeTpBusy(false);
           }}
@@ -868,10 +888,11 @@ export default function ZoneCard({
         <View style={styles.actionRow}>
           {canRiskFree && (
             <Pressable
-              style={styles.rfBtn}
+              style={({ pressed }) => [styles.rfBtn, btnPressed(pressed)]}
               onPress={async () => {
                 if (!onRiskFree || busy) return;
                 setBusy(true);
+                await triggerAppHaptic(hapticEnabled, "medium");
                 const result = await onRiskFree(zone.zoneId);
                 setBusy(false);
                 if (!result.ok) Alert.alert("Risk Free failed", result.message ?? "Try again");
@@ -884,10 +905,11 @@ export default function ZoneCard({
           )}
           {showCloseAllWorst && (
             <Pressable
-              style={[styles.secureBtn, !canCloseAllWorst && { opacity: 0.45 }]}
+              style={({ pressed }) => [styles.secureBtn, !canCloseAllWorst && { opacity: 0.45 }, btnPressed(pressed)]}
               onPress={async () => {
                 if (!onCloseAllWorst || worstBusy || !canCloseAllWorst) return;
                 setWorstBusy(true);
+                await triggerAppHaptic(hapticEnabled, "medium");
                 const result = await onCloseAllWorst(zone.zoneId);
                 setWorstBusy(false);
                 if (!result.ok) Alert.alert("Secure failed", result.message ?? "Try again");
@@ -899,10 +921,11 @@ export default function ZoneCard({
           )}
           {canCancelOrders && (
             <Pressable
-              style={styles.delBtn}
+              style={({ pressed }) => [styles.delBtn, btnPressed(pressed)]}
               onPress={async () => {
                 if (!onCancelOrders || delBusy) return;
                 setDelBusy(true);
+                await triggerAppHaptic(hapticEnabled, "light");
                 const result = await onCancelOrders(zone.zoneId);
                 setDelBusy(false);
                 if (!result.ok) Alert.alert("Delete limits failed", result.message ?? "Try again");

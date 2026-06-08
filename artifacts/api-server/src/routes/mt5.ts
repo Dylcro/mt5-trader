@@ -3690,7 +3690,12 @@ async function handleClosePartial(
       });
     }
     if (tpLevel === 3) {
-      notifyZoneEvent(zoneId, "tp3_runners", 3, 0, st.direction);
+      const notified = st.tpNotified ?? { tp1: false, tp2: false, tp3: false, runner1: false, runner2: false, runner3: false };
+      if (!notified.tp3) {
+        notified.tp3 = true;
+        st.tpNotified = notified;
+        void notifyZoneEvent(zoneId, "tp3_runners", 3, 0, st.direction);
+      }
     }
     console.log(`[take-tp] zone ${zoneId} manual TP${tpLevel} closed ${closeLots.toFixed(2)} lots across ${pendingLegs.length} leg(s)`);
     return { ok: true };
@@ -4191,6 +4196,14 @@ export function pickBestZonePositionForCloseWorst(
   if (positions.some((p) => p.profit != null && !Number.isNaN(p.profit))) {
     return pickBestZonePositionByFloatingPnl(positions);
   }
+  return pickBestEntryLadderPosition(positions, direction);
+}
+
+/** Best entry to keep on the ladder: BUY = lowest price, SELL = highest price. */
+export function pickBestEntryLadderPosition(
+  positions: LivePosition[],
+  direction: "buy" | "sell",
+): LivePosition {
   const sorted = sortZonePositions(positions, direction);
   return sorted[sorted.length - 1]!;
 }
@@ -4579,7 +4592,12 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         }
 
         if (lvl === 3) {
-          notifyZoneEvent(zoneId, "tp3_runners", 3, 0, st.direction);
+          const tpNotif = st.tpNotified ?? { tp1: false, tp2: false, tp3: false, runner1: false, runner2: false, runner3: false };
+          if (!tpNotif.tp3) {
+            tpNotif.tp3 = true;
+            st.tpNotified = tpNotif;
+            void notifyZoneEvent(zoneId, "tp3_runners", 3, 0, st.direction);
+          }
         }
         console.log(`[auto-tp] zone ${zoneId} TP${lvl} (${tpPct}%) closed ${closeLots.toFixed(2)} lots across ${pendingLegs.length} leg(s)`);
       } catch (err) {
@@ -4598,9 +4616,10 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         const rLots = st[`runner${n}Lots`] as number | undefined;
         const key = `runner${n}` as keyof typeof notified;
         if (!rPrice || notified[key] || st[`runner${n}Hit`]) continue;
+        const runnerTol = ZONE_TP_TOLERANCE_PIPS * PIP;
         const reached = st.direction === "buy"
-          ? price.bid >= rPrice
-          : price.ask <= rPrice;
+          ? price.bid >= rPrice - runnerTol
+          : price.ask <= rPrice + runnerTol;
         if (reached) {
           const autoClose = Boolean(st[`runner${n}Auto`]);
           if (autoClose && rLots != null && rLots >= 0.01) {
@@ -5580,6 +5599,8 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
       const autoVal = body[`runner${n}Auto`];
       if (typeof autoVal === "boolean") {
         update[`runner${n}Auto`] = autoVal;
+      } else if (update[`runner${n}Price`] != null) {
+        update[`runner${n}Auto`] = true;
       }
     }
     await db.update(cascadeZonesTable).set(update).where(eq(cascadeZonesTable.zoneId, zoneId));
@@ -5755,11 +5776,12 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
       res.status(409).json({ ok: false, message: "Only one position left — nothing to secure" });
       return;
     }
-    const sorted = [...live].sort((a, b) =>
-      st.direction === "buy" ? a.openPrice - b.openPrice : b.openPrice - a.openPrice,
-    );
-    const best = sorted[0]!;
-    const toClose = sorted[sorted.length - 1]!;
+    const best = pickBestEntryLadderPosition(live, st.direction);
+    const toClose = pickNextLegToTrimForSecureProfits(live, best, st.direction);
+    if (!toClose) {
+      res.status(409).json({ ok: false, message: "Only one position left — nothing to secure" });
+      return;
+    }
     const { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, [toClose]);
     if (!failed.includes(toClose.id)) st.trackedPositions.delete(toClose.id);
     if (failed.length > 0) {

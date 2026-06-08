@@ -100,7 +100,7 @@ export function NotificationSettingsProvider({ children }: { children: React.Rea
     const reg = await registerForPushTokenAsync();
     setPermissionStatus(reg.status);
     if (!reg.token) return;
-    if (!force && !enabled.nearEnabled && !enabled.hitEnabled) return;
+    // Always sync when we have a token — TP3 runner alerts push even if near/hit toggles are off.
     if (!force && lastTokenSent.current === reg.token) return;
     lastTokenSent.current = reg.token;
     try {
@@ -135,12 +135,14 @@ export function NotificationSettingsProvider({ children }: { children: React.Rea
       if (!API_BASE) { setLoading(false); return; }
       try {
         await refreshPrefs();
+        // Register push token up-front so TP3 runner alerts work even if near/hit toggles stay off.
+        await syncPushTokenIfNeeded(DEFAULTS, true);
       } finally {
         if (!cancelled) setLoading(false);
       }
     })();
     return () => { cancelled = true; };
-  }, [refreshPrefs]);
+  }, [refreshPrefs, syncPushTokenIfNeeded]);
 
   // Re-register push token when app returns to foreground (iOS can rotate tokens).
   useEffect(() => {
@@ -160,14 +162,13 @@ export function NotificationSettingsProvider({ children }: { children: React.Rea
     // and iOS permission resets left hasToken true with a stale server token).
     let pushToken: string | null | undefined;
     const wantsAlerts = merged.nearEnabled || merged.hitEnabled;
-    if (wantsAlerts) {
-      const reg = await registerForPushTokenAsync();
-      setPermissionStatus(reg.status);
-      if (!reg.token) {
-        return { ok: false, message: "Notification permission was not granted." };
-      }
+    const reg = await registerForPushTokenAsync();
+    setPermissionStatus(reg.status);
+    if (reg.token) {
       pushToken = reg.token;
       lastTokenSent.current = reg.token;
+    } else if (wantsAlerts) {
+      return { ok: false, message: "Notification permission was not granted." };
     }
 
     try {
