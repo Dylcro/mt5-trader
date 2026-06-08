@@ -510,12 +510,19 @@ export function computeTpPricesFromPips(
 }
 
 export function tpPipsOrderingValid(
-  config: Pick<CascadeConfig, "tp1Pips" | "tp2Pips" | "tp3Pips" | "tp4Pips">,
+  config: Pick<CascadeConfig, "tp1Pips" | "tp2Pips" | "tp3Pips" | "tp4Pips" | "tp1Enabled" | "tp2Enabled" | "tp3Enabled" | "tp4Enabled">,
 ): boolean {
-  return config.tp1Pips > 0
-    && config.tp2Pips > config.tp1Pips
-    && config.tp3Pips > config.tp2Pips
-    && (config.tp4Pips === 0 || config.tp4Pips > config.tp3Pips);
+  const levels: { enabled: boolean; pips: number }[] = [
+    { enabled: config.tp1Enabled !== false, pips: config.tp1Pips },
+    { enabled: config.tp2Enabled !== false, pips: config.tp2Pips },
+    { enabled: config.tp3Enabled !== false, pips: config.tp3Pips },
+    { enabled: config.tp4Enabled !== false && config.tp4Pips > 0, pips: config.tp4Pips },
+  ].filter((l) => l.enabled && l.pips > 0);
+  if (levels.length === 0) return false;
+  for (let i = 1; i < levels.length; i++) {
+    if (levels[i]!.pips <= levels[i - 1]!.pips) return false;
+  }
+  return true;
 }
 
 export type Mt5AutoCascadeSkipInput = {
@@ -1817,6 +1824,10 @@ async function triggerMt5OneClickAutoCascadeInner(
     {
       tp1Price, tp2Price, tp3Price, tp4Price,
       tp1Pct, tp2Pct, tp3Pct, tp4Pct,
+      tp1Enabled: config.tp1Enabled,
+      tp2Enabled: config.tp2Enabled,
+      tp3Enabled: config.tp3Enabled,
+      tp4Enabled: config.tp4Enabled,
       autoBeAtTp: config.autoBeAtTp,
     },
     volume,
@@ -2343,8 +2354,11 @@ export function computeNextTakeTpLevel(
 ): 0 | 1 | 2 | 3 {
   if (openRows.length === 0) return 0;
   if (enabled.tp1Enabled && openRows.some((r) => !r.tp1Hit)) return 1;
-  if (enabled.tp2Enabled && openRows.some((r) => r.tp1Hit && !r.tp2Hit)) return 2;
-  if (enabled.tp3Enabled && openRows.some((r) => r.tp2Hit && !r.tp3Hit)) return 3;
+  if (enabled.tp2Enabled && openRows.some((r) => (!enabled.tp1Enabled || r.tp1Hit) && !r.tp2Hit)) return 2;
+  if (enabled.tp3Enabled && openRows.some((r) => {
+    const priorOk = (!enabled.tp1Enabled || r.tp1Hit) && (!enabled.tp2Enabled || r.tp2Hit);
+    return priorOk && !r.tp3Hit;
+  })) return 3;
   return 0;
 }
 
@@ -2354,6 +2368,7 @@ export function legNeedsTpSlice(
   st: {
     trackedPositions: Map<string, { volume: number; tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean }>;
     tp1Pct: number; tp2Pct: number; tp3Pct: number;
+    tp1Enabled?: boolean; tp2Enabled?: boolean;
   },
   lvl: 1 | 2 | 3,
 ): boolean {
@@ -2366,17 +2381,19 @@ export function legNeedsTpSlice(
     if (cached) return Boolean(cached[key]);
     return positionShowsTpLevelApplied(leg.volume, origVol, n, tpPcts);
   };
-  if (lvl >= 2 && !posHit(1)) return false;
-  if (lvl >= 3 && !posHit(2)) return false;
+  if (lvl >= 2 && (st.tp1Enabled ?? true) && !posHit(1)) return false;
+  if (lvl >= 3 && (st.tp2Enabled ?? true) && !posHit(2)) return false;
   return !posHit(lvl);
 }
 
 /** Cascade limits are cancelled only on the first successful TP2, never on TP1. */
 export function shouldCancelCascadeLimitsAtTpStage(
   tpStage: 1 | 2 | 3 | 4,
-  zone: { tp1Hit: boolean; tp2Hit: boolean },
+  zone: { tp1Hit: boolean; tp2Hit: boolean; tp1Enabled?: boolean },
 ): boolean {
-  return tpStage === 2 && zone.tp1Hit && !zone.tp2Hit;
+  if (tpStage !== 2 || zone.tp2Hit) return false;
+  if (zone.tp1Enabled === false) return true;
+  return zone.tp1Hit;
 }
 
 /** Unfilled cascade limits are stale once TP2 has fired (same as evaluateZone after TP2). */
@@ -2759,8 +2776,10 @@ export function sanitizeZoneTpLadder<T extends {
   const tp3Enabled = z.tp3Enabled ?? true;
   const tp4Enabled = z.tp4Enabled ?? true;
   const tp1Hit = tp1Enabled && Boolean(z.tp1Hit);
-  const tp2Hit = tp2Enabled && tp1Hit && Boolean(z.tp2Hit);
-  const tp3Hit = tp3Enabled && tp2Hit && Boolean(z.tp3Hit);
+  const tp2PriorMet = !tp1Enabled || tp1Hit;
+  const tp2Hit = tp2Enabled && tp2PriorMet && Boolean(z.tp2Hit);
+  const tp3PriorMet = tp2PriorMet && (!tp2Enabled || tp2Hit);
+  const tp3Hit = tp3Enabled && tp3PriorMet && Boolean(z.tp3Hit);
   const manualTp4 = isManualTp4Zone(z.tp4Price, tp4Enabled);
   const tp4Hit = tp4Enabled && Boolean(z.tp4Hit) && (
     manualTp4 ? true : tp3Hit
@@ -3355,6 +3374,7 @@ function prepareZoneForCascade(
   tps: {
     tp1Price: number; tp2Price: number; tp3Price: number; tp4Price: number | null;
     tp1Pct: number; tp2Pct: number; tp3Pct: number; tp4Pct: number;
+    tp1Enabled?: boolean; tp2Enabled?: boolean; tp3Enabled?: boolean; tp4Enabled?: boolean;
     autoBeAtTp?: unknown;
   },
   originalVolume: number,
@@ -3364,10 +3384,10 @@ function prepareZoneForCascade(
 ): ZoneState {
   void userId;
   const zoneId = explicitZoneId && /^z_[a-z0-9_]+$/i.test(explicitZoneId) ? explicitZoneId : newZoneId();
-  const tp1Enabled = tps.tp1Pct > 0;
-  const tp2Enabled = tps.tp2Pct > 0;
-  const tp3Enabled = tps.tp3Pct > 0;
-  const tp4Enabled = tps.tp4Pct > 0;
+  const tp1Enabled = tps.tp1Enabled ?? (tps.tp1Pct > 0);
+  const tp2Enabled = tps.tp2Enabled ?? (tps.tp2Pct > 0);
+  const tp3Enabled = tps.tp3Enabled ?? (tps.tp3Pct > 0);
+  const tp4Enabled = tps.tp4Enabled ?? (tps.tp4Pct > 0);
   const state: ZoneState = {
     zoneId, accountId, direction, anchorPrice: anchorPriceHint > 0 ? anchorPriceHint : 0,
     tp1Price: tps.tp1Price, tp2Price: tps.tp2Price, tp3Price: tps.tp3Price, tp4Price: tps.tp4Price,

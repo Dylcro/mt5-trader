@@ -374,6 +374,20 @@ describe("tpPipsOrderingValid", () => {
   it("rejects out-of-order pips", () => {
     expect(tpPipsOrderingValid({ tp1Pips: 50, tp2Pips: 50, tp3Pips: 90, tp4Pips: 0 })).toBe(false);
   });
+
+  it("accepts tp1 disabled with stale tp1Pips when enabled levels are ordered", () => {
+    expect(tpPipsOrderingValid({
+      tp1Pips: 50, tp2Pips: 30, tp3Pips: 90, tp4Pips: 0,
+      tp1Enabled: false, tp2Enabled: true, tp3Enabled: true,
+    })).toBe(true);
+  });
+
+  it("rejects when enabled tp2 >= enabled tp3", () => {
+    expect(tpPipsOrderingValid({
+      tp1Pips: 20, tp2Pips: 90, tp3Pips: 90, tp4Pips: 0,
+      tp1Enabled: false, tp2Enabled: true, tp3Enabled: true,
+    })).toBe(false);
+  });
 });
 
 // ── rowToZoneState restart-hydration tests ───────────────────────────────────
@@ -826,6 +840,14 @@ describe("disabled TP history", () => {
     }).tp4Hit).toBe(true);
   });
 
+  it("sanitizeZoneTpLadder: tp1 disabled allows tp2Hit without tp1Hit", () => {
+    expect(sanitizeZoneTpLadder({
+      tp1Enabled: false, tp2Enabled: true, tp3Enabled: true, tp4Enabled: true,
+      tp1Hit: false, tp2Hit: true, tp3Hit: false, tp4Hit: false,
+      tp4Price: null,
+    })).toMatchObject({ tp1Hit: false, tp2Hit: true, tp3Hit: false });
+  });
+
   it("zonePrimaryOutcome: exit reason for a closed zone", () => {
     const base = {
       status: "CLOSED",
@@ -918,6 +940,13 @@ describe("computeNextTakeTpLevel", () => {
       { tp1Enabled: true, tp2Enabled: true, tp3Enabled: true },
     )).toBe(2);
   });
+
+  it("shows Take TP2 when tp1 disabled and legs need TP2", () => {
+    expect(computeNextTakeTpLevel(
+      [{ tp1Hit: false, tp2Hit: false, tp3Hit: false }],
+      { tp1Enabled: false, tp2Enabled: true, tp3Enabled: true },
+    )).toBe(2);
+  });
 });
 
 describe("legNeedsTpSlice (per-position TP ladder)", () => {
@@ -940,6 +969,12 @@ describe("legNeedsTpSlice (per-position TP ladder)", () => {
     expect(legNeedsTpSlice({ id: "limit2", volume: 0.04 }, st, 2)).toBe(false);
     st.trackedPositions.set("limit2", { volume: 0.04, tp1Hit: true, tp2Hit: false, tp3Hit: false, tp4Hit: false });
     expect(legNeedsTpSlice({ id: "limit2", volume: 0.03 }, st, 2)).toBe(true);
+  });
+
+  it("leg can take TP2 without TP1 when tp1Enabled is false", () => {
+    const st = { ...makeSt(), tp1Enabled: false };
+    st.trackedPositions.set("limit2", { volume: 0.04, tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false });
+    expect(legNeedsTpSlice({ id: "limit2", volume: 0.04 }, st, 2)).toBe(true);
   });
 
   it("uses zone-configured pct via position volume gate", () => {
@@ -1006,9 +1041,13 @@ describe("cascade limit cancel timing", () => {
   });
 
   it("cancels limits only on first TP2 after TP1 hit", () => {
-    expect(shouldCancelCascadeLimitsAtTpStage(2, { tp1Hit: true, tp2Hit: false })).toBe(true);
-    expect(shouldCancelCascadeLimitsAtTpStage(2, { tp1Hit: false, tp2Hit: false })).toBe(false);
-    expect(shouldCancelCascadeLimitsAtTpStage(2, { tp1Hit: true, tp2Hit: true })).toBe(false);
+    expect(shouldCancelCascadeLimitsAtTpStage(2, { tp1Hit: true, tp2Hit: false, tp1Enabled: true })).toBe(true);
+    expect(shouldCancelCascadeLimitsAtTpStage(2, { tp1Hit: false, tp2Hit: false, tp1Enabled: true })).toBe(false);
+    expect(shouldCancelCascadeLimitsAtTpStage(2, { tp1Hit: true, tp2Hit: true, tp1Enabled: true })).toBe(false);
+  });
+
+  it("cancels limits on TP2 when tp1 is disabled", () => {
+    expect(shouldCancelCascadeLimitsAtTpStage(2, { tp1Hit: false, tp2Hit: false, tp1Enabled: false })).toBe(true);
   });
 
   it("close-worst / cleanup: cancel pending limits only after zone TP2", () => {

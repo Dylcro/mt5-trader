@@ -19,6 +19,7 @@ import Colors from "@/constants/colors";
 import { useTrading, type PendingOrder, type Position } from "@/context/TradingContext";
 import { useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useZones } from "@/hooks/useZones";
+import LivePriceStrip from "@/components/LivePriceStrip";
 import ZoneCard from "@/components/ZoneCard";
 import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
 import { subscribeAccountEvents } from "@/lib/accountEventBus";
@@ -273,7 +274,8 @@ export default function PositionsScreen() {
   const {
     positions, pendingOrders, status, accountInfo,
     refreshPositions, refreshPendingOrders, refreshAccountInfo,
-    closePosition, cancelOrder, accountId, region, sseConnected, price, ensureSessionForTrade,
+    closePosition, cancelOrder, accountId, region, sseConnected, price,
+    priceError, priceStale, syncSession, ensureSessionForTrade,
     closeZonePartial, activateRunner, setRunnerAuto,
   } = useTrading();
   const { zones, refresh: refreshZones, riskFree, closeZone, closeAllWorst, cancelZoneOrders } = useZones(accountId, {
@@ -433,6 +435,7 @@ export default function PositionsScreen() {
   useFocusEffect(
     useCallback(() => {
       if (status !== "connected" || !accountId) return;
+      if (!price || priceError || priceStale) void syncSession(false);
       const syncLight = () => void Promise.all([
         refreshZones(),
         refreshPositions(),
@@ -441,8 +444,12 @@ export default function PositionsScreen() {
       syncLight();
       const id = setInterval(syncLight, 20_000);
       return () => clearInterval(id);
-    }, [status, accountId, refreshZones, refreshPositions, refreshPendingOrders]),
+    }, [status, accountId, price, priceError, priceStale, syncSession, refreshZones, refreshPositions, refreshPendingOrders]),
   );
+
+  const handlePriceSync = useCallback(() => {
+    void syncSession(true);
+  }, [syncSession]);
 
   const handleCancelOrder = useCallback(
     async (order: PendingOrder) => {
@@ -549,6 +556,14 @@ export default function PositionsScreen() {
         <Text style={styles.headerTitle}>Positions</Text>
         <Text style={styles.openCount}>{positions.length} open</Text>
       </View>
+
+      <LivePriceStrip
+        price={price}
+        priceError={priceError}
+        priceStale={priceStale}
+        connected={status === "connected"}
+        onSync={handlePriceSync}
+      />
 
       {positions.length > 0 && (
         <View

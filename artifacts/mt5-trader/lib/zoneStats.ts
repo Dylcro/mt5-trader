@@ -57,8 +57,15 @@ export function zonePrimaryOutcome(z: Zone): ZonePrimaryOutcome {
 /** True only when this TP level was enabled and all prior ladder levels were hit. */
 export function zoneReachedTpLevel(z: Zone, level: 1 | 2 | 3 | 4): boolean {
   if (level === 1) return z.tp1Enabled !== false && Boolean(z.tp1Hit);
-  if (level === 2) return zoneReachedTpLevel(z, 1) && z.tp2Enabled !== false && Boolean(z.tp2Hit);
-  if (level === 3) return zoneReachedTpLevel(z, 2) && z.tp3Enabled !== false && Boolean(z.tp3Hit);
+  if (level === 2) {
+    const priorOk = z.tp1Enabled === false || Boolean(z.tp1Hit);
+    return priorOk && z.tp2Enabled !== false && Boolean(z.tp2Hit);
+  }
+  if (level === 3) {
+    const priorOk = (z.tp1Enabled === false || Boolean(z.tp1Hit))
+      && (z.tp2Enabled === false || Boolean(z.tp2Hit));
+    return priorOk && z.tp3Enabled !== false && Boolean(z.tp3Hit);
+  }
   return zoneReachedTpLevel(z, 3) && isTp4LevelEnabled(z) && Boolean(z.tp4Hit);
 }
 

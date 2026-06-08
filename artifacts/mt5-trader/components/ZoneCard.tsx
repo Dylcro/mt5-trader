@@ -64,21 +64,21 @@ function getNextTpAction(
   const tp2Lots = roundLot(origVol * (zone.tp2Pct ?? 25) / 100);
   const tp3Lots = roundLot(origVol * (zone.tp3Pct ?? 25) / 100);
 
-  if (!zone.tp1Hit) {
+  if (zone.tp1Enabled !== false && !zone.tp1Hit) {
     return {
       label: "Take TP1",
       sub: `${tp1Lots.toFixed(2)} lots`,
       call: () => { void onClosePartial?.(zone.zoneId, { pct: zone.tp1Pct ?? 25, tpLevel: 1, emergency: true }); },
     };
   }
-  if (!zone.tp2Hit) {
+  if (zone.tp2Enabled !== false && !zone.tp2Hit) {
     return {
       label: "Take TP2",
       sub: `${tp2Lots.toFixed(2)} lots`,
       call: () => { void onClosePartial?.(zone.zoneId, { pct: zone.tp2Pct ?? 25, tpLevel: 2, emergency: true }); },
     };
   }
-  if (!zone.tp3Hit) {
+  if (zone.tp3Enabled !== false && !zone.tp3Hit) {
     return {
       label: "Take TP3",
       sub: `${tp3Lots.toFixed(2)} lots`,

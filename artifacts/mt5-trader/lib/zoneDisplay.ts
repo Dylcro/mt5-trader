@@ -58,6 +58,17 @@ export function enrichZoneDisplayFields(zone: Zone): Zone {
   };
 }
 
+function prevTpPriceForProgress(zone: Zone, nextTp: number, tps: (number | null)[]): number {
+  for (let i = nextTp - 2; i >= 0; i--) {
+    if (i === 0 && zone.tp1Enabled === false) continue;
+    if (i === 1 && zone.tp2Enabled === false) continue;
+    if (i === 2 && zone.tp3Enabled === false) continue;
+    const px = tps[i];
+    if (px != null) return px;
+  }
+  return zone.anchorPrice;
+}
+
 /** Client-side progress when the zones API omits live fields. */
 export function enrichZoneLiveFields(zone: Zone, price: Price | null): Zone {
   if (zone.status === "CLOSED" || zone.status === "ARMED" || !price || zone.anchorPrice <= 0) return zone;
@@ -77,7 +88,7 @@ export function enrichZoneLiveFields(zone: Zone, price: Price | null): Zone {
   if (nextTp === 0) return { ...zone, currentPrice: cmp };
 
   const nextPx = tps[nextTp - 1];
-  const prevPx = nextTp === 1 ? zone.anchorPrice : (tps[nextTp - 2] ?? zone.anchorPrice);
+  const prevPx = nextTp === 1 ? zone.anchorPrice : prevTpPriceForProgress(zone, nextTp, tps);
   if (nextPx == null) return { ...zone, currentPrice: cmp, nextTp };
 
   const sign = dir === "buy" ? 1 : -1;
