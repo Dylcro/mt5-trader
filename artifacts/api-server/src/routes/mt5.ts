@@ -606,11 +606,14 @@ async function mergeZoneHitsFromPositions(
   const posRows = await db.select().from(zonePositionsTable)
     .where(eq(zonePositionsTable.zoneId, zoneId));
   const open = posRows.filter((r) => r.status === "OPEN");
-  // Zone-level hit flags = ALL open legs completed that level (not just one leg).
-  let tp1Hit = Boolean(row.tp1Hit) || (open.length > 0 && open.every((r) => r.tp1Hit));
-  let tp2Hit = Boolean(row.tp2Hit) || (open.length > 0 && open.every((r) => r.tp2Hit));
-  let tp3Hit = Boolean(row.tp3Hit) || (open.length > 0 && open.every((r) => r.tp3Hit));
-  let tp4Hit = Boolean(row.tp4Hit) || (open.length > 0 && open.every((r) => r.tp4Hit));
+  // Zone-level hit flags = ALL open legs completed that level. New late fills can
+  // clear a level (e.g. anchor hit TP1 → zone true; limit fills → zone false again).
+  const allLegsHit = (getter: (r: (typeof open)[number]) => boolean, rowHit: boolean) =>
+    open.length > 0 ? open.every(getter) : Boolean(rowHit);
+  let tp1Hit = allLegsHit((r) => r.tp1Hit, row.tp1Hit);
+  let tp2Hit = allLegsHit((r) => r.tp2Hit, row.tp2Hit);
+  let tp3Hit = allLegsHit((r) => r.tp3Hit, row.tp3Hit);
+  let tp4Hit = allLegsHit((r) => r.tp4Hit, row.tp4Hit);
   const sanitized = sanitizeZoneTpLadder({
     tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
     tp1Hit, tp2Hit, tp3Hit, tp4Hit, tp4Price,
@@ -619,10 +622,10 @@ async function mergeZoneHitsFromPositions(
   tp2Hit = sanitized.tp2Hit;
   tp3Hit = sanitized.tp3Hit;
   tp4Hit = sanitized.tp4Hit;
-  const persistTp1 = Boolean(row.tp1Hit) || tp1Hit;
-  const persistTp2 = Boolean(row.tp2Hit) || tp2Hit;
-  const persistTp3 = Boolean(row.tp3Hit) || tp3Hit;
-  const persistTp4 = Boolean(row.tp4Hit) || tp4Hit;
+  const persistTp1 = tp1Hit;
+  const persistTp2 = tp2Hit;
+  const persistTp3 = tp3Hit;
+  const persistTp4 = tp4Hit;
   if (persistTp1 !== row.tp1Hit || persistTp2 !== row.tp2Hit || persistTp3 !== row.tp3Hit || persistTp4 !== row.tp4Hit) {
     await db.update(cascadeZonesTable)
       .set({ tp1Hit: persistTp1, tp2Hit: persistTp2, tp3Hit: persistTp3, tp4Hit: persistTp4 })
