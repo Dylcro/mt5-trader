@@ -606,14 +606,14 @@ async function mergeZoneHitsFromPositions(
   const posRows = await db.select().from(zonePositionsTable)
     .where(eq(zonePositionsTable.zoneId, zoneId));
   const open = posRows.filter((r) => r.status === "OPEN");
-  // Zone-level hit flags = ALL open legs completed that level. New late fills can
-  // clear a level (e.g. anchor hit TP1 → zone true; limit fills → zone false again).
-  const allLegsHit = (getter: (r: (typeof open)[number]) => boolean, rowHit: boolean) =>
-    open.length > 0 ? open.every(getter) : Boolean(rowHit);
-  let tp1Hit = allLegsHit((r) => r.tp1Hit, row.tp1Hit);
-  let tp2Hit = allLegsHit((r) => r.tp2Hit, row.tp2Hit);
-  let tp3Hit = allLegsHit((r) => r.tp3Hit, row.tp3Hit);
-  let tp4Hit = allLegsHit((r) => r.tp4Hit, row.tp4Hit);
+  // Zone gold-bar / API hit flags latch true once ANY leg hits a level (sticky).
+  // Per-leg auto TP still uses legNeedsTpSlice — late pullback fills are handled silently.
+  const zoneDisplayHit = (getter: (r: (typeof open)[number]) => boolean, rowHit: boolean) =>
+    Boolean(rowHit) || (open.length > 0 && open.some(getter));
+  let tp1Hit = zoneDisplayHit((r) => r.tp1Hit, row.tp1Hit);
+  let tp2Hit = zoneDisplayHit((r) => r.tp2Hit, row.tp2Hit);
+  let tp3Hit = zoneDisplayHit((r) => r.tp3Hit, row.tp3Hit);
+  let tp4Hit = zoneDisplayHit((r) => r.tp4Hit, row.tp4Hit);
   const sanitized = sanitizeZoneTpLadder({
     tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
     tp1Hit, tp2Hit, tp3Hit, tp4Hit, tp4Price,
@@ -3676,6 +3676,7 @@ async function handleClosePartial(
     }
     const closeLots = await closeTpSliceOnEveryLiveLeg(token, region, st, zoneId, pendingLegs, tpLevel);
     if (closeLots < 0.01) return { ok: false, message: "Lot too small" };
+    st[`tp${tpLevel}Hit`] = true;
     await mergeZoneHitsFromPositions(zoneId, {
       tp1Hit: st.tp1Hit, tp2Hit: st.tp2Hit, tp3Hit: st.tp3Hit, tp4Hit: st.tp4Hit,
       tp1Enabled: st.tp1Enabled, tp2Enabled: st.tp2Enabled,
@@ -4470,9 +4471,10 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
     // this, a TP set at the exact bid/ask never triggers because the broker's
     // spread keeps the comparison side just shy of the level (e.g. user sets
     // TP1 at 2400.00, bid peaks at 2399.94 due to 6-pip spread, and the close
-    // never fires). 3 pips is a typical XAUUSD spread + a small slippage buffer.
+    // never fires). 4 pips covers typical XAUUSD spread + a small slippage buffer.
     const tol = ZONE_TP_TOLERANCE_PIPS * PIP;
-    const hit = (tp: number) => st.direction === "buy" ? cmpPrice >= (tp - tol) : cmpPrice <= (tp + tol);
+    const hit = (tp: number, px = cmpPrice) =>
+      st.direction === "buy" ? px >= (tp - tol) : px <= (tp + tol);
 
     // No auto cashout — the user closes upper entries manually if they want.
     // All four cascade orders share the same SL and TP1-4 (set broker-side at
@@ -4534,29 +4536,18 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       const tpPrice = st[`tp${lvl}Price`];
       if (tpPrice == null || st[`tp${lvl}PassedAt`]) continue;
       const crossed = st.direction === "buy"
-        ? (st.highestPriceSeen ?? 0) >= tpPrice
-        : (st.lowestPriceSeen ?? Infinity) <= tpPrice;
+        ? hit(tpPrice, st.highestPriceSeen ?? 0)
+        : hit(tpPrice, st.lowestPriceSeen ?? Infinity);
       if (crossed) st[`tp${lvl}PassedAt`] = Date.now();
     }
 
-    const AUTO_TP_BUFFER = 0.30;
-    const AUTO_TP_BUFFER_WINDOW_MS = 15_000;
     for (const lvl of [1, 2, 3] as const) {
       const tpPrice = st[`tp${lvl}Price`];
       const tpPct = st[`tp${lvl}Pct`];
       const enabled = st[`tp${lvl}Enabled`] !== false;
-      const passedAt = st[`tp${lvl}PassedAt`];
       if (tpPrice == null || !enabled || !(tpPct > 0)) continue;
 
-      const atLevel = st.direction === "buy"
-        ? price.bid >= tpPrice
-        : price.ask <= tpPrice;
-      const withinWindow = passedAt != null && (Date.now() - passedAt) < AUTO_TP_BUFFER_WINDOW_MS;
-      const withinBuffer = st.direction === "buy"
-        ? price.bid >= tpPrice - AUTO_TP_BUFFER
-        : price.ask <= tpPrice + AUTO_TP_BUFFER;
-      const bufferedClose = withinWindow && withinBuffer;
-      if (!atLevel && !bufferedClose) continue;
+      if (!hit(tpPrice)) continue;
 
       try {
         // Fresh broker read so limits that filled since tick start join this TP.
@@ -4571,6 +4562,7 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         );
         if (closeLots < 0.01) continue;
 
+        st[`tp${lvl}Hit`] = true;
         st[`tp${lvl}PassedAt`] = undefined;
         await mergeZoneHitsFromPositions(zoneId, {
           tp1Hit: st.tp1Hit, tp2Hit: st.tp2Hit, tp3Hit: st.tp3Hit, tp4Hit: st.tp4Hit,
