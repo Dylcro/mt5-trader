@@ -106,6 +106,9 @@ export async function ensureTables(): Promise<void> {
       runner1_hit         BOOLEAN NOT NULL DEFAULT FALSE,
       runner2_hit         BOOLEAN NOT NULL DEFAULT FALSE,
       runner3_hit         BOOLEAN NOT NULL DEFAULT FALSE,
+      runner1_auto        BOOLEAN NOT NULL DEFAULT FALSE,
+      runner2_auto        BOOLEAN NOT NULL DEFAULT FALSE,
+      runner3_auto        BOOLEAN NOT NULL DEFAULT FALSE,
       runner_active       BOOLEAN NOT NULL DEFAULT FALSE
     );
     CREATE INDEX IF NOT EXISTS cascade_zones_acct_status

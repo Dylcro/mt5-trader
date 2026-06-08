@@ -74,6 +74,9 @@ export const cascadeZonesTable = pgTable("cascade_zones", {
   runner1Hit:   boolean("runner1_hit").notNull().default(false),
   runner2Hit:   boolean("runner2_hit").notNull().default(false),
   runner3Hit:   boolean("runner3_hit").notNull().default(false),
+  runner1Auto:  boolean("runner1_auto").notNull().default(false),
+  runner2Auto:  boolean("runner2_auto").notNull().default(false),
+  runner3Auto:  boolean("runner3_auto").notNull().default(false),
   runnerActive: boolean("runner_active").notNull().default(false),
 });
 

@@ -137,7 +137,9 @@ interface TradingContextValue {
       r2?: { price: number; lots: number };
       r3?: { price: number; lots: number };
     },
+    opts?: { r1Auto?: boolean; r2Auto?: boolean; r3Auto?: boolean },
   ) => Promise<{ ok: boolean; message: string }>;
+  setRunnerAuto: (zoneId: string, runnerN: 1 | 2 | 3, auto: boolean) => Promise<{ ok: boolean; message: string }>;
 }
 
 export interface PlaceTradeParams {
@@ -1557,6 +1559,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         r2?: { price: number; lots: number };
         r3?: { price: number; lots: number };
       },
+      opts?: { r1Auto?: boolean; r2Auto?: boolean; r3Auto?: boolean },
     ): Promise<{ ok: boolean; message: string }> => {
       if (status !== "connected") return { ok: false, message: "Not connected" };
       try {
@@ -1572,6 +1575,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
               runner2Lots: targets.r2?.lots,
               runner3Price: targets.r3?.price,
               runner3Lots: targets.r3?.lots,
+              runner1Auto: opts?.r1Auto,
+              runner2Auto: opts?.r2Auto,
+              runner3Auto: opts?.r3Auto,
             }),
           },
         );
@@ -1583,6 +1589,27 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       }
     },
     [status, accountId, region, refreshPositions],
+  );
+
+  const setRunnerAuto = useCallback(
+    async (zoneId: string, runnerN: 1 | 2 | 3, auto: boolean): Promise<{ ok: boolean; message: string }> => {
+      if (status !== "connected") return { ok: false, message: "Not connected" };
+      try {
+        const r = await authFetch(
+          `${API_BASE}/mt5/account/${accountId}/zones/${encodeURIComponent(zoneId)}/runner-auto?region=${region}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ runnerN, auto }),
+          },
+        );
+        const d = await safeJson<{ ok?: boolean; message?: string }>(r);
+        return { ok: r.ok && !!d.ok, message: d.message ?? "" };
+      } catch (err) {
+        return { ok: false, message: err instanceof Error ? err.message : "Failed" };
+      }
+    },
+    [status, accountId, region],
   );
 
   return (
@@ -1620,6 +1647,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         ensureSessionForTrade,
         closeZonePartial,
         activateRunner,
+        setRunnerAuto,
       }}
     >
       {children}

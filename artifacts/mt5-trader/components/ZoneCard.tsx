@@ -295,6 +295,26 @@ function PipelineTrack({
   );
 }
 
+function RunnerAutoChip({
+  active,
+  disabled,
+  onPress,
+}: {
+  active: boolean;
+  disabled?: boolean;
+  onPress: () => void;
+}) {
+  return (
+    <Pressable
+      style={[styles.runnerAutoChip, active && styles.runnerAutoChipOn, disabled && { opacity: 0.5 }]}
+      onPress={onPress}
+      disabled={disabled}
+    >
+      <Text style={[styles.runnerAutoChipText, active && styles.runnerAutoChipTextOn]}>AUTO</Text>
+    </Pressable>
+  );
+}
+
 function RunnerSetupPanel({
   zone,
   remaining,
@@ -304,15 +324,19 @@ function RunnerSetupPanel({
   busy,
   editMode = false,
   initialTargets,
+  initialAutos,
 }: {
   zone: Zone;
   remaining: number;
   currentMarketPrice: number;
-  onActivate: (targets: {
-    r1?: { price: number; lots: number };
-    r2?: { price: number; lots: number };
-    r3?: { price: number; lots: number };
-  }) => Promise<{ ok: boolean; message?: string }>;
+  onActivate: (
+    targets: {
+      r1?: { price: number; lots: number };
+      r2?: { price: number; lots: number };
+      r3?: { price: number; lots: number };
+    },
+    autos?: { r1Auto?: boolean; r2Auto?: boolean; r3Auto?: boolean },
+  ) => Promise<{ ok: boolean; message?: string }>;
   onSkipClose: () => void;
   busy: boolean;
   editMode?: boolean;
@@ -321,6 +345,7 @@ function RunnerSetupPanel({
     r2?: { price: number; lots: number };
     r3?: { price: number; lots: number };
   };
+  initialAutos?: { r1Auto?: boolean; r2Auto?: boolean; r3Auto?: boolean };
 }) {
   const [r1, setR1] = useState({
     price: initialTargets?.r1 ? String(initialTargets.r1.price) : "",
@@ -334,6 +359,9 @@ function RunnerSetupPanel({
     price: initialTargets?.r3 ? String(initialTargets.r3.price) : "",
     lots: initialTargets?.r3 ? String(initialTargets.r3.lots) : "",
   });
+  const [r1Auto, setR1Auto] = useState(Boolean(initialAutos?.r1Auto));
+  const [r2Auto, setR2Auto] = useState(Boolean(initialAutos?.r2Auto));
+  const [r3Auto, setR3Auto] = useState(Boolean(initialAutos?.r3Auto));
 
   const filledPrices = [r1, r2, r3].filter((r) => r.price.trim().length > 0);
   const autoLot =
@@ -342,9 +370,9 @@ function RunnerSetupPanel({
       : remaining;
 
   const rows = [
-    { n: 1, s: r1, set: setR1 },
-    { n: 2, s: r2, set: setR2 },
-    { n: 3, s: r3, set: setR3 },
+    { n: 1, s: r1, set: setR1, auto: r1Auto, setAuto: setR1Auto },
+    { n: 2, s: r2, set: setR2, auto: r2Auto, setAuto: setR2Auto },
+    { n: 3, s: r3, set: setR3, auto: r3Auto, setAuto: setR3Auto },
   ] as const;
 
   const total =
@@ -385,7 +413,7 @@ function RunnerSetupPanel({
         </Text>
         <Text style={styles.runnerRemaining}>Remaining: {remaining.toFixed(2)} lots</Text>
       </View>
-      {rows.map(({ n, s, set }) => (
+      {rows.map(({ n, s, set, auto, setAuto }) => (
         <View key={n} style={styles.runnerRow}>
           <Text style={styles.runnerRowLabel}>R{n}</Text>
           <View style={{ flex: 1 }}>
@@ -400,6 +428,10 @@ function RunnerSetupPanel({
               keyboardType="decimal-pad"
               placeholderTextColor={C.specMuted}
             />
+          </View>
+          <View style={{ alignItems: "center", width: 48 }}>
+            <Text style={styles.runnerFieldLabel}>Auto</Text>
+            <RunnerAutoChip active={auto} disabled={busy} onPress={() => setAuto(!auto)} />
           </View>
           <View style={{ width: 72 }}>
             <Text style={styles.runnerFieldLabel}>Lots</Text>
@@ -420,7 +452,7 @@ function RunnerSetupPanel({
         style={[styles.runnerActivateBtn, (!ok || busy) && { backgroundColor: "#9CA3AF" }]}
         disabled={!ok || busy}
         onPress={async () => {
-          const result = await onActivate(buildTargets());
+          const result = await onActivate(buildTargets(), { r1Auto, r2Auto, r3Auto });
           if (!result.ok) Alert.alert("Activate failed", result.message ?? "Try again");
         }}
       >
@@ -453,7 +485,9 @@ interface ZoneCardProps {
       r2?: { price: number; lots: number };
       r3?: { price: number; lots: number };
     },
+    autos?: { r1Auto?: boolean; r2Auto?: boolean; r3Auto?: boolean },
   ) => Promise<{ ok: boolean; message?: string }>;
+  onSetRunnerAuto?: (zoneId: string, runnerN: 1 | 2 | 3, auto: boolean) => Promise<{ ok: boolean; message?: string }>;
   onCancelOrders?: (zoneId: string) => Promise<{ ok: boolean; message?: string; cancelledCount?: number }>;
   historical?: boolean;
 }
@@ -468,6 +502,7 @@ export default function ZoneCard({
   onCloseZone,
   onClosePartial,
   onActivateRunner,
+  onSetRunnerAuto,
   onCancelOrders,
   historical = false,
 }: ZoneCardProps) {
@@ -580,6 +615,11 @@ export default function ZoneCard({
       ? { price: zone.runner2Price, lots: zone.runner2Lots } : undefined,
     r3: zone.runner3Price != null && zone.runner3Lots != null
       ? { price: zone.runner3Price, lots: zone.runner3Lots } : undefined,
+  };
+  const runnerInitialAutos = {
+    r1Auto: Boolean(zone.runner1Auto),
+    r2Auto: Boolean(zone.runner2Auto),
+    r3Auto: Boolean(zone.runner3Auto),
   };
 
   if (historical) {
@@ -707,9 +747,9 @@ export default function ZoneCard({
           currentMarketPrice={cmp}
           busy={runnerBusy}
           onSkipClose={() => setShowRunnerPanel(false)}
-          onActivate={async (targets) => {
+          onActivate={async (targets, autos) => {
             setRunnerBusy(true);
-            const result = await onActivateRunner(zone.zoneId, targets);
+            const result = await onActivateRunner(zone.zoneId, targets, autos);
             setRunnerBusy(false);
             if (result.ok) setShowRunnerPanel(false);
             return result;
@@ -725,10 +765,11 @@ export default function ZoneCard({
           busy={runnerBusy}
           editMode
           initialTargets={runnerInitialTargets}
+          initialAutos={runnerInitialAutos}
           onSkipClose={() => setShowEditRunners(false)}
-          onActivate={async (targets) => {
+          onActivate={async (targets, autos) => {
             setRunnerBusy(true);
-            const result = await onActivateRunner(zone.zoneId, targets);
+            const result = await onActivateRunner(zone.zoneId, targets, autos);
             setRunnerBusy(false);
             if (result.ok) setShowEditRunners(false);
             return result;
@@ -748,42 +789,59 @@ export default function ZoneCard({
 
       {runnerActive && runners.length > 0 && (
         <View style={{ marginBottom: 8 }}>
-          <Text style={styles.runnerSectionLabel}>RUNNER TARGETS · push notification when each is hit</Text>
+          <Text style={styles.runnerSectionLabel}>RUNNER TARGETS · tap AUTO to bank while you sleep</Text>
           <View style={styles.tpBtnRow}>
             {runners.map((r) => {
               const isNext = !r.hit && r.n === nextRunnerN;
               const notified = Boolean(zone[`runner${r.n}Notified`]);
+              const autoOn = Boolean(zone[`runner${r.n}Auto`]);
               return (
-                <Pressable
+                <View
                   key={r.n}
                   style={[
                     styles.tpBtn,
                     styles.tpBtnRunner,
                     r.hit && styles.tpBtnHit,
                     isNext && styles.tpBtnRunnerNext,
+                    autoOn && !r.hit && styles.tpBtnRunnerAuto,
                     r.hit && { opacity: 0.75 },
                   ]}
-                  disabled={r.hit || !onClosePartial || tpBusy != null}
-                  onPress={async () => {
-                    setTpBusy(r.n);
-                    const result = await onClosePartial!(zone.zoneId, { lots: r.lots!, runnerN: r.n });
-                    setTpBusy(null);
-                    if (!result.ok) Alert.alert("Close failed", result.message ?? "Try again");
-                  }}
                 >
-                  {notified && !r.hit && (
-                    <Animated.View
-                      style={[styles.runnerPulseDot, { opacity: pulseAnim }]}
-                    />
-                  )}
-                  <Text style={[styles.tpBtnSub, (r.hit || isNext) && { color: r.hit ? C.specGold : C.teal }]}>
-                    {r.hit ? "✓ HIT" : `R${r.n}`}
-                  </Text>
-                  <Text style={[styles.tpBtnPrice, r.hit && { color: C.specGold }, isNext && { color: C.teal }]}>
-                    {formatPrice(r.price!)}
-                  </Text>
-                  <Text style={[styles.tpBtnLots, r.hit && { color: C.specGold }]}>{r.lots!.toFixed(2)} lots</Text>
-                </Pressable>
+                  <Pressable
+                    style={{ alignItems: "center", flex: 1 }}
+                    disabled={r.hit || !onClosePartial || tpBusy != null}
+                    onPress={async () => {
+                      setTpBusy(r.n);
+                      const result = await onClosePartial!(zone.zoneId, { lots: r.lots!, runnerN: r.n });
+                      setTpBusy(null);
+                      if (!result.ok) Alert.alert("Close failed", result.message ?? "Try again");
+                    }}
+                  >
+                    {notified && !r.hit && !autoOn && (
+                      <Animated.View
+                        style={[styles.runnerPulseDot, { opacity: pulseAnim }]}
+                      />
+                    )}
+                    <Text style={[styles.tpBtnSub, (r.hit || isNext) && { color: r.hit ? C.specGold : C.teal }]}>
+                      {r.hit ? "✓ HIT" : `R${r.n}`}
+                    </Text>
+                    <Text style={[styles.tpBtnPrice, r.hit && { color: C.specGold }, isNext && { color: C.teal }]}>
+                      {formatPrice(r.price!)}
+                    </Text>
+                  </Pressable>
+                  <View style={styles.runnerLotsRow}>
+                    {onSetRunnerAuto && !r.hit && (
+                      <RunnerAutoChip
+                        active={autoOn}
+                        disabled={tpBusy != null}
+                        onPress={() => {
+                          void onSetRunnerAuto(zone.zoneId, r.n, !autoOn);
+                        }}
+                      />
+                    )}
+                    <Text style={[styles.tpBtnLots, r.hit && { color: C.specGold }]}>{r.lots!.toFixed(2)} lots</Text>
+                  </View>
+                </View>
               );
             })}
           </View>
@@ -1005,6 +1063,19 @@ const styles = StyleSheet.create({
   tpBtnManual: { borderStyle: "dashed" },
   tpBtnRunner: { borderStyle: "dashed" },
   tpBtnRunnerNext: { borderColor: C.tealBdr, backgroundColor: C.tealBg },
+  tpBtnRunnerAuto: { borderColor: C.teal, backgroundColor: "rgba(14,116,144,0.12)" },
+  runnerLotsRow: { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 2 },
+  runnerAutoChip: {
+    paddingHorizontal: 5,
+    paddingVertical: 2,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: C.specBorder,
+    backgroundColor: "#fff",
+  },
+  runnerAutoChipOn: { borderColor: C.teal, backgroundColor: C.tealBg },
+  runnerAutoChipText: { fontSize: 7, fontFamily: "Inter_700Bold", color: C.specMuted, letterSpacing: 0.5 },
+  runnerAutoChipTextOn: { color: C.teal },
   tpBtnSub: { fontSize: 8.5, fontFamily: "Inter_700Bold", color: C.specMuted, letterSpacing: 0.7, marginBottom: 2 },
   tpBtnMain: { fontSize: 13, fontFamily: "Inter_700Bold", color: C.specText },
   tpBtnManualText: { fontSize: 11, fontFamily: "Inter_600SemiBold", color: C.specMuted },
