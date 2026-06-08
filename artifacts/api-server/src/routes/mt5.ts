@@ -1967,6 +1967,27 @@ export function positionShowsTpLevelApplied(
   return currentVol <= origVol * keepFractionGate;
 }
 
+/** Whether this leg still needs the zone's configured TP slice at `lvl` (per-position, per-zone). */
+export function legNeedsTpSlice(
+  leg: { id: string; volume: number },
+  st: {
+    trackedPositions: Map<string, { volume: number; tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean }>;
+    tp1Pct: number; tp2Pct: number; tp3Pct: number;
+  },
+  lvl: 1 | 2 | 3,
+): boolean {
+  const tpPcts = { tp1Pct: st.tp1Pct, tp2Pct: st.tp2Pct, tp3Pct: st.tp3Pct };
+  const cached = st.trackedPositions.get(leg.id);
+  const origVol = cached?.volume && cached.volume > 0 ? cached.volume : leg.volume;
+  const posHit = (n: 1 | 2 | 3): boolean => {
+    const key = `tp${n}Hit` as const;
+    return Boolean(cached?.[key]) || positionShowsTpLevelApplied(leg.volume, origVol, n, tpPcts);
+  };
+  if (lvl >= 2 && !posHit(1)) return false;
+  if (lvl >= 3 && !posHit(2)) return false;
+  return !posHit(lvl);
+}
+
 /** Cascade limits are cancelled only on the first successful TP2, never on TP1. */
 export function shouldCancelCascadeLimitsAtTpStage(
   tpStage: 1 | 2 | 3 | 4,
@@ -3192,7 +3213,19 @@ async function recordZonePositionFill(
  * Anchor is often missing from OPEN rows while limits are tracked — union prevents
  * close-zone from closing only the ladder and leaving the market entry running.
  */
-/** Close tpPct% from every live leg (same rule for anchor + each filled limit). */
+async function markPositionTpLevelHit(
+  zoneId: string, positionId: string, lvl: 1 | 2 | 3 | 4, st: ZoneState,
+): Promise<void> {
+  const key = `tp${lvl}Hit` as const;
+  const cached = st.trackedPositions.get(positionId);
+  if (cached) cached[key] = true;
+  await db.update(zonePositionsTable)
+    .set({ [key]: true })
+    .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.positionId, positionId)))
+    .catch((e: Error) => console.warn(`[zone ${zoneId}] pos ${positionId} ${key} persist failed:`, e.message));
+}
+
+/** Close this zone's configured tpPct from each leg that still needs level `lvl`. */
 async function closeTpSliceOnEveryLiveLeg(
   token: string,
   region: string,
@@ -3201,11 +3234,13 @@ async function closeTpSliceOnEveryLiveLeg(
   legs: LivePosition[],
   lvl: 1 | 2 | 3,
 ): Promise<number> {
-  const tpPct = st[`tp${lvl}Pct`] ?? 25;
+  const tpPct = st[`tp${lvl}Pct`];
+  if (!(tpPct > 0) || st[`tp${lvl}Enabled`] === false) return 0;
   const isLast = isLastEnabledTpLevel(lvl, st);
   const LOT_STEP = 0.01;
   let totalClosed = 0;
   for (const leg of legs) {
+    if (!legNeedsTpSlice(leg, st, lvl)) continue;
     const cached = st.trackedPositions.get(leg.id);
     const cascadeLot = cached?.volume && cached.volume > 0 ? cached.volume : leg.volume;
     const slice = computeTpSliceVolume({
@@ -3216,10 +3251,15 @@ async function closeTpSliceOnEveryLiveLeg(
     });
     if (slice.closeVol < LOT_STEP) continue;
     const toClose = Math.min(slice.closeVol, leg.volume);
+    let closed = 0;
     if (toClose >= leg.volume - 1e-9) {
-      if (await closeZonePosition(token, region, st.accountId, leg.id)) totalClosed += leg.volume;
+      if (await closeZonePosition(token, region, st.accountId, leg.id)) closed = leg.volume;
     } else if (await closeZonePosition(token, region, st.accountId, leg.id, toClose)) {
-      totalClosed += toClose;
+      closed = toClose;
+    }
+    if (closed > 0) {
+      totalClosed += closed;
+      await markPositionTpLevelHit(zoneId, leg.id, lvl, st);
     }
   }
   return totalClosed;
@@ -4111,14 +4151,13 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       // Merge DB snapshot into existing cache (do NOT replace the Map wholesale)
       // — replacing would clobber a concurrent recordZonePositionFill().add()
       // landing between our SELECT and this assignment.
-      for (const z of zps) {
-        const existing = st.trackedPositions.get(z.positionId);
-        st.trackedPositions.set(z.positionId, {
-          volume: z.volume, entryPrice: z.entryPrice,
-          tp1Hit: existing?.tp1Hit ?? false,
-          tp2Hit: existing?.tp2Hit ?? false,
-          tp3Hit: existing?.tp3Hit ?? false,
-          tp4Hit: existing?.tp4Hit ?? false,
+      for (const r of rows) {
+        st.trackedPositions.set(r.positionId, {
+          volume: Number(r.volume), entryPrice: Number(r.entryPrice),
+          tp1Hit: Boolean(r.tp1Hit),
+          tp2Hit: Boolean(r.tp2Hit),
+          tp3Hit: Boolean(r.tp3Hit),
+          tp4Hit: Boolean(r.tp4Hit),
         });
       }
       // Drop entries the authoritative DB view says are no longer OPEN.
@@ -4400,12 +4439,11 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
     const AUTO_TP_BUFFER = 0.30;
     const AUTO_TP_BUFFER_WINDOW_MS = 15_000;
     for (const lvl of [1, 2, 3] as const) {
-      if (st[`tp${lvl}Hit`]) continue;
       const tpPrice = st[`tp${lvl}Price`];
-      const tpPct = st[`tp${lvl}Pct`] ?? 25;
+      const tpPct = st[`tp${lvl}Pct`];
       const enabled = st[`tp${lvl}Enabled`] !== false;
       const passedAt = st[`tp${lvl}PassedAt`];
-      if (tpPrice == null || !enabled) continue;
+      if (tpPrice == null || !enabled || !(tpPct > 0)) continue;
 
       const atLevel = st.direction === "buy"
         ? price.bid >= tpPrice
@@ -4422,23 +4460,24 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         const tpLegs = await resolveLivePositionsForZoneAction(
           token, region, st.accountId, zoneId, st, { fresh: true },
         );
-        if (tpLegs.length === 0) continue;
+        const pendingLegs = tpLegs.filter((leg) => legNeedsTpSlice(leg, st, lvl));
+        if (pendingLegs.length === 0) continue;
 
+        const zoneHadTpHit = st[`tp${lvl}Hit`];
         const closeLots = await closeTpSliceOnEveryLiveLeg(
-          token, region, st, zoneId, tpLegs, lvl,
+          token, region, st, zoneId, pendingLegs, lvl,
         );
         if (closeLots < 0.01) continue;
 
-        const hitKey = `tp${lvl}Hit` as const;
-        st[hitKey] = true;
         st[`tp${lvl}PassedAt`] = undefined;
-        await db.update(cascadeZonesTable)
-          .set({ [hitKey]: true })
-          .where(eq(cascadeZonesTable.zoneId, zoneId))
-          .catch(() => {});
+        await mergeZoneHitsFromPositions(zoneId, {
+          tp1Hit: st.tp1Hit, tp2Hit: st.tp2Hit, tp3Hit: st.tp3Hit, tp4Hit: st.tp4Hit,
+          tp1Enabled: st.tp1Enabled, tp2Enabled: st.tp2Enabled,
+          tp3Enabled: st.tp3Enabled, tp4Enabled: st.tp4Enabled,
+        });
         broadcastZoneUpdate(zoneId);
 
-        if (lvl === 2) {
+        if (lvl === 2 && !zoneHadTpHit) {
           try {
             await cancelZoneLimits(token, region, st.accountId, zoneId);
             const legs = await resolveLivePositionsForZoneAction(
@@ -4456,7 +4495,7 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         if (lvl === 3) {
           notifyZoneEvent(zoneId, "tp3_runners", 3, 0, st.direction);
         }
-        console.log(`[auto-tp] zone ${zoneId} TP${lvl} closed ${closeLots.toFixed(2)} lots across ${tpLegs.length} leg(s)`);
+        console.log(`[auto-tp] zone ${zoneId} TP${lvl} (${tpPct}%) closed ${closeLots.toFixed(2)} lots across ${pendingLegs.length} leg(s)`);
       } catch (err) {
         console.error(`[auto-tp] TP${lvl} close failed for ${zoneId}:`, err);
       }
@@ -4765,7 +4804,7 @@ export async function loadZone(zoneId: string): Promise<ZoneState | null> {
         // intentionally and have their flags set by evaluateZone going forward.
         st.trackedPositions.set(zp.positionId, {
           volume: Number(zp.volume), entryPrice: Number(zp.entryPrice),
-          tp1Hit: Boolean(zp.tp1Hit) || st.tp1Hit,
+          tp1Hit: Boolean(zp.tp1Hit),
           tp2Hit: Boolean(zp.tp2Hit),
           tp3Hit: Boolean(zp.tp3Hit),
           tp4Hit: Boolean(zp.tp4Hit),
@@ -4809,7 +4848,7 @@ export async function loadZoneState(): Promise<void> {
         const st = zoneStates.get(zp.zoneId);
         if (st) st.trackedPositions.set(zp.positionId, {
           volume: Number(zp.volume), entryPrice: Number(zp.entryPrice),
-          tp1Hit: Boolean(zp.tp1Hit) || st.tp1Hit,
+          tp1Hit: Boolean(zp.tp1Hit),
           tp2Hit: Boolean(zp.tp2Hit),
           tp3Hit: Boolean(zp.tp3Hit),
           tp4Hit: Boolean(zp.tp4Hit),

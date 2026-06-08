@@ -46,6 +46,7 @@ import {
   deleteZoneLimitOrder,
   mergeLiveZoneLegs,
   zoneLegsNeedFreshResolve,
+  legNeedsTpSlice,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
@@ -750,6 +751,38 @@ describe("disabled TP history", () => {
     } as Parameters<typeof makeRow>[0]));
     expect(st.tp3Hit).toBe(false);
     expect(st.tp3Enabled).toBe(false);
+  });
+});
+
+describe("legNeedsTpSlice (per-position TP ladder)", () => {
+  const makeSt = (tp1Pct = 30, tp2Pct = 30, tp3Pct = 40) => ({
+    tp1Pct, tp2Pct, tp3Pct,
+    trackedPositions: new Map<string, { volume: number; tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean }>(),
+  });
+
+  it("new leg needs TP1 even when zone already hit TP1 on other legs", () => {
+    const st = makeSt();
+    st.trackedPositions.set("anchor", { volume: 0.04, tp1Hit: true, tp2Hit: false, tp3Hit: false, tp4Hit: false });
+    st.trackedPositions.set("limit2", { volume: 0.04, tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false });
+    expect(legNeedsTpSlice({ id: "limit2", volume: 0.04 }, st, 1)).toBe(true);
+    expect(legNeedsTpSlice({ id: "anchor", volume: 0.03 }, st, 1)).toBe(false);
+  });
+
+  it("leg cannot take TP2 until TP1 slice applied on that leg", () => {
+    const st = makeSt();
+    st.trackedPositions.set("limit2", { volume: 0.04, tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false });
+    expect(legNeedsTpSlice({ id: "limit2", volume: 0.04 }, st, 2)).toBe(false);
+    st.trackedPositions.set("limit2", { volume: 0.04, tp1Hit: true, tp2Hit: false, tp3Hit: false, tp4Hit: false });
+    expect(legNeedsTpSlice({ id: "limit2", volume: 0.03 }, st, 2)).toBe(true);
+  });
+
+  it("uses zone-configured pct via position volume gate", () => {
+    const st = makeSt(50, 25, 25);
+    st.trackedPositions.set("leg", { volume: 0.04, tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false });
+    expect(legNeedsTpSlice({ id: "leg", volume: 0.02 }, st, 1)).toBe(true);
+    expect(legNeedsTpSlice({ id: "leg", volume: 0.02 }, st, 1)).toBe(true);
+    st.trackedPositions.set("leg", { volume: 0.04, tp1Hit: true, tp2Hit: false, tp3Hit: false, tp4Hit: false });
+    expect(legNeedsTpSlice({ id: "leg", volume: 0.02 }, st, 1)).toBe(false);
   });
 });
 
