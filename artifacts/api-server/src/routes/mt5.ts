@@ -536,9 +536,15 @@ export type Mt5AutoCascadeSkipInput = {
   tpPipsValid: boolean;
 };
 
+/** Broker symbols vary (XAUUSD, XAUUSD+, GOLD, XAUUSDm) — normalize before matching. */
+export function isXauusdSymbol(symbol: string): boolean {
+  const core = symbol.toUpperCase().replace(/[^A-Z]/g, "");
+  return core === "XAUUSD" || core === "GOLD";
+}
+
 /** Returns a short skip-reason code, or null when auto-cascade should proceed. */
 export function evaluateMt5AutoCascadeSkip(input: Mt5AutoCascadeSkipInput): string | null {
-  if (input.symbol !== "XAUUSD") return "symbol";
+  if (!isXauusdSymbol(input.symbol)) return "symbol";
   if (parseZoneIdFromComment(input.comment) || input.comment.includes("zone:")) return "zone_tag";
   if (input.comment.startsWith("Cascade")) return "cascade_comment";
   if (!input.syncReady) return "not_synced";
@@ -660,6 +666,44 @@ function mapPositionDirection(position: Record<string, unknown>): "buy" | "sell"
   if (t.includes("BUY")) return "buy";
   if (t.includes("SELL")) return "sell";
   return null;
+}
+
+function markStreamSyncReady(accountId: string, source: "deals" | "positions"): void {
+  if (syncReady.has(accountId)) return;
+  syncReady.add(accountId);
+  syncReadyAt.set(accountId, Date.now());
+  skipLogged.delete(accountId);
+  const pending = recoveryTimers.get(accountId);
+  if (pending) {
+    clearTimeout(pending);
+    recoveryTimers.delete(accountId);
+  }
+  console.log(`[stream ${accountId}] ${source} sync complete`);
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function positionPayloadFromDeal(deal: any): Record<string, unknown> {
+  const price = Number(deal?.price ?? deal?.openPrice ?? 0);
+  return {
+    id: deal?.positionId,
+    positionId: deal?.positionId,
+    symbol: deal?.symbol,
+    comment: deal?.comment,
+    openPrice: price,
+    volume: deal?.volume,
+    type: deal?.type,
+    time: deal?.time,
+  };
+}
+
+function isMt5ManualMarketDeal(deal: Record<string, unknown>): boolean {
+  if (deal.entryType !== "DEAL_ENTRY_IN") return false;
+  const t = String(deal.type ?? "");
+  if (t !== "DEAL_TYPE_BUY" && t !== "DEAL_TYPE_SELL") return false;
+  if (!deal.positionId) return false;
+  const comment = String(deal.comment ?? "");
+  if (comment.startsWith("Cascade") || comment === "XAUUSD Trader App") return false;
+  return true;
 }
 
 async function positionAlreadyInZone(accountId: string, positionId: string): Promise<boolean> {
@@ -1162,17 +1206,12 @@ function makeDealListener(accountId: string) {
     // onDealsSynchronized fires after all historical deals have been replayed.
     async onDealsSynchronized(_instanceIndex: string, _synchronizationId: string): Promise<void> {
       lastEventAt.set(accountId, Date.now());
-      if (!syncReady.has(accountId)) {
-        syncReady.add(accountId);
-        syncReadyAt.set(accountId, Date.now());
-        skipLogged.delete(accountId);
-        const pending = recoveryTimers.get(accountId);
-        if (pending) {
-          clearTimeout(pending);
-          recoveryTimers.delete(accountId);
-        }
-        console.log(`[stream ${accountId}] deals sync complete`);
-      }
+      markStreamSyncReady(accountId, "deals");
+    },
+    // Positions can finish syncing before deals — arm auto-cascade without waiting.
+    async onPositionsSynchronized(_instanceIndex: string, _synchronizationId: string): Promise<void> {
+      lastEventAt.set(accountId, Date.now());
+      markStreamSyncReady(accountId, "positions");
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async onDealAdded(_instanceIndex: string, deal: any): Promise<void> {
@@ -1265,6 +1304,13 @@ function makeDealListener(accountId: string) {
       console.log(`[stream ${accountId}] deal dealId=${evt.dealId} posId=${evt.positionId} type=${evt.type} sym=${evt.symbol} price=${evt.openPrice} comment="${evt.comment ?? ""}"`);
       storeDealEvent(accountId, evt);
       broadcastToAccount(accountId, "deal", { type: "position_changed" });
+      // MT5 one-click trades reliably arrive as onDealAdded; onPositionAdded is
+      // a backup — both paths share triggerMt5OneClickAutoCascade + dedup guards.
+      if (isMt5ManualMarketDeal(deal as Record<string, unknown>)) {
+        void triggerMt5OneClickAutoCascade(accountId, positionPayloadFromDeal(deal)).catch((err) =>
+          console.error(`[auto-cascade] onDealAdded failed accountId=${accountId}:`, (err as Error).message),
+        );
+      }
     },
     // Streaming tick handlers — drive evaluateZone off real broker ticks so
     // TPs fire within ~100ms of the level being touched (vs the 3 s timer's
@@ -1718,8 +1764,14 @@ async function triggerMt5OneClickAutoCascade(
     tpPipsValid: tpPipsOrderingValid(config),
   });
   if (skip) {
-    if (skip !== "disabled" && skip !== "not_synced" && skip !== "historical" && skip !== "duplicate") {
-      console.log(`[auto-cascade] skip posId=${posId} reason=${skip}`);
+    const quiet = new Set(["historical", "duplicate", "already_cascaded", "app_cascade_pending"]);
+    if (!quiet.has(skip)) {
+      const hint = skip === "disabled"
+        ? " — enable Auto-cascade on MT5 one-click in app Settings"
+        : skip === "not_synced"
+          ? " — stream still syncing; retry after connect"
+          : "";
+      console.log(`[auto-cascade] skip posId=${posId} sym=${symbol} reason=${skip}${hint}`);
     }
     return;
   }
