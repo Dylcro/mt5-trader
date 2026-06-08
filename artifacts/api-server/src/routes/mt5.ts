@@ -788,11 +788,15 @@ async function mergeZoneHitsFromPositions(
       .where(eq(cascadeZonesTable.zoneId, zoneId))
       .catch((e: Error) => console.warn(`[zone ${zoneId}] hit-flag sync failed:`, e.message));
     const st = zoneStates.get(zoneId);
+    const prevTp3Hit = Boolean(st?.tp3Hit ?? row.tp3Hit);
     if (st) {
       st.tp1Hit = persistTp1;
       st.tp2Hit = persistTp2;
       st.tp3Hit = persistTp3;
       st.tp4Hit = persistTp4;
+    }
+    if (persistTp3 && !prevTp3Hit) {
+      void maybeNotifyTp3Runners(zoneId);
     }
   }
   return {
@@ -4051,12 +4055,7 @@ async function handleClosePartial(
       });
     }
     if (tpLevel === 3) {
-      const notified = st.tpNotified ?? { tp1: false, tp2: false, tp3: false, runner1: false, runner2: false, runner3: false };
-      if (!notified.tp3) {
-        notified.tp3 = true;
-        st.tpNotified = notified;
-        void notifyZoneEvent(zoneId, "tp3_runners", 3, 0, st.direction);
-      }
+      void maybeNotifyTp3Runners(zoneId);
     }
     console.log(`[take-tp] zone ${zoneId} manual TP${tpLevel} closed ${closeLots.toFixed(2)} lots across ${pendingLegs.length} leg(s)`);
     return { ok: true };
@@ -5028,12 +5027,7 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         }
 
         if (lvl === 3) {
-          const tpNotif = st.tpNotified ?? { tp1: false, tp2: false, tp3: false, runner1: false, runner2: false, runner3: false };
-          if (!tpNotif.tp3) {
-            tpNotif.tp3 = true;
-            st.tpNotified = tpNotif;
-            void notifyZoneEvent(zoneId, "tp3_runners", 3, 0, st.direction);
-          }
+          void maybeNotifyTp3Runners(zoneId);
         }
         console.log(`[auto-tp] zone ${zoneId} TP${lvl} (${tpPct}%) closed ${closeLots.toFixed(2)} lots across ${pendingLegs.length} leg(s)`);
       } catch (err) {
@@ -5522,7 +5516,7 @@ async function resolveZoneNotifyUserIdAsync(zoneId: string, accountId?: string):
   const immediate = resolveZoneNotifyUserId(zoneId, accountId);
   if (immediate) return immediate;
   try {
-    const [row] = await db.select({ userId: cascadeZonesTable.userId })
+    const [row] = await db.select({ userId: cascadeZonesTable.userId, accountId: cascadeZonesTable.accountId })
       .from(cascadeZonesTable)
       .where(eq(cascadeZonesTable.zoneId, zoneId))
       .limit(1);
@@ -5530,20 +5524,31 @@ async function resolveZoneNotifyUserIdAsync(zoneId: string, accountId?: string):
       zoneIdToUserId.set(zoneId, row.userId);
       return row.userId;
     }
+    const acctId = accountId ?? row?.accountId;
+    if (acctId) {
+      const [acct] = await db.select({ userId: storedAccountsTable.userId })
+        .from(storedAccountsTable)
+        .where(eq(storedAccountsTable.accountId, acctId))
+        .limit(1);
+      if (acct?.userId) {
+        zoneIdToUserId.set(zoneId, acct.userId);
+        return acct.userId;
+      }
+    }
   } catch (e) {
     console.warn(`[notif] userId DB lookup failed for zone ${zoneId}:`, (e as Error).message);
   }
   return undefined;
 }
 
-async function loadPrefsForUser(userId: string): Promise<NotificationPrefs | null> {
+async function loadPrefsForUser(userId: string, opts?: { freshToken?: boolean }): Promise<NotificationPrefs | null> {
   const cached = notificationPrefs.get(userId);
-  if (cached) return cached;
+  if (cached && !opts?.freshToken) return cached;
   try {
     const [row] = await db.select().from(notificationPrefsTable)
       .where(eq(notificationPrefsTable.userId, userId))
       .limit(1);
-    if (!row) return null;
+    if (!row) return cached ?? null;
     const prefs: NotificationPrefs = {
       nearEnabled: row.nearEnabled,
       hitEnabled: row.hitEnabled,
@@ -5554,8 +5559,23 @@ async function loadPrefsForUser(userId: string): Promise<NotificationPrefs | nul
     return prefs;
   } catch (e) {
     console.warn(`[notif] prefs DB lookup failed for user ${userId}:`, (e as Error).message);
-    return null;
+    return cached ?? null;
   }
+}
+
+/** Fire TP3 runner push once per zone — works from auto-TP, manual take-TP, or hit sync. */
+async function maybeNotifyTp3Runners(zoneId: string): Promise<void> {
+  let st = zoneStates.get(zoneId);
+  if (!st) st = (await loadZone(zoneId)) ?? undefined;
+  if (!st?.tp3Hit) return;
+  const tpNotif = st.tpNotified ?? {
+    tp1: false, tp2: false, tp3: false,
+    runner1: false, runner2: false, runner3: false,
+  };
+  if (tpNotif.tp3) return;
+  await notifyZoneEvent(zoneId, "tp3_runners", 3, 0, st.direction);
+  tpNotif.tp3 = true;
+  st.tpNotified = tpNotif;
 }
 
 async function notifyZoneEvent(
@@ -5573,7 +5593,7 @@ async function notifyZoneEvent(
     console.warn(`[notif] no userId for zone ${zoneId} — skipping ${kind} TP${tp}`);
     return;
   }
-  const prefs = await loadPrefsForUser(userId);
+  const prefs = await loadPrefsForUser(userId, { freshToken: kind === "tp3_runners" });
   if (!prefs?.expoPushToken) {
     console.warn(`[notif] no push token for user ${userId} — skipping ${kind} TP${tp} zone ${zoneId}`);
     return;
@@ -5583,6 +5603,7 @@ async function notifyZoneEvent(
   if (kind === "hit" || kind === "runner") {
     if (!prefs.hitEnabled) return;
   }
+  // tp3_runners intentionally ignores hitEnabled — see app NotificationSettingsProvider.
   const dir = direction.toUpperCase();
   const anchor = st?.anchorPrice;
   const anchorFmt = anchor != null ? anchor.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "—";
