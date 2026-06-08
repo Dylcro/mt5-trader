@@ -6,6 +6,9 @@ import { buildCascadeComment } from "@/lib/zoneComments";
 import {
   collectActiveZoneLinkedPositionIds,
   getLinkedPositionsForZone,
+  pipelineBarFill,
+  pipelineEnabledTps,
+  pipelineSegmentProgress,
   positionsNotInActiveZones,
 } from "./zoneDisplay";
 
@@ -43,6 +46,34 @@ function zone(zoneId: string, overrides: Partial<Zone> = {}): Zone {
     ...overrides,
   };
 }
+
+describe("pipeline gold bar (sell + disabled TP1)", () => {
+  const sellZone = zone("z_sell", {
+    direction: "sell",
+    anchorPrice: 2650,
+    tp1Price: 2648,
+    tp2Price: 2645,
+    tp3Price: 2641,
+    tp1Enabled: false,
+    tp2Enabled: true,
+    tp3Enabled: true,
+  });
+
+  it("skips disabled TP1 for next segment", () => {
+    const steps = pipelineEnabledTps(sellZone);
+    expect(steps.map((s) => s.level)).toEqual([2, 3]);
+    const { nextStep, prevPrice, progressPct } = pipelineSegmentProgress(sellZone, steps, 2650);
+    expect(nextStep?.level).toBe(2);
+    expect(prevPrice).toBe(2650);
+    expect(progressPct).toBe(0);
+  });
+
+  it("starts sell fill at SL side, not TP3 side", () => {
+    const steps = pipelineEnabledTps(sellZone);
+    const { progressPct } = pipelineSegmentProgress(sellZone, steps, 2650);
+    expect(pipelineBarFill(steps, progressPct)).toBeLessThan(30);
+  });
+});
 
 describe("getLinkedPositionsForZone", () => {
   const zoneId = "z_oneclick_anchor";

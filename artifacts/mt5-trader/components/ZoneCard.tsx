@@ -16,6 +16,12 @@ import {
 import Colors from "@/constants/colors";
 import { triggerAppHaptic, useHapticSettings } from "@/hooks/useHapticSettings";
 import type { Zone } from "@/hooks/useZones";
+import {
+  PIPELINE_DOT_POSITIONS,
+  pipelineBarFill,
+  pipelineEnabledTps,
+  pipelineSegmentProgress,
+} from "@/lib/zoneDisplay";
 
 const C = Colors.dark;
 const TP_BUFFER = 5.0;
@@ -109,27 +115,6 @@ function computeTpLot(originalVol: number, tpPct: number): number | null {
   return snapped >= LOT_STEP ? snapped : null;
 }
 
-const DOT_POSITIONS = {
-  sl: 5,
-  tp1: 25,
-  tp2: 50,
-  tp3: 75,
-  runner: 93,
-} as const;
-
-function getBarFill(tpHit: boolean[], progressPct: number): number {
-  const base = tpHit[2] ? DOT_POSITIONS.tp3
-    : tpHit[1] ? DOT_POSITIONS.tp2
-      : tpHit[0] ? DOT_POSITIONS.tp1
-        : DOT_POSITIONS.sl;
-  const nextDot = tpHit[2] ? DOT_POSITIONS.runner
-    : tpHit[1] ? DOT_POSITIONS.tp3
-      : tpHit[0] ? DOT_POSITIONS.tp2
-        : DOT_POSITIONS.tp1;
-  const range = nextDot - base;
-  return base + (range * progressPct / 100);
-}
-
 function PipelineTrack({
   zone,
   currentPrice,
@@ -138,16 +123,10 @@ function PipelineTrack({
   currentPrice: number;
 }) {
   const [trackWidth, setTrackWidth] = useState(0);
-  const tpHit = [zone.tp1Hit, zone.tp2Hit, zone.tp3Hit];
-  const tps = [
-    { level: 1 as const, price: zone.tp1Price, hit: zone.tp1Hit },
-    { level: 2 as const, price: zone.tp2Price, hit: zone.tp2Hit },
-    { level: 3 as const, price: zone.tp3Price, hit: zone.tp3Hit },
-  ].filter((t) => t.price != null) as Array<{ level: 1 | 2 | 3; price: number; hit: boolean }>;
+  const steps = pipelineEnabledTps(zone);
 
   const toPos = (price: number): number => {
-    const allPrices = [zone.anchorPrice, zone.tp1Price, zone.tp2Price, zone.tp3Price]
-      .filter((p): p is number => p != null);
+    const allPrices = [zone.anchorPrice, ...steps.map((s) => s.price)];
     const min = Math.min(...allPrices);
     const max = Math.max(...allPrices);
     const buf = (max - min) * 0.15;
@@ -156,28 +135,20 @@ function PipelineTrack({
     return zone.direction === "sell" ? 100 - raw : raw;
   };
 
-  const nextTpIdx = tps.findIndex((t) => !t.hit);
-  const nextTp = nextTpIdx >= 0 ? tps[nextTpIdx] : null;
-  const allTpHit = tps.length > 0 && tps.every((t) => t.hit);
-  const prevPrice = nextTpIdx > 0 ? tps[nextTpIdx - 1]!.price : nextTpIdx === 0 ? zone.anchorPrice : tps.at(-1)?.price ?? zone.anchorPrice;
+  const { progressPct, nextStep, nextPrice: segNextPrice, allHit: allTpHit } =
+    pipelineSegmentProgress(zone, steps, currentPrice);
   const nextPrice = allTpHit
     ? (zone.runner1Price ?? (zone.tp3Price != null
       ? zone.direction === "buy" ? zone.tp3Price + 10 : zone.tp3Price - 10
       : null))
-    : nextTp?.price ?? null;
-  const progressPct =
-    nextPrice != null && prevPrice != null
-      ? zone.direction === "buy"
-        ? Math.min(Math.max(((currentPrice - prevPrice) / (nextPrice - prevPrice)) * 100, 0), 100)
-        : Math.min(Math.max(((prevPrice - currentPrice) / (prevPrice - nextPrice)) * 100, 0), 100)
-      : 100;
+    : segNextPrice;
   const atLevel = nextPrice != null && (
     zone.direction === "buy"
       ? currentPrice >= nextPrice - 0.5
       : currentPrice <= nextPrice + 0.5
   );
 
-  const fillPct = getBarFill(tpHit, progressPct);
+  const fillPct = pipelineBarFill(steps, progressPct);
   const needlePct = toPos(currentPrice);
   const fillAnim = useRef(new Animated.Value(fillPct)).current;
   const progAnim = useRef(new Animated.Value(progressPct)).current;
@@ -197,11 +168,12 @@ function PipelineTrack({
     }).start();
   }, [fillPct, progressPct, fillAnim, progAnim]);
 
-  const dotDefs = [
-    { key: "tp1", pos: DOT_POSITIONS.tp1, hit: zone.tp1Hit, isNext: nextTp?.level === 1 },
-    { key: "tp2", pos: DOT_POSITIONS.tp2, hit: zone.tp2Hit, isNext: nextTp?.level === 2 },
-    { key: "tp3", pos: DOT_POSITIONS.tp3, hit: zone.tp3Hit, isNext: nextTp?.level === 3 },
-  ];
+  const dotDefs = steps.map((s) => ({
+    key: `tp${s.level}` as const,
+    pos: s.dotPos,
+    hit: s.hit,
+    isNext: nextStep?.level === s.level,
+  }));
 
   return (
     <View style={{ marginBottom: 12 }}>
@@ -214,7 +186,6 @@ function PipelineTrack({
           <Animated.View
             style={[
               styles.pipeFill,
-              zone.direction === "sell" && { left: undefined, right: 0 },
               {
                 width: fillAnim.interpolate({
                   inputRange: [0, 100],
@@ -245,7 +216,7 @@ function PipelineTrack({
               styles.pipeDot,
               styles.pipeDotRunner,
               {
-                left: trackWidth * DOT_POSITIONS.runner / 100 - 7,
+                left: trackWidth * PIPELINE_DOT_POSITIONS.runner / 100 - 7,
                 backgroundColor: zone.runnerActive ? C.tealBg : "#fff",
                 borderColor: zone.runnerActive ? C.teal : "#D1D5DB",
               },
@@ -257,18 +228,24 @@ function PipelineTrack({
         )}
       </View>
       <View style={{ position: "relative", height: 16, marginTop: 4 }}>
-        <Text style={[styles.pipeLabel, { position: "absolute", left: `${DOT_POSITIONS.sl}%`, transform: [{ translateX: -12 }], color: C.specSell }]}>SL</Text>
-        <Text style={[styles.pipeLabel, { position: "absolute", left: `${DOT_POSITIONS.tp1}%`, transform: [{ translateX: -12 }], color: zone.tp1Hit ? C.specGold : C.specMuted }]}>TP1</Text>
-        <Text style={[styles.pipeLabel, { position: "absolute", left: `${DOT_POSITIONS.tp2}%`, transform: [{ translateX: -12 }], color: zone.tp2Hit ? C.specGold : C.specMuted }]}>TP2</Text>
-        <Text style={[styles.pipeLabel, { position: "absolute", left: `${DOT_POSITIONS.tp3}%`, transform: [{ translateX: -12 }], color: zone.tp3Hit ? C.specGold : C.specMuted }]}>TP3</Text>
-        <Text style={[styles.pipeLabel, { position: "absolute", left: `${DOT_POSITIONS.runner}%`, transform: [{ translateX: -20 }], color: zone.runnerActive ? C.teal : C.specMuted }]}>Runner</Text>
+        <Text style={[styles.pipeLabel, { position: "absolute", left: `${PIPELINE_DOT_POSITIONS.sl}%`, transform: [{ translateX: -12 }], color: C.specSell }]}>SL</Text>
+        {zone.tp1Enabled !== false && (
+          <Text style={[styles.pipeLabel, { position: "absolute", left: `${PIPELINE_DOT_POSITIONS.tp1}%`, transform: [{ translateX: -12 }], color: zone.tp1Hit ? C.specGold : C.specMuted }]}>TP1</Text>
+        )}
+        {zone.tp2Enabled !== false && (
+          <Text style={[styles.pipeLabel, { position: "absolute", left: `${PIPELINE_DOT_POSITIONS.tp2}%`, transform: [{ translateX: -12 }], color: zone.tp2Hit ? C.specGold : C.specMuted }]}>TP2</Text>
+        )}
+        {zone.tp3Enabled !== false && (
+          <Text style={[styles.pipeLabel, { position: "absolute", left: `${PIPELINE_DOT_POSITIONS.tp3}%`, transform: [{ translateX: -12 }], color: zone.tp3Hit ? C.specGold : C.specMuted }]}>TP3</Text>
+        )}
+        <Text style={[styles.pipeLabel, { position: "absolute", left: `${PIPELINE_DOT_POSITIONS.runner}%`, transform: [{ translateX: -20 }], color: zone.runnerActive ? C.teal : C.specMuted }]}>Runner</Text>
       </View>
       {nextPrice != null && (
         <View style={{ marginTop: 10 }}>
           <View style={styles.progressHeader}>
             <Text style={styles.progressPrice}>{formatPrice(currentPrice)}</Text>
             <Text style={styles.progressTarget}>
-              → {allTpHit ? "Runner" : `TP${nextTp!.level}`} {formatPrice(nextPrice)}
+              → {allTpHit ? "Runner" : `TP${nextStep!.level}`} {formatPrice(nextPrice)}
             </Text>
             <Text style={[styles.progressDist, atLevel && { color: C.specBuy }]}>
               {atLevel

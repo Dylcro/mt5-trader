@@ -5868,8 +5868,16 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         const cmp = dir === "buy" ? price.bid : price.ask;
         currentPrice = cmp;
         const tps = [tp1Price, tp2Price, tp3Price, tp4Price];
+        const tpEnabled = [tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled];
         const nextPx = tps[nextTp - 1];
-        const prevPx = nextTp === 1 ? anchor : (tps[nextTp - 2] ?? anchor);
+        let prevPx = anchor;
+        if (nextTp > 1) {
+          for (let i = nextTp - 2; i >= 0; i--) {
+            if (!tpEnabled[i]) continue;
+            const px = tps[i];
+            if (px != null) { prevPx = px; break; }
+          }
+        }
         if (nextPx != null) {
           nextTpPrice = parseFloat(nextPx.toFixed(2));
           const sign = dir === "buy" ? 1 : -1;
