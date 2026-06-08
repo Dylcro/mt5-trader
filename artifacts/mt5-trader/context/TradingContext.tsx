@@ -60,6 +60,8 @@ export interface Position {
   profit: number;
   time: string;
   comment?: string;
+  /** Set by API when zone_positions row exists but MT5 comment tag is missing. */
+  zoneId?: string;
 }
 
 export interface PendingOrder {
@@ -500,6 +502,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         profit: Number(pos.profit ?? 0),
         time: String(pos.time ?? ""),
         comment: pos.comment != null ? String(pos.comment) : undefined,
+        zoneId: pos.zoneId != null ? String(pos.zoneId) : undefined,
       };
     });
   }, []);

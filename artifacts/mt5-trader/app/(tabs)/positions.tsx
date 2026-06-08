@@ -329,11 +329,12 @@ export default function PositionsScreen() {
   );
   const trackedPositionIds = useMemo(() => {
     const ids = new Set<string>();
-    for (const z of displayActiveZones) {
-      for (const pid of z.trackedPositionIds ?? []) ids.add(pid);
+    for (const z of zones) {
+      if (z.status !== "OPEN" && z.status !== "RISK_FREE" && z.status !== "ARMED") continue;
+      for (const pid of z.trackedPositionIds ?? []) ids.add(String(pid));
     }
     return ids;
-  }, [displayActiveZones]);
+  }, [zones]);
   const standalonePositions = useMemo(
     () => positionsWithoutZone(positions, displayZoneIds, trackedPositionIds),
     [positions, displayZoneIds, trackedPositionIds],

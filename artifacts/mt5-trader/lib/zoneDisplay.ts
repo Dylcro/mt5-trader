@@ -6,6 +6,14 @@ import { isTp4LevelEnabled, zoneReachedTpLevel } from "@/lib/zoneStats";
 
 const PIP = 0.1;
 
+function normalizePositionId(id: string | number | undefined | null): string {
+  return String(id ?? "");
+}
+
+function zoneIdForPosition(p: Position): string | null {
+  return parseZoneIdFromComment(p.comment) ?? p.zoneId ?? null;
+}
+
 function positionDirection(p: Position): "buy" | "sell" {
   return p.type === "POSITION_TYPE_BUY" ? "buy" : "sell";
 }
@@ -124,7 +132,7 @@ function syntheticZoneFromPositions(
 export function groupPositionsByZoneId(positions: Position[]): Map<string, Position[]> {
   const map = new Map<string, Position[]>();
   for (const p of positions) {
-    const zid = parseZoneIdFromComment(p.comment);
+    const zid = zoneIdForPosition(p);
     if (!zid) continue;
     const arr = map.get(zid) ?? [];
     arr.push(p);
@@ -158,14 +166,35 @@ export function buildDisplayActiveZones(
     apiZones.filter((z) => z.status === "CLOSED").map((z) => z.zoneId),
   );
   const active = apiZones.filter((z) => z.status === "OPEN" || z.status === "RISK_FREE" || z.status === "ARMED");
+  const trackedByZone = new Map<string, Set<string>>();
+  for (const z of active) {
+    const ids = new Set((z.trackedPositionIds ?? []).map(normalizePositionId));
+    if (ids.size > 0) trackedByZone.set(z.zoneId, ids);
+  }
+  const allTrackedIds = new Set<string>();
+  for (const ids of trackedByZone.values()) {
+    for (const id of ids) allTrackedIds.add(id);
+  }
   const byComment = groupPositionsByZoneId(positions);
   const byPending = groupPendingByZoneId(pendingOrders);
   const seen = new Set<string>();
   const out: Zone[] = [];
 
+  const linkedPositionsForZone = (zoneId: string): Position[] => {
+    const fromComment = byComment.get(zoneId) ?? [];
+    const tracked = trackedByZone.get(zoneId);
+    if (!tracked?.size) return fromComment;
+    const byId = new Map(fromComment.map((p) => [normalizePositionId(p.id), p]));
+    for (const p of positions) {
+      const pid = normalizePositionId(p.id);
+      if (tracked.has(pid) && !byId.has(pid)) byId.set(pid, p);
+    }
+    return [...byId.values()];
+  };
+
   for (const z of active) {
     seen.add(z.zoneId);
-    const linked = byComment.get(z.zoneId) ?? [];
+    const linked = linkedPositionsForZone(z.zoneId);
     const merged: Zone = enrichZoneDisplayFields({
       ...z,
       positionCount: linked.length > 0 ? linked.length : z.positionCount,
@@ -180,6 +209,7 @@ export function buildDisplayActiveZones(
       return;
     }
     if (closedIds.has(zoneId) && linked.length === 0) return;
+    if (linked.some((p) => allTrackedIds.has(normalizePositionId(p.id)))) return;
     const syn = syntheticZoneFromPositions(zoneId, linked, cs);
     if (!syn) return;
     const status = apiRow?.status === "RISK_FREE"
@@ -222,8 +252,9 @@ export function positionsWithoutZone(
   trackedPositionIds?: Set<string>,
 ): Position[] {
   return positions.filter((p) => {
-    if (trackedPositionIds?.has(p.id)) return false;
-    const zid = parseZoneIdFromComment(p.comment);
+    const pid = normalizePositionId(p.id);
+    if (trackedPositionIds?.has(pid)) return false;
+    const zid = zoneIdForPosition(p);
     return !zid || !zoneIds.has(zid);
   });
 }

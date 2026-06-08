@@ -642,6 +642,8 @@ function isDuplicate(dealId: string): boolean {
 
 // MetaAPI dual-node dedup for onPositionAdded (same pattern as seenDealIds).
 const seenPositionIds = new Set<string>();
+/** Prevents concurrent duplicate zone creation when deal + position events race. */
+const autoCascadeInFlight = new Set<string>();
 function isDuplicatePosition(accountId: string, positionId: string): boolean {
   const key = `${accountId}:${positionId}`;
   if (seenPositionIds.has(key)) return true;
@@ -1736,6 +1738,21 @@ async function triggerMt5OneClickAutoCascade(
   const posId = String(pos.id ?? pos.positionId ?? "");
   if (!posId) return;
 
+  const flightKey = `${accountId}:${posId}`;
+  if (autoCascadeInFlight.has(flightKey)) return;
+  autoCascadeInFlight.add(flightKey);
+  try {
+    await triggerMt5OneClickAutoCascadeInner(accountId, pos, posId);
+  } finally {
+    autoCascadeInFlight.delete(flightKey);
+  }
+}
+
+async function triggerMt5OneClickAutoCascadeInner(
+  accountId: string,
+  pos: Record<string, unknown>,
+  posId: string,
+): Promise<void> {
   const symbol = String(pos.symbol ?? "");
   const comment = String(pos.comment ?? "");
   const anchorPrice = Number(pos.openPrice ?? 0);
@@ -2209,6 +2226,25 @@ export function parseZoneIdFromComment(comment: string | undefined | null): stri
   const pipeMatch = comment.match(/^Cascade\|([^|]+)\|\d+\/\d+$/);
   if (pipeMatch?.[1]) return pipeMatch[1];
   return null;
+}
+
+/** Inject cascade comment/zoneId for zone_positions rows missing MT5 tags (old app builds). */
+export function enrichPositionsWithZoneTags(
+  positions: Array<Record<string, unknown>>,
+  positionToZoneId: Map<string, string>,
+): Array<Record<string, unknown>> {
+  return positions.map((p) => {
+    const posId = String(p.id ?? p.positionId ?? "");
+    if (!posId) return p;
+    if (parseZoneIdFromComment(String(p.comment ?? ""))) return p;
+    const zoneId = positionToZoneId.get(posId);
+    if (!zoneId) return p;
+    return {
+      ...p,
+      comment: buildCascadeComment(zoneId, 1, 1),
+      zoneId,
+    };
+  });
 }
 
 export function commentBelongsToZone(comment: string | undefined | null, zoneId: string): boolean {
@@ -7088,7 +7124,30 @@ router.get("/mt5/account/:accountId/positions", checkOwner, async (req: Request,
     if (!posRes.ok) return res.status(posRes.status).json({ error: "Positions fetch failed" });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const body = await posRes.json() as any[];
-    return res.json(body);
+    const positionToZoneId = new Map<string, string>();
+    try {
+      const rows = await db.select({
+        positionId: zonePositionsTable.positionId,
+        zoneId: zonePositionsTable.zoneId,
+      })
+        .from(zonePositionsTable)
+        .innerJoin(cascadeZonesTable, eq(zonePositionsTable.zoneId, cascadeZonesTable.zoneId))
+        .where(and(
+          eq(cascadeZonesTable.accountId, accountId),
+          eq(zonePositionsTable.status, "OPEN"),
+          inArray(cascadeZonesTable.status, ["OPEN", "RISK_FREE", "ARMED"]),
+        ));
+      for (const row of rows) {
+        positionToZoneId.set(String(row.positionId), String(row.zoneId));
+      }
+    } catch (e) {
+      console.warn(`[positions] zone enrichment lookup failed accountId=${accountId}:`, (e as Error).message);
+    }
+    const enriched = enrichPositionsWithZoneTags(
+      Array.isArray(body) ? body as Array<Record<string, unknown>> : [],
+      positionToZoneId,
+    );
+    return res.json(enriched);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
   }

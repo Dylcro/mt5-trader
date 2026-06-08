@@ -10,6 +10,7 @@ import {
   _zoneStatesForTest,
   buildCascadeComment,
   parseZoneIdFromComment,
+  enrichPositionsWithZoneTags,
   commentBelongsToZone,
   positionBelongsToZone,
   zoneMagicNumber,
@@ -640,6 +641,49 @@ describe("Restart-hydration integration (pod-restart safety)", () => {
     expect(retrieved.anchorPrice).toBe(stA.anchorPrice);
     expect(retrieved.status).toBe(stA.status);
     expect(retrieved.direction).toBe(stA.direction);
+  });
+});
+
+describe("enrichPositionsWithZoneTags (GET /positions dedupe)", () => {
+  const zoneId = "z_oneclick_abc";
+
+  it("injects cascade comment and zoneId when position lacks MT5 tag", () => {
+    const map = new Map([["12345", zoneId]]);
+    const out = enrichPositionsWithZoneTags(
+      [{ id: "12345", symbol: "XAUUSD", comment: "" }],
+      map,
+    );
+    expect(out[0]?.comment).toBe(buildCascadeComment(zoneId, 1, 1));
+    expect(out[0]?.zoneId).toBe(zoneId);
+  });
+
+  it("leaves positions with existing cascade comments unchanged", () => {
+    const tagged = buildCascadeComment(zoneId, 2, 4);
+    const map = new Map([["99", zoneId]]);
+    const out = enrichPositionsWithZoneTags(
+      [{ id: "99", comment: tagged }],
+      map,
+    );
+    expect(out[0]?.comment).toBe(tagged);
+    expect(out[0]?.zoneId).toBeUndefined();
+  });
+
+  it("skips positions not in zone_positions map", () => {
+    const out = enrichPositionsWithZoneTags(
+      [{ id: "777", comment: "manual trade" }],
+      new Map(),
+    );
+    expect(out[0]?.comment).toBe("manual trade");
+    expect(out[0]?.zoneId).toBeUndefined();
+  });
+
+  it("matches positionId field when id is absent", () => {
+    const map = new Map([["555", zoneId]]);
+    const out = enrichPositionsWithZoneTags(
+      [{ positionId: "555", comment: null }],
+      map,
+    );
+    expect(out[0]?.comment).toBe(buildCascadeComment(zoneId, 1, 1));
   });
 });
 
