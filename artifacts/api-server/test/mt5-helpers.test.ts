@@ -44,6 +44,10 @@ import {
   getZoneLimitOrder,
   orderIdsForZone,
   deleteZoneLimitOrder,
+  mergeLiveZoneLegs,
+  zoneLegsNeedFreshResolve,
+  legNeedsTpSlice,
+  computeNextTakeTpLevel,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
@@ -748,6 +752,94 @@ describe("disabled TP history", () => {
     } as Parameters<typeof makeRow>[0]));
     expect(st.tp3Hit).toBe(false);
     expect(st.tp3Enabled).toBe(false);
+  });
+});
+
+describe("computeNextTakeTpLevel", () => {
+  it("shows Take TP1 when any open leg still needs TP1", () => {
+    expect(computeNextTakeTpLevel(
+      [{ tp1Hit: true, tp2Hit: false, tp3Hit: false }, { tp1Hit: false, tp2Hit: false, tp3Hit: false }],
+      { tp1Enabled: true, tp2Enabled: true, tp3Enabled: true },
+    )).toBe(1);
+  });
+
+  it("shows Take TP2 when all legs have TP1 but one needs TP2", () => {
+    expect(computeNextTakeTpLevel(
+      [{ tp1Hit: true, tp2Hit: true, tp3Hit: false }, { tp1Hit: true, tp2Hit: false, tp3Hit: false }],
+      { tp1Enabled: true, tp2Enabled: true, tp3Enabled: true },
+    )).toBe(2);
+  });
+});
+
+describe("legNeedsTpSlice (per-position TP ladder)", () => {
+  const makeSt = (tp1Pct = 30, tp2Pct = 30, tp3Pct = 40) => ({
+    tp1Pct, tp2Pct, tp3Pct,
+    trackedPositions: new Map<string, { volume: number; tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean }>(),
+  });
+
+  it("new leg needs TP1 even when zone already hit TP1 on other legs", () => {
+    const st = makeSt();
+    st.trackedPositions.set("anchor", { volume: 0.04, tp1Hit: true, tp2Hit: false, tp3Hit: false, tp4Hit: false });
+    st.trackedPositions.set("limit2", { volume: 0.04, tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false });
+    expect(legNeedsTpSlice({ id: "limit2", volume: 0.04 }, st, 1)).toBe(true);
+    expect(legNeedsTpSlice({ id: "anchor", volume: 0.03 }, st, 1)).toBe(false);
+  });
+
+  it("leg cannot take TP2 until TP1 slice applied on that leg", () => {
+    const st = makeSt();
+    st.trackedPositions.set("limit2", { volume: 0.04, tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false });
+    expect(legNeedsTpSlice({ id: "limit2", volume: 0.04 }, st, 2)).toBe(false);
+    st.trackedPositions.set("limit2", { volume: 0.04, tp1Hit: true, tp2Hit: false, tp3Hit: false, tp4Hit: false });
+    expect(legNeedsTpSlice({ id: "limit2", volume: 0.03 }, st, 2)).toBe(true);
+  });
+
+  it("uses zone-configured pct via position volume gate", () => {
+    const st = makeSt(50, 25, 25);
+    st.trackedPositions.set("leg", { volume: 0.04, tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false });
+    expect(legNeedsTpSlice({ id: "leg", volume: 0.02 }, st, 1)).toBe(true);
+    expect(legNeedsTpSlice({ id: "leg", volume: 0.02 }, st, 1)).toBe(true);
+    st.trackedPositions.set("leg", { volume: 0.04, tp1Hit: true, tp2Hit: false, tp3Hit: false, tp4Hit: false });
+    expect(legNeedsTpSlice({ id: "leg", volume: 0.02 }, st, 1)).toBe(false);
+  });
+});
+
+describe("mergeLiveZoneLegs / zoneLegsNeedFreshResolve", () => {
+  const zoneId = "z_test_zone";
+  const anchorId = "pos-anchor";
+  const limitId = "pos-limit";
+  const anchor = {
+    id: anchorId,
+    openPrice: 2400,
+    volume: 0.04,
+    type: "POSITION_TYPE_BUY",
+    symbol: "XAUUSD",
+    comment: buildCascadeComment(zoneId, 1, 4),
+  };
+  const limit = {
+    id: limitId,
+    openPrice: 2395,
+    volume: 0.04,
+    type: "POSITION_TYPE_BUY",
+    symbol: "XAUUSD",
+    comment: buildCascadeComment(zoneId, 2, 4),
+  };
+
+  it("mergeLiveZoneLegs unions DB-tracked ids with tagged broker legs", () => {
+    const tracked = new Set([anchorId]);
+    const merged = mergeLiveZoneLegs([anchor, limit], zoneId, tracked);
+    expect(merged.map((p) => p.id).sort()).toEqual([anchorId, limitId]);
+  });
+
+  it("zoneLegsNeedFreshResolve when DB has more OPEN rows than snapshot live set", () => {
+    const tracked = new Set([anchorId, limitId]);
+    const live = mergeLiveZoneLegs([anchor], zoneId, tracked);
+    expect(zoneLegsNeedFreshResolve(live, zoneId, tracked, [anchor], 2)).toBe(true);
+  });
+
+  it("zoneLegsNeedFreshResolve is false when every tracked id is in live", () => {
+    const tracked = new Set([anchorId, limitId]);
+    const live = mergeLiveZoneLegs([anchor, limit], zoneId, tracked);
+    expect(zoneLegsNeedFreshResolve(live, zoneId, tracked, [anchor, limit], 2)).toBe(false);
   });
 });
 

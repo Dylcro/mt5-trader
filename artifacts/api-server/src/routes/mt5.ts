@@ -606,10 +606,14 @@ async function mergeZoneHitsFromPositions(
   const posRows = await db.select().from(zonePositionsTable)
     .where(eq(zonePositionsTable.zoneId, zoneId));
   const open = posRows.filter((r) => r.status === "OPEN");
-  let tp1Hit = Boolean(row.tp1Hit) || posRows.some((r) => r.tp1Hit);
-  let tp2Hit = Boolean(row.tp2Hit) || posRows.some((r) => r.tp2Hit);
-  let tp3Hit = Boolean(row.tp3Hit) || posRows.some((r) => r.tp3Hit);
-  let tp4Hit = Boolean(row.tp4Hit) || posRows.some((r) => r.tp4Hit);
+  // Zone-level hit flags = ALL open legs completed that level. New late fills can
+  // clear a level (e.g. anchor hit TP1 → zone true; limit fills → zone false again).
+  const allLegsHit = (getter: (r: (typeof open)[number]) => boolean, rowHit: boolean) =>
+    open.length > 0 ? open.every(getter) : Boolean(rowHit);
+  let tp1Hit = allLegsHit((r) => r.tp1Hit, row.tp1Hit);
+  let tp2Hit = allLegsHit((r) => r.tp2Hit, row.tp2Hit);
+  let tp3Hit = allLegsHit((r) => r.tp3Hit, row.tp3Hit);
+  let tp4Hit = allLegsHit((r) => r.tp4Hit, row.tp4Hit);
   const sanitized = sanitizeZoneTpLadder({
     tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
     tp1Hit, tp2Hit, tp3Hit, tp4Hit, tp4Price,
@@ -618,10 +622,10 @@ async function mergeZoneHitsFromPositions(
   tp2Hit = sanitized.tp2Hit;
   tp3Hit = sanitized.tp3Hit;
   tp4Hit = sanitized.tp4Hit;
-  const persistTp1 = Boolean(row.tp1Hit) || tp1Hit;
-  const persistTp2 = Boolean(row.tp2Hit) || tp2Hit;
-  const persistTp3 = Boolean(row.tp3Hit) || tp3Hit;
-  const persistTp4 = Boolean(row.tp4Hit) || tp4Hit;
+  const persistTp1 = tp1Hit;
+  const persistTp2 = tp2Hit;
+  const persistTp3 = tp3Hit;
+  const persistTp4 = tp4Hit;
   if (persistTp1 !== row.tp1Hit || persistTp2 !== row.tp2Hit || persistTp3 !== row.tp3Hit || persistTp4 !== row.tp4Hit) {
     await db.update(cascadeZonesTable)
       .set({ tp1Hit: persistTp1, tp2Hit: persistTp2, tp3Hit: persistTp3, tp4Hit: persistTp4 })
@@ -885,7 +889,7 @@ function markOrderCompleted(accountId: string, orderId: string): void {
 // many times per second; we cap each zone at one evaluation per
 // STREAMING_EVAL_MIN_INTERVAL_MS so the broker isn't hammered on duplicates.
 // The periodic timer remains as a safety net for ticks lost to a streaming dropout.
-const STREAMING_EVAL_MIN_INTERVAL_MS = 1_000;
+const STREAMING_EVAL_MIN_INTERVAL_MS = 500;
 const MONITOR_EVAL_SKIP_IF_STREAM_MS = 12_000;
 const lastStreamingEvalAt = new Map<string, number>(); // zoneId → epoch ms
 
@@ -990,6 +994,7 @@ async function processStreamingTickBatch(accountId: string): Promise<void> {
       console.error(`[eval] ${zoneId}:`, (err as Error).message);
     }
   }
+  invalidateBrokerSnapshot(accountId);
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1115,11 +1120,18 @@ function makeDealListener(accountId: string) {
           }
         }
         if (zoneId && deal.positionId) {
+          invalidateBrokerSnapshot(accountId);
           void recordZonePositionFill(
             zoneId, String(deal.positionId),
             Number(deal.price ?? deal.openPrice ?? 0),
             Number(deal.volume ?? 0),
-          );
+          ).then(() => {
+            lastStreamingEvalAt.delete(zoneId);
+            try {
+              const tkn = getToken();
+              void evaluateZone(zoneId, tkn);
+            } catch { /* token unavailable */ }
+          });
         } else if (deal.positionId) {
           console.warn(`[stream ${accountId}] cascade fill orderId=${deal.orderId} posId=${deal.positionId} could not be linked to any active zone — position will be orphaned`);
         }
@@ -1892,6 +1904,40 @@ export function positionBelongsToZone(
   return false;
 }
 
+/** DB-tracked ∪ comment/magic-tagged legs — same union as resolveLivePositionsForZoneAction. */
+export function mergeLiveZoneLegs(
+  allLive: LivePosition[],
+  zoneId: string,
+  trackedIds: Set<string>,
+): LivePosition[] {
+  const byId = new Map<string, LivePosition>();
+  for (const p of allLive) {
+    if (trackedIds.has(p.id) || positionBelongsToZone(p, zoneId)) byId.set(p.id, p);
+  }
+  return [...byId.values()];
+}
+
+/**
+ * True when the broker snapshot is missing legs we know about (DB rows or tagged
+ * positions). Batch snapshots can lag behind a limit fill while anchor is
+ * already visible — relink + fresh REST avoids TP closes on anchor only.
+ */
+export function zoneLegsNeedFreshResolve(
+  live: LivePosition[],
+  zoneId: string,
+  trackedIds: Set<string>,
+  allLive: LivePosition[],
+  dbOpenCount: number,
+): boolean {
+  if (dbOpenCount > live.length) return true;
+  for (const id of trackedIds) {
+    if (!live.some((p) => p.id === id)) return true;
+  }
+  return allLive
+    .filter((p) => positionBelongsToZone(p, zoneId))
+    .some((p) => !live.some((l) => l.id === p.id));
+}
+
 /** True when evaluateZone can run TP/BE logic (anchor or absolute TP prices set). */
 export function zoneHasTpTargets(st: {
   anchorPrice: number;
@@ -1923,6 +1969,41 @@ export function positionShowsTpLevelApplied(
         : tpPcts.tp1Pct + tpPcts.tp2Pct + tpPcts.tp3Pct;
   const keepFractionGate = Math.max(0, (100 - priorPct - tpPct + 1) / 100);
   return currentVol <= origVol * keepFractionGate;
+}
+
+/** Next manual Take TP level: lowest TP any open leg in this zone still needs. */
+export function computeNextTakeTpLevel(
+  openRows: Array<{ tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean }>,
+  enabled: { tp1Enabled: boolean; tp2Enabled: boolean; tp3Enabled: boolean },
+): 0 | 1 | 2 | 3 {
+  if (openRows.length === 0) return 0;
+  if (enabled.tp1Enabled && openRows.some((r) => !r.tp1Hit)) return 1;
+  if (enabled.tp2Enabled && openRows.some((r) => r.tp1Hit && !r.tp2Hit)) return 2;
+  if (enabled.tp3Enabled && openRows.some((r) => r.tp2Hit && !r.tp3Hit)) return 3;
+  return 0;
+}
+
+/** Whether this leg still needs the zone's configured TP slice at `lvl` (per-position, per-zone). */
+export function legNeedsTpSlice(
+  leg: { id: string; volume: number },
+  st: {
+    trackedPositions: Map<string, { volume: number; tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean; tp4Hit: boolean }>;
+    tp1Pct: number; tp2Pct: number; tp3Pct: number;
+  },
+  lvl: 1 | 2 | 3,
+): boolean {
+  const tpPcts = { tp1Pct: st.tp1Pct, tp2Pct: st.tp2Pct, tp3Pct: st.tp3Pct };
+  const cached = st.trackedPositions.get(leg.id);
+  const origVol = cached?.volume && cached.volume > 0 ? cached.volume : leg.volume;
+  const posHit = (n: 1 | 2 | 3): boolean => {
+    const key = `tp${n}Hit` as const;
+    // Tracked row present: honor persisted per-leg flags only (volume gate is fallback when untracked).
+    if (cached) return Boolean(cached[key]);
+    return positionShowsTpLevelApplied(leg.volume, origVol, n, tpPcts);
+  };
+  if (lvl >= 2 && !posHit(1)) return false;
+  if (lvl >= 3 && !posHit(2)) return false;
+  return !posHit(lvl);
 }
 
 /** Cascade limits are cancelled only on the first successful TP2, never on TP1. */
@@ -2563,6 +2644,8 @@ interface ZoneState {
   // Both fields are runtime-only (not persisted); after a restart we re-attempt
   // BE up to the cap, which is safe (modify-sl is idempotent).
   tp2SlMoved: boolean;
+  /** True after first TP2 cancelled limits + BE pass for this zone (runtime). */
+  tp2HousekeepingDone: boolean;
   tp2BeAttempts: number;
   // True iff the SL we got onto the position(s) at TP2 is a "best effort"
   // protective SL (broker rejected true BE because price had retraced
@@ -2930,7 +3013,7 @@ function prepareZoneForCascade(
     cashoutDone: false,
     // Disabled TPs stay false — they are not "hit", they are skipped by the engine.
     tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
-    tp2SlMoved: false, tp2BeAttempts: 0, tp2SlIsBestEffort: false,
+    tp2SlMoved: false, tp2HousekeepingDone: false, tp2BeAttempts: 0, tp2SlIsBestEffort: false,
     autoBeAtTp: resolveAutoBeAtTp(sanitizeAutoBeAtTp(tps.autoBeAtTp), {
       tp1: tp1Enabled, tp2: tp2Enabled, tp3: tp3Enabled,
     }),
@@ -3150,14 +3233,131 @@ async function recordZonePositionFill(
  * Anchor is often missing from OPEN rows while limits are tracked — union prevents
  * close-zone from closing only the ladder and leaving the market entry running.
  */
+/**
+ * TP2 zone housekeeping (per zone): cancel all unfilled cascade limits, then
+ * SL→BE on active legs. On first zone TP2 → all legs; on late legs → those legs only.
+ */
+async function applyZoneTp2Housekeeping(
+  token: string,
+  region: string,
+  zoneId: string,
+  st: ZoneState,
+  opts: { beLegs?: LivePosition[]; isFirstZoneTp2: boolean },
+): Promise<void> {
+  try {
+    if (opts.isFirstZoneTp2 && !st.tp2HousekeepingDone) {
+      await cancelZoneLimits(token, region, st.accountId, zoneId);
+      st.tp2HousekeepingDone = true;
+      console.log(`[tp2] cancelled unfilled limits for ${zoneId}`);
+    }
+    if (!isAutoBeTriggerSatisfied(st)) return;
+
+    const legs = opts.beLegs ?? await resolveLivePositionsForZoneAction(
+      token, region, st.accountId, zoneId, st, { fresh: true },
+    );
+    if (legs.length === 0) return;
+
+    const price = await priceForZoneEval(st.accountId, token, region, legs[0]!.symbol || "XAUUSD");
+    if (!price) return;
+
+    let allTrueBe = true;
+    const results = await Promise.all(legs.map(async (p) => {
+      const { sl, isBestEffort } = computeBrokerSafeBeSl(st.direction, p.openPrice, price);
+      if (isBestEffort) allTrueBe = false;
+      const ok = await modifyZonePositionSl(token, region, st.accountId, p.id, sl);
+      return { ok, isBestEffort };
+    }));
+    const allOk = results.every((r) => r.ok);
+
+    if (allOk && allTrueBe) {
+      const wasBestEffort = st.tp2SlIsBestEffort;
+      st.tp2SlMoved = true;
+      st.tp2SlIsBestEffort = false;
+      if (wasBestEffort) {
+        await withDbRetry(`zones[${zoneId}].tp2SlIsBestEffort=false`,
+          () => db.update(cascadeZonesTable).set({ tp2SlIsBestEffort: false } as Record<string, unknown>)
+            .where(eq(cascadeZonesTable.zoneId, zoneId)),
+        ).catch(() => {/* logged inside withDbRetry */});
+      }
+      console.log(`[tp2] ${zoneId} SL→BE on ${legs.length} leg(s)${opts.isFirstZoneTp2 ? "" : " (late leg)"}`);
+    } else if (allOk) {
+      if (!st.tp2SlIsBestEffort) {
+        st.tp2SlIsBestEffort = true;
+        await withDbRetry(`zones[${zoneId}].tp2SlIsBestEffort=true`,
+          () => db.update(cascadeZonesTable).set({ tp2SlIsBestEffort: true } as Record<string, unknown>)
+            .where(eq(cascadeZonesTable.zoneId, zoneId)),
+        ).catch(() => {/* logged inside withDbRetry */});
+        console.warn(`[tp2] ${zoneId} SL set to best-effort protective level`);
+      }
+    } else if (opts.isFirstZoneTp2 && st.tp2BeAttempts < MAX_TP2_BE_ATTEMPTS) {
+      st.tp2BeAttempts += 1;
+    }
+  } catch (err) {
+    console.error(`[tp2] housekeeping failed for ${zoneId}:`, (err as Error).message);
+  }
+}
+
+async function markPositionTpLevelHit(
+  zoneId: string, positionId: string, lvl: 1 | 2 | 3 | 4, st: ZoneState,
+): Promise<void> {
+  const key = `tp${lvl}Hit` as const;
+  const cached = st.trackedPositions.get(positionId);
+  if (cached) cached[key] = true;
+  await db.update(zonePositionsTable)
+    .set({ [key]: true })
+    .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.positionId, positionId)))
+    .catch((e: Error) => console.warn(`[zone ${zoneId}] pos ${positionId} ${key} persist failed:`, e.message));
+}
+
+/** Close this zone's configured tpPct from each leg that still needs level `lvl`. */
+async function closeTpSliceOnEveryLiveLeg(
+  token: string,
+  region: string,
+  st: ZoneState,
+  zoneId: string,
+  legs: LivePosition[],
+  lvl: 1 | 2 | 3,
+): Promise<number> {
+  const tpPct = st[`tp${lvl}Pct`];
+  if (!(tpPct > 0) || st[`tp${lvl}Enabled`] === false) return 0;
+  const isLast = isLastEnabledTpLevel(lvl, st);
+  const LOT_STEP = 0.01;
+  let totalClosed = 0;
+  for (const leg of legs) {
+    if (!legNeedsTpSlice(leg, st, lvl)) continue;
+    const cached = st.trackedPositions.get(leg.id);
+    const cascadeLot = cached?.volume && cached.volume > 0 ? cached.volume : leg.volume;
+    const slice = computeTpSliceVolume({
+      cascadeLot,
+      tpPct,
+      remainingVol: leg.volume,
+      isLastEnabledTp: isLast,
+    });
+    if (slice.closeVol < LOT_STEP) continue;
+    const toClose = Math.min(slice.closeVol, leg.volume);
+    let closed = 0;
+    if (toClose >= leg.volume - 1e-9) {
+      if (await closeZonePosition(token, region, st.accountId, leg.id)) closed = leg.volume;
+    } else if (await closeZonePosition(token, region, st.accountId, leg.id, toClose)) {
+      closed = toClose;
+    }
+    if (closed > 0) {
+      totalClosed += closed;
+      await markPositionTpLevelHit(zoneId, leg.id, lvl, st);
+    }
+  }
+  return totalClosed;
+}
+
 async function resolveLivePositionsForZoneAction(
   token: string,
   region: string,
   accountId: string,
   zoneId: string,
   st: ZoneState,
+  opts?: { fresh?: boolean },
 ): Promise<LivePosition[]> {
-  const allLive = await fetchOpenPositions(token, region, accountId);
+  const allLive = await fetchOpenPositions(token, region, accountId, opts);
   const openRows = await db.select().from(zonePositionsTable)
     .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
   const trackedIds = new Set(openRows.map((z) => z.positionId));
@@ -3454,13 +3654,46 @@ async function handleClosePartial(
   token: string,
   region: string,
 ): Promise<{ ok: boolean; message?: string }> {
-  const st = await loadZone(zoneId);
+  let st = await loadZone(zoneId);
   if (!st || st.accountId !== accountId) return { ok: false, message: "Zone not found" };
-  if (st.status === "CLOSED" || st.status === "ARMED") {
-    return { ok: false, message: "Zone not active" };
+  if (st.status === "CLOSED") {
+    const reopened = await reopenClosedZoneIfBrokerLegsRemain(token, region, accountId, zoneId, st);
+    if (!reopened) return { ok: false, message: "Zone closed" };
+    st = (await loadZone(zoneId)) ?? st;
   }
-  const legs = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+  if (st.status === "ARMED") return { ok: false, message: "Zone not active" };
+
+  const legs = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st, { fresh: true });
   if (legs.length === 0) return { ok: false, message: "No open positions" };
+
+  const tpLevel = body.tpLevel != null && body.tpLevel >= 1 && body.tpLevel <= 3
+    ? (body.tpLevel as 1 | 2 | 3) : null;
+
+  if (tpLevel != null) {
+    const pendingLegs = legs.filter((leg) => legNeedsTpSlice(leg, st, tpLevel));
+    if (pendingLegs.length === 0) {
+      return { ok: false, message: `TP${tpLevel} already taken on all open legs` };
+    }
+    const closeLots = await closeTpSliceOnEveryLiveLeg(token, region, st, zoneId, pendingLegs, tpLevel);
+    if (closeLots < 0.01) return { ok: false, message: "Lot too small" };
+    await mergeZoneHitsFromPositions(zoneId, {
+      tp1Hit: st.tp1Hit, tp2Hit: st.tp2Hit, tp3Hit: st.tp3Hit, tp4Hit: st.tp4Hit,
+      tp1Enabled: st.tp1Enabled, tp2Enabled: st.tp2Enabled,
+      tp3Enabled: st.tp3Enabled, tp4Enabled: st.tp4Enabled,
+    });
+    broadcastZoneUpdate(zoneId);
+    if (tpLevel === 2) {
+      await applyZoneTp2Housekeeping(token, region, zoneId, st, {
+        isFirstZoneTp2: !st.tp2HousekeepingDone,
+        beLegs: st.tp2HousekeepingDone ? pendingLegs : undefined,
+      });
+    }
+    if (tpLevel === 3) {
+      notifyZoneEvent(zoneId, "tp3_runners", 3, 0, st.direction);
+    }
+    console.log(`[take-tp] zone ${zoneId} manual TP${tpLevel} closed ${closeLots.toFixed(2)} lots across ${pendingLegs.length} leg(s)`);
+    return { ok: true };
+  }
 
   const totalVol = legs.reduce((s, p) => s + p.volume, 0);
   const LOT_STEP = 0.01;
@@ -3495,20 +3728,6 @@ async function handleClosePartial(
   }
 
   const stAfter = zoneStates.get(zoneId) ?? st;
-  if (body.tpLevel != null && body.tpLevel >= 1 && body.tpLevel <= 3) {
-    const hitKey = `tp${body.tpLevel}Hit` as "tp1Hit" | "tp2Hit" | "tp3Hit";
-    if (stAfter && !stAfter[hitKey]) {
-      stAfter[hitKey] = true;
-      await db.update(cascadeZonesTable)
-        .set({ [hitKey]: true })
-        .where(eq(cascadeZonesTable.zoneId, zoneId))
-        .catch(() => {});
-      broadcastZoneUpdate(zoneId);
-      if (body.tpLevel === 3) {
-        notifyZoneEvent(zoneId, "tp3_runners", 3, 0, stAfter.direction);
-      }
-    }
-  }
   if (body.runnerN != null && body.runnerN >= 1 && body.runnerN <= 3 && stAfter?.runnerActive) {
     const hitKey = `runner${body.runnerN}Hit` as "runner1Hit" | "runner2Hit" | "runner3Hit";
     if (stAfter && !stAfter[hitKey]) {
@@ -4035,14 +4254,13 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       // Merge DB snapshot into existing cache (do NOT replace the Map wholesale)
       // — replacing would clobber a concurrent recordZonePositionFill().add()
       // landing between our SELECT and this assignment.
-      for (const z of zps) {
-        const existing = st.trackedPositions.get(z.positionId);
-        st.trackedPositions.set(z.positionId, {
-          volume: z.volume, entryPrice: z.entryPrice,
-          tp1Hit: existing?.tp1Hit ?? false,
-          tp2Hit: existing?.tp2Hit ?? false,
-          tp3Hit: existing?.tp3Hit ?? false,
-          tp4Hit: existing?.tp4Hit ?? false,
+      for (const r of rows) {
+        st.trackedPositions.set(r.positionId, {
+          volume: Number(r.volume), entryPrice: Number(r.entryPrice),
+          tp1Hit: Boolean(r.tp1Hit),
+          tp2Hit: Boolean(r.tp2Hit),
+          tp3Hit: Boolean(r.tp3Hit),
+          tp4Hit: Boolean(r.tp4Hit),
         });
       }
       // Drop entries the authoritative DB view says are no longer OPEN.
@@ -4127,15 +4345,39 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         return;
       }
     }
-    const allLive = snap?.positions ?? await fetchOpenPositions(token, region, st.accountId);
-    let live = allLive.filter(p => trackedIds.has(p.id));
+    let allLive = snap?.positions ?? await fetchOpenPositions(token, region, st.accountId);
+    let live = mergeLiveZoneLegs(allLive, zoneId, trackedIds);
     const hasBrokerLegs = snap
       ? zoneHasLegsInSnapshot(st.accountId, zoneId, snap.positions, snap.orders)
       : await brokerHasOpenLegsForZone(token, region, st.accountId, zoneId);
-    if (live.length === 0 && hasBrokerLegs) {
+    const needsLegResolve =
+      (live.length === 0 && hasBrokerLegs)
+      || zoneLegsNeedFreshResolve(live, zoneId, trackedIds, allLive, zps.length);
+    if (needsLegResolve) {
       await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st);
-      const refreshed = snap?.positions ?? await fetchOpenPositions(token, region, st.accountId);
-      live = refreshed.filter((p) => positionBelongsToZone(p, zoneId) || trackedIds.has(p.id));
+      try {
+        const rows = await withDbRetry(`evalZone.legResolveRefresh zone=${zoneId}`, () => db.select().from(zonePositionsTable)
+          .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
+        );
+        zps = rows.map((r) => ({
+          positionId: r.positionId, volume: Number(r.volume), entryPrice: Number(r.entryPrice),
+        }));
+        trackedIds = new Set(zps.map((z) => z.positionId));
+        for (const z of zps) {
+          const existing = st.trackedPositions.get(z.positionId);
+          st.trackedPositions.set(z.positionId, {
+            volume: z.volume, entryPrice: z.entryPrice,
+            tp1Hit: existing?.tp1Hit ?? false,
+            tp2Hit: existing?.tp2Hit ?? false,
+            tp3Hit: existing?.tp3Hit ?? false,
+            tp4Hit: existing?.tp4Hit ?? false,
+          });
+        }
+      } catch (e) {
+        console.warn(`[zone ${zoneId}] leg-resolve tracked refresh failed, using cache (${trackedIds.size} ids): ${(e as Error).message}`);
+      }
+      allLive = await fetchOpenPositions(token, region, st.accountId, { fresh: true });
+      live = mergeLiveZoneLegs(allLive, zoneId, trackedIds);
     }
     // Skip the destructive reconciliation path (which permanently marks
     // positions CLOSED in the DB) when we're operating off the cache —
@@ -4288,9 +4530,9 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       }
     }
     for (const lvl of [1, 2, 3] as const) {
-      if (st[`tp${lvl}Hit`] || st[`tp${lvl}PassedAt`]) continue;
+      if (!live.some((leg) => legNeedsTpSlice(leg, st, lvl))) continue;
       const tpPrice = st[`tp${lvl}Price`];
-      if (tpPrice == null) continue;
+      if (tpPrice == null || st[`tp${lvl}PassedAt`]) continue;
       const crossed = st.direction === "buy"
         ? (st.highestPriceSeen ?? 0) >= tpPrice
         : (st.lowestPriceSeen ?? Infinity) <= tpPrice;
@@ -4300,12 +4542,11 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
     const AUTO_TP_BUFFER = 0.30;
     const AUTO_TP_BUFFER_WINDOW_MS = 15_000;
     for (const lvl of [1, 2, 3] as const) {
-      if (st[`tp${lvl}Hit`]) continue;
       const tpPrice = st[`tp${lvl}Price`];
-      const tpPct = st[`tp${lvl}Pct`] ?? 25;
+      const tpPct = st[`tp${lvl}Pct`];
       const enabled = st[`tp${lvl}Enabled`] !== false;
       const passedAt = st[`tp${lvl}PassedAt`];
-      if (tpPrice == null || !enabled) continue;
+      if (tpPrice == null || !enabled || !(tpPct > 0)) continue;
 
       const atLevel = st.direction === "buy"
         ? price.bid >= tpPrice
@@ -4318,55 +4559,37 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       if (!atLevel && !bufferedClose) continue;
 
       try {
-        const autoLive = live.filter((p) => positionBelongsToZone(p, zoneId) || trackedIds.has(p.id));
-        if (autoLive.length === 0) continue;
+        // Fresh broker read so limits that filled since tick start join this TP.
+        const tpLegs = await resolveLivePositionsForZoneAction(
+          token, region, st.accountId, zoneId, st, { fresh: true },
+        );
+        const pendingLegs = tpLegs.filter((leg) => legNeedsTpSlice(leg, st, lvl));
+        if (pendingLegs.length === 0) continue;
 
-        const totalVol = autoLive.reduce((s, p) => s + p.volume, 0);
-        const LOT_STEP = 0.01;
-        const baseVol = st.originalVolume > 0 ? st.originalVolume : totalVol;
-        const targetLots = Math.round((baseVol * tpPct / 100) / LOT_STEP) * LOT_STEP;
-        const closeLots = Math.min(Math.max(targetLots, LOT_STEP), totalVol);
+        const closeLots = await closeTpSliceOnEveryLiveLeg(
+          token, region, st, zoneId, pendingLegs, lvl,
+        );
+        if (closeLots < 0.01) continue;
 
-        const sortedLegs = [...autoLive].sort((a, b) => b.volume - a.volume);
-        let remaining = closeLots;
-        for (const leg of sortedLegs) {
-          if (remaining <= 0) break;
-          if (leg.volume <= remaining + 1e-9) {
-            await closeZonePosition(token, region, st.accountId, leg.id);
-            remaining = Math.round((remaining - leg.volume) / LOT_STEP) * LOT_STEP;
-          } else if (remaining >= LOT_STEP) {
-            await closeZonePosition(token, region, st.accountId, leg.id, remaining);
-            remaining = 0;
-          }
-        }
-
-        const hitKey = `tp${lvl}Hit` as const;
-        st[hitKey] = true;
         st[`tp${lvl}PassedAt`] = undefined;
-        await db.update(cascadeZonesTable)
-          .set({ [hitKey]: true })
-          .where(eq(cascadeZonesTable.zoneId, zoneId))
-          .catch(() => {});
+        await mergeZoneHitsFromPositions(zoneId, {
+          tp1Hit: st.tp1Hit, tp2Hit: st.tp2Hit, tp3Hit: st.tp3Hit, tp4Hit: st.tp4Hit,
+          tp1Enabled: st.tp1Enabled, tp2Enabled: st.tp2Enabled,
+          tp3Enabled: st.tp3Enabled, tp4Enabled: st.tp4Enabled,
+        });
         broadcastZoneUpdate(zoneId);
 
         if (lvl === 2) {
-          try {
-            await cancelZoneLimits(token, region, st.accountId, zoneId);
-            const remaining = await fetchOpenPositions(token, region, st.accountId);
-            const legs = remaining.filter((p) => positionBelongsToZone(p, zoneId) || trackedIds.has(p.id));
-            for (const leg of legs) {
-              await modifyZonePositionSl(token, region, st.accountId, leg.id, leg.openPrice);
-            }
-            console.log(`[tp2] SL moved to break even, limits cancelled for ${zoneId}`);
-          } catch (err) {
-            console.error(`[tp2] break even / cancel failed:`, err);
-          }
+          await applyZoneTp2Housekeeping(token, region, zoneId, st, {
+            isFirstZoneTp2: !st.tp2HousekeepingDone,
+            beLegs: st.tp2HousekeepingDone ? pendingLegs : undefined,
+          });
         }
 
         if (lvl === 3) {
           notifyZoneEvent(zoneId, "tp3_runners", 3, 0, st.direction);
         }
-        console.log(`[auto-tp] zone ${zoneId} TP${lvl} closed ${closeLots} lots`);
+        console.log(`[auto-tp] zone ${zoneId} TP${lvl} (${tpPct}%) closed ${closeLots.toFixed(2)} lots across ${pendingLegs.length} leg(s)`);
       } catch (err) {
         console.error(`[auto-tp] TP${lvl} close failed for ${zoneId}:`, err);
       }
@@ -4437,55 +4660,18 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
     // apply the safest possible protective SL and flag the zone as
     // "best effort" so the app can warn the user — and keep trying to
     // upgrade to true BE on later ticks without consuming the retry budget.
-    if (isAutoBeTriggerSatisfied(st) && live.length > 0 && (!st.tp2SlMoved || st.tp2SlIsBestEffort)) {
-      const price = await priceForZoneEval(st.accountId, token, region, live[0]!.symbol || "XAUUSD");
-      if (price) {
-        // Compute per-position safe SL (openPrice differs across cascade
-        // entries). If ALL positions can reach true BE this tick, we'll
-        // clear the flag below; otherwise the zone stays "best effort".
-        let allTrueBe = true;
-        const results = await Promise.all(live.map(async (p) => {
-          const { sl, isBestEffort } = computeBrokerSafeBeSl(st.direction, p.openPrice, price);
-          if (isBestEffort) allTrueBe = false;
-          const ok = await modifyZonePositionSl(token, region, st.accountId, p.id, sl);
-          return { ok, isBestEffort };
-        }));
-        const allOk = results.every(r => r.ok);
-        if (allOk && allTrueBe) {
-          // True BE achieved on every entry.
-          const wasBestEffort = st.tp2SlIsBestEffort;
-          st.tp2SlMoved = true;
-          st.tp2SlIsBestEffort = false;
-          if (wasBestEffort) {
-            await withDbRetry(`zones[${zoneId}].tp2SlIsBestEffort=false`,
-              () => db.update(cascadeZonesTable).set({ tp2SlIsBestEffort: false } as Record<string, unknown>).where(eq(cascadeZonesTable.zoneId, zoneId))
-            ).catch(() => {/* logged inside withDbRetry */});
-          }
-          console.log(`[zone ${zoneId}] TP${st.autoBeAtTp} SL→BE complete on ${live.length} entr${live.length === 1 ? "y" : "ies"}${wasBestEffort ? " (upgraded from best-effort)" : ""}`);
-        } else if (allOk) {
-          // Best-effort SL accepted on every entry but at least one isn't
-          // at true BE yet (price hasn't moved far enough). Mark the zone
-          // so the app warns the user, and keep trying on future ticks
-          // WITHOUT consuming retry budget — the budget is only for genuine
-          // broker errors, not for waiting on price.
-          if (!st.tp2SlIsBestEffort) {
-            st.tp2SlIsBestEffort = true;
-            await withDbRetry(`zones[${zoneId}].tp2SlIsBestEffort=true`,
-              () => db.update(cascadeZonesTable).set({ tp2SlIsBestEffort: true } as Record<string, unknown>).where(eq(cascadeZonesTable.zoneId, zoneId))
-            ).catch(() => {/* logged inside withDbRetry */});
-            console.warn(`[zone ${zoneId}] TP2 SL set to best-effort protective level (price has retraced through entry — will keep trying to upgrade to true BE)`);
-          }
-        } else if (st.tp2BeAttempts < MAX_TP2_BE_ATTEMPTS) {
-          // Real broker error (not a price-side rejection that we pre-filtered).
-          // Burn budget; retry next tick.
-          st.tp2BeAttempts += 1;
-        } else {
-          // Budget exhausted on real broker errors. Stop retrying.
-          st.tp2SlMoved = true;
-          console.error(`[zone ${zoneId}] TP2 SL→BE giving up after ${MAX_TP2_BE_ATTEMPTS} attempts — broker keeps rejecting the move; positions remain at their original SL`);
-        }
+    const lateLegNeedsBe = live.some((p) => st.trackedPositions.get(p.id)?.tp2Hit);
+    if (isAutoBeTriggerSatisfied(st) && live.length > 0
+      && (!st.tp2SlMoved || st.tp2SlIsBestEffort || lateLegNeedsBe)) {
+      const beLegs = lateLegNeedsBe && st.tp2SlMoved
+        ? live.filter((p) => st.trackedPositions.get(p.id)?.tp2Hit)
+        : live;
+      if (beLegs.length > 0) {
+        await applyZoneTp2Housekeeping(token, region, zoneId, st, {
+          isFirstZoneTp2: false,
+          beLegs,
+        });
       }
-      // If price is null we just skip this tick — no budget burn, retry later.
     }
   } catch (e) {
     console.error(`[zone ${zoneId}] evaluate error:`, (e as Error).message);
@@ -4612,7 +4798,9 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
     // BE again (modify-sl is idempotent). If the broker still rejects, the
     // bounded retry budget below stops the loop quickly. The best-effort
     // flag IS persisted so the app warning chip survives a restart.
-    tp2SlMoved: false, tp2BeAttempts: 0,
+    tp2SlMoved: false,
+    tp2HousekeepingDone: Boolean(z.tp2Hit),
+    tp2BeAttempts: 0,
     tp2SlIsBestEffort: (z as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
     autoBeAtTp: sanitizeAutoBeAtTp((z as { autoBeAtTp?: number }).autoBeAtTp),
     status: z.status === "CLOSED" ? "CLOSED"
@@ -4675,7 +4863,7 @@ export async function loadZone(zoneId: string): Promise<ZoneState | null> {
         // intentionally and have their flags set by evaluateZone going forward.
         st.trackedPositions.set(zp.positionId, {
           volume: Number(zp.volume), entryPrice: Number(zp.entryPrice),
-          tp1Hit: Boolean(zp.tp1Hit) || st.tp1Hit,
+          tp1Hit: Boolean(zp.tp1Hit),
           tp2Hit: Boolean(zp.tp2Hit),
           tp3Hit: Boolean(zp.tp3Hit),
           tp4Hit: Boolean(zp.tp4Hit),
@@ -4719,7 +4907,7 @@ export async function loadZoneState(): Promise<void> {
         const st = zoneStates.get(zp.zoneId);
         if (st) st.trackedPositions.set(zp.positionId, {
           volume: Number(zp.volume), entryPrice: Number(zp.entryPrice),
-          tp1Hit: Boolean(zp.tp1Hit) || st.tp1Hit,
+          tp1Hit: Boolean(zp.tp1Hit),
           tp2Hit: Boolean(zp.tp2Hit),
           tp3Hit: Boolean(zp.tp3Hit),
           tp4Hit: Boolean(zp.tp4Hit),
