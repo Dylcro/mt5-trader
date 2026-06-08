@@ -4120,22 +4120,74 @@ async function modifyZonePositionSl(
   return r.ok;
 }
 
+/** SL to re-apply when a leg lost its stop after pending limits were cancelled. */
+export function stopLossToRestoreForZoneLeg(
+  st: { status: string; direction: "buy" | "sell"; anchorPrice: number; riskFreeOffset?: number },
+  leg: { openPrice: number; stopLoss?: number },
+  config: Pick<CascadeConfig, "slPips" | "numPositions" | "pipsBetween">,
+): number | null {
+  if (leg.stopLoss != null && Number.isFinite(leg.stopLoss) && leg.stopLoss > 0) return null;
+  if (st.anchorPrice <= 0) return null;
+  if (st.status === "RISK_FREE") {
+    return computeRiskFreeSl(st.direction, leg.openPrice, st.riskFreeOffset ?? ZONE_RISK_FREE_PIPS);
+  }
+  if (st.status !== "OPEN") return null;
+  return buildCascadeLevels(st.anchorPrice, st.direction, config as CascadeConfig).stopLoss;
+}
+
+/** Re-attach SL on open zone legs after limit cancel (MT5 can clear position SL with the orders). */
+async function restoreZoneStopLossAfterLimitCancel(
+  token: string, region: string, accountId: string, zoneId: string,
+): Promise<void> {
+  let st = zoneStates.get(zoneId);
+  if (!st) st = (await loadZone(zoneId)) ?? undefined;
+  if (!st || st.accountId !== accountId || st.status === "CLOSED" || st.status === "ARMED") return;
+
+  invalidateBrokerSnapshot(accountId);
+  const config = getCascadeConfig(accountId, zoneIdToUserId.get(zoneId));
+  const legs = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st, { fresh: true });
+  if (legs.length === 0) return;
+
+  let restored = 0;
+  for (const leg of legs) {
+    // OPEN: always re-apply cascade SL — brokers often clear position SL when pending
+    // limits (which shared the same SL) are cancelled; in-app anchors keep SL at open.
+    let sl: number | null = null;
+    if (st.status === "OPEN" && st.anchorPrice > 0) {
+      sl = buildCascadeLevels(st.anchorPrice, st.direction, config).stopLoss;
+    } else {
+      sl = stopLossToRestoreForZoneLeg(st, leg, config);
+    }
+    if (sl == null) continue;
+    if (await modifyZonePositionSl(token, region, accountId, leg.id, sl)) restored++;
+  }
+  if (restored > 0) {
+    console.log(`[zone ${zoneId}] restored SL on ${restored} open leg(s) after limit cancel`);
+    invalidateBrokerSnapshot(accountId);
+  }
+}
+
 /** Tag an existing MT5 anchor leg like an app cascade market entry (SL + zone comment + magic). */
 async function tagMt5AnchorForZone(
   token: string, region: string, accountId: string,
   positionId: string, zoneId: string, stopLoss: number, total: number,
 ): Promise<void> {
+  // SL first — in-app market entries carry SL at open; some brokers drop position SL
+  // when sibling pending limits are cancelled unless the anchor owns its own SL.
+  const slOk = await modifyZonePositionSl(token, region, accountId, positionId, stopLoss);
   const r = await tradeAction(token, region, accountId, {
     actionType: "POSITION_MODIFY",
     positionId,
-    stopLoss,
     comment: buildCascadeComment(zoneId, 1, total),
     magic: zoneMagicNumber(zoneId),
   });
   if (!r.ok) {
     console.warn(
-      `[auto-cascade] anchor tag posId=${positionId} zone=${zoneId} failed code=${r.code} msg="${r.message ?? ""}"`,
+      `[auto-cascade] anchor comment/magic posId=${positionId} zone=${zoneId} failed code=${r.code} msg="${r.message ?? ""}"`,
     );
+  }
+  if (!slOk) {
+    console.warn(`[auto-cascade] anchor SL posId=${positionId} zone=${zoneId} sl=${stopLoss} failed`);
   } else {
     console.log(`[auto-cascade] anchor tagged posId=${positionId} zone=${zoneId} sl=${stopLoss}`);
   }
@@ -4238,6 +4290,7 @@ async function cancelZoneLimits(
 interface LivePosition {
   id: string; openPrice: number; volume: number; type: string; symbol: string;
   magic?: number; comment?: string;
+  stopLoss?: number;
   /** MetaAPI floating P&L (profit field on open positions). */
   profit?: number;
 }
@@ -4337,6 +4390,7 @@ async function fetchOpenPositionsUncached(token: string, region: string, account
         symbol: String(p.symbol ?? ""),
         magic: p.magic != null ? Number(p.magic) : undefined,
         comment: p.comment != null ? String(p.comment) : undefined,
+        stopLoss: p.stopLoss != null ? Number(p.stopLoss) : undefined,
         profit: p.profit != null ? Number(p.profit) : undefined,
       })).filter((p) => p.id);
     }
@@ -6424,6 +6478,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/cancel-pending", checkOwner, 
     }
     const pendingBefore = orderIdsForZone(accountId, zoneId).length;
     await cancelZoneLimits(token, region, accountId, zoneId);
+    await restoreZoneStopLossAfterLimitCancel(token, region, accountId, zoneId);
     const pendingAfter = orderIdsForZone(accountId, zoneId).length;
     const cancelledCount = Math.max(0, pendingBefore - pendingAfter);
     broadcastToAccount(accountId, "pending_order", {});

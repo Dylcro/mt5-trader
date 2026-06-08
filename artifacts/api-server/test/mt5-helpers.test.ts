@@ -53,6 +53,7 @@ import {
   zoneLegsNeedFreshResolve,
   legNeedsTpSlice,
   computeNextTakeTpLevel,
+  stopLossToRestoreForZoneLeg,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
@@ -1218,6 +1219,27 @@ describe("zone limit order map (per-account scoping)", () => {
     deleteZoneLimitOrder(acctA, "ord-1");
     expect(getZoneLimitOrder(acctA, "ord-1")).toBeUndefined();
     expect(getZoneLimitOrder(acctB, "ord-1")).toBe(zoneSell);
+  });
+});
+
+describe("stopLossToRestoreForZoneLeg (delete-orders SL preserve)", () => {
+  const config = { slPips: 100, numPositions: 4, pipsBetween: 10 };
+
+  it("returns cascade SL when leg has no stop (OPEN zone)", () => {
+    const st = { status: "OPEN", direction: "buy" as const, anchorPrice: 2650 };
+    const sl = stopLossToRestoreForZoneLeg(st, { openPrice: 2650 }, config);
+    expect(sl).toBeCloseTo(2640, 2); // 2650 - 100 pips × 0.10
+  });
+
+  it("returns null when leg already has SL", () => {
+    const st = { status: "OPEN", direction: "buy" as const, anchorPrice: 2650 };
+    expect(stopLossToRestoreForZoneLeg(st, { openPrice: 2650, stopLoss: 2640 }, config)).toBeNull();
+  });
+
+  it("uses risk-free SL for RISK_FREE zones", () => {
+    const st = { status: "RISK_FREE", direction: "buy" as const, anchorPrice: 2650, riskFreeOffset: -5 };
+    const sl = stopLossToRestoreForZoneLeg(st, { openPrice: 2650 }, config);
+    expect(sl).toBe(computeRiskFreeSl("buy", 2650, -5));
   });
 });
 
