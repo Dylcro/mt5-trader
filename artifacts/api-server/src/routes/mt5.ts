@@ -606,10 +606,11 @@ async function mergeZoneHitsFromPositions(
   const posRows = await db.select().from(zonePositionsTable)
     .where(eq(zonePositionsTable.zoneId, zoneId));
   const open = posRows.filter((r) => r.status === "OPEN");
-  let tp1Hit = Boolean(row.tp1Hit) || posRows.some((r) => r.tp1Hit);
-  let tp2Hit = Boolean(row.tp2Hit) || posRows.some((r) => r.tp2Hit);
-  let tp3Hit = Boolean(row.tp3Hit) || posRows.some((r) => r.tp3Hit);
-  let tp4Hit = Boolean(row.tp4Hit) || posRows.some((r) => r.tp4Hit);
+  // Zone-level hit flags = ALL open legs completed that level (not just one leg).
+  let tp1Hit = Boolean(row.tp1Hit) || (open.length > 0 && open.every((r) => r.tp1Hit));
+  let tp2Hit = Boolean(row.tp2Hit) || (open.length > 0 && open.every((r) => r.tp2Hit));
+  let tp3Hit = Boolean(row.tp3Hit) || (open.length > 0 && open.every((r) => r.tp3Hit));
+  let tp4Hit = Boolean(row.tp4Hit) || (open.length > 0 && open.every((r) => r.tp4Hit));
   const sanitized = sanitizeZoneTpLadder({
     tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
     tp1Hit, tp2Hit, tp3Hit, tp4Hit, tp4Price,
@@ -2638,6 +2639,8 @@ interface ZoneState {
   // Both fields are runtime-only (not persisted); after a restart we re-attempt
   // BE up to the cap, which is safe (modify-sl is idempotent).
   tp2SlMoved: boolean;
+  /** True after first TP2 cancelled limits + BE pass for this zone (runtime). */
+  tp2HousekeepingDone: boolean;
   tp2BeAttempts: number;
   // True iff the SL we got onto the position(s) at TP2 is a "best effort"
   // protective SL (broker rejected true BE because price had retraced
@@ -3005,7 +3008,7 @@ function prepareZoneForCascade(
     cashoutDone: false,
     // Disabled TPs stay false — they are not "hit", they are skipped by the engine.
     tp1Hit: false, tp2Hit: false, tp3Hit: false, tp4Hit: false,
-    tp2SlMoved: false, tp2BeAttempts: 0, tp2SlIsBestEffort: false,
+    tp2SlMoved: false, tp2HousekeepingDone: false, tp2BeAttempts: 0, tp2SlIsBestEffort: false,
     autoBeAtTp: resolveAutoBeAtTp(sanitizeAutoBeAtTp(tps.autoBeAtTp), {
       tp1: tp1Enabled, tp2: tp2Enabled, tp3: tp3Enabled,
     }),
@@ -3234,14 +3237,13 @@ async function applyZoneTp2Housekeeping(
   region: string,
   zoneId: string,
   st: ZoneState,
-  opts: { beLegs?: LivePosition[]; isFirstZoneTp2: boolean; cancelLimits?: boolean },
+  opts: { beLegs?: LivePosition[]; isFirstZoneTp2: boolean },
 ): Promise<void> {
   try {
-    if (opts.cancelLimits !== false) {
+    if (opts.isFirstZoneTp2 && !st.tp2HousekeepingDone) {
       await cancelZoneLimits(token, region, st.accountId, zoneId);
-      if (opts.isFirstZoneTp2) {
-        console.log(`[tp2] cancelled unfilled limits for ${zoneId}`);
-      }
+      st.tp2HousekeepingDone = true;
+      console.log(`[tp2] cancelled unfilled limits for ${zoneId}`);
     }
     if (!isAutoBeTriggerSatisfied(st)) return;
 
@@ -3667,7 +3669,6 @@ async function handleClosePartial(
     if (pendingLegs.length === 0) {
       return { ok: false, message: `TP${tpLevel} already taken on all open legs` };
     }
-    const zoneHadTpHit = st[`tp${tpLevel}Hit`];
     const closeLots = await closeTpSliceOnEveryLiveLeg(token, region, st, zoneId, pendingLegs, tpLevel);
     if (closeLots < 0.01) return { ok: false, message: "Lot too small" };
     await mergeZoneHitsFromPositions(zoneId, {
@@ -3676,10 +3677,10 @@ async function handleClosePartial(
       tp3Enabled: st.tp3Enabled, tp4Enabled: st.tp4Enabled,
     });
     broadcastZoneUpdate(zoneId);
-    if (tpLevel === 2 && st.tp2Hit) {
+    if (tpLevel === 2) {
       await applyZoneTp2Housekeeping(token, region, zoneId, st, {
-        isFirstZoneTp2: !zoneHadTpHit,
-        beLegs: zoneHadTpHit ? pendingLegs : undefined,
+        isFirstZoneTp2: !st.tp2HousekeepingDone,
+        beLegs: st.tp2HousekeepingDone ? pendingLegs : undefined,
       });
     }
     if (tpLevel === 3) {
@@ -4524,9 +4525,9 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       }
     }
     for (const lvl of [1, 2, 3] as const) {
-      if (st[`tp${lvl}Hit`] || st[`tp${lvl}PassedAt`]) continue;
+      if (!live.some((leg) => legNeedsTpSlice(leg, st, lvl))) continue;
       const tpPrice = st[`tp${lvl}Price`];
-      if (tpPrice == null) continue;
+      if (tpPrice == null || st[`tp${lvl}PassedAt`]) continue;
       const crossed = st.direction === "buy"
         ? (st.highestPriceSeen ?? 0) >= tpPrice
         : (st.lowestPriceSeen ?? Infinity) <= tpPrice;
@@ -4560,7 +4561,6 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         const pendingLegs = tpLegs.filter((leg) => legNeedsTpSlice(leg, st, lvl));
         if (pendingLegs.length === 0) continue;
 
-        const zoneHadTpHit = st[`tp${lvl}Hit`];
         const closeLots = await closeTpSliceOnEveryLiveLeg(
           token, region, st, zoneId, pendingLegs, lvl,
         );
@@ -4574,10 +4574,10 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         });
         broadcastZoneUpdate(zoneId);
 
-        if (lvl === 2 && st.tp2Hit) {
+        if (lvl === 2) {
           await applyZoneTp2Housekeeping(token, region, zoneId, st, {
-            isFirstZoneTp2: !zoneHadTpHit,
-            beLegs: zoneHadTpHit ? pendingLegs : undefined,
+            isFirstZoneTp2: !st.tp2HousekeepingDone,
+            beLegs: st.tp2HousekeepingDone ? pendingLegs : undefined,
           });
         }
 
@@ -4664,7 +4664,6 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       if (beLegs.length > 0) {
         await applyZoneTp2Housekeeping(token, region, zoneId, st, {
           isFirstZoneTp2: false,
-          cancelLimits: false,
           beLegs,
         });
       }
@@ -4794,7 +4793,9 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
     // BE again (modify-sl is idempotent). If the broker still rejects, the
     // bounded retry budget below stops the loop quickly. The best-effort
     // flag IS persisted so the app warning chip survives a restart.
-    tp2SlMoved: false, tp2BeAttempts: 0,
+    tp2SlMoved: false,
+    tp2HousekeepingDone: Boolean(z.tp2Hit),
+    tp2BeAttempts: 0,
     tp2SlIsBestEffort: (z as { tp2SlIsBestEffort?: boolean }).tp2SlIsBestEffort ?? false,
     autoBeAtTp: sanitizeAutoBeAtTp((z as { autoBeAtTp?: number }).autoBeAtTp),
     status: z.status === "CLOSED" ? "CLOSED"
@@ -5355,14 +5356,6 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         tp4Price,
       });
 
-      const openPosRows = await db.select({
-        tp1Hit: zonePositionsTable.tp1Hit,
-        tp2Hit: zonePositionsTable.tp2Hit,
-        tp3Hit: zonePositionsTable.tp3Hit,
-      }).from(zonePositionsTable)
-        .where(and(eq(zonePositionsTable.zoneId, row.zoneId), eq(zonePositionsTable.status, "OPEN")));
-      const takeTpLevel = computeNextTakeTpLevel(openPosRows, { tp1Enabled, tp2Enabled, tp3Enabled });
-
       let nextTp: 0 | 1 | 2 | 3 | 4 = 0;
       if (tp1Enabled && !mergedHits.tp1Hit) nextTp = 1;
       else if (tp2Enabled && !mergedHits.tp2Hit) nextTp = 2;
@@ -5452,7 +5445,6 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         runner2Notified: Boolean(zoneStates.get(row.zoneId)?.tpNotified?.runner2),
         runner3Notified: Boolean(zoneStates.get(row.zoneId)?.tpNotified?.runner3),
         currentPrice,
-        takeTpLevel,
         nextTp,
         nextTpPrice,
         pipsToNextTp,

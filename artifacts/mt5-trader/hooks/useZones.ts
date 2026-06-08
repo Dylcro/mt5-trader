@@ -69,8 +69,6 @@ export interface Zone {
   runner2Notified?: boolean;
   runner3Notified?: boolean;
   currentPrice?: number | null;
-  /** Lowest TP any open leg still needs — drives Take TP{n} button. */
-  takeTpLevel?: 0 | 1 | 2 | 3;
   nextTp?: 0 | 1 | 2 | 3 | 4;
   nextTpPrice?: number | null;
   pipsToNextTp?: number | null;
