@@ -1817,6 +1817,10 @@ async function triggerMt5OneClickAutoCascade(
 
   const { limitEntries, stopLoss } = buildCascadeLevels(anchorPrice, direction!, config);
   const total = 1 + limitEntries.length;
+
+  // Match app cascade: anchor carries its own SL + zone tag (not borrowed from pending limits).
+  await tagMt5AnchorForZone(token, region, accountId, posId, zoneState.zoneId, stopLoss, total);
+
   let placedCount = 0;
 
   for (let i = 0; i < limitEntries.length; i++) {
@@ -4080,6 +4084,27 @@ async function modifyZonePositionSl(
   return r.ok;
 }
 
+/** Tag an existing MT5 anchor leg like an app cascade market entry (SL + zone comment + magic). */
+async function tagMt5AnchorForZone(
+  token: string, region: string, accountId: string,
+  positionId: string, zoneId: string, stopLoss: number, total: number,
+): Promise<void> {
+  const r = await tradeAction(token, region, accountId, {
+    actionType: "POSITION_MODIFY",
+    positionId,
+    stopLoss,
+    comment: buildCascadeComment(zoneId, 1, total),
+    magic: zoneMagicNumber(zoneId),
+  });
+  if (!r.ok) {
+    console.warn(
+      `[auto-cascade] anchor tag posId=${positionId} zone=${zoneId} failed code=${r.code} msg="${r.message ?? ""}"`,
+    );
+  } else {
+    console.log(`[auto-cascade] anchor tagged posId=${positionId} zone=${zoneId} sl=${stopLoss}`);
+  }
+}
+
 async function cancelZoneLimits(
   token: string, region: string, accountId: string, zoneId: string,
 ): Promise<void> {
@@ -5681,6 +5706,10 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
       const tp4Price = row.tp4Price != null ? Number(row.tp4Price) : null;
       mergedHits = sanitizeZoneTpLadder({ ...mergedHits, tp4Price });
       const positionCount = mergedHits.positionCount;
+      const trackedPositionIds = (await db.select({ positionId: zonePositionsTable.positionId })
+        .from(zonePositionsTable)
+        .where(and(eq(zonePositionsTable.zoneId, row.zoneId), eq(zonePositionsTable.status, "OPEN"))))
+        .map((r) => r.positionId);
       const finalTpReached = computeFinalTpReached({
         tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
         tp1Hit: mergedHits.tp1Hit, tp2Hit: mergedHits.tp2Hit, tp3Hit: mergedHits.tp3Hit, tp4Hit: mergedHits.tp4Hit,
@@ -5754,6 +5783,7 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
           };
         })(),
         positionCount,
+        trackedPositionIds,
         originalVolume: row.originalVolume != null ? Number(row.originalVolume) : 0,
         tp1Pct: Number(row.tp1Pct ?? 25),
         tp2Pct: Number(row.tp2Pct ?? 25),

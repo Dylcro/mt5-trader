@@ -216,8 +216,13 @@ export function buildDisplayActiveZones(
   });
 }
 
-export function positionsWithoutZone(positions: Position[], zoneIds: Set<string>): Position[] {
+export function positionsWithoutZone(
+  positions: Position[],
+  zoneIds: Set<string>,
+  trackedPositionIds?: Set<string>,
+): Position[] {
   return positions.filter((p) => {
+    if (trackedPositionIds?.has(p.id)) return false;
     const zid = parseZoneIdFromComment(p.comment);
     return !zid || !zoneIds.has(zid);
   });
