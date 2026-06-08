@@ -24,9 +24,9 @@ import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
 import { subscribeAccountEvents } from "@/lib/accountEventBus";
 import {
   buildDisplayActiveZones,
-  groupPositionsByZoneId,
+  getLinkedPositionsForZone,
   pendingWithoutZone,
-  positionsWithoutZone,
+  positionsNotInActiveZones,
 } from "@/lib/zoneDisplay";
 
 const C = Colors.dark;
@@ -314,7 +314,7 @@ export default function PositionsScreen() {
     return () => clearTimeout(id);
   }, [runnerAlert]);
 
-  const positionsByZone = useMemo(() => groupPositionsByZoneId(positions), [positions]);
+  const apiZonesById = useMemo(() => new Map(zones.map((z) => [z.zoneId, z])), [zones]);
   const normalZones = useMemo(
     () => displayActiveZones.filter((z) => !z.runnerActive),
     [displayActiveZones],
@@ -327,16 +327,9 @@ export default function PositionsScreen() {
     () => new Set(displayActiveZones.map((z) => z.zoneId)),
     [displayActiveZones],
   );
-  const trackedPositionIds = useMemo(() => {
-    const ids = new Set<string>();
-    for (const z of displayActiveZones) {
-      for (const pid of z.trackedPositionIds ?? []) ids.add(pid);
-    }
-    return ids;
-  }, [displayActiveZones]);
   const standalonePositions = useMemo(
-    () => positionsWithoutZone(positions, displayZoneIds, trackedPositionIds),
-    [positions, displayZoneIds, trackedPositionIds],
+    () => positionsNotInActiveZones(positions, displayActiveZones, zones),
+    [positions, displayActiveZones, zones],
   );
   const orphanPendingOrders = useMemo(
     () => pendingWithoutZone(pendingOrders, displayZoneIds),
@@ -499,7 +492,7 @@ export default function PositionsScreen() {
   }, [cancellingAll, orphanPendingOrders, cancelOrder]);
 
   const renderZoneCard = (z: typeof displayActiveZones[number]) => {
-    const linked = positionsByZone.get(z.zoneId) ?? [];
+    const linked = getLinkedPositionsForZone(z.zoneId, apiZonesById.get(z.zoneId) ?? z, positions);
     const liveVol = linked.reduce((s, p) => s + p.volume, 0);
     const floatingPnl = linked.reduce((s, p) => s + p.profit, 0);
     return (
