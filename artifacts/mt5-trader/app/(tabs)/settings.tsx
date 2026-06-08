@@ -736,7 +736,7 @@ export default function SettingsScreen() {
               </View>
             </View>
             <Text style={styles.cascadeCardDesc}>
-              Controls the ladder of orders placed when you tap Buy or Sell on the Trade screen of this app. Has no effect on trades you place inside the MT5 app.
+              Controls the ladder of orders placed when you tap Buy or Sell on the Trade screen. Enable auto-cascade below to apply the same ladder when you one-click in MT5.
             </Text>
 
             <View style={styles.cascadeDivider} />
@@ -792,6 +792,23 @@ export default function SettingsScreen() {
                 {cs.numPositions > 1 ? "\n" : ""}
                 {`SL  ${(5058 - cs.slPips * 0.10).toFixed(2)}  ← all orders (${cs.slPips} pips from entry)`}
               </Text>
+            </View>
+
+            <View style={styles.cascadeDivider} />
+
+            <View style={styles.settingRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.settingLabel}>Auto-cascade on MT5 one-click</Text>
+                <Text style={styles.settingHint}>
+                  Tap buy/sell in MT5 and the cascade fires automatically
+                </Text>
+              </View>
+              <Switch
+                value={cs.autoCascadeEnabled}
+                onValueChange={(val) => updateSettings({ autoCascadeEnabled: val })}
+                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
+                thumbColor={cs.autoCascadeEnabled ? C.gold : C.textMuted}
+              />
             </View>
 
             <Pressable
