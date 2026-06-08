@@ -327,9 +327,16 @@ export default function PositionsScreen() {
     () => new Set(displayActiveZones.map((z) => z.zoneId)),
     [displayActiveZones],
   );
+  const trackedPositionIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const z of displayActiveZones) {
+      for (const pid of z.trackedPositionIds ?? []) ids.add(pid);
+    }
+    return ids;
+  }, [displayActiveZones]);
   const standalonePositions = useMemo(
-    () => positionsWithoutZone(positions, displayZoneIds),
-    [positions, displayZoneIds],
+    () => positionsWithoutZone(positions, displayZoneIds, trackedPositionIds),
+    [positions, displayZoneIds, trackedPositionIds],
   );
   const orphanPendingOrders = useMemo(
     () => pendingWithoutZone(pendingOrders, displayZoneIds),

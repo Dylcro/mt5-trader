@@ -47,6 +47,8 @@ export interface Zone {
   /** SL on survivor after Risk free — History RF, not SL. */
   riskFreeSlExit?: boolean;
   positionCount: number;
+  /** Open legs tracked in zone_positions (covers MT5 one-click anchors before comment tag). */
+  trackedPositionIds?: string[];
   originalVolume?: number;
   tp1Pct?: number;
   tp2Pct?: number;
