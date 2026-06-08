@@ -493,6 +493,69 @@ function buildCascadeLevels(
   return { limitEntries, stopLoss };
 }
 
+/** Absolute TP prices from anchor + pip distances (same math as the app trade screen). */
+export function computeTpPricesFromPips(
+  anchorPrice: number,
+  direction: "buy" | "sell",
+  config: Pick<CascadeConfig, "tp1Pips" | "tp2Pips" | "tp3Pips" | "tp4Pips">,
+): { tp1Price: number; tp2Price: number; tp3Price: number; tp4Price: number | null } {
+  const sign = direction === "buy" ? 1 : -1;
+  const round2 = (v: number) => parseFloat(v.toFixed(2));
+  return {
+    tp1Price: round2(anchorPrice + sign * config.tp1Pips * PIP),
+    tp2Price: round2(anchorPrice + sign * config.tp2Pips * PIP),
+    tp3Price: round2(anchorPrice + sign * config.tp3Pips * PIP),
+    tp4Price: config.tp4Pips > 0 ? round2(anchorPrice + sign * config.tp4Pips * PIP) : null,
+  };
+}
+
+export function tpPipsOrderingValid(
+  config: Pick<CascadeConfig, "tp1Pips" | "tp2Pips" | "tp3Pips" | "tp4Pips">,
+): boolean {
+  return config.tp1Pips > 0
+    && config.tp2Pips > config.tp1Pips
+    && config.tp3Pips > config.tp2Pips
+    && (config.tp4Pips === 0 || config.tp4Pips > config.tp3Pips);
+}
+
+export type Mt5AutoCascadeSkipInput = {
+  syncReady: boolean;
+  syncReadyAtMs: number;
+  positionOpenTimeMs: number;
+  pendingAppCascade: boolean;
+  configEnabled: boolean;
+  symbol: string;
+  comment: string;
+  alreadyCascaded: boolean;
+  duplicatePosition: boolean;
+  anchorPrice: number;
+  rapidDuplicate: boolean;
+  alreadyInZone: boolean;
+  direction: "buy" | "sell" | null;
+  volume: number;
+  tpPipsValid: boolean;
+};
+
+/** Returns a short skip-reason code, or null when auto-cascade should proceed. */
+export function evaluateMt5AutoCascadeSkip(input: Mt5AutoCascadeSkipInput): string | null {
+  if (input.symbol !== "XAUUSD") return "symbol";
+  if (parseZoneIdFromComment(input.comment) || input.comment.includes("zone:")) return "zone_tag";
+  if (input.comment.startsWith("Cascade")) return "cascade_comment";
+  if (!input.syncReady) return "not_synced";
+  if (input.positionOpenTimeMs > 0 && input.positionOpenTimeMs < input.syncReadyAtMs - 2_000) return "historical";
+  if (input.pendingAppCascade) return "app_cascade_pending";
+  if (!input.configEnabled) return "disabled";
+  if (input.alreadyCascaded) return "already_cascaded";
+  if (input.duplicatePosition) return "duplicate";
+  if (!(input.anchorPrice > 0)) return "no_price";
+  if (input.rapidDuplicate) return "rapid_duplicate";
+  if (input.alreadyInZone) return "in_zone";
+  if (!input.direction) return "direction";
+  if (input.volume < 0.01) return "volume";
+  if (!input.tpPipsValid) return "tp_pips";
+  return null;
+}
+
 function getSdk(token: string): InstanceType<typeof MetaApi> {
   if (!sdkInstance) sdkInstance = new MetaApi(token);
   return sdkInstance;
@@ -569,6 +632,53 @@ function isDuplicate(dealId: string): boolean {
     if (first !== undefined) seenDealIds.delete(first);
   }
   return false;
+}
+
+// MetaAPI dual-node dedup for onPositionAdded (same pattern as seenDealIds).
+const seenPositionIds = new Set<string>();
+function isDuplicatePosition(accountId: string, positionId: string): boolean {
+  const key = `${accountId}:${positionId}`;
+  if (seenPositionIds.has(key)) return true;
+  seenPositionIds.add(key);
+  if (seenPositionIds.size > 5000) {
+    const first = seenPositionIds.values().next().value;
+    if (first !== undefined) seenPositionIds.delete(first);
+  }
+  return false;
+}
+
+function positionOpenTimeMs(position: Record<string, unknown>): number {
+  const t = position.time ?? position.openTime ?? position.updateTime;
+  if (t == null) return 0;
+  if (typeof t === "number") return t > 1e12 ? t : t * 1000;
+  const ms = new Date(String(t)).getTime();
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function mapPositionDirection(position: Record<string, unknown>): "buy" | "sell" | null {
+  const t = String(position.type ?? "");
+  if (t.includes("BUY")) return "buy";
+  if (t.includes("SELL")) return "sell";
+  return null;
+}
+
+async function positionAlreadyInZone(accountId: string, positionId: string): Promise<boolean> {
+  for (const st of zoneStates.values()) {
+    if (st.accountId === accountId && st.trackedPositions.has(positionId)) return true;
+  }
+  try {
+    const rows = await db.select({ zoneId: zonePositionsTable.zoneId })
+      .from(zonePositionsTable)
+      .innerJoin(cascadeZonesTable, eq(zonePositionsTable.zoneId, cascadeZonesTable.zoneId))
+      .where(and(
+        eq(zonePositionsTable.positionId, positionId),
+        eq(cascadeZonesTable.accountId, accountId),
+      ))
+      .limit(1);
+    return rows.length > 0;
+  } catch {
+    return false;
+  }
 }
 
 // ── SSE fan-out ────────────────────────────────────────────────────────────────
@@ -1200,6 +1310,13 @@ function makeDealListener(accountId: string) {
       void markZonePositionClosed(accountId, posId, position);
       broadcastToAccount(accountId, "deal", { type: "position_changed" });
     },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    async onPositionAdded(_instanceIndex: string, position: any): Promise<void> {
+      lastEventAt.set(accountId, Date.now());
+      void triggerMt5OneClickAutoCascade(accountId, position).catch((err) =>
+        console.error(`[auto-cascade] onPositionAdded failed accountId=${accountId}:`, (err as Error).message),
+      );
+    },
   };
 
   // Proxy: any property access that isn't `onDealAdded` returns a silent no-op.
@@ -1562,6 +1679,158 @@ async function placeCascadeLimitFast(
     throw new Error(userFacingTradeMessage(result.code, result.data.message));
   }
   return result.data.orderId;
+}
+
+async function triggerMt5OneClickAutoCascade(
+  accountId: string,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  position: any,
+): Promise<void> {
+  const pos = position as Record<string, unknown>;
+  const posId = String(pos.id ?? pos.positionId ?? "");
+  if (!posId) return;
+
+  const symbol = String(pos.symbol ?? "");
+  const comment = String(pos.comment ?? "");
+  const anchorPrice = Number(pos.openPrice ?? 0);
+  const volume = Number(pos.volume ?? 0);
+  const direction = mapPositionDirection(pos);
+  const userId = knownAccounts.get(accountId)?.userId;
+  const config = getCascadeConfig(accountId, userId);
+  const openMs = positionOpenTimeMs(pos);
+  const readyAt = syncReadyAt.get(accountId) ?? 0;
+
+  const skip = evaluateMt5AutoCascadeSkip({
+    syncReady: syncReady.has(accountId),
+    syncReadyAtMs: readyAt,
+    positionOpenTimeMs: openMs,
+    pendingAppCascade: pendingAppCascades.has(accountId),
+    configEnabled: config.enabled,
+    symbol,
+    comment,
+    alreadyCascaded: hasBeenCascaded(accountId, posId),
+    duplicatePosition: isDuplicatePosition(accountId, posId),
+    anchorPrice,
+    rapidDuplicate: isRapidDuplicate(accountId, anchorPrice),
+    alreadyInZone: await positionAlreadyInZone(accountId, posId),
+    direction,
+    volume,
+    tpPipsValid: tpPipsOrderingValid(config),
+  });
+  if (skip) {
+    if (skip !== "disabled" && skip !== "not_synced" && skip !== "historical" && skip !== "duplicate") {
+      console.log(`[auto-cascade] skip posId=${posId} reason=${skip}`);
+    }
+    return;
+  }
+
+  let token: string;
+  try { token = getToken(); } catch { return; }
+  const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
+  const conn = activeConnections.get(accountId);
+
+  console.log(`[auto-cascade] MT5 one-click detected — ${direction!.toUpperCase()} ${symbol} @ ${anchorPrice} posId=${posId}`);
+
+  const { tp1Price, tp2Price, tp3Price, tp4Price } = computeTpPricesFromPips(anchorPrice, direction!, config);
+  const tp1Pct = config.tp1Enabled ? config.tp1Pct : 0;
+  const tp2Pct = config.tp2Enabled ? config.tp2Pct : 0;
+  const tp3Pct = config.tp3Enabled ? config.tp3Pct : 0;
+  const tp4Pct = config.tp4Enabled ? config.tp4Pct : 0;
+
+  markCascaded(accountId, posId);
+
+  const zoneState = prepareZoneForCascade(
+    accountId, direction!, userId,
+    {
+      tp1Price, tp2Price, tp3Price, tp4Price,
+      tp1Pct, tp2Pct, tp3Pct, tp4Pct,
+      autoBeAtTp: config.autoBeAtTp,
+    },
+    volume,
+    undefined,
+    anchorPrice,
+    config.riskFreePips,
+  );
+  zoneState.anchorPrice = anchorPrice;
+
+  try {
+    await persistPreparedZone(zoneState, userId, posId, volume);
+  } catch (e) {
+    unmarkCascaded(accountId, posId);
+    console.error(`[auto-cascade] zone persist failed for posId=${posId}:`, (e as Error).message);
+    return;
+  }
+
+  zoneStates.set(zoneState.zoneId, zoneState);
+
+  const { limitEntries, stopLoss } = buildCascadeLevels(anchorPrice, direction!, config);
+  const total = 1 + limitEntries.length;
+  let placedCount = 0;
+
+  for (let i = 0; i < limitEntries.length; i++) {
+    const limitPrice = limitEntries[i]!;
+    const legNum = i + 2;
+    const cascadeComment = buildCascadeComment(zoneState.zoneId, legNum, total);
+    const actionType = direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT";
+    try {
+      const orderId = await placeCascadeLimitFast(
+        conn, region, accountId, token,
+        {
+          actionType,
+          symbol,
+          volume,
+          openPrice: limitPrice,
+          stopLoss,
+          comment: cascadeComment,
+        },
+        legNum,
+        total,
+      );
+      if (orderId) {
+        placedCount++;
+        trackCascadeOrder(accountId, orderId);
+        await attachLimitOrderToZone(accountId, orderId, cascadeComment, direction);
+      }
+    } catch (e) {
+      console.error(`[auto-cascade] limit ${legNum}/${total} failed for zone ${zoneState.zoneId}:`, (e as Error).message);
+    }
+  }
+
+  recordCascade(accountId, anchorPrice);
+  scheduleCascadeReconcile(accountId, region, token);
+  broadcastZoneUpdate(zoneState.zoneId);
+  broadcastToAccount(accountId, "deal", { type: "position_changed" });
+
+  const evt: DealEvent = {
+    dealId:     `auto_${posId}_${Date.now()}`,
+    positionId: posId,
+    symbol,
+    type:       direction === "buy" ? "DEAL_TYPE_BUY" : "DEAL_TYPE_SELL",
+    entryType:  "DEAL_ENTRY_IN",
+    openPrice:  anchorPrice,
+    volume,
+    comment,
+    time:       Date.now(),
+    autoCascade: true,
+    autoCascadeCount: placedCount,
+  };
+  storeDealEvent(accountId, evt);
+
+  const notifyUserId = await resolveZoneNotifyUserIdAsync(zoneState.zoneId, accountId);
+  if (notifyUserId) {
+    const prefs = await loadPrefsForUser(notifyUserId);
+    if (prefs?.expoPushToken) {
+      const dirLabel = direction === "buy" ? "BUY" : "SELL";
+      void sendExpoPush(
+        prefs.expoPushToken,
+        `📊 Zone created — ${dirLabel} ${anchorPrice.toFixed(2)}`,
+        "MT5 one-click detected · cascade placed automatically",
+        { type: "zone_created", zoneId: zoneState.zoneId, direction },
+      );
+    }
+  }
+
+  console.log(`[auto-cascade] zone ${zoneState.zoneId} created — ${placedCount} limit(s) placed`);
 }
 
 // ── Post-cascade orphan sweeper ─────────────────────────────────────────────

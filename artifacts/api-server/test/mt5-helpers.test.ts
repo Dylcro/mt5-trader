@@ -2,6 +2,9 @@ import { describe, it, expect, beforeEach } from "vitest";
 import {
   computeRiskFreeSl,
   buildCascadeConfigUpdate,
+  computeTpPricesFromPips,
+  tpPipsOrderingValid,
+  evaluateMt5AutoCascadeSkip,
   ZONE_RISK_FREE_PIPS,
   rowToZoneState,
   _zoneStatesForTest,
@@ -268,6 +271,101 @@ describe("buildCascadeConfigUpdate (PUT /cascade-config TP ordering)", () => {
     const r2 = buildCascadeConfigUpdate(undefined, BASE_CONFIG);
     expect(r1.ok).toBe(true);
     expect(r2.ok).toBe(true);
+  });
+});
+
+describe("computeTpPricesFromPips (MT5 one-click auto-cascade)", () => {
+  const pips = { tp1Pips: 20, tp2Pips: 50, tp3Pips: 90, tp4Pips: 0 };
+
+  it("BUY: TPs sit above anchor at pip distances", () => {
+    const anchor = 3120.50;
+    const tps = computeTpPricesFromPips(anchor, "buy", pips);
+    expect(tps.tp1Price).toBeCloseTo(3122.50, 2);
+    expect(tps.tp2Price).toBeCloseTo(3125.50, 2);
+    expect(tps.tp3Price).toBeCloseTo(3129.50, 2);
+    expect(tps.tp4Price).toBeNull();
+  });
+
+  it("SELL: TPs sit below anchor at pip distances", () => {
+    const anchor = 3120.50;
+    const tps = computeTpPricesFromPips(anchor, "sell", pips);
+    expect(tps.tp1Price).toBeCloseTo(3118.50, 2);
+    expect(tps.tp2Price).toBeCloseTo(3115.50, 2);
+    expect(tps.tp3Price).toBeCloseTo(3111.50, 2);
+    expect(tps.tp4Price).toBeNull();
+  });
+
+  it("tp4Price is set when tp4Pips > 0", () => {
+    const tps = computeTpPricesFromPips(3000, "buy", { ...pips, tp4Pips: 120 });
+    expect(tps.tp4Price).toBeCloseTo(3012.0, 2);
+  });
+});
+
+describe("evaluateMt5AutoCascadeSkip (MT5 one-click guards)", () => {
+  const base = {
+    syncReady: true,
+    syncReadyAtMs: 1_000_000,
+    positionOpenTimeMs: 1_000_500,
+    pendingAppCascade: false,
+    configEnabled: true,
+    symbol: "XAUUSD",
+    comment: "",
+    alreadyCascaded: false,
+    duplicatePosition: false,
+    anchorPrice: 3120.5,
+    rapidDuplicate: false,
+    alreadyInZone: false,
+    direction: "buy" as const,
+    volume: 0.04,
+    tpPipsValid: true,
+  };
+
+  it("returns null when all guards pass", () => {
+    expect(evaluateMt5AutoCascadeSkip(base)).toBeNull();
+  });
+
+  it("skips when auto-cascade disabled", () => {
+    expect(evaluateMt5AutoCascadeSkip({ ...base, configEnabled: false })).toBe("disabled");
+  });
+
+  it("skips non-XAUUSD symbols", () => {
+    expect(evaluateMt5AutoCascadeSkip({ ...base, symbol: "EURUSD" })).toBe("symbol");
+  });
+
+  it("skips cascade-tagged comments", () => {
+    expect(evaluateMt5AutoCascadeSkip({ ...base, comment: "Cascade|z_abc|2/4" })).toBe("zone_tag");
+    expect(evaluateMt5AutoCascadeSkip({ ...base, comment: "Cascade 1/4" })).toBe("cascade_comment");
+  });
+
+  it("skips until stream sync completes", () => {
+    expect(evaluateMt5AutoCascadeSkip({ ...base, syncReady: false })).toBe("not_synced");
+  });
+
+  it("skips positions opened before sync (historical replay)", () => {
+    expect(evaluateMt5AutoCascadeSkip({
+      ...base,
+      positionOpenTimeMs: 990_000,
+      syncReadyAtMs: 1_000_000,
+    })).toBe("historical");
+  });
+
+  it("skips when app cascade is in-flight", () => {
+    expect(evaluateMt5AutoCascadeSkip({ ...base, pendingAppCascade: true })).toBe("app_cascade_pending");
+  });
+
+  it("skips rapid duplicate taps", () => {
+    expect(evaluateMt5AutoCascadeSkip({ ...base, rapidDuplicate: true })).toBe("rapid_duplicate");
+  });
+});
+
+describe("tpPipsOrderingValid", () => {
+  it("accepts strictly increasing TP1–TP3 with optional TP4", () => {
+    expect(tpPipsOrderingValid({ tp1Pips: 20, tp2Pips: 50, tp3Pips: 90, tp4Pips: 0 })).toBe(true);
+    expect(tpPipsOrderingValid({ tp1Pips: 20, tp2Pips: 50, tp3Pips: 90, tp4Pips: 120 })).toBe(true);
+  });
+
+  it("rejects out-of-order pips", () => {
+    expect(tpPipsOrderingValid({ tp1Pips: 50, tp2Pips: 50, tp3Pips: 90, tp4Pips: 0 })).toBe(false);
   });
 });
 
