@@ -1899,6 +1899,40 @@ export function positionBelongsToZone(
   return false;
 }
 
+/** DB-tracked ∪ comment/magic-tagged legs — same union as resolveLivePositionsForZoneAction. */
+export function mergeLiveZoneLegs(
+  allLive: LivePosition[],
+  zoneId: string,
+  trackedIds: Set<string>,
+): LivePosition[] {
+  const byId = new Map<string, LivePosition>();
+  for (const p of allLive) {
+    if (trackedIds.has(p.id) || positionBelongsToZone(p, zoneId)) byId.set(p.id, p);
+  }
+  return [...byId.values()];
+}
+
+/**
+ * True when the broker snapshot is missing legs we know about (DB rows or tagged
+ * positions). Batch snapshots can lag behind a limit fill while anchor is
+ * already visible — relink + fresh REST avoids TP closes on anchor only.
+ */
+export function zoneLegsNeedFreshResolve(
+  live: LivePosition[],
+  zoneId: string,
+  trackedIds: Set<string>,
+  allLive: LivePosition[],
+  dbOpenCount: number,
+): boolean {
+  if (dbOpenCount > live.length) return true;
+  for (const id of trackedIds) {
+    if (!live.some((p) => p.id === id)) return true;
+  }
+  return allLive
+    .filter((p) => positionBelongsToZone(p, zoneId))
+    .some((p) => !live.some((l) => l.id === p.id));
+}
+
 /** True when evaluateZone can run TP/BE logic (anchor or absolute TP prices set). */
 export function zoneHasTpTargets(st: {
   anchorPrice: number;
@@ -3157,14 +3191,48 @@ async function recordZonePositionFill(
  * Anchor is often missing from OPEN rows while limits are tracked — union prevents
  * close-zone from closing only the ladder and leaving the market entry running.
  */
+/** Close tpPct% from every live leg (same rule for anchor + each filled limit). */
+async function closeTpSliceOnEveryLiveLeg(
+  token: string,
+  region: string,
+  st: ZoneState,
+  zoneId: string,
+  legs: LivePosition[],
+  lvl: 1 | 2 | 3,
+): Promise<number> {
+  const tpPct = st[`tp${lvl}Pct`] ?? 25;
+  const isLast = isLastEnabledTpLevel(lvl, st);
+  const LOT_STEP = 0.01;
+  let totalClosed = 0;
+  for (const leg of legs) {
+    const cached = st.trackedPositions.get(leg.id);
+    const cascadeLot = cached?.volume && cached.volume > 0 ? cached.volume : leg.volume;
+    const slice = computeTpSliceVolume({
+      cascadeLot,
+      tpPct,
+      remainingVol: leg.volume,
+      isLastEnabledTp: isLast,
+    });
+    if (slice.closeVol < LOT_STEP) continue;
+    const toClose = Math.min(slice.closeVol, leg.volume);
+    if (toClose >= leg.volume - 1e-9) {
+      if (await closeZonePosition(token, region, st.accountId, leg.id)) totalClosed += leg.volume;
+    } else if (await closeZonePosition(token, region, st.accountId, leg.id, toClose)) {
+      totalClosed += toClose;
+    }
+  }
+  return totalClosed;
+}
+
 async function resolveLivePositionsForZoneAction(
   token: string,
   region: string,
   accountId: string,
   zoneId: string,
   st: ZoneState,
+  opts?: { fresh?: boolean },
 ): Promise<LivePosition[]> {
-  const allLive = await fetchOpenPositions(token, region, accountId);
+  const allLive = await fetchOpenPositions(token, region, accountId, opts);
   const openRows = await db.select().from(zonePositionsTable)
     .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
   const trackedIds = new Set(openRows.map((z) => z.positionId));
@@ -4135,33 +4203,38 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       }
     }
     let allLive = snap?.positions ?? await fetchOpenPositions(token, region, st.accountId);
-    let live = allLive.filter(p => trackedIds.has(p.id));
+    let live = mergeLiveZoneLegs(allLive, zoneId, trackedIds);
     const hasBrokerLegs = snap
       ? zoneHasLegsInSnapshot(st.accountId, zoneId, snap.positions, snap.orders)
       : await brokerHasOpenLegsForZone(token, region, st.accountId, zoneId);
-    // Union zone-tagged broker legs — a limit can fill before its DB row lands,
-    // leaving only the anchor in trackedIds so TP partials hit one leg only.
-    const tagged = allLive.filter((p) => positionBelongsToZone(p, zoneId));
-    const liveById = new Map(live.map((p) => [p.id, p]));
-    for (const p of tagged) liveById.set(p.id, p);
-    live = [...liveById.values()];
-    for (const p of tagged) {
-      if (!trackedIds.has(p.id)) {
-        trackedIds.add(p.id);
-        void recordZonePositionFill(zoneId, p.id, p.openPrice, p.volume);
-      }
-    }
-    if ((live.length === 0 && hasBrokerLegs)
-      || (hasBrokerLegs && live.length > 0 && tagged.length === 0)) {
+    const needsLegResolve =
+      (live.length === 0 && hasBrokerLegs)
+      || zoneLegsNeedFreshResolve(live, zoneId, trackedIds, allLive, zps.length);
+    if (needsLegResolve) {
       await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st);
-      allLive = await fetchOpenPositions(token, region, st.accountId, { fresh: true });
-      live = allLive.filter((p) => positionBelongsToZone(p, zoneId) || trackedIds.has(p.id));
-      for (const p of live) {
-        if (!trackedIds.has(p.id)) {
-          trackedIds.add(p.id);
-          void recordZonePositionFill(zoneId, p.id, p.openPrice, p.volume);
+      try {
+        const rows = await withDbRetry(`evalZone.legResolveRefresh zone=${zoneId}`, () => db.select().from(zonePositionsTable)
+          .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
+        );
+        zps = rows.map((r) => ({
+          positionId: r.positionId, volume: Number(r.volume), entryPrice: Number(r.entryPrice),
+        }));
+        trackedIds = new Set(zps.map((z) => z.positionId));
+        for (const z of zps) {
+          const existing = st.trackedPositions.get(z.positionId);
+          st.trackedPositions.set(z.positionId, {
+            volume: z.volume, entryPrice: z.entryPrice,
+            tp1Hit: existing?.tp1Hit ?? false,
+            tp2Hit: existing?.tp2Hit ?? false,
+            tp3Hit: existing?.tp3Hit ?? false,
+            tp4Hit: existing?.tp4Hit ?? false,
+          });
         }
+      } catch (e) {
+        console.warn(`[zone ${zoneId}] leg-resolve tracked refresh failed, using cache (${trackedIds.size} ids): ${(e as Error).message}`);
       }
+      allLive = await fetchOpenPositions(token, region, st.accountId, { fresh: true });
+      live = mergeLiveZoneLegs(allLive, zoneId, trackedIds);
     }
     // Skip the destructive reconciliation path (which permanently marks
     // positions CLOSED in the DB) when we're operating off the cache —
@@ -4344,27 +4417,16 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       if (!atLevel && !bufferedClose) continue;
 
       try {
-        const autoLive = live.filter((p) => positionBelongsToZone(p, zoneId) || trackedIds.has(p.id));
-        if (autoLive.length === 0) continue;
+        // Fresh broker read so limits that filled since tick start join this TP.
+        const tpLegs = await resolveLivePositionsForZoneAction(
+          token, region, st.accountId, zoneId, st, { fresh: true },
+        );
+        if (tpLegs.length === 0) continue;
 
-        const totalVol = autoLive.reduce((s, p) => s + p.volume, 0);
-        const LOT_STEP = 0.01;
-        const baseVol = st.originalVolume > 0 ? st.originalVolume : totalVol;
-        const targetLots = Math.round((baseVol * tpPct / 100) / LOT_STEP) * LOT_STEP;
-        const closeLots = Math.min(Math.max(targetLots, LOT_STEP), totalVol);
-
-        const sortedLegs = [...autoLive].sort((a, b) => b.volume - a.volume);
-        let remaining = closeLots;
-        for (const leg of sortedLegs) {
-          if (remaining <= 0) break;
-          if (leg.volume <= remaining + 1e-9) {
-            await closeZonePosition(token, region, st.accountId, leg.id);
-            remaining = Math.round((remaining - leg.volume) / LOT_STEP) * LOT_STEP;
-          } else if (remaining >= LOT_STEP) {
-            await closeZonePosition(token, region, st.accountId, leg.id, remaining);
-            remaining = 0;
-          }
-        }
+        const closeLots = await closeTpSliceOnEveryLiveLeg(
+          token, region, st, zoneId, tpLegs, lvl,
+        );
+        if (closeLots < 0.01) continue;
 
         const hitKey = `tp${lvl}Hit` as const;
         st[hitKey] = true;
@@ -4378,8 +4440,9 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         if (lvl === 2) {
           try {
             await cancelZoneLimits(token, region, st.accountId, zoneId);
-            const remaining = await fetchOpenPositions(token, region, st.accountId);
-            const legs = remaining.filter((p) => positionBelongsToZone(p, zoneId) || trackedIds.has(p.id));
+            const legs = await resolveLivePositionsForZoneAction(
+              token, region, st.accountId, zoneId, st, { fresh: true },
+            );
             for (const leg of legs) {
               await modifyZonePositionSl(token, region, st.accountId, leg.id, leg.openPrice);
             }
@@ -4392,7 +4455,7 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         if (lvl === 3) {
           notifyZoneEvent(zoneId, "tp3_runners", 3, 0, st.direction);
         }
-        console.log(`[auto-tp] zone ${zoneId} TP${lvl} closed ${closeLots} lots`);
+        console.log(`[auto-tp] zone ${zoneId} TP${lvl} closed ${closeLots.toFixed(2)} lots across ${tpLegs.length} leg(s)`);
       } catch (err) {
         console.error(`[auto-tp] TP${lvl} close failed for ${zoneId}:`, err);
       }
