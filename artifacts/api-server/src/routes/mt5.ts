@@ -885,7 +885,7 @@ function markOrderCompleted(accountId: string, orderId: string): void {
 // many times per second; we cap each zone at one evaluation per
 // STREAMING_EVAL_MIN_INTERVAL_MS so the broker isn't hammered on duplicates.
 // The periodic timer remains as a safety net for ticks lost to a streaming dropout.
-const STREAMING_EVAL_MIN_INTERVAL_MS = 1_000;
+const STREAMING_EVAL_MIN_INTERVAL_MS = 500;
 const MONITOR_EVAL_SKIP_IF_STREAM_MS = 12_000;
 const lastStreamingEvalAt = new Map<string, number>(); // zoneId → epoch ms
 
@@ -1115,11 +1115,18 @@ function makeDealListener(accountId: string) {
           }
         }
         if (zoneId && deal.positionId) {
+          invalidateBrokerSnapshot(accountId);
           void recordZonePositionFill(
             zoneId, String(deal.positionId),
             Number(deal.price ?? deal.openPrice ?? 0),
             Number(deal.volume ?? 0),
-          );
+          ).then(() => {
+            lastStreamingEvalAt.delete(zoneId);
+            try {
+              const tkn = getToken();
+              void evaluateZone(zoneId, tkn);
+            } catch { /* token unavailable */ }
+          });
         } else if (deal.positionId) {
           console.warn(`[stream ${accountId}] cascade fill orderId=${deal.orderId} posId=${deal.positionId} could not be linked to any active zone — position will be orphaned`);
         }
@@ -4127,15 +4134,34 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         return;
       }
     }
-    const allLive = snap?.positions ?? await fetchOpenPositions(token, region, st.accountId);
+    let allLive = snap?.positions ?? await fetchOpenPositions(token, region, st.accountId);
     let live = allLive.filter(p => trackedIds.has(p.id));
     const hasBrokerLegs = snap
       ? zoneHasLegsInSnapshot(st.accountId, zoneId, snap.positions, snap.orders)
       : await brokerHasOpenLegsForZone(token, region, st.accountId, zoneId);
-    if (live.length === 0 && hasBrokerLegs) {
+    // Union zone-tagged broker legs — a limit can fill before its DB row lands,
+    // leaving only the anchor in trackedIds so TP partials hit one leg only.
+    const tagged = allLive.filter((p) => positionBelongsToZone(p, zoneId));
+    const liveById = new Map(live.map((p) => [p.id, p]));
+    for (const p of tagged) liveById.set(p.id, p);
+    live = [...liveById.values()];
+    for (const p of tagged) {
+      if (!trackedIds.has(p.id)) {
+        trackedIds.add(p.id);
+        void recordZonePositionFill(zoneId, p.id, p.openPrice, p.volume);
+      }
+    }
+    if ((live.length === 0 && hasBrokerLegs)
+      || (hasBrokerLegs && live.length > 0 && tagged.length === 0)) {
       await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st);
-      const refreshed = snap?.positions ?? await fetchOpenPositions(token, region, st.accountId);
-      live = refreshed.filter((p) => positionBelongsToZone(p, zoneId) || trackedIds.has(p.id));
+      allLive = await fetchOpenPositions(token, region, st.accountId, { fresh: true });
+      live = allLive.filter((p) => positionBelongsToZone(p, zoneId) || trackedIds.has(p.id));
+      for (const p of live) {
+        if (!trackedIds.has(p.id)) {
+          trackedIds.add(p.id);
+          void recordZonePositionFill(zoneId, p.id, p.openPrice, p.volume);
+        }
+      }
     }
     // Skip the destructive reconciliation path (which permanently marks
     // positions CLOSED in the DB) when we're operating off the cache —
