@@ -141,6 +141,50 @@ export function groupPositionsByZoneId(positions: Position[]): Map<string, Posit
   return map;
 }
 
+/** Positions linked to a zone via comment/zoneId field and/or trackedPositionIds (MT5 one-click). */
+export function getLinkedPositionsForZone(
+  zoneId: string,
+  zone: Pick<Zone, "trackedPositionIds"> | undefined,
+  positions: Position[],
+): Position[] {
+  const fromComment = groupPositionsByZoneId(positions).get(zoneId) ?? [];
+  const tracked = new Set((zone?.trackedPositionIds ?? []).map(normalizePositionId));
+  if (!tracked.size) return fromComment;
+  const byId = new Map(fromComment.map((p) => [normalizePositionId(p.id), p]));
+  for (const p of positions) {
+    const pid = normalizePositionId(p.id);
+    if (tracked.has(pid) && !byId.has(pid)) byId.set(pid, p);
+  }
+  return [...byId.values()];
+}
+
+/** All position IDs linked to any active display zone (unified comment + tracked IDs). */
+export function collectActiveZoneLinkedPositionIds(
+  displayActiveZones: Zone[],
+  apiZones: Zone[],
+  positions: Position[],
+): Set<string> {
+  const apiById = new Map(apiZones.map((z) => [z.zoneId, z]));
+  const ids = new Set<string>();
+  for (const z of displayActiveZones) {
+    const apiZone = apiById.get(z.zoneId);
+    for (const p of getLinkedPositionsForZone(z.zoneId, apiZone ?? z, positions)) {
+      ids.add(normalizePositionId(p.id));
+    }
+  }
+  return ids;
+}
+
+/** Orphan MT5 positions not tied to any active zone card (manual trades only). */
+export function positionsNotInActiveZones(
+  positions: Position[],
+  displayActiveZones: Zone[],
+  apiZones: Zone[],
+): Position[] {
+  const linked = collectActiveZoneLinkedPositionIds(displayActiveZones, apiZones, positions);
+  return positions.filter((p) => !linked.has(normalizePositionId(p.id)));
+}
+
 function groupPendingByZoneId(orders: PendingOrder[]): Map<string, PendingOrder[]> {
   const map = new Map<string, PendingOrder[]>();
   for (const o of orders) {
@@ -180,21 +224,9 @@ export function buildDisplayActiveZones(
   const seen = new Set<string>();
   const out: Zone[] = [];
 
-  const linkedPositionsForZone = (zoneId: string): Position[] => {
-    const fromComment = byComment.get(zoneId) ?? [];
-    const tracked = trackedByZone.get(zoneId);
-    if (!tracked?.size) return fromComment;
-    const byId = new Map(fromComment.map((p) => [normalizePositionId(p.id), p]));
-    for (const p of positions) {
-      const pid = normalizePositionId(p.id);
-      if (tracked.has(pid) && !byId.has(pid)) byId.set(pid, p);
-    }
-    return [...byId.values()];
-  };
-
   for (const z of active) {
     seen.add(z.zoneId);
-    const linked = linkedPositionsForZone(z.zoneId);
+    const linked = getLinkedPositionsForZone(z.zoneId, z, positions);
     const merged: Zone = enrichZoneDisplayFields({
       ...z,
       positionCount: linked.length > 0 ? linked.length : z.positionCount,
