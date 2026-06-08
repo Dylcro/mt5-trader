@@ -990,6 +990,7 @@ async function processStreamingTickBatch(accountId: string): Promise<void> {
       console.error(`[eval] ${zoneId}:`, (err as Error).message);
     }
   }
+  invalidateBrokerSnapshot(accountId);
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

@@ -44,6 +44,8 @@ import {
   getZoneLimitOrder,
   orderIdsForZone,
   deleteZoneLimitOrder,
+  mergeLiveZoneLegs,
+  zoneLegsNeedFreshResolve,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
@@ -748,6 +750,46 @@ describe("disabled TP history", () => {
     } as Parameters<typeof makeRow>[0]));
     expect(st.tp3Hit).toBe(false);
     expect(st.tp3Enabled).toBe(false);
+  });
+});
+
+describe("mergeLiveZoneLegs / zoneLegsNeedFreshResolve", () => {
+  const zoneId = "z_test_zone";
+  const anchorId = "pos-anchor";
+  const limitId = "pos-limit";
+  const anchor = {
+    id: anchorId,
+    openPrice: 2400,
+    volume: 0.04,
+    type: "POSITION_TYPE_BUY",
+    symbol: "XAUUSD",
+    comment: buildCascadeComment(zoneId, 1, 4),
+  };
+  const limit = {
+    id: limitId,
+    openPrice: 2395,
+    volume: 0.04,
+    type: "POSITION_TYPE_BUY",
+    symbol: "XAUUSD",
+    comment: buildCascadeComment(zoneId, 2, 4),
+  };
+
+  it("mergeLiveZoneLegs unions DB-tracked ids with tagged broker legs", () => {
+    const tracked = new Set([anchorId]);
+    const merged = mergeLiveZoneLegs([anchor, limit], zoneId, tracked);
+    expect(merged.map((p) => p.id).sort()).toEqual([anchorId, limitId]);
+  });
+
+  it("zoneLegsNeedFreshResolve when DB has more OPEN rows than snapshot live set", () => {
+    const tracked = new Set([anchorId, limitId]);
+    const live = mergeLiveZoneLegs([anchor], zoneId, tracked);
+    expect(zoneLegsNeedFreshResolve(live, zoneId, tracked, [anchor], 2)).toBe(true);
+  });
+
+  it("zoneLegsNeedFreshResolve is false when every tracked id is in live", () => {
+    const tracked = new Set([anchorId, limitId]);
+    const live = mergeLiveZoneLegs([anchor, limit], zoneId, tracked);
+    expect(zoneLegsNeedFreshResolve(live, zoneId, tracked, [anchor, limit], 2)).toBe(false);
   });
 });
 
