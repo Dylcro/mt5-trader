@@ -61,6 +61,9 @@ export interface Zone {
   runner1Hit?: boolean;
   runner2Hit?: boolean;
   runner3Hit?: boolean;
+  runner1Auto?: boolean;
+  runner2Auto?: boolean;
+  runner3Auto?: boolean;
   runnerActive?: boolean;
   runner1Notified?: boolean;
   runner2Notified?: boolean;
@@ -170,7 +173,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
 
   // Prune zones the server no longer reports (e.g. closed externally in MT5).
   useEffect(() => {
-    if (!API_BASE || !accountId) return;
+    if (!API_BASE || !accountId || sseConnected) return;
     const prune = async () => {
       try {
         const qs = includeClosed ? "?includeClosed=true" : "";
@@ -188,9 +191,9 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
         });
       } catch { /* non-fatal */ }
     };
-    const id = setInterval(() => void prune(), 20_000);
+    const id = setInterval(() => void prune(), 60_000);
     return () => clearInterval(id);
-  }, [accountId, includeClosed]);
+  }, [accountId, includeClosed, sseConnected]);
 
   // Subscribe to SSE-driven zone events via the module-level accountEventBus.
   // zone_update → patch the matching zone in-place for instant TP/status changes.

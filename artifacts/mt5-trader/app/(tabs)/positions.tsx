@@ -274,7 +274,7 @@ export default function PositionsScreen() {
     positions, pendingOrders, status, accountInfo,
     refreshPositions, refreshPendingOrders, refreshAccountInfo,
     closePosition, cancelOrder, accountId, region, sseConnected, price, ensureSessionForTrade,
-    closeZonePartial, activateRunner,
+    closeZonePartial, activateRunner, setRunnerAuto,
   } = useTrading();
   const { zones, refresh: refreshZones, riskFree, closeZone, closeAllWorst, cancelZoneOrders } = useZones(accountId, {
     includeClosed: true, pollIntervalMs: 10_000, sseConnected, region,
@@ -439,7 +439,7 @@ export default function PositionsScreen() {
         refreshPendingOrders(),
       ]);
       syncLight();
-      const id = setInterval(syncLight, 10_000);
+      const id = setInterval(syncLight, 20_000);
       return () => clearInterval(id);
     }, [status, accountId, refreshZones, refreshPositions, refreshPendingOrders]),
   );
@@ -520,8 +520,11 @@ export default function PositionsScreen() {
           onClosePartial={(zoneId, opts) =>
             withSessionReady(() => handleClosePartial(zoneId, opts))
           }
-          onActivateRunner={(zoneId, targets) =>
-            withSessionReady(() => activateRunner(zoneId, targets))
+          onActivateRunner={(zoneId, targets, autos) =>
+            withSessionReady(() => activateRunner(zoneId, targets, autos))
+          }
+          onSetRunnerAuto={(zoneId, runnerN, auto) =>
+            withSessionReady(() => setRunnerAuto(zoneId, runnerN, auto))
           }
           onCancelOrders={(zoneId) =>
             withSessionReady(() => handleCancelZoneOrders(zoneId))

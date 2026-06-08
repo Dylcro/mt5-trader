@@ -151,6 +151,9 @@ export async function ensureCascadeZoneRunnerColumns(): Promise<void> {
         ADD COLUMN IF NOT EXISTS runner1_hit BOOLEAN NOT NULL DEFAULT FALSE,
         ADD COLUMN IF NOT EXISTS runner2_hit BOOLEAN NOT NULL DEFAULT FALSE,
         ADD COLUMN IF NOT EXISTS runner3_hit BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS runner1_auto BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS runner2_auto BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS runner3_auto BOOLEAN NOT NULL DEFAULT FALSE,
         ADD COLUMN IF NOT EXISTS runner_active BOOLEAN NOT NULL DEFAULT FALSE;
     `).then(() => undefined).catch((e) => {
       cascadeRunnerColumnsReady = null;
@@ -719,6 +722,9 @@ function broadcastZoneUpdate(zoneId: string): void {
       runner1Hit: Boolean(dbRow?.runner1Hit ?? st?.runner1Hit),
       runner2Hit: Boolean(dbRow?.runner2Hit ?? st?.runner2Hit),
       runner3Hit: Boolean(dbRow?.runner3Hit ?? st?.runner3Hit),
+      runner1Auto: Boolean((dbRow as { runner1Auto?: boolean } | undefined)?.runner1Auto ?? st?.runner1Auto),
+      runner2Auto: Boolean((dbRow as { runner2Auto?: boolean } | undefined)?.runner2Auto ?? st?.runner2Auto),
+      runner3Auto: Boolean((dbRow as { runner3Auto?: boolean } | undefined)?.runner3Auto ?? st?.runner3Auto),
       runnerActive: Boolean(dbRow?.runnerActive ?? st?.runnerActive),
       runner1Notified: Boolean(st?.tpNotified?.runner1),
       runner2Notified: Boolean(st?.tpNotified?.runner2),
@@ -878,9 +884,113 @@ function markOrderCompleted(accountId: string, orderId: string): void {
 // Per-zone throttle for streaming-driven evaluateZone calls. Ticks can arrive
 // many times per second; we cap each zone at one evaluation per
 // STREAMING_EVAL_MIN_INTERVAL_MS so the broker isn't hammered on duplicates.
-// The 3 s timer remains as a safety net for ticks lost to a streaming dropout.
-const STREAMING_EVAL_MIN_INTERVAL_MS = 300;
+// The periodic timer remains as a safety net for ticks lost to a streaming dropout.
+const STREAMING_EVAL_MIN_INTERVAL_MS = 1_000;
+const MONITOR_EVAL_SKIP_IF_STREAM_MS = 12_000;
 const lastStreamingEvalAt = new Map<string, number>(); // zoneId → epoch ms
+
+/** Short-lived per-account broker snapshot — dedupes concurrent position/order REST calls. */
+const BROKER_SNAPSHOT_TTL_MS = 5_000;
+const brokerSnapshotCache = new Map<string, {
+  positions: LivePosition[];
+  orders: Array<{ id: string; comment?: string; magic?: number }>;
+  fetchedAt: number;
+}>();
+const brokerSnapshotInflight = new Map<string, Promise<{
+  positions: LivePosition[];
+  orders: Array<{ id: string; comment?: string; magic?: number }>;
+}>>();
+
+async function getBrokerSnapshot(
+  token: string,
+  region: string,
+  accountId: string,
+  opts?: { fresh?: boolean },
+): Promise<{
+  positions: LivePosition[];
+  orders: Array<{ id: string; comment?: string; magic?: number }>;
+}> {
+  if (!opts?.fresh) {
+    const cached = brokerSnapshotCache.get(accountId);
+    if (cached && Date.now() - cached.fetchedAt < BROKER_SNAPSHOT_TTL_MS) {
+      return { positions: cached.positions, orders: cached.orders };
+    }
+    const pending = brokerSnapshotInflight.get(accountId);
+    if (pending) return pending;
+  }
+  const load = (async () => {
+    const [positions, orders] = await Promise.all([
+      fetchOpenPositionsUncached(token, region, accountId),
+      fetchLivePendingOrdersUncached(token, region, accountId),
+    ]);
+    brokerSnapshotCache.set(accountId, { positions, orders, fetchedAt: Date.now() });
+    brokerSnapshotInflight.delete(accountId);
+    return { positions, orders };
+  })();
+  if (!opts?.fresh) brokerSnapshotInflight.set(accountId, load);
+  try {
+    return await load;
+  } catch (e) {
+    brokerSnapshotInflight.delete(accountId);
+    throw e;
+  }
+}
+
+function invalidateBrokerSnapshot(accountId: string): void {
+  brokerSnapshotCache.delete(accountId);
+  brokerSnapshotInflight.delete(accountId);
+}
+
+/** Gold market hours — skip zone eval/reconcile off-hours to cut MetaAPI load. */
+function isMarketOpen(): boolean {
+  const now = new Date();
+  const day = now.getUTCDay();
+  const hour = now.getUTCHours();
+  if (day === 6) return false;
+  if (day === 0 && hour < 23) return false;
+  if (day === 5 && hour >= 22) return false;
+  return true;
+}
+
+type BrokerSnap = {
+  positions: LivePosition[];
+  orders: Array<{ id: string; comment?: string; magic?: number }>;
+};
+
+/** One tick → one broker snapshot → evaluate all zones on the account (read-only snap). */
+async function processStreamingTickBatch(accountId: string): Promise<void> {
+  if (!isMarketOpen()) return;
+  let token: string;
+  try { token = getToken(); } catch { return; }
+
+  const zones: string[] = [];
+  for (const [zoneId, st] of zoneStates.entries()) {
+    if (st.accountId !== accountId || st.status === "CLOSED") continue;
+    zones.push(zoneId);
+  }
+  if (zones.length === 0) return;
+
+  const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
+  let snap: BrokerSnap;
+  try {
+    snap = await getBrokerSnapshot(token, region, accountId);
+  } catch (err) {
+    console.warn(`[tick-batch] snapshot failed for ${accountId}:`, (err as Error).message);
+    return;
+  }
+
+  const now = Date.now();
+  for (const zoneId of zones) {
+    const last = lastStreamingEvalAt.get(zoneId) ?? 0;
+    if (now - last < STREAMING_EVAL_MIN_INTERVAL_MS) continue;
+    lastStreamingEvalAt.set(zoneId, now);
+    try {
+      await evaluateZone(zoneId, token, { brokerSnap: snap });
+    } catch (err) {
+      console.error(`[eval] ${zoneId}:`, (err as Error).message);
+    }
+  }
+}
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function handleStreamingTick(accountId: string, price: any): void {
@@ -898,18 +1008,7 @@ function handleStreamingTick(accountId: string, price: any): void {
   lastEventAt.set(accountId, Date.now());
   lastTickAtByAccount.set(accountId, Date.now());
   broadcastToAccount(accountId, "price", { bid, ask });
-  // Trigger evaluateZone for any OPEN zone on this account, throttled.
-  let token: string;
-  try { token = getToken(); } catch { return; }
-  const now = Date.now();
-  for (const [zoneId, st] of zoneStates.entries()) {
-    if (st.accountId !== accountId) continue;
-    if (st.status === "CLOSED") continue;
-    const last = lastStreamingEvalAt.get(zoneId) ?? 0;
-    if (now - last < STREAMING_EVAL_MIN_INTERVAL_MS) continue;
-    lastStreamingEvalAt.set(zoneId, now);
-    void evaluateZone(zoneId, token);
-  }
+  void processStreamingTickBatch(accountId);
 }
 
 function makeDealListener(accountId: string) {
@@ -968,17 +1067,8 @@ function makeDealListener(accountId: string) {
       if (deal?.entryType === "DEAL_ENTRY_OUT") {
         const posId = String(deal.positionId ?? "");
         if (posId) {
-          void markZonePositionClosed(accountId, posId, deal).then(async () => {
-            try {
-              const tkn = getToken();
-              const rgn = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
-              for (const [zoneId, st] of zoneStates.entries()) {
-                if (st.accountId === accountId && st.status !== "CLOSED") {
-                  await reconcileZoneFromBroker(accountId, zoneId, tkn, rgn, "deal_exit");
-                }
-              }
-            } catch { /* token unavailable */ }
-          });
+          invalidateBrokerSnapshot(accountId);
+          void markZonePositionClosed(accountId, posId, deal);
         }
         broadcastToAccount(accountId, "deal", { type: "position_changed" });
         // MetaAPI REST has eventual consistency — the first broadcast above races
@@ -1094,17 +1184,8 @@ function makeDealListener(accountId: string) {
       lastEventAt.set(accountId, Date.now());
       const posId = String(position?.id ?? position?.positionId ?? "");
       if (!posId) return;
-      void markZonePositionClosed(accountId, posId, position).then(async () => {
-        try {
-          const tkn = getToken();
-          const rgn = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
-          for (const [zoneId, st] of zoneStates.entries()) {
-            if (st.accountId === accountId && st.status !== "CLOSED") {
-              await reconcileZoneFromBroker(accountId, zoneId, tkn, rgn, "position_removed");
-            }
-          }
-        } catch { /* token unavailable */ }
-      });
+      invalidateBrokerSnapshot(accountId);
+      void markZonePositionClosed(accountId, posId, position);
       broadcastToAccount(accountId, "deal", { type: "position_changed" });
     },
   };
@@ -2517,6 +2598,9 @@ interface ZoneState {
   runner1Hit?: boolean;
   runner2Hit?: boolean;
   runner3Hit?: boolean;
+  runner1Auto?: boolean;
+  runner2Auto?: boolean;
+  runner3Auto?: boolean;
   runnerActive?: boolean;
   /** Signed pip offset for Risk Free SL (-30..+30), stored at zone creation. */
   riskFreeOffset?: number;
@@ -3220,12 +3304,14 @@ async function markZonePositionClosed(
     // if the cache hasn't refreshed yet the position appears "gone" and we'd
     // incorrectly mark it CLOSED and cancel limits. Retry once after another
     // 1.5s (2.25s total) to cover the typical MetaAPI cache refresh window.
+    invalidateBrokerSnapshot(accountId);
     await sleep(750);
-    const live = await fetchOpenPositions(token, region, accountId);
+    const live = await fetchOpenPositions(token, region, accountId, { fresh: true });
     let stillOpen = live.some(p => p.id === positionId);
     if (!stillOpen) {
       await sleep(1500);
-      const liveRetry = await fetchOpenPositions(token, region, accountId);
+      invalidateBrokerSnapshot(accountId);
+      const liveRetry = await fetchOpenPositions(token, region, accountId, { fresh: true });
       stillOpen = liveRetry.some(p => p.id === positionId);
       if (stillOpen) {
         console.log(`[markClosed] posId=${positionId} appeared on retry — partial close, leaving OPEN`);
@@ -3320,6 +3406,7 @@ async function tradeAction(
 async function closeZonePosition(
   token: string, region: string, accountId: string, positionId: string, volume?: number,
 ): Promise<boolean> {
+  invalidateBrokerSnapshot(accountId);
   const body: Record<string, unknown> = volume !== undefined && volume > 0
     ? { actionType: "POSITION_PARTIAL", positionId, volume }
     : { actionType: "POSITION_CLOSE_ID", positionId };
@@ -3560,6 +3647,23 @@ function isRateLimitError(err: unknown): boolean {
     || msg.includes("too many") || msg.includes("rate limit");
 }
 
+async function metaApiCallWithBackoff<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      if (isRateLimitError(err) && i < maxRetries - 1) {
+        const wait = Math.pow(2, i) * 1000;
+        console.warn(`[metaapi] rate limited, waiting ${wait}ms`);
+        await new Promise((r) => setTimeout(r, wait));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error("Max retries exceeded");
+}
+
 function userFacingTradeMessage(code: number, raw?: string): string {
   if (code === 10024 || (raw ?? "").toLowerCase().includes("too many")) {
     return MARKET_BUSY_MSG;
@@ -3599,53 +3703,67 @@ function respondZoneActionError(res: Response, label: string, err: unknown): voi
   res.status(isRateLimitError(err) ? 429 : 500).json({ ok: false, error: msg, message: msg });
 }
 
-async function fetchOpenPositions(token: string, region: string, accountId: string): Promise<LivePosition[]> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      if (attempt > 0) await new Promise((r) => setTimeout(r, 1200 * attempt));
-      recordApiCall(accountId);
-      const r = await fetch(
-        `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
-        { headers: authHeaders(token), signal: AbortSignal.timeout(8000) },
-      );
-      if (r.ok) {
-        const arr = await r.json() as Array<Record<string, unknown>>;
-        return arr.map((p) => ({
-          id: String(p.id ?? p._id ?? ""),
-          openPrice: Number(p.openPrice ?? 0),
-          volume: Number(p.volume ?? 0),
-          type: String(p.type ?? ""),
-          symbol: String(p.symbol ?? ""),
-          magic: p.magic != null ? Number(p.magic) : undefined,
-          comment: p.comment != null ? String(p.comment) : undefined,
-          profit: p.profit != null ? Number(p.profit) : undefined,
-        })).filter((p) => p.id);
-      }
-      lastError = new Error(`fetchOpenPositions ${r.status} for ${accountId}`);
-      console.warn(`[positions] attempt ${attempt + 1} failed: ${r.status}`);
-    } catch (err) {
-      lastError = err;
-      console.warn(`[positions] attempt ${attempt + 1} threw:`, err);
+async function fetchOpenPositions(
+  token: string, region: string, accountId: string, opts?: { fresh?: boolean },
+): Promise<LivePosition[]> {
+  const snap = await getBrokerSnapshot(token, region, accountId, opts);
+  return snap.positions;
+}
+
+async function fetchOpenPositionsUncached(token: string, region: string, accountId: string): Promise<LivePosition[]> {
+  return metaApiCallWithBackoff(async () => {
+    recordApiCall(accountId);
+    const r = await fetch(
+      `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
+      { headers: authHeaders(token), signal: AbortSignal.timeout(8000) },
+    );
+    if (r.status === 429) {
+      throw Object.assign(new Error("too many requests"), { status: 429 });
     }
-  }
-  throw lastError;
+    if (r.ok) {
+      const arr = await r.json() as Array<Record<string, unknown>>;
+      return arr.map((p) => ({
+        id: String(p.id ?? p._id ?? ""),
+        openPrice: Number(p.openPrice ?? 0),
+        volume: Number(p.volume ?? 0),
+        type: String(p.type ?? ""),
+        symbol: String(p.symbol ?? ""),
+        magic: p.magic != null ? Number(p.magic) : undefined,
+        comment: p.comment != null ? String(p.comment) : undefined,
+        profit: p.profit != null ? Number(p.profit) : undefined,
+      })).filter((p) => p.id);
+    }
+    throw new Error(`fetchOpenPositions ${r.status} for ${accountId}`);
+  });
 }
 
 async function fetchLivePendingOrders(
+  token: string, region: string, accountId: string, opts?: { fresh?: boolean },
+): Promise<Array<{ id: string; comment?: string; magic?: number }>> {
+  const snap = await getBrokerSnapshot(token, region, accountId, opts);
+  return snap.orders;
+}
+
+async function fetchLivePendingOrdersUncached(
   token: string, region: string, accountId: string,
 ): Promise<Array<{ id: string; comment?: string; magic?: number }>> {
   try {
-    const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`, {
-      headers: authHeaders(token),
+    return await metaApiCallWithBackoff(async () => {
+      recordApiCall(accountId);
+      const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`, {
+        headers: authHeaders(token),
+      });
+      if (r.status === 429) {
+        throw Object.assign(new Error("too many requests"), { status: 429 });
+      }
+      if (!r.ok) return [];
+      const raw = await r.json() as Array<{ id?: string; _id?: string; comment?: string; magic?: number }>;
+      return raw.map(o => ({
+        id: String(o.id ?? o._id ?? ""),
+        comment: o.comment,
+        magic: o.magic != null ? Number(o.magic) : undefined,
+      })).filter(o => o.id);
     });
-    if (!r.ok) return [];
-    const raw = await r.json() as Array<{ id?: string; _id?: string; comment?: string; magic?: number }>;
-    return raw.map(o => ({
-      id: String(o.id ?? o._id ?? ""),
-      comment: o.comment,
-      magic: o.magic != null ? Number(o.magic) : undefined,
-    })).filter(o => o.id);
   } catch {
     return [];
   }
@@ -3654,25 +3772,41 @@ async function fetchLivePendingOrders(
 /** Any open position or pending cascade order on the broker tagged for this zone. */
 export async function brokerHasOpenLegsForZone(
   token: string, region: string, accountId: string, zoneId: string,
+  opts?: { fresh?: boolean },
 ): Promise<boolean> {
-  const [live, orders] = await Promise.all([
-    fetchOpenPositions(token, region, accountId),
-    fetchLivePendingOrders(token, region, accountId),
-  ]);
-  if (live.some((p) => positionBelongsToZone(p, zoneId))) return true;
+  return zoneHasLiveTrackedPositionsOnBroker(token, region, accountId, zoneId, opts);
+}
+
+function zoneHasPendingLimitsInSnapshot(
+  accountId: string,
+  zoneId: string,
+  orders: Array<{ id: string; comment?: string; magic?: number }>,
+): boolean {
+  const expectedMagic = zoneMagicNumber(zoneId);
   return orders.some((o) => {
     if (getZoneLimitOrder(accountId, o.id) === zoneId) return true;
-    if (o.magic != null && o.magic === zoneMagicNumber(zoneId)) return true;
+    if (o.magic != null && o.magic === expectedMagic) return true;
     return commentBelongsToZone(o.comment, zoneId);
   });
 }
 
 async function zoneHasLivePendingCascadeLimits(
   token: string, region: string, accountId: string, zoneId: string,
+  orders?: Array<{ id: string; comment?: string; magic?: number }>,
 ): Promise<boolean> {
-  const liveOrders = await fetchLivePendingOrders(token, region, accountId);
+  const liveOrders = orders ?? await fetchLivePendingOrders(token, region, accountId);
+  return zoneHasPendingLimitsInSnapshot(accountId, zoneId, liveOrders);
+}
+
+function zoneHasLegsInSnapshot(
+  accountId: string,
+  zoneId: string,
+  live: LivePosition[],
+  orders: Array<{ id: string; comment?: string; magic?: number }>,
+): boolean {
+  if (live.some((p) => positionBelongsToZone(p, zoneId))) return true;
   const expectedMagic = zoneMagicNumber(zoneId);
-  return liveOrders.some((o) => {
+  return orders.some((o) => {
     if (getZoneLimitOrder(accountId, o.id) === zoneId) return true;
     if (o.magic != null && o.magic === expectedMagic) return true;
     return commentBelongsToZone(o.comment, zoneId);
@@ -3681,18 +3815,10 @@ async function zoneHasLivePendingCascadeLimits(
 
 async function zoneHasLiveTrackedPositionsOnBroker(
   token: string, region: string, accountId: string, zoneId: string,
+  opts?: { fresh?: boolean },
 ): Promise<boolean> {
-  const [live, orders] = await Promise.all([
-    fetchOpenPositions(token, region, accountId),
-    fetchLivePendingOrders(token, region, accountId),
-  ]);
-  if (live.some((p) => positionBelongsToZone(p, zoneId))) return true;
-  const expectedMagic = zoneMagicNumber(zoneId);
-  return orders.some((o) => {
-    if (getZoneLimitOrder(accountId, o.id) === zoneId) return true;
-    if (o.magic != null && o.magic === expectedMagic) return true;
-    return commentBelongsToZone(o.comment, zoneId);
-  });
+  const snap = await getBrokerSnapshot(token, region, accountId, opts);
+  return zoneHasLegsInSnapshot(accountId, zoneId, snap.positions, snap.orders);
 }
 
 /** Close zone when MT5 has no open legs or pending limits for it (manual MT5 close, etc.). */
@@ -3741,16 +3867,23 @@ async function fetchSymbolPrice(
   token: string, region: string, accountId: string, symbol: string,
   opts?: { useTickFallback?: boolean },
 ): Promise<{ bid: number; ask: number } | null> {
-  recordApiCall(accountId);
   try {
-    const r = await fetch(
-      `${clientBase(region)}/users/current/accounts/${accountId}/symbols/${encodeURIComponent(symbol)}/current-price`,
-      { headers: authHeaders(token) },
-    );
-    if (r.ok) {
-      const j = await r.json() as { bid?: number; ask?: number };
-      if (typeof j.bid === "number" && typeof j.ask === "number") return { bid: j.bid, ask: j.ask };
-    }
+    const rest = await metaApiCallWithBackoff(async () => {
+      recordApiCall(accountId);
+      const r = await fetch(
+        `${clientBase(region)}/users/current/accounts/${accountId}/symbols/${encodeURIComponent(symbol)}/current-price`,
+        { headers: authHeaders(token) },
+      );
+      if (r.status === 429) {
+        throw Object.assign(new Error("too many requests"), { status: 429 });
+      }
+      if (r.ok) {
+        const j = await r.json() as { bid?: number; ask?: number };
+        if (typeof j.bid === "number" && typeof j.ask === "number") return { bid: j.bid, ask: j.ask };
+      }
+      return null;
+    });
+    if (rest) return rest;
   } catch {
     /* fall through to tick cache */
   }
@@ -3768,6 +3901,21 @@ function latestPrice(accountId: string): { bid: number; ask: number } | null {
   if (!ticks || ticks.length === 0) return null;
   const t = ticks[ticks.length - 1]!;
   return { bid: t.bid, ask: t.ask };
+}
+
+/** Prefer recent streaming ticks for TP/BE — avoids a MetaAPI REST price call per eval. */
+function priceForZoneEval(
+  accountId: string,
+  token: string,
+  region: string,
+  symbol: string,
+): Promise<{ bid: number; ask: number } | null> {
+  const ticks = tickStore.get(accountId);
+  if (ticks && ticks.length > 0) {
+    const t = ticks[ticks.length - 1]!;
+    if (Date.now() - t.time <= 15_000) return Promise.resolve({ bid: t.bid, ask: t.ask });
+  }
+  return fetchSymbolPrice(token, region, accountId, symbol);
 }
 
 function isQuotesLive(accountId: string): boolean {
@@ -3849,7 +3997,9 @@ export function pickNextLegToTrimForSecureProfits(
   return pool.slice().sort((a, b) => b.openPrice - a.openPrice)[0]!;
 }
 
-async function evaluateZone(zoneId: string, token: string): Promise<void> {
+type EvaluateZoneOpts = { brokerSnap?: BrokerSnap };
+
+async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOpts): Promise<void> {
   if (!zoneStates.has(zoneId)) return;
   const st = zoneStates.get(zoneId);
   if (!st) return;
@@ -3907,9 +4057,14 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       trackedIds = new Set(zps.map(z => z.positionId));
       console.warn(`[zone ${zoneId}] tracked-positions DB query failed, using in-memory cache (${trackedIds.size} ids): ${(e as Error).message}`);
     }
+    const snap = opts?.brokerSnap;
     if (zps.length === 0) {
-      const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, st.accountId, zoneId);
-      const brokerLegs = await brokerHasOpenLegsForZone(token, region, st.accountId, zoneId);
+      const pendingLeft = snap
+        ? zoneHasPendingLimitsInSnapshot(st.accountId, zoneId, snap.orders)
+        : await zoneHasLivePendingCascadeLimits(token, region, st.accountId, zoneId);
+      const brokerLegs = snap
+        ? zoneHasLegsInSnapshot(st.accountId, zoneId, snap.positions, snap.orders)
+        : await brokerHasOpenLegsForZone(token, region, st.accountId, zoneId);
       if (brokerLegs) {
         await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st);
         try {
@@ -3972,12 +4127,15 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
         return;
       }
     }
-    const allLive = await fetchOpenPositions(token, region, st.accountId);
+    const allLive = snap?.positions ?? await fetchOpenPositions(token, region, st.accountId);
     let live = allLive.filter(p => trackedIds.has(p.id));
-    if (live.length === 0 && await brokerHasOpenLegsForZone(token, region, st.accountId, zoneId)) {
+    const hasBrokerLegs = snap
+      ? zoneHasLegsInSnapshot(st.accountId, zoneId, snap.positions, snap.orders)
+      : await brokerHasOpenLegsForZone(token, region, st.accountId, zoneId);
+    if (live.length === 0 && hasBrokerLegs) {
       await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st);
-      live = (await fetchOpenPositions(token, region, st.accountId))
-        .filter((p) => positionBelongsToZone(p, zoneId) || trackedIds.has(p.id));
+      const refreshed = snap?.positions ?? await fetchOpenPositions(token, region, st.accountId);
+      live = refreshed.filter((p) => positionBelongsToZone(p, zoneId) || trackedIds.has(p.id));
     }
     // Skip the destructive reconciliation path (which permanently marks
     // positions CLOSED in the DB) when we're operating off the cache —
@@ -4013,8 +4171,12 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
           .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
       ).catch(() => null);
       if (stillOpen && stillOpen.length === 0) {
-        const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, st.accountId, zoneId);
-        const brokerStillOpen = await zoneHasLiveTrackedPositionsOnBroker(token, region, st.accountId, zoneId);
+        const pendingLeft = snap
+          ? zoneHasPendingLimitsInSnapshot(st.accountId, zoneId, snap.orders)
+          : await zoneHasLivePendingCascadeLimits(token, region, st.accountId, zoneId);
+        const brokerStillOpen = snap
+          ? zoneHasLegsInSnapshot(st.accountId, zoneId, snap.positions, snap.orders)
+          : await zoneHasLiveTrackedPositionsOnBroker(token, region, st.accountId, zoneId);
         if (brokerStillOpen) {
           console.log(`[zone ${zoneId}] reconcile: broker still has open legs — zone stays active`);
           return;
@@ -4054,7 +4216,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
       return;
     }
 
-    const price = await fetchSymbolPrice(token, region, st.accountId, live[0]!.symbol || "XAUUSD");
+    const price = await priceForZoneEval(st.accountId, token, region, live[0]!.symbol || "XAUUSD");
     if (!price) return;
     // For BUY closes use bid; for SELL closes use ask. Allow TP checks when
     // absolute TP prices are set even if anchor was closed before persisting.
@@ -4225,6 +4387,25 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
           ? price.bid >= rPrice
           : price.ask <= rPrice;
         if (reached) {
+          const autoClose = Boolean(st[`runner${n}Auto`]);
+          if (autoClose && rLots != null && rLots >= 0.01) {
+            try {
+              const result = await handleClosePartial(
+                st.accountId, zoneId, { lots: rLots, runnerN: n }, token, region,
+              );
+              if (result.ok) {
+                notified[key] = true;
+                st.tpNotified = notified;
+                broadcastToAccount(st.accountId, "deal", { type: "position_changed" });
+                console.log(`[auto-runner] zone ${zoneId} R${n} auto-closed ${rLots} lots`);
+              } else {
+                console.warn(`[auto-runner] zone ${zoneId} R${n} close failed: ${result.message ?? "unknown"}`);
+              }
+            } catch (err) {
+              console.error(`[auto-runner] zone ${zoneId} R${n} error:`, (err as Error).message);
+            }
+            continue;
+          }
           notified[key] = true;
           st.tpNotified = notified;
           notifyZoneEvent(st.zoneId, "runner", n, 0, st.direction, rPrice, rLots ?? undefined);
@@ -4257,7 +4438,7 @@ async function evaluateZone(zoneId: string, token: string): Promise<void> {
     // "best effort" so the app can warn the user — and keep trying to
     // upgrade to true BE on later ticks without consuming the retry budget.
     if (isAutoBeTriggerSatisfied(st) && live.length > 0 && (!st.tp2SlMoved || st.tp2SlIsBestEffort)) {
-      const price = await fetchSymbolPrice(token, region, st.accountId, live[0]!.symbol || "XAUUSD");
+      const price = await priceForZoneEval(st.accountId, token, region, live[0]!.symbol || "XAUUSD");
       if (price) {
         // Compute per-position safe SL (openPrice differs across cascade
         // entries). If ALL positions can reach true BE this tick, we'll
@@ -4322,25 +4503,43 @@ export function startZoneTpMonitor(): void {
   void ensureMonitorsForActiveZones();
   if (!zoneReconcileTimer) {
     zoneReconcileTimer = setInterval(() => {
+      if (!isMarketOpen()) return;
       const token = (() => { try { return getToken(); } catch { return null; } })();
       if (!token) return;
+      const byAccount = new Map<string, { region: string; zoneIds: string[] }>();
       for (const [zoneId, st] of zoneStates.entries()) {
         if (st.status === "CLOSED") continue;
+        if (!syncReady.has(st.accountId)) continue;
         const region = activeRegions.get(st.accountId) ?? knownAccounts.get(st.accountId)?.region ?? DEFAULT_REGION;
-        void reconcileZoneFromBroker(st.accountId, zoneId, token, region, "periodic_reconcile")
-          .catch((err) => console.error(`[reconcile] ${zoneId}:`, (err as Error).message));
+        const bucket = byAccount.get(st.accountId) ?? { region, zoneIds: [] };
+        bucket.zoneIds.push(zoneId);
+        byAccount.set(st.accountId, bucket);
       }
-    }, 15_000);
+      for (const [accountId, { region, zoneIds }] of byAccount) {
+        void (async () => {
+          try {
+            const snap = await getBrokerSnapshot(token, region, accountId);
+            for (const zoneId of zoneIds) {
+              if (zoneHasLegsInSnapshot(accountId, zoneId, snap.positions, snap.orders)) continue;
+              await reconcileZoneFromBroker(accountId, zoneId, token, region, "periodic_reconcile");
+            }
+          } catch (err) {
+            console.error(`[reconcile] account ${accountId}:`, (err as Error).message);
+          }
+        })();
+      }
+    }, 60_000);
     zoneReconcileTimer.unref?.();
-    console.log("[zone-reconcile] started (15 s interval)");
+    console.log("[zone-reconcile] started (60 s interval, batched per account)");
   }
   zoneMonitorTimer = setInterval(() => {
+    if (!isMarketOpen()) return;
     const token = (() => { try { return getToken(); } catch { return null; } })();
     if (!token) return;
     zoneMonitorTick += 1;
-    // Every ~60 s, hydrate any OPEN/RISK_FREE zones missing from memory (e.g.
+    // Every ~100 s, hydrate any OPEN/RISK_FREE zones missing from memory (e.g.
     // created while this pod was down or lost from cache after a partial failure).
-    if (zoneMonitorTick % 20 === 0) {
+    if (zoneMonitorTick % 10 === 0) {
       void (async () => {
         try {
           const rows = await db.select({ zoneId: cascadeZonesTable.zoneId })
@@ -4354,10 +4553,16 @@ export function startZoneTpMonitor(): void {
         }
       })();
     }
+    const now = Date.now();
     for (const [zoneId, st] of zoneStates.entries()) {
-      if (st.status !== "CLOSED" && st.status !== "ARMED") void evaluateZone(zoneId, token);
+      if (st.status === "CLOSED" || st.status === "ARMED") continue;
+      if (syncReady.has(st.accountId)) {
+        const lastStreamEval = lastStreamingEvalAt.get(zoneId) ?? 0;
+        if (now - lastStreamEval < MONITOR_EVAL_SKIP_IF_STREAM_MS) continue;
+      }
+      void evaluateZone(zoneId, token);
     }
-  }, 3_000);
+  }, 10_000);
   if (!zoneKeepaliveTimer) {
     zoneKeepaliveTimer = setInterval(() => {
       const now = Date.now();
@@ -4373,7 +4578,7 @@ export function startZoneTpMonitor(): void {
     }, 15_000);
     zoneKeepaliveTimer.unref?.();
   }
-  console.log("[zone-monitor] started (3 s interval)");
+  console.log("[zone-monitor] started (10 s interval; streaming eval min 1 s)");
 }
 
 // Convert a cascadeZonesTable row to a ZoneState (transient fields get safe defaults).
@@ -4432,6 +4637,9 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
     runner1Hit: Boolean((z as { runner1Hit?: boolean }).runner1Hit),
     runner2Hit: Boolean((z as { runner2Hit?: boolean }).runner2Hit),
     runner3Hit: Boolean((z as { runner3Hit?: boolean }).runner3Hit),
+    runner1Auto: Boolean((z as { runner1Auto?: boolean }).runner1Auto),
+    runner2Auto: Boolean((z as { runner2Auto?: boolean }).runner2Auto),
+    runner3Auto: Boolean((z as { runner3Auto?: boolean }).runner3Auto),
     runnerActive: Boolean((z as { runnerActive?: boolean }).runnerActive),
     riskFreeOffset: sanitizeRiskFreePips((z as { riskFreeOffset?: number }).riskFreeOffset ?? 0),
   };
@@ -5046,6 +5254,9 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         runner1Hit: Boolean((row as { runner1Hit?: boolean }).runner1Hit),
         runner2Hit: Boolean((row as { runner2Hit?: boolean }).runner2Hit),
         runner3Hit: Boolean((row as { runner3Hit?: boolean }).runner3Hit),
+        runner1Auto: Boolean((row as { runner1Auto?: boolean }).runner1Auto),
+        runner2Auto: Boolean((row as { runner2Auto?: boolean }).runner2Auto),
+        runner3Auto: Boolean((row as { runner3Auto?: boolean }).runner3Auto),
         runnerActive: Boolean((row as { runnerActive?: boolean }).runnerActive),
         runner1Notified: Boolean(zoneStates.get(row.zoneId)?.tpNotified?.runner1),
         runner2Notified: Boolean(zoneStates.get(row.zoneId)?.tpNotified?.runner2),
@@ -5116,6 +5327,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
       runner1Price?: unknown; runner1Lots?: unknown;
       runner2Price?: unknown; runner2Lots?: unknown;
       runner3Price?: unknown; runner3Lots?: unknown;
+      runner1Auto?: unknown; runner2Auto?: unknown; runner3Auto?: unknown;
     };
     const targets: Array<{ price: number; lots: number }> = [];
     for (const n of [1, 2, 3] as const) {
@@ -5185,6 +5397,10 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
       if (!updateMode || update[`runner${n}Price`] != null) {
         update[`runner${n}Hit`] = false;
       }
+      const autoVal = body[`runner${n}Auto`];
+      if (typeof autoVal === "boolean") {
+        update[`runner${n}Auto`] = autoVal;
+      }
     }
     await db.update(cascadeZonesTable).set(update).where(eq(cascadeZonesTable.zoneId, zoneId));
     st.runnerActive = true;
@@ -5193,6 +5409,9 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
       st[`runner${n}Lots`] = update[`runner${n}Lots`] as number | null;
       if (!updateMode || update[`runner${n}Price`] != null) {
         st[`runner${n}Hit`] = false;
+      }
+      if (typeof update[`runner${n}Auto`] === "boolean") {
+        st[`runner${n}Auto`] = update[`runner${n}Auto`] as boolean;
       }
     }
     const tpNotified = {
@@ -5214,6 +5433,39 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
     res.json({ ok: true });
   } catch (err) {
     respondZoneActionError(res, "activate-runner", err);
+  }
+});
+
+// POST /api/mt5/account/:accountId/zones/:zoneId/runner-auto
+// Toggle per-runner auto bank (server closes when price hits while app is closed).
+router.post("/mt5/account/:accountId/zones/:zoneId/runner-auto", checkOwner, async (req: Request, res: Response) => {
+  const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
+  try {
+    await ensureCascadeZoneRunnerColumns();
+    const st = await loadZone(zoneId);
+    if (!st || st.accountId !== accountId || st.status === "CLOSED") {
+      res.status(404).json({ ok: false, message: "Zone not found" });
+      return;
+    }
+    const body = (req.body ?? {}) as { runnerN?: unknown; auto?: unknown };
+    const runnerN = typeof body.runnerN === "number" ? body.runnerN : Number(body.runnerN);
+    if (![1, 2, 3].includes(runnerN)) {
+      res.status(400).json({ ok: false, message: "runnerN must be 1, 2, or 3" });
+      return;
+    }
+    if (typeof body.auto !== "boolean") {
+      res.status(400).json({ ok: false, message: "auto must be a boolean" });
+      return;
+    }
+    const autoKey = `runner${runnerN}Auto` as "runner1Auto" | "runner2Auto" | "runner3Auto";
+    await db.update(cascadeZonesTable)
+      .set({ [autoKey]: body.auto })
+      .where(eq(cascadeZonesTable.zoneId, zoneId));
+    st[autoKey] = body.auto;
+    broadcastZoneUpdate(zoneId);
+    res.json({ ok: true, runnerN, auto: body.auto });
+  } catch (err) {
+    respondZoneActionError(res, "runner-auto", err);
   }
 });
 
