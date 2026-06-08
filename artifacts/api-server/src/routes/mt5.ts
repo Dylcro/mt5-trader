@@ -1967,6 +1967,18 @@ export function positionShowsTpLevelApplied(
   return currentVol <= origVol * keepFractionGate;
 }
 
+/** Next manual Take TP level: lowest TP any open leg in this zone still needs. */
+export function computeNextTakeTpLevel(
+  openRows: Array<{ tp1Hit: boolean; tp2Hit: boolean; tp3Hit: boolean }>,
+  enabled: { tp1Enabled: boolean; tp2Enabled: boolean; tp3Enabled: boolean },
+): 0 | 1 | 2 | 3 {
+  if (openRows.length === 0) return 0;
+  if (enabled.tp1Enabled && openRows.some((r) => !r.tp1Hit)) return 1;
+  if (enabled.tp2Enabled && openRows.some((r) => r.tp1Hit && !r.tp2Hit)) return 2;
+  if (enabled.tp3Enabled && openRows.some((r) => r.tp2Hit && !r.tp3Hit)) return 3;
+  return 0;
+}
+
 /** Whether this leg still needs the zone's configured TP slice at `lvl` (per-position, per-zone). */
 export function legNeedsTpSlice(
   leg: { id: string; volume: number },
@@ -3635,13 +3647,47 @@ async function handleClosePartial(
   token: string,
   region: string,
 ): Promise<{ ok: boolean; message?: string }> {
-  const st = await loadZone(zoneId);
+  let st = await loadZone(zoneId);
   if (!st || st.accountId !== accountId) return { ok: false, message: "Zone not found" };
-  if (st.status === "CLOSED" || st.status === "ARMED") {
-    return { ok: false, message: "Zone not active" };
+  if (st.status === "CLOSED") {
+    const reopened = await reopenClosedZoneIfBrokerLegsRemain(token, region, accountId, zoneId, st);
+    if (!reopened) return { ok: false, message: "Zone closed" };
+    st = (await loadZone(zoneId)) ?? st;
   }
-  const legs = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+  if (st.status === "ARMED") return { ok: false, message: "Zone not active" };
+
+  const legs = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st, { fresh: true });
   if (legs.length === 0) return { ok: false, message: "No open positions" };
+
+  const tpLevel = body.tpLevel != null && body.tpLevel >= 1 && body.tpLevel <= 3
+    ? (body.tpLevel as 1 | 2 | 3) : null;
+
+  if (tpLevel != null) {
+    const pendingLegs = legs.filter((leg) => legNeedsTpSlice(leg, st, tpLevel));
+    if (pendingLegs.length === 0) {
+      return { ok: false, message: `TP${tpLevel} already taken on all open legs` };
+    }
+    const zoneHadTpHit = st[`tp${tpLevel}Hit`];
+    const closeLots = await closeTpSliceOnEveryLiveLeg(token, region, st, zoneId, pendingLegs, tpLevel);
+    if (closeLots < 0.01) return { ok: false, message: "Lot too small" };
+    await mergeZoneHitsFromPositions(zoneId, {
+      tp1Hit: st.tp1Hit, tp2Hit: st.tp2Hit, tp3Hit: st.tp3Hit, tp4Hit: st.tp4Hit,
+      tp1Enabled: st.tp1Enabled, tp2Enabled: st.tp2Enabled,
+      tp3Enabled: st.tp3Enabled, tp4Enabled: st.tp4Enabled,
+    });
+    broadcastZoneUpdate(zoneId);
+    if (tpLevel === 2 && st.tp2Hit) {
+      await applyZoneTp2Housekeeping(token, region, zoneId, st, {
+        isFirstZoneTp2: !zoneHadTpHit,
+        beLegs: zoneHadTpHit ? pendingLegs : undefined,
+      });
+    }
+    if (tpLevel === 3) {
+      notifyZoneEvent(zoneId, "tp3_runners", 3, 0, st.direction);
+    }
+    console.log(`[take-tp] zone ${zoneId} manual TP${tpLevel} closed ${closeLots.toFixed(2)} lots across ${pendingLegs.length} leg(s)`);
+    return { ok: true };
+  }
 
   const totalVol = legs.reduce((s, p) => s + p.volume, 0);
   const LOT_STEP = 0.01;
@@ -3676,20 +3722,6 @@ async function handleClosePartial(
   }
 
   const stAfter = zoneStates.get(zoneId) ?? st;
-  if (body.tpLevel != null && body.tpLevel >= 1 && body.tpLevel <= 3) {
-    const hitKey = `tp${body.tpLevel}Hit` as "tp1Hit" | "tp2Hit" | "tp3Hit";
-    if (stAfter && !stAfter[hitKey]) {
-      stAfter[hitKey] = true;
-      await db.update(cascadeZonesTable)
-        .set({ [hitKey]: true })
-        .where(eq(cascadeZonesTable.zoneId, zoneId))
-        .catch(() => {});
-      broadcastZoneUpdate(zoneId);
-      if (body.tpLevel === 3) {
-        notifyZoneEvent(zoneId, "tp3_runners", 3, 0, stAfter.direction);
-      }
-    }
-  }
   if (body.runnerN != null && body.runnerN >= 1 && body.runnerN <= 3 && stAfter?.runnerActive) {
     const hitKey = `runner${body.runnerN}Hit` as "runner1Hit" | "runner2Hit" | "runner3Hit";
     if (stAfter && !stAfter[hitKey]) {
@@ -5323,6 +5355,14 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         tp4Price,
       });
 
+      const openPosRows = await db.select({
+        tp1Hit: zonePositionsTable.tp1Hit,
+        tp2Hit: zonePositionsTable.tp2Hit,
+        tp3Hit: zonePositionsTable.tp3Hit,
+      }).from(zonePositionsTable)
+        .where(and(eq(zonePositionsTable.zoneId, row.zoneId), eq(zonePositionsTable.status, "OPEN")));
+      const takeTpLevel = computeNextTakeTpLevel(openPosRows, { tp1Enabled, tp2Enabled, tp3Enabled });
+
       let nextTp: 0 | 1 | 2 | 3 | 4 = 0;
       if (tp1Enabled && !mergedHits.tp1Hit) nextTp = 1;
       else if (tp2Enabled && !mergedHits.tp2Hit) nextTp = 2;
@@ -5412,6 +5452,7 @@ router.get("/mt5/account/:accountId/zones", checkOwner, async (req: Request, res
         runner2Notified: Boolean(zoneStates.get(row.zoneId)?.tpNotified?.runner2),
         runner3Notified: Boolean(zoneStates.get(row.zoneId)?.tpNotified?.runner3),
         currentPrice,
+        takeTpLevel,
         nextTp,
         nextTpPrice,
         pipsToNextTp,

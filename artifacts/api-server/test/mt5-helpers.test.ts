@@ -47,6 +47,7 @@ import {
   mergeLiveZoneLegs,
   zoneLegsNeedFreshResolve,
   legNeedsTpSlice,
+  computeNextTakeTpLevel,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
@@ -751,6 +752,22 @@ describe("disabled TP history", () => {
     } as Parameters<typeof makeRow>[0]));
     expect(st.tp3Hit).toBe(false);
     expect(st.tp3Enabled).toBe(false);
+  });
+});
+
+describe("computeNextTakeTpLevel", () => {
+  it("shows Take TP1 when any open leg still needs TP1", () => {
+    expect(computeNextTakeTpLevel(
+      [{ tp1Hit: true, tp2Hit: false, tp3Hit: false }, { tp1Hit: false, tp2Hit: false, tp3Hit: false }],
+      { tp1Enabled: true, tp2Enabled: true, tp3Enabled: true },
+    )).toBe(1);
+  });
+
+  it("shows Take TP2 when all legs have TP1 but one needs TP2", () => {
+    expect(computeNextTakeTpLevel(
+      [{ tp1Hit: true, tp2Hit: true, tp3Hit: false }, { tp1Hit: true, tp2Hit: false, tp3Hit: false }],
+      { tp1Enabled: true, tp2Enabled: true, tp3Enabled: true },
+    )).toBe(2);
   });
 });
 

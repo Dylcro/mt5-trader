@@ -56,29 +56,35 @@ function getNextTpAction(
   setShowRunnerPanel: (v: boolean) => void,
 ): TpAction {
   const origVol = zone.originalVolume ?? 0;
-  const tp1Lots = roundLot(origVol * (zone.tp1Pct ?? 25) / 100);
-  const tp2Lots = roundLot(origVol * (zone.tp2Pct ?? 25) / 100);
-  const tp3Lots = roundLot(origVol * (zone.tp3Pct ?? 25) / 100);
+  const legCount = Math.max(1, zone.positionCount ?? 1);
+  const sliceLots = (pct: number) => roundLot(origVol * pct / 100);
+  const estTotalLots = (pct: number) => (sliceLots(pct) * legCount).toFixed(2);
 
-  if (!zone.tp1Hit) {
+  const takeLvl = zone.takeTpLevel
+    ?? (!zone.tp1Hit ? 1 : !zone.tp2Hit ? 2 : !zone.tp3Hit ? 3 : 0);
+
+  if (takeLvl === 1 && (zone.tp1Enabled !== false)) {
+    const pct = zone.tp1Pct ?? 25;
     return {
       label: "Take TP1",
-      sub: `${tp1Lots.toFixed(2)} lots`,
-      call: () => { void onClosePartial?.(zone.zoneId, { pct: zone.tp1Pct ?? 25, tpLevel: 1, emergency: true }); },
+      sub: `${estTotalLots(pct)} lots`,
+      call: () => { void onClosePartial?.(zone.zoneId, { pct, tpLevel: 1, emergency: true }); },
     };
   }
-  if (!zone.tp2Hit) {
+  if (takeLvl === 2 && (zone.tp2Enabled !== false)) {
+    const pct = zone.tp2Pct ?? 25;
     return {
       label: "Take TP2",
-      sub: `${tp2Lots.toFixed(2)} lots`,
-      call: () => { void onClosePartial?.(zone.zoneId, { pct: zone.tp2Pct ?? 25, tpLevel: 2, emergency: true }); },
+      sub: `${estTotalLots(pct)} lots`,
+      call: () => { void onClosePartial?.(zone.zoneId, { pct, tpLevel: 2, emergency: true }); },
     };
   }
-  if (!zone.tp3Hit) {
+  if (takeLvl === 3 && (zone.tp3Enabled !== false)) {
+    const pct = zone.tp3Pct ?? 25;
     return {
       label: "Take TP3",
-      sub: `${tp3Lots.toFixed(2)} lots`,
-      call: () => { void onClosePartial?.(zone.zoneId, { pct: zone.tp3Pct ?? 25, tpLevel: 3, emergency: true }); },
+      sub: `${estTotalLots(pct)} lots`,
+      call: () => { void onClosePartial?.(zone.zoneId, { pct, tpLevel: 3, emergency: true }); },
     };
   }
   if (!zone.runnerActive) {
