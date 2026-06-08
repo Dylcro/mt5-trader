@@ -1997,7 +1997,9 @@ export function legNeedsTpSlice(
   const origVol = cached?.volume && cached.volume > 0 ? cached.volume : leg.volume;
   const posHit = (n: 1 | 2 | 3): boolean => {
     const key = `tp${n}Hit` as const;
-    return Boolean(cached?.[key]) || positionShowsTpLevelApplied(leg.volume, origVol, n, tpPcts);
+    // Tracked row present: honor persisted per-leg flags only (volume gate is fallback when untracked).
+    if (cached) return Boolean(cached[key]);
+    return positionShowsTpLevelApplied(leg.volume, origVol, n, tpPcts);
   };
   if (lvl >= 2 && !posHit(1)) return false;
   if (lvl >= 3 && !posHit(2)) return false;
