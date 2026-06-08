@@ -3213,6 +3213,71 @@ async function recordZonePositionFill(
  * Anchor is often missing from OPEN rows while limits are tracked — union prevents
  * close-zone from closing only the ladder and leaving the market entry running.
  */
+/**
+ * TP2 zone housekeeping (per zone): cancel all unfilled cascade limits, then
+ * SL→BE on active legs. On first zone TP2 → all legs; on late legs → those legs only.
+ */
+async function applyZoneTp2Housekeeping(
+  token: string,
+  region: string,
+  zoneId: string,
+  st: ZoneState,
+  opts: { beLegs?: LivePosition[]; isFirstZoneTp2: boolean; cancelLimits?: boolean },
+): Promise<void> {
+  try {
+    if (opts.cancelLimits !== false) {
+      await cancelZoneLimits(token, region, st.accountId, zoneId);
+      if (opts.isFirstZoneTp2) {
+        console.log(`[tp2] cancelled unfilled limits for ${zoneId}`);
+      }
+    }
+    if (!isAutoBeTriggerSatisfied(st)) return;
+
+    const legs = opts.beLegs ?? await resolveLivePositionsForZoneAction(
+      token, region, st.accountId, zoneId, st, { fresh: true },
+    );
+    if (legs.length === 0) return;
+
+    const price = await priceForZoneEval(st.accountId, token, region, legs[0]!.symbol || "XAUUSD");
+    if (!price) return;
+
+    let allTrueBe = true;
+    const results = await Promise.all(legs.map(async (p) => {
+      const { sl, isBestEffort } = computeBrokerSafeBeSl(st.direction, p.openPrice, price);
+      if (isBestEffort) allTrueBe = false;
+      const ok = await modifyZonePositionSl(token, region, st.accountId, p.id, sl);
+      return { ok, isBestEffort };
+    }));
+    const allOk = results.every((r) => r.ok);
+
+    if (allOk && allTrueBe) {
+      const wasBestEffort = st.tp2SlIsBestEffort;
+      st.tp2SlMoved = true;
+      st.tp2SlIsBestEffort = false;
+      if (wasBestEffort) {
+        await withDbRetry(`zones[${zoneId}].tp2SlIsBestEffort=false`,
+          () => db.update(cascadeZonesTable).set({ tp2SlIsBestEffort: false } as Record<string, unknown>)
+            .where(eq(cascadeZonesTable.zoneId, zoneId)),
+        ).catch(() => {/* logged inside withDbRetry */});
+      }
+      console.log(`[tp2] ${zoneId} SL→BE on ${legs.length} leg(s)${opts.isFirstZoneTp2 ? "" : " (late leg)"}`);
+    } else if (allOk) {
+      if (!st.tp2SlIsBestEffort) {
+        st.tp2SlIsBestEffort = true;
+        await withDbRetry(`zones[${zoneId}].tp2SlIsBestEffort=true`,
+          () => db.update(cascadeZonesTable).set({ tp2SlIsBestEffort: true } as Record<string, unknown>)
+            .where(eq(cascadeZonesTable.zoneId, zoneId)),
+        ).catch(() => {/* logged inside withDbRetry */});
+        console.warn(`[tp2] ${zoneId} SL set to best-effort protective level`);
+      }
+    } else if (opts.isFirstZoneTp2 && st.tp2BeAttempts < MAX_TP2_BE_ATTEMPTS) {
+      st.tp2BeAttempts += 1;
+    }
+  } catch (err) {
+    console.error(`[tp2] housekeeping failed for ${zoneId}:`, (err as Error).message);
+  }
+}
+
 async function markPositionTpLevelHit(
   zoneId: string, positionId: string, lvl: 1 | 2 | 3 | 4, st: ZoneState,
 ): Promise<void> {
@@ -4477,19 +4542,11 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         });
         broadcastZoneUpdate(zoneId);
 
-        if (lvl === 2 && !zoneHadTpHit) {
-          try {
-            await cancelZoneLimits(token, region, st.accountId, zoneId);
-            const legs = await resolveLivePositionsForZoneAction(
-              token, region, st.accountId, zoneId, st, { fresh: true },
-            );
-            for (const leg of legs) {
-              await modifyZonePositionSl(token, region, st.accountId, leg.id, leg.openPrice);
-            }
-            console.log(`[tp2] SL moved to break even, limits cancelled for ${zoneId}`);
-          } catch (err) {
-            console.error(`[tp2] break even / cancel failed:`, err);
-          }
+        if (lvl === 2 && st.tp2Hit) {
+          await applyZoneTp2Housekeeping(token, region, zoneId, st, {
+            isFirstZoneTp2: !zoneHadTpHit,
+            beLegs: zoneHadTpHit ? pendingLegs : undefined,
+          });
         }
 
         if (lvl === 3) {
@@ -4566,55 +4623,19 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
     // apply the safest possible protective SL and flag the zone as
     // "best effort" so the app can warn the user — and keep trying to
     // upgrade to true BE on later ticks without consuming the retry budget.
-    if (isAutoBeTriggerSatisfied(st) && live.length > 0 && (!st.tp2SlMoved || st.tp2SlIsBestEffort)) {
-      const price = await priceForZoneEval(st.accountId, token, region, live[0]!.symbol || "XAUUSD");
-      if (price) {
-        // Compute per-position safe SL (openPrice differs across cascade
-        // entries). If ALL positions can reach true BE this tick, we'll
-        // clear the flag below; otherwise the zone stays "best effort".
-        let allTrueBe = true;
-        const results = await Promise.all(live.map(async (p) => {
-          const { sl, isBestEffort } = computeBrokerSafeBeSl(st.direction, p.openPrice, price);
-          if (isBestEffort) allTrueBe = false;
-          const ok = await modifyZonePositionSl(token, region, st.accountId, p.id, sl);
-          return { ok, isBestEffort };
-        }));
-        const allOk = results.every(r => r.ok);
-        if (allOk && allTrueBe) {
-          // True BE achieved on every entry.
-          const wasBestEffort = st.tp2SlIsBestEffort;
-          st.tp2SlMoved = true;
-          st.tp2SlIsBestEffort = false;
-          if (wasBestEffort) {
-            await withDbRetry(`zones[${zoneId}].tp2SlIsBestEffort=false`,
-              () => db.update(cascadeZonesTable).set({ tp2SlIsBestEffort: false } as Record<string, unknown>).where(eq(cascadeZonesTable.zoneId, zoneId))
-            ).catch(() => {/* logged inside withDbRetry */});
-          }
-          console.log(`[zone ${zoneId}] TP${st.autoBeAtTp} SL→BE complete on ${live.length} entr${live.length === 1 ? "y" : "ies"}${wasBestEffort ? " (upgraded from best-effort)" : ""}`);
-        } else if (allOk) {
-          // Best-effort SL accepted on every entry but at least one isn't
-          // at true BE yet (price hasn't moved far enough). Mark the zone
-          // so the app warns the user, and keep trying on future ticks
-          // WITHOUT consuming retry budget — the budget is only for genuine
-          // broker errors, not for waiting on price.
-          if (!st.tp2SlIsBestEffort) {
-            st.tp2SlIsBestEffort = true;
-            await withDbRetry(`zones[${zoneId}].tp2SlIsBestEffort=true`,
-              () => db.update(cascadeZonesTable).set({ tp2SlIsBestEffort: true } as Record<string, unknown>).where(eq(cascadeZonesTable.zoneId, zoneId))
-            ).catch(() => {/* logged inside withDbRetry */});
-            console.warn(`[zone ${zoneId}] TP2 SL set to best-effort protective level (price has retraced through entry — will keep trying to upgrade to true BE)`);
-          }
-        } else if (st.tp2BeAttempts < MAX_TP2_BE_ATTEMPTS) {
-          // Real broker error (not a price-side rejection that we pre-filtered).
-          // Burn budget; retry next tick.
-          st.tp2BeAttempts += 1;
-        } else {
-          // Budget exhausted on real broker errors. Stop retrying.
-          st.tp2SlMoved = true;
-          console.error(`[zone ${zoneId}] TP2 SL→BE giving up after ${MAX_TP2_BE_ATTEMPTS} attempts — broker keeps rejecting the move; positions remain at their original SL`);
-        }
+    const lateLegNeedsBe = live.some((p) => st.trackedPositions.get(p.id)?.tp2Hit);
+    if (isAutoBeTriggerSatisfied(st) && live.length > 0
+      && (!st.tp2SlMoved || st.tp2SlIsBestEffort || lateLegNeedsBe)) {
+      const beLegs = lateLegNeedsBe && st.tp2SlMoved
+        ? live.filter((p) => st.trackedPositions.get(p.id)?.tp2Hit)
+        : live;
+      if (beLegs.length > 0) {
+        await applyZoneTp2Housekeeping(token, region, zoneId, st, {
+          isFirstZoneTp2: false,
+          cancelLimits: false,
+          beLegs,
+        });
       }
-      // If price is null we just skip this tick — no budget burn, retry later.
     }
   } catch (e) {
     console.error(`[zone ${zoneId}] evaluate error:`, (e as Error).message);
