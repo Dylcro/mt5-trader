@@ -992,7 +992,6 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
                 login: useCreds.login.trim(),
                 password: useCreds.password.trim(),
                 server: useCreds.server.trim(),
-                forceReconnect: true,
               }),
             }, 90_000);
             data = await safeJson<{

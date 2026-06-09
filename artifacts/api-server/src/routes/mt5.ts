@@ -7424,7 +7424,7 @@ router.get("/mt5/account/:accountId/price", checkOwner, async (req: Request, res
       || knownAccounts.get(accountId)?.region
       || DEFAULT_REGION;
     const priceRes = await fetch(
-      `${clientBase(region)}/users/current/accounts/${req.params.accountId}/symbols/XAUUSD/current-price`,
+      `${clientBase(region)}/users/current/accounts/${accountId}/symbols/XAUUSD/current-price`,
       { headers: authHeaders(token) }
     );
     if (!priceRes.ok) return res.status(priceRes.status).json({ error: "Price fetch failed" });
