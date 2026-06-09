@@ -281,7 +281,7 @@ async function safeJson<T = Record<string, unknown>>(res: Response): Promise<T> 
   }
 }
 
-const DEFAULT_REGION = "london";
+const DEFAULT_REGION = "new-york";
 
 const TradingContext = createContext<TradingContextValue | null>(null);
 

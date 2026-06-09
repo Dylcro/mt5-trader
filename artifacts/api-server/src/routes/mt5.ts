@@ -2109,7 +2109,9 @@ function buildCandles(accountId: string, timeframe: string, limit: number): Ohlc
 
 const PROVISIONING_BASE = "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai";
 const CLIENT_DOMAIN = "agiliumtrade.ai";
-const DEFAULT_REGION = "london";
+/** Vantage executes from Equinix NY4 — new MetaAPI accounts must provision in new-york. */
+const NEW_ACCOUNT_REGION = "new-york";
+const DEFAULT_REGION = NEW_ACCOUNT_REGION;
 
 function getToken(): string {
   const token = process.env.METAAPI_TOKEN;
@@ -2119,6 +2121,38 @@ function getToken(): string {
 
 function authHeaders(token: string) {
   return { "auth-token": token, "Content-Type": "application/json" };
+}
+
+function buildMetaApiCreatePayload(creds: {
+  login: string;
+  password: string;
+  server: string;
+  region?: string;
+}): Record<string, string | number> {
+  return {
+    login: creds.login,
+    password: creds.password,
+    name: `MT5 ${creds.login}`,
+    server: creds.server,
+    platform: "mt5",
+    type: "cloud-g2",
+    reliability: "regular",
+    magic: 47182,
+    region: creds.region ?? NEW_ACCOUNT_REGION,
+  };
+}
+
+async function createMetaApiAccount(
+  token: string,
+  creds: { login: string; password: string; server: string },
+  opts?: { signal?: AbortSignal; region?: string },
+): Promise<Response> {
+  return fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify(buildMetaApiCreatePayload({ ...creds, region: opts?.region })),
+    signal: opts?.signal,
+  });
 }
 
 // Normalise whatever MetaAPI returns as "region" to the short subdomain form (e.g. "london").
@@ -7168,22 +7202,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
     }
 
     // ── CREATE BRAND-NEW MetaAPI ACCOUNT ──────────────────────────────────────
-    const createPayload = {
-      login: loginStr,
-      password,
-      name: `MT5 ${loginStr}`,
-      server: serverStr,
-      platform: "mt5",
-      type: "cloud-g2",
-      reliability: "regular",
-      magic: 47182,
-      // Vantage Markets executes from Equinix NY4 — provisioning the MetaAPI
-      // account in new-york minimises broker round-trip latency, which is the
-      // dominant cost when cascading limit orders.
-      region: "new-york",
-    };
-
-    console.log(`[connect] creating new account login=${login} server=${server}`);
+    console.log(`[connect] creating new account login=${login} server=${server} region=${NEW_ACCOUNT_REGION}`);
 
     // MetaAPI provisioning can take 30-40s for unknown brokers (it downloads the broker .dat file).
     // Use a 38-second abort signal to capture the 202 response, then handle it.
@@ -7195,12 +7214,11 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
     let fetchRes: any = null;
     let createTimedOut = false;
     try {
-      fetchRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
-        method: "POST",
-        headers: authHeaders(token),
-        body: JSON.stringify(createPayload),
-        signal: ctrl.signal,
-      });
+      fetchRes = await createMetaApiAccount(
+        token,
+        { login: loginStr, password, server: serverStr },
+        { signal: ctrl.signal, region: NEW_ACCOUNT_REGION },
+      );
       clearTimeout(createTimer);
       console.log(`[connect] create status=${fetchRes.status}`);
     } catch (fetchErr) {
@@ -7242,14 +7260,14 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       const queuedId = queued?._id ?? queued?.id;
       if (queued && queuedId) {
         console.log(`[connect] found queued account ${queuedId} — deploying`);
-        const region = normalizeRegion(queued.region);
+        const region = normalizeRegion(queued.region) || NEW_ACCOUNT_REGION;
         if (userId) {
           await upsertStoredAccount({
             accountId: queuedId,
             region,
             userId,
-            mt5Login: login,
-            mt5Server: server,
+            mt5Login: loginStr,
+            mt5Server: serverStr,
           }).catch((e: Error) => console.warn(`[connect] queued account persist failed:`, e.message));
         }
         if (queued.connectionStatus !== "CONNECTED") {
@@ -7271,7 +7289,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       return res.status(500).json({ error: "Unexpected error establishing connection. Please try again." });
     }
 
-    const region = normalizeRegion(created.region);
+    const region = NEW_ACCOUNT_REGION;
     console.log(`[connect] created accountId=${newId} region=${region} — deploying`);
 
     if (userId) {
@@ -7279,8 +7297,8 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         accountId: newId,
         region,
         userId,
-        mt5Login: login,
-        mt5Server: server,
+        mt5Login: loginStr,
+        mt5Server: serverStr,
       }).catch((e: Error) => console.warn(`[connect] new account persist failed:`, e.message));
     }
 
@@ -7511,14 +7529,11 @@ async function migrateRegionHandler(req: Request, res: Response): Promise<void> 
     }
 
     // 7. Provision fresh account in target region
-    const createPayload = {
-      login: loginStr, password, name: `MT5 ${loginStr}`, server,
-      platform: "mt5", type: "cloud-g2", reliability: "regular", magic: 47182,
-      region: target,
-    };
-    const createR = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
-      method: "POST", headers: authHeaders(token), body: JSON.stringify(createPayload),
-    });
+    const createR = await createMetaApiAccount(
+      token,
+      { login: loginStr, password, server },
+      { region: target },
+    );
     if (!createR.ok && createR.status !== 202) {
       const errBody = await createR.json().catch(() => ({})) as { message?: string; details?: string };
       const msg = errBody.message ?? `create failed: ${createR.status}`;
