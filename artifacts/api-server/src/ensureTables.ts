@@ -22,7 +22,7 @@ export async function ensureTables(): Promise<void> {
     CREATE TABLE IF NOT EXISTS stored_accounts (
       id          SERIAL PRIMARY KEY,
       account_id  TEXT NOT NULL UNIQUE,
-      region      TEXT NOT NULL DEFAULT 'london',
+      region      TEXT NOT NULL DEFAULT 'new-york',
       stored_at   BIGINT,
       user_id     TEXT,
       mt5_login   TEXT,

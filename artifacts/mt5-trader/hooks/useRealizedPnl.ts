@@ -32,7 +32,7 @@ export function useRealizedPnl(
       if (token) headers.Authorization = `Bearer ${token}`;
       const qs = new URLSearchParams({
         since: String(since),
-        region: region || "london",
+        region: region || "new-york",
       });
       const res = await fetch(
         `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/realized-pnl?${qs}`,

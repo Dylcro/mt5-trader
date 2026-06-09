@@ -2156,13 +2156,13 @@ async function createMetaApiAccount(
   });
 }
 
-// Normalise whatever MetaAPI returns as "region" to the short subdomain form (e.g. "london").
-// MetaAPI may return the full host like "mt-client-api-v1.london.agiliumtrade.ai".
+// Normalise whatever MetaAPI returns as "region" to the short subdomain form (e.g. "new-york").
+// MetaAPI may return the full host like "mt-client-api-v1.new-york.agiliumtrade.ai".
 function normalizeRegion(region: string | undefined): string {
   if (!region) return DEFAULT_REGION;
-  // Already short form: "london", "new-york", etc.
+  // Already short form: "new-york", etc.
   if (!region.includes(".")) return region;
-  // Full host: "mt-client-api-v1.london.agiliumtrade.ai" → extract "london"
+  // Full host: "mt-client-api-v1.new-york.agiliumtrade.ai" → extract "new-york"
   const m = region.match(/^mt-client-api-v1\.(.+?)\.agiliumtrade\.ai$/);
   if (m?.[1]) return m[1];
   // Fallback: use as-is and let MetaAPI reject it with a clear error
@@ -2201,6 +2201,15 @@ interface ProvisioningAccount {
 function isBrokerDisconnected(acct: { connectionStatus?: string }): boolean {
   const s = acct.connectionStatus ?? "";
   return s === "DISCONNECTED" || s === "DISCONNECTED_FROM_BROKER";
+}
+
+function accountProvisionedRegion(acct: { region?: string }): string {
+  return normalizeRegion(acct.region);
+}
+
+/** MetaAPI region cannot be changed in-place — delete and recreate in NEW_ACCOUNT_REGION. */
+function isWrongMetaApiRegion(acct: { region?: string }): boolean {
+  return accountProvisionedRegion(acct) !== NEW_ACCOUNT_REGION;
 }
 
 function formatMetaApiAuthError(body: { message?: string; details?: string }): string {
@@ -7081,7 +7090,14 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         if (userId) await disconnectUserMt5(userId);
         return res.status(404).json({ error: "Account not found on MetaAPI. Connect again with your MT5 credentials." });
       }
-      const region = normalizeRegion(acct.region);
+      if (isWrongMetaApiRegion(acct)) {
+        console.log(`[connect] ${existingId} in ${accountProvisionedRegion(acct)} — requires credential reconnect for ${NEW_ACCOUNT_REGION}`);
+        if (userId) await disconnectUserMt5(userId);
+        return res.status(409).json({
+          error: `MT5 account is in ${accountProvisionedRegion(acct)} region. Use Settings → Connect with your MT5 credentials to recreate in ${NEW_ACCOUNT_REGION}.`,
+        });
+      }
+      const region = NEW_ACCOUNT_REGION;
       void upsertStoredAccount({
         accountId: existingId,
         region,
@@ -7146,10 +7162,18 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
     const foundId = existing?._id ?? existing?.id;
 
     if (existing && foundId) {
-      console.log(`[connect] reusing ${foundId} status=${existing.connectionStatus}`);
+      console.log(`[connect] reusing ${foundId} status=${existing.connectionStatus} region=${accountProvisionedRegion(existing)}`);
 
-      // Stale DEPLOYED/DISCONNECTED survives manual undeploy→deploy — delete and reprovision.
-      if (
+      // MetaAPI cannot move an account between regions — delete london (etc.) and recreate in new-york.
+      if (isWrongMetaApiRegion(existing)) {
+        console.log(`[connect] deleting ${foundId} in ${accountProvisionedRegion(existing)} for ${NEW_ACCOUNT_REGION} recreate`);
+        await deleteMetaApiAccount(token, foundId).catch((e: Error) =>
+          console.warn(`[connect] delete wrong-region ${foundId}:`, e.message),
+        );
+        await db.delete(storedAccountsTable).where(eq(storedAccountsTable.accountId, foundId)).catch(() => {});
+        if (userId) userAccountCache.delete(userId);
+        // Fall through to CREATE path below.
+      } else if (
         forceBrokerReset
         && isBrokerDisconnected(existing)
         && existing.state === "DEPLOYED"
@@ -7168,14 +7192,14 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       // Eagerly transfer DB ownership to the current user so checkOwner
       // passes immediately on subsequent requests (startStreaming also does
       // this, but it runs asynchronously after this response returns).
-      const region = normalizeRegion(existing.region);
+      const region = NEW_ACCOUNT_REGION;
       if (userId) {
         await upsertStoredAccount({
           accountId: foundId,
           region,
           userId,
-          mt5Login: login,
-          mt5Server: server,
+          mt5Login: loginStr,
+          mt5Server: serverStr,
         }).catch((e: Error) => console.warn(`[connect] eager ownership transfer failed:`, e.message));
         userAccountCache.set(userId, foundId);
       }
@@ -7640,7 +7664,7 @@ router.post("/mt5/account/:accountId/disconnect", checkOwner, async (req: Reques
   }
 });
 
-// GET /api/mt5/account/:accountId/realized-pnl?since=<ms>&region=london
+// GET /api/mt5/account/:accountId/realized-pnl?since=<ms>&region=new-york
 // Sums profit+commission+swap on closed trade deals (DEAL_ENTRY_OUT) since `since` (ms epoch).
 router.get("/mt5/account/:accountId/realized-pnl", checkOwner, async (req: Request, res: Response) => {
   try {
@@ -7655,7 +7679,7 @@ router.get("/mt5/account/:accountId/realized-pnl", checkOwner, async (req: Reque
   }
 });
 
-// GET /api/mt5/account/:accountId/info?region=london
+// GET /api/mt5/account/:accountId/info?region=new-york
 router.get("/mt5/account/:accountId/info", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
@@ -7667,7 +7691,7 @@ router.get("/mt5/account/:accountId/info", checkOwner, async (req: Request, res:
   }
 });
 
-// GET /api/mt5/account/:accountId/candles?region=london&timeframe=5m&limit=150
+// GET /api/mt5/account/:accountId/candles?region=new-york&timeframe=5m&limit=150
 // Candles are built from live price ticks accumulated by the /price endpoint.
 router.get("/mt5/account/:accountId/candles", checkOwner, (req: Request, res: Response) => {
   const timeframe = qstr(req.query.timeframe) || "5m";
@@ -7676,7 +7700,7 @@ router.get("/mt5/account/:accountId/candles", checkOwner, (req: Request, res: Re
   return res.json(candles);
 });
 
-// GET /api/mt5/account/:accountId/price?region=london
+// GET /api/mt5/account/:accountId/price?region=new-york
 router.get("/mt5/account/:accountId/price", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
@@ -7717,7 +7741,7 @@ router.get("/mt5/account/:accountId/display-fx", checkOwner, async (req: Request
   }
 });
 
-// GET /api/mt5/account/:accountId/positions?region=london
+// GET /api/mt5/account/:accountId/positions?region=new-york
 router.get("/mt5/account/:accountId/positions", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
@@ -7759,7 +7783,7 @@ router.get("/mt5/account/:accountId/positions", checkOwner, async (req: Request,
   }
 });
 
-// GET /api/mt5/account/:accountId/orders?region=london  (pending orders)
+// GET /api/mt5/account/:accountId/orders?region=new-york  (pending orders)
 router.get("/mt5/account/:accountId/orders", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
@@ -7784,7 +7808,7 @@ router.get("/mt5/account/:accountId/orders", checkOwner, async (req: Request, re
   }
 });
 
-// DELETE /api/mt5/account/:accountId/order/:orderId?region=london  (cancel pending order)
+// DELETE /api/mt5/account/:accountId/order/:orderId?region=new-york  (cancel pending order)
 router.delete("/mt5/account/:accountId/order/:orderId", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
@@ -7855,7 +7879,7 @@ const TRADE_ERROR_MESSAGES: Record<number, string> = {
   10045: "Positions can only be closed in FIFO order.",
 };
 
-// POST /api/mt5/account/:accountId/trade?region=london
+// POST /api/mt5/account/:accountId/trade?region=new-york
 // Tries the SDK WebSocket path first (reuses existing stream connection → no new TCP/TLS to MetaAPI).
 // Falls back to REST if the connection is unavailable or the SDK call throws.
 router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, res: Response) => {

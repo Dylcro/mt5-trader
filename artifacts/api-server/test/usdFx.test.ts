@@ -13,7 +13,7 @@ describe("usdFx", () => {
 
   it("usdToTargetRate returns 1 for USD", async () => {
     const fetchPrice = vi.fn();
-    const r = await usdToTargetRate("t", "london", "acc", "USD", fetchPrice);
+    const r = await usdToTargetRate("t", "new-york", "acc", "USD", fetchPrice);
     expect(r).toEqual({ rate: 1, currency: "USD" });
     expect(fetchPrice).not.toHaveBeenCalled();
   });
@@ -23,7 +23,7 @@ describe("usdFx", () => {
       if (sym === "USDJPY") return { bid: 149, ask: 151 };
       return null;
     });
-    const r = await usdToTargetRate("t", "london", "acc", "JPY", fetchPrice);
+    const r = await usdToTargetRate("t", "new-york", "acc", "JPY", fetchPrice);
     expect(r.currency).toBe("JPY");
     expect(r.rate).toBeCloseTo(150, 5);
   });
@@ -33,7 +33,7 @@ describe("usdFx", () => {
       if (sym === "GBPUSD") return { bid: 1.24, ask: 1.26 };
       return null;
     });
-    const r = await usdToTargetRate("t", "london", "acc2", "GBP", fetchPrice);
+    const r = await usdToTargetRate("t", "new-york", "acc2", "GBP", fetchPrice);
     expect(r.currency).toBe("GBP");
     expect(r.rate).toBeCloseTo(1 / 1.25, 5);
   });
@@ -45,7 +45,7 @@ describe("usdFx", () => {
       if (sym === "GBPUSD") return { bid: 1.24, ask: 1.26 };
       return null;
     });
-    const r = await usdToTargetRate("t", "london", "acc3", "GBP", fetchPrice);
+    const r = await usdToTargetRate("t", "new-york", "acc3", "GBP", fetchPrice);
     expect(r.rate).toBeCloseTo(0.8, 2);
   });
 });

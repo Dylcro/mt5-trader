@@ -92,7 +92,7 @@ export function DisplayCurrencyProvider({ children }: { children: React.ReactNod
         const token = await getAuthToken();
         const headers: Record<string, string> = {};
         if (token) headers.Authorization = `Bearer ${token}`;
-        const rgn = encodeURIComponent(region || "london");
+        const rgn = encodeURIComponent(region || "new-york");
         const res = await fetch(
           `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/display-fx?to=${currency}&region=${rgn}`,
           { headers },
