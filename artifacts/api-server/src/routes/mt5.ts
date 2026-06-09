@@ -4066,6 +4066,9 @@ async function tradeAction(
   return { ok: r.ok && TRADE_SUCCESS_CODES.has(code), code, message: data.message };
 }
 
+/** MetaAPI returns these when the leg is already gone or a close is in flight — treat as success. */
+const CLOSE_POSITION_IDEMPOTENT_CODES = new Set([10036, 10039]);
+
 async function closeZonePosition(
   token: string, region: string, accountId: string, positionId: string, volume?: number,
 ): Promise<boolean> {
@@ -4075,8 +4078,9 @@ async function closeZonePosition(
     : { actionType: "POSITION_CLOSE_ID", positionId };
   return closeWithRetry(async () => {
     const r = await tradeAction(token, region, accountId, body);
-    if (!r.ok) console.warn(`[zone] close posId=${positionId} vol=${volume ?? "full"} failed code=${r.code} msg="${r.message ?? ""}"`);
-    return r.ok;
+    if (r.ok || CLOSE_POSITION_IDEMPOTENT_CODES.has(r.code)) return true;
+    console.warn(`[zone] close posId=${positionId} vol=${volume ?? "full"} failed code=${r.code} msg="${r.message ?? ""}"`);
+    return false;
   });
 }
 
@@ -6501,8 +6505,20 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
         res.json({ ok: true, closedCount: 0, alreadyClosed: true });
         return;
       }
-      const { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, live);
+      let { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, live);
       for (const id of live.map((p) => p.id)) st.trackedPositions.delete(id);
+      if (failed.length > 0) {
+        invalidateBrokerSnapshot(accountId);
+        const remaining = await resolveLivePositionsForZoneAction(
+          token, region, accountId, zoneId, st, { fresh: true },
+        );
+        if (remaining.length === 0) {
+          console.log(
+            `[zone ${zoneId}] close cleanup: broker empty after ${failed.length} API failure(s) — reconciled`,
+          );
+          failed = [];
+        }
+      }
       if (failed.length > 0) {
         res.status(207).json({
           ok: false,
@@ -6521,12 +6537,41 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
     }
 
     if (live.length === 0) {
-      res.status(409).json({ error: "No open positions in this zone" });
+      const closedAt = Date.now();
+      await db.update(cascadeZonesTable)
+        .set({ status: "CLOSED", closedAt })
+        .where(eq(cascadeZonesTable.zoneId, zoneId));
+      const wasRiskFree = st.status === "RISK_FREE";
+      st.status = "CLOSED";
+      zoneStates.delete(zoneId);
+      await finalizeZoneClose(accountId, zoneId, {
+        wasRiskFree,
+        exitPrice: exitPriceForZoneClose(accountId, st.direction),
+        userInitiated: true,
+      });
+      void settleZoneClosedPnl(accountId, zoneId);
+      broadcastZoneUpdate(zoneId);
+      broadcastToAccount(accountId, "deal", { type: "position_changed" });
+      logEvent("zone.close", { accountId, zoneId, closedCount: 0, trigger: "user_empty_broker" });
+      res.json({ ok: true, closedCount: 0, alreadyClosed: true });
       return;
     }
 
-    const { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, live);
+    let { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, live);
     for (const id of live.map((p) => p.id)) st.trackedPositions.delete(id);
+
+    if (failed.length > 0) {
+      invalidateBrokerSnapshot(accountId);
+      const remaining = await resolveLivePositionsForZoneAction(
+        token, region, accountId, zoneId, st, { fresh: true },
+      );
+      if (remaining.length === 0) {
+        console.log(
+          `[zone ${zoneId}] close: broker empty after ${failed.length} API failure(s) — reconciled`,
+        );
+        failed = [];
+      }
+    }
 
     if (failed.length > 0) {
       console.warn(`[zone ${zoneId}] close: failedCloses=${failed.length}/${live.length}`);
