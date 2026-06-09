@@ -4,7 +4,6 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   ActivityIndicator,
   Alert,
-  FlatList,
   Platform,
   Pressable,
   RefreshControl,
@@ -278,10 +277,11 @@ export default function PositionsScreen() {
     refreshPositions, refreshPendingOrders, refreshAccountInfo,
     closePosition, cancelOrder, accountId, region, sseConnected, price,
     priceError, priceStale, syncSession, ensureSessionForTrade,
-    activateRunner, setRunnerAuto,
+    closeZonePartial, activateRunner, setRunnerAuto,
   } = useTrading();
   const {
     zones, loading: zonesLoading, refresh: refreshZones, pruneStaleFromServer,
+    riskFree, closeZone, closeAllWorst, cancelZoneOrders,
   } = useZones(accountId, {
     includeClosed: true, sseConnected, region,
   });
@@ -375,6 +375,42 @@ export default function PositionsScreen() {
     [ensureSessionForTrade],
   );
 
+  const handleCancelZoneOrders = useCallback(
+    async (zoneId: string) => {
+      const result = await cancelZoneOrders(zoneId);
+      void Promise.all([refreshPendingOrders(), refreshZones(), refreshPositions()]);
+      return result;
+    },
+    [cancelZoneOrders, refreshPendingOrders, refreshZones, refreshPositions],
+  );
+
+  const handleCloseZone = useCallback(
+    async (zoneId: string) => {
+      const result = await closeZone(zoneId);
+      void Promise.all([refreshPendingOrders(), refreshZones()]);
+      return result;
+    },
+    [closeZone, refreshPendingOrders, refreshZones],
+  );
+
+  const handleClosePartial = useCallback(
+    async (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number; runnerN?: number }) => {
+      const result = await closeZonePartial(zoneId, opts);
+      if (result.ok) void refreshZones();
+      return result;
+    },
+    [closeZonePartial, refreshZones],
+  );
+
+  const handleRiskFree = useCallback(
+    async (zoneId: string) => {
+      const result = await riskFree(zoneId, { riskFreePips: cs.riskFreePips });
+      if (result.ok) void refreshZones();
+      return result;
+    },
+    [riskFree, cs.riskFreePips, refreshZones],
+  );
+
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
     await Promise.all([
@@ -390,10 +426,13 @@ export default function PositionsScreen() {
       if (type === "zone_update") {
         const u = data as { status?: string };
         if (u.status === "CLOSED") {
-          void Promise.all([refreshZones(), refreshPositions(), refreshPendingOrders()]);
+          void refreshPositions();
         }
       }
-      if (type === "deal") void Promise.all([refreshZones(), refreshPositions()]);
+      if (type === "deal") {
+        void refreshPositions();
+        if (!sseConnected) void refreshZones();
+      }
       if (type === "runner_alert") {
         const d = data as {
           zoneId?: string;
@@ -415,7 +454,7 @@ export default function PositionsScreen() {
         }
       }
     });
-  }, [accountId, refreshPendingOrders, refreshZones, refreshPositions]);
+  }, [accountId, sseConnected, refreshPendingOrders, refreshZones, refreshPositions]);
 
   useFocusEffect(
     useCallback(() => {
@@ -424,10 +463,10 @@ export default function PositionsScreen() {
     }, [accountId, pruneStaleFromServer]),
   );
 
-  // Light poll while focused — refresh fetches only, no session wake pings.
+  // Poll only when SSE is down — live stream patches zones; polling here caused lag.
   useFocusEffect(
     useCallback(() => {
-      if (status !== "connected" || !accountId) return;
+      if (status !== "connected" || !accountId || sseConnected) return;
       if (!price || priceError || priceStale) void syncSession(false);
       const syncLight = () => void Promise.all([
         refreshZones(),
@@ -437,7 +476,7 @@ export default function PositionsScreen() {
       syncLight();
       const id = setInterval(syncLight, 20_000);
       return () => clearInterval(id);
-    }, [status, accountId, price, priceError, priceStale, syncSession, refreshZones, refreshPositions, refreshPendingOrders]),
+    }, [status, accountId, sseConnected, price, priceError, priceStale, syncSession, refreshZones, refreshPositions, refreshPendingOrders]),
   );
 
   const handlePriceSync = useCallback(() => {
@@ -505,20 +544,29 @@ export default function PositionsScreen() {
       >
         <ZoneCard
           zone={z}
-          accountId={accountId}
-          region={region}
-          riskFreePips={cs.riskFreePips}
-          onActionComplete={() => {
-            void Promise.all([refreshZones(), refreshPositions(), refreshPendingOrders()]);
-          }}
           liveVolume={liveVol}
           floatingPnl={floatingPnl}
           flash={flashZone === z.zoneId}
+          onRiskFree={(zoneId) =>
+            withSessionReady(() => handleRiskFree(zoneId))
+          }
+          onCloseAllWorst={(zoneId) =>
+            withSessionReady(() => closeAllWorst(zoneId))
+          }
+          onCloseZone={(zoneId) =>
+            withSessionReady(() => handleCloseZone(zoneId))
+          }
+          onClosePartial={(zoneId, opts) =>
+            withSessionReady(() => handleClosePartial(zoneId, opts))
+          }
           onActivateRunner={(zoneId, targets, autos) =>
             withSessionReady(() => activateRunner(zoneId, targets, autos))
           }
           onSetRunnerAuto={(zoneId, runnerN, auto) =>
             withSessionReady(() => setRunnerAuto(zoneId, runnerN, auto))
+          }
+          onCancelOrders={(zoneId) =>
+            withSessionReady(() => handleCancelZoneOrders(zoneId))
           }
         />
       </View>
@@ -632,36 +680,18 @@ export default function PositionsScreen() {
                 {normalZones.length > 0 && (
                   <>
                     <SectionHeader label="ACTIVE" count={normalZones.length} color="#059669" />
-                    <FlatList
-                      data={normalZones}
-                      keyExtractor={(z) => z.zoneId}
-                      renderItem={({ item }) => renderZoneCard(item)}
-                      scrollEnabled={false}
-                      removeClippedSubviews
-                      maxToRenderPerBatch={5}
-                      windowSize={3}
-                      initialNumToRender={3}
-                      ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
-                      style={{ marginBottom: runnerZones.length > 0 ? 12 : showStandalone || orphanPendingOrders.length > 0 ? 20 : 0 }}
-                    />
+                    <View style={{ gap: 10, marginBottom: runnerZones.length > 0 ? 12 : showStandalone || orphanPendingOrders.length > 0 ? 20 : 0 }}>
+                      {normalZones.map((z) => renderZoneCard(z))}
+                    </View>
                   </>
                 )}
                 {runnerZones.length > 0 && (
                   <>
                     {normalZones.length > 0 && <View style={styles.sectionDivider} />}
                     <SectionHeader label="RUNNERS" count={runnerZones.length} color="#0E7490" />
-                    <FlatList
-                      data={runnerZones}
-                      keyExtractor={(z) => z.zoneId}
-                      renderItem={({ item }) => renderZoneCard(item)}
-                      scrollEnabled={false}
-                      removeClippedSubviews
-                      maxToRenderPerBatch={5}
-                      windowSize={3}
-                      initialNumToRender={3}
-                      ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
-                      style={{ marginBottom: showStandalone || orphanPendingOrders.length > 0 ? 20 : 0 }}
-                    />
+                    <View style={{ gap: 10, marginBottom: showStandalone || orphanPendingOrders.length > 0 ? 20 : 0 }}>
+                      {runnerZones.map((z) => renderZoneCard(z))}
+                    </View>
                   </>
                 )}
               </>

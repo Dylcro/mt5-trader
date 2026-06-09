@@ -221,10 +221,10 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
       } else if (type === "runner_alert") {
         // Handled by positions screen banner — no zone list patch needed here.
       } else if (type === "deal" || type === "pending_order") {
-        void refresh();
+        if (!sseConnected) void refresh();
       }
     });
-  }, [accountId, refresh, includeClosed]);
+  }, [accountId, refresh, includeClosed, sseConnected]);
 
   const riskFree = useCallback(async (
     zoneId: string,
