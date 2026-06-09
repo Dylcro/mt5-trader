@@ -2129,9 +2129,22 @@ interface ProvisioningAccount {
 }
 
 async function getProvisioningAccount(token: string, accountId: string): Promise<ProvisioningAccount> {
-  const res = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
-    headers: authHeaders(token),
-  });
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 30_000);
+  let res: Response;
+  try {
+    res = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
+      headers: authHeaders(token),
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    if (e instanceof Error && e.name === "AbortError") {
+      throw new Error("MetaAPI account lookup timed out — please retry.");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
   if (!res.ok) {
     const err = await res.json().catch(() => ({})) as { message?: string };
     throw new Error(err.message ?? `Account lookup failed: ${res.status}`);
@@ -2177,11 +2190,57 @@ async function getAccountInfo(token: string, accountId: string, region: string |
   return res.json() as Promise<Record<string, unknown>>;
 }
 
+/** Broker is CONNECTED — account-information can lag; never block the client on it. */
+function brokerConnectedFields(
+  accountId: string,
+  region: string,
+  info: Record<string, unknown> | null | undefined,
+): {
+  accountId: string;
+  region: string;
+  name: string;
+  balance: number;
+  equity: number;
+  margin: number;
+  freeMargin: number;
+  currency: string;
+  leverage: number;
+} {
+  return {
+    accountId,
+    region,
+    name: String(info?.name ?? "Account"),
+    balance: Number(info?.balance ?? 0),
+    equity: Number(info?.equity ?? 0),
+    margin: Number(info?.margin ?? 0),
+    freeMargin: Number(info?.freeMargin ?? 0),
+    currency: String(info?.currency ?? "USD"),
+    leverage: Number(info?.leverage ?? 100),
+  };
+}
+
+async function fetchAccountInfoSafe(
+  token: string, accountId: string, region: string,
+): Promise<Record<string, unknown> | null> {
+  try {
+    return await getAccountInfo(token, accountId, region);
+  } catch (e) {
+    console.warn(`[account-info] ${accountId} (${region}) failed:`, (e as Error).message);
+    return null;
+  }
+}
+
+const deployKickAt = new Map<string, number>();
+const DEPLOY_KICK_INTERVAL_MS = 90_000;
+
 async function deployAccount(token: string, accountId: string): Promise<void> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 45_000);
   const res = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}/deploy`, {
     method: "POST",
     headers: authHeaders(token),
-  });
+    signal: ctrl.signal,
+  }).finally(() => clearTimeout(timer));
   if (!res.ok) {
     const body = await res.json().catch(() => ({})) as { message?: string };
     const msg = body.message ?? `Deploy failed (HTTP ${res.status})`;
@@ -6749,29 +6808,9 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       console.log(`[connect] reconnect status=${acct.connectionStatus} region=${region}`);
 
       if (acct.connectionStatus === "CONNECTED") {
-        // Already connected — fetch info and return immediately.
-        // If the client API isn't warm yet (just redeployed), fall back to polling.
-        // Kick off streaming in background so deal events (and auto-cascade) work
-        // even though the app never polls the /events endpoint directly.
-        void startStreaming(token, existingId, region, userId ?? undefined);
-        try {
-          const info = await getAccountInfo(token, existingId, region) as Record<string, unknown>;
-          return res.json({
-            status: "connected",
-            accountId: existingId,
-            region,
-            name: info.name ?? "Account",
-            balance: info.balance ?? 0,
-            equity: info.equity ?? 0,
-            margin: info.margin ?? 0,
-            freeMargin: info.freeMargin ?? 0,
-            currency: info.currency ?? "USD",
-            leverage: info.leverage ?? 100,
-          });
-        } catch {
-          console.log(`[connect] client API not ready yet for ${existingId} — falling back to polling`);
-          return res.json({ status: "deploying", accountId: existingId, region });
-        }
+        ensureAccountStreaming(token, existingId, region, userId ?? undefined);
+        const info = await fetchAccountInfoSafe(token, existingId, region);
+        return res.json({ status: "connected", ...brokerConnectedFields(existingId, region, info) });
       }
 
       // Not connected — trigger deploy and return "deploying" immediately
@@ -6832,24 +6871,8 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
 
       if (existing.connectionStatus === "CONNECTED") {
         ensureAccountStreaming(token, foundId, region, userId);
-        try {
-          const info = await getAccountInfo(token, foundId, region) as Record<string, unknown>;
-          return res.json({
-            status: "connected",
-            accountId: foundId,
-            region,
-            name: info.name ?? "Account",
-            balance: info.balance ?? 0,
-            equity: info.equity ?? 0,
-            margin: info.margin ?? 0,
-            freeMargin: info.freeMargin ?? 0,
-            currency: info.currency ?? "USD",
-            leverage: info.leverage ?? 100,
-          });
-        } catch {
-          console.log(`[connect] client API not ready for ${foundId} — falling back to polling`);
-          return res.json({ status: "deploying", accountId: foundId, region });
-        }
+        const info = await fetchAccountInfoSafe(token, foundId, region);
+        return res.json({ status: "connected", ...brokerConnectedFields(foundId, region, info) });
       }
 
       await deployAccount(token, foundId);
@@ -6994,25 +7017,10 @@ router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, re
       const effectiveRegion = normalizeRegion(acct.region) || region;
       const statusUserId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
       ensureAccountStreaming(token, accountId, effectiveRegion, statusUserId);
-      let info: Record<string, unknown> = {};
-      try {
-        info = await getAccountInfo(token, accountId, effectiveRegion) as Record<string, unknown>;
-      } catch (infoErr) {
-        // Client API not yet ready — report still connecting to keep polling
-        console.warn(`[status] getAccountInfo failed for ${accountId}:`, (infoErr as Error).message);
-        return res.json({ connectionStatus: "CONNECTING", state: acct.state });
-      }
+      const info = await fetchAccountInfoSafe(token, accountId, effectiveRegion);
       return res.json({
         connectionStatus: "CONNECTED",
-        accountId,
-        region: effectiveRegion,
-        name: info.name ?? "Account",
-        balance: info.balance ?? 0,
-        equity: info.equity ?? 0,
-        margin: info.margin ?? 0,
-        freeMargin: info.freeMargin ?? 0,
-        currency: info.currency ?? "USD",
-        leverage: info.leverage ?? 100,
+        ...brokerConnectedFields(accountId, effectiveRegion, info),
       });
     }
 
@@ -7037,6 +7045,16 @@ router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, re
             : msg,
         });
       }
+    }
+
+    // Stuck DEPLOYING/CONNECTING — re-kick deploy periodically (sync-recovery undeploy, broker drop).
+    const lastKick = deployKickAt.get(accountId) ?? 0;
+    if (Date.now() - lastKick >= DEPLOY_KICK_INTERVAL_MS) {
+      deployKickAt.set(accountId, Date.now());
+      console.log(`[status] ${accountId} stuck at ${acct.connectionStatus}/${acct.state} — re-kicking deploy`);
+      await deployAccount(token, accountId).catch((e: Error) =>
+        console.warn(`[status] deploy re-kick failed for ${accountId}:`, e.message),
+      );
     }
 
     return res.json({ connectionStatus: acct.connectionStatus ?? "DEPLOYING", state: acct.state });

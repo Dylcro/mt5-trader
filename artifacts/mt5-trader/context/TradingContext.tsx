@@ -245,6 +245,25 @@ async function authFetch(url: string, options: RequestInit = {}): Promise<Respon
   return fetch(url, { ...options, headers });
 }
 
+async function authFetchWithTimeout(
+  url: string,
+  options: RequestInit = {},
+  timeoutMs = 45_000,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await authFetch(url, { ...options, signal: controller.signal });
+  } catch (e) {
+    if (e instanceof Error && e.name === "AbortError") {
+      throw new Error("Connection timed out — open Settings and reconnect with your MT5 password.");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Safely parse a fetch Response as JSON. If the body is HTML (server not ready yet
 // or proxy error), throws a human-readable message instead of a raw parse error.
 async function safeJson<T = Record<string, unknown>>(res: Response): Promise<T> {
@@ -360,12 +379,16 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // Poll /status until CONNECTED, then finalise the session
-  const pollUntilConnected = useCallback(async (accId: string, accRegion: string, maxWaitMs = 120000) => {
+  const pollUntilConnected = useCallback(async (accId: string, accRegion: string, maxWaitMs = 180_000) => {
     const deadline = Date.now() + maxWaitMs;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 5000));
       try {
-        const r = await authFetch(`${API_BASE}/mt5/account/${accId}/status?region=${accRegion}`);
+        const r = await authFetchWithTimeout(
+          `${API_BASE}/mt5/account/${accId}/status?region=${accRegion}`,
+          {},
+          25_000,
+        );
         const d = await safeJson<{
           connectionStatus?: string;
           error?: string;
@@ -407,11 +430,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       let data: ({ status?: string; error?: string; accountId?: string; region?: string } & Partial<AccountInfo>) | null = null;
       for (let attempt = 1; attempt <= 8; attempt++) {
         try {
-          res = await authFetch(`${API_BASE}/mt5/connect`, {
+          res = await authFetchWithTimeout(`${API_BASE}/mt5/connect`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ accountId: savedId }),
-          });
+          }, 60_000);
           data = await safeJson<{ status?: string; error?: string; accountId?: string; region?: string } & Partial<AccountInfo>>(res);
           break; // success — exit retry loop
         } catch (err) {
@@ -962,7 +985,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         // Retry up to 8 times — autoscale cold-starts can take 20-30 s before serving JSON
         for (let attempt = 1; attempt <= 8; attempt++) {
           try {
-            res = await authFetch(connectUrl, {
+            res = await authFetchWithTimeout(connectUrl, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -970,7 +993,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
                 password: useCreds.password.trim(),
                 server: useCreds.server.trim(),
               }),
-            });
+            }, 60_000);
             data = await safeJson<{
               status?: string; error?: string; accountId?: string; region?: string; retryAfterMs?: number;
             } & Partial<AccountInfo>>(res);
