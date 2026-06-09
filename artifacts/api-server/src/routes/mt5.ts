@@ -687,6 +687,11 @@ function markStreamSyncReady(accountId: string, source: "deals" | "positions"): 
     clearTimeout(pending);
     recoveryTimers.delete(accountId);
   }
+  const syncFallback = syncFallbackTimers.get(accountId);
+  if (syncFallback) {
+    clearTimeout(syncFallback);
+    syncFallbackTimers.delete(accountId);
+  }
   console.log(`[stream ${accountId}] ${source} sync complete`);
 }
 
@@ -1047,6 +1052,7 @@ const syncReady = new Set<string>();
 // timer scheduled by an old stream cannot fire against a future fresh stream
 // (which would tear down a perfectly healthy new connection).
 const recoveryTimers = new Map<string, NodeJS.Timeout>();
+const syncFallbackTimers = new Map<string, NodeJS.Timeout>();
 // Records the server-side ms timestamp when each account's sync completed.
 // Used to filter out historical deal events that the SDK delivers AFTER
 // onDealsSynchronized fires (a known SDK buffering quirk).
@@ -1426,6 +1432,11 @@ async function stopStreaming(accountId: string): Promise<void> {
     clearTimeout(pending);
     recoveryTimers.delete(accountId);
   }
+  const syncFallback = syncFallbackTimers.get(accountId);
+  if (syncFallback) {
+    clearTimeout(syncFallback);
+    syncFallbackTimers.delete(accountId);
+  }
   console.log(`[stream ${accountId}] stopped and cleaned up`);
 }
 
@@ -1456,8 +1467,8 @@ function ensureAccountStreaming(
 }
 
 async function startStreaming(token: string, accountId: string, region: string = DEFAULT_REGION, userId?: string): Promise<void> {
-  if (activeStreams.has(accountId)) return;
-  activeStreams.add(accountId);
+  if (activeStreams.has(accountId) || startingStreams.has(accountId)) return;
+  startingStreams.add(accountId);
   // Load persisted cascade history BEFORE sync so post-sync catch-up
   // sees already-cascaded positions and skips re-cascading them.
   await loadCascadeHistory(accountId);
@@ -1503,6 +1514,7 @@ async function startStreaming(token: string, accountId: string, region: string =
     // instead of making new HTTP calls to MetaAPI REST for every order.
     activeConnections.set(accountId, conn);
     activeRegions.set(accountId, region);
+    activeStreams.add(accountId);
     // Keep the in-memory registry current so the watchdog/safety-net can work
     // even when the DB is temporarily unavailable.
     knownAccounts.set(accountId, { accountId, userId, region });
@@ -1530,6 +1542,18 @@ async function startStreaming(token: string, accountId: string, region: string =
       void recoverStuckSync(token, accountId);
     }, 240_000);
     recoveryTimers.set(accountId, timer);
+    // Empty-history connects (startTime = now) should sync in seconds. Some
+    // MetaAPI accounts never emit onDealsSynchronized — arm sync after 30 s so
+    // trading isn't blocked while the 240 s full recovery timer waits.
+    const syncFallback = setTimeout(() => {
+      syncFallbackTimers.delete(accountId);
+      if (syncReady.has(accountId)) return;
+      const current = activeConnections.get(accountId);
+      if (!current || current !== myConn) return;
+      markStreamSyncReady(accountId, "positions");
+      console.log(`[stream ${accountId}] sync fallback — armed after 30s (empty-history connect)`);
+    }, 30_000);
+    syncFallbackTimers.set(accountId, syncFallback);
     // Persist credentials so the server can auto-reconnect after a restart
     // without waiting for the app to call /connect again.
     // userId is included when available so /my-account lookups work reliably.
@@ -1548,7 +1572,7 @@ async function startStreaming(token: string, accountId: string, region: string =
       console.warn(`[stream ${accountId}] failed to persist account to DB:`, (dbErr as Error).message);
     }
   } catch (err) {
-    activeStreams.delete(accountId); // allow retry on next poll
+    activeStreams.delete(accountId);
     activeConnections.delete(accountId);
     const msg = (err as Error).message ?? "";
     // MetaAPI auto-undeploys accounts during inactivity. Detect the error and
@@ -1576,6 +1600,8 @@ async function startStreaming(token: string, accountId: string, region: string =
     } else {
       console.error(`[stream ${accountId}] streaming start failed:`, msg);
     }
+  } finally {
+    startingStreams.delete(accountId);
   }
 }
 
@@ -1635,7 +1661,15 @@ export function startConnectionWatchdog(): void {
         }
       }
       for (const { accountId, region } of accounts) {
-        if (!activeStreams.has(accountId)) {
+        const lastTick = lastEventAt.get(accountId) ?? 0;
+        const wedged = activeStreams.has(accountId)
+          && !syncReady.has(accountId)
+          && Date.now() - lastTick > 120_000;
+        if (wedged) {
+          console.warn(`[watchdog] ${accountId} stream wedged (no sync/ticks) — resetting`);
+          await stopStreaming(accountId);
+        }
+        if (!activeStreams.has(accountId) && !startingStreams.has(accountId)) {
           console.log(`[watchdog] ${accountId} not streaming — reconnecting`);
           void startStreaming(token, accountId, region);
         }
@@ -2231,7 +2265,9 @@ async function fetchAccountInfoSafe(
 }
 
 const deployKickAt = new Map<string, number>();
-const DEPLOY_KICK_INTERVAL_MS = 90_000;
+/** Gentle redeploy only — never undeploy on status poll (that prevented CONNECTED during client poll). */
+const STUCK_REDEPLOY_MS = 180_000;
+const startingStreams = new Set<string>();
 
 async function deployAccount(token: string, accountId: string): Promise<void> {
   const ctrl = new AbortController();
@@ -2262,6 +2298,22 @@ async function undeployAccount(token: string, accountId: string): Promise<void> 
   }
 }
 
+/** MetaAPI is mid-deploy or mid-broker-handshake — never interrupt with undeploy. */
+export function isMetaApiProvisioningInProgress(acct: {
+  state?: string;
+  connectionStatus?: string;
+}): boolean {
+  return acct.state === "DEPLOYING" || acct.connectionStatus === "CONNECTING";
+}
+
+/** Whether to undeploy→deploy before deploy. Never during DEPLOYING/CONNECTING. */
+export function shouldUndeployBeforeDeploy(
+  acct: { state?: string; connectionStatus?: string },
+): boolean {
+  if (isMetaApiProvisioningInProgress(acct)) return false;
+  return acct.connectionStatus === "DISCONNECTED" || acct.state === "DEPLOY_FAILED";
+}
+
 /** Undeploy→deploy when MetaAPI is DEPLOYED but broker link is dead (common after server restarts). */
 async function prepareAccountForConnect(
   token: string,
@@ -2271,10 +2323,7 @@ async function prepareAccountForConnect(
   const acct = await getProvisioningAccount(token, accountId);
   if (acct.connectionStatus === "CONNECTED" && !opts?.force) return;
 
-  const shouldCycle = Boolean(opts?.force)
-    || acct.state === "DEPLOYED"
-    || acct.connectionStatus === "DISCONNECTED"
-    || acct.state === "DEPLOY_FAILED";
+  const shouldCycle = shouldUndeployBeforeDeploy(acct);
 
   if (shouldCycle) {
     console.log(
@@ -6851,7 +6900,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
 
       // Not connected — cycle undeploy→deploy when broker link is dead
       try {
-        await prepareAccountForConnect(token, existingId, { force: forceBrokerReset || true });
+        await prepareAccountForConnect(token, existingId, { force: forceBrokerReset });
       } catch (deployErr) {
         const msg = (deployErr as Error).message ?? "Deploy failed";
         const isBilling = msg.toLowerCase().includes("top up") || msg.toLowerCase().includes("forbidden");
@@ -7081,7 +7130,7 @@ router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, re
     if (acct.state === "UNDEPLOYED") {
       console.log(`[status] account ${accountId} is UNDEPLOYED — re-triggering deploy`);
       try {
-        await prepareAccountForConnect(token, accountId);
+        await deployAccount(token, accountId);
         return res.json({ connectionStatus: "DEPLOYING", state: "DEPLOYING" });
       } catch (deployErr) {
         const msg = (deployErr as Error).message ?? "Deploy failed";
@@ -7095,17 +7144,27 @@ router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, re
       }
     }
 
-    // Stuck DEPLOYING/CONNECTING — re-kick deploy periodically (sync-recovery undeploy, broker drop).
+    // DEPLOYING/CONNECTING: let MetaAPI finish — do NOT undeploy here (client polls every 5s;
+    // force-undeploy every 90s was the root cause of permanent connect timeouts today).
+    // Only gentle redeploy when DEPLOYED but broker DISCONNECTED, and at most every 3 min.
     const lastKick = deployKickAt.get(accountId) ?? 0;
-    if (Date.now() - lastKick >= DEPLOY_KICK_INTERVAL_MS) {
+    if (
+      Date.now() - lastKick >= STUCK_REDEPLOY_MS
+      && acct.state === "DEPLOYED"
+      && acct.connectionStatus === "DISCONNECTED"
+    ) {
       deployKickAt.set(accountId, Date.now());
-      console.log(`[status] ${accountId} stuck at ${acct.connectionStatus}/${acct.state} — re-kicking deploy`);
-      await prepareAccountForConnect(token, accountId, { force: true }).catch((e: Error) =>
-        console.warn(`[status] deploy re-kick failed for ${accountId}:`, e.message),
+      console.log(`[status] ${accountId} DEPLOYED/DISCONNECTED — gentle redeploy`);
+      await deployAccount(token, accountId).catch((e: Error) =>
+        console.warn(`[status] gentle redeploy failed for ${accountId}:`, e.message),
       );
     }
 
-    return res.json({ connectionStatus: acct.connectionStatus ?? "DEPLOYING", state: acct.state });
+    return res.json({
+      connectionStatus: acct.connectionStatus ?? "DEPLOYING",
+      state: acct.state,
+      region: normalizeRegion(acct.region) || region,
+    });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Status check failed" });
   }
@@ -7359,7 +7418,11 @@ router.get("/mt5/account/:accountId/candles", checkOwner, (req: Request, res: Re
 router.get("/mt5/account/:accountId/price", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
-    const region = qstr(req.query.region) || DEFAULT_REGION;
+    const accountId = String(req.params.accountId);
+    const region = qstr(req.query.region)
+      || activeRegions.get(accountId)
+      || knownAccounts.get(accountId)?.region
+      || DEFAULT_REGION;
     const priceRes = await fetch(
       `${clientBase(region)}/users/current/accounts/${req.params.accountId}/symbols/XAUUSD/current-price`,
       { headers: authHeaders(token) }
@@ -7367,7 +7430,7 @@ router.get("/mt5/account/:accountId/price", checkOwner, async (req: Request, res
     if (!priceRes.ok) return res.status(priceRes.status).json({ error: "Price fetch failed" });
     const priceData = await priceRes.json() as { bid?: number; ask?: number };
     // Accumulate tick for chart history
-    if (priceData.bid && priceData.ask) storeTick(req.params.accountId as string, priceData.bid, priceData.ask);
+    if (priceData.bid && priceData.ask) storeTick(accountId, priceData.bid, priceData.ask);
     return res.json(priceData);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
