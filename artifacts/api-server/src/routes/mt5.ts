@@ -849,6 +849,10 @@ function broadcastZoneUpdate(zoneId: string): void {
       tp1Hit: merged.tp1Hit, tp2Hit: merged.tp2Hit, tp3Hit: merged.tp3Hit, tp4Hit: merged.tp4Hit,
       tp4Price,
     });
+    const trackedPositionIds = (await db.select({ positionId: zonePositionsTable.positionId })
+      .from(zonePositionsTable)
+      .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN"))))
+      .map((r) => r.positionId);
     const dir = (dbRow?.direction ?? st?.direction ?? "buy") as "buy" | "sell";
     const anchor = Number(dbRow?.anchorPrice ?? st?.anchorPrice ?? 0);
     const tp1Price = dbRow?.tp1Price != null ? Number(dbRow.tp1Price) : st?.tp1Price ?? null;
@@ -879,6 +883,7 @@ function broadcastZoneUpdate(zoneId: string): void {
       enabledTpCount,
       hitEnabledTpCount,
       positionCount: merged.positionCount,
+      trackedPositionIds,
       tp2SlIsBestEffort: (dbRow as { tp2SlIsBestEffort?: boolean } | undefined)?.tp2SlIsBestEffort
         ?? (st as { tp2SlIsBestEffort?: boolean } | undefined)?.tp2SlIsBestEffort ?? false,
       manualClose: (dbRow as { manualClose?: boolean } | undefined)?.manualClose ?? false,
@@ -3812,7 +3817,8 @@ async function reopenClosedZoneIfBrokerLegsRemain(
   st: ZoneState,
 ): Promise<boolean> {
   if (st.status !== "CLOSED") return false;
-  const brokerOpen = await brokerHasOpenLegsForZone(token, region, accountId, zoneId);
+  const trackedIds = await loadZoneTrackedPositionIds(zoneId);
+  const brokerOpen = await brokerHasOpenLegsForZone(token, region, accountId, zoneId, { trackedIds });
   if (!brokerOpen) return false;
   await db.update(cascadeZonesTable)
     .set({ status: "OPEN", closedAt: null, manualClose: false })
@@ -3918,7 +3924,11 @@ async function markZonePositionClosed(
       .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
     );
     if (openInZone.length === 0) {
-      const brokerStillOpen = await zoneHasLiveTrackedPositionsOnBroker(token, region, accountId, zoneId);
+      const trackedIds = await loadZoneTrackedPositionIds(zoneId);
+      for (const id of st?.trackedPositions.keys() ?? []) trackedIds.add(id);
+      const brokerStillOpen = await zoneHasLiveTrackedPositionsOnBroker(
+        token, region, accountId, zoneId, { fresh: true }, trackedIds,
+      );
       if (brokerStillOpen) {
         console.log(`[markClosed] zone ${zoneId} DB empty but broker still has open legs — zone stays active`);
         broadcastZoneUpdate(zoneId);
@@ -4453,9 +4463,9 @@ async function fetchLivePendingOrdersUncached(
 /** Any open position or pending cascade order on the broker tagged for this zone. */
 export async function brokerHasOpenLegsForZone(
   token: string, region: string, accountId: string, zoneId: string,
-  opts?: { fresh?: boolean },
+  opts?: { fresh?: boolean; trackedIds?: Set<string> },
 ): Promise<boolean> {
-  return zoneHasLiveTrackedPositionsOnBroker(token, region, accountId, zoneId, opts);
+  return zoneHasLiveTrackedPositionsOnBroker(token, region, accountId, zoneId, opts, opts?.trackedIds);
 }
 
 function zoneHasPendingLimitsInSnapshot(
@@ -4479,13 +4489,39 @@ async function zoneHasLivePendingCascadeLimits(
   return zoneHasPendingLimitsInSnapshot(accountId, zoneId, liveOrders);
 }
 
+/** True when any live broker position id is tracked OPEN in zone_positions (MT5 one-click anchors). */
+export function zoneHasTrackedLegsInSnapshot(
+  trackedIds: Iterable<string>,
+  live: Array<{ id: string }>,
+): boolean {
+  const ids = trackedIds instanceof Set ? trackedIds : new Set(trackedIds);
+  if (ids.size === 0) return false;
+  return live.some((p) => ids.has(String(p.id)));
+}
+
+/** All position ids ever linked to this zone (OPEN + CLOSED) — for broker reconcile during risk-free races. */
+async function loadZoneTrackedPositionIds(
+  zoneId: string,
+  opts?: { openOnly?: boolean },
+): Promise<Set<string>> {
+  const where = opts?.openOnly
+    ? and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN"))
+    : eq(zonePositionsTable.zoneId, zoneId);
+  const rows = await db.select({ positionId: zonePositionsTable.positionId })
+    .from(zonePositionsTable)
+    .where(where);
+  return new Set(rows.map((r) => r.positionId));
+}
+
 function zoneHasLegsInSnapshot(
   accountId: string,
   zoneId: string,
   live: LivePosition[],
   orders: Array<{ id: string; comment?: string; magic?: number }>,
+  trackedIds?: Set<string>,
 ): boolean {
   if (live.some((p) => positionBelongsToZone(p, zoneId))) return true;
+  if (trackedIds && zoneHasTrackedLegsInSnapshot(trackedIds, live)) return true;
   const expectedMagic = zoneMagicNumber(zoneId);
   return orders.some((o) => {
     if (getZoneLimitOrder(accountId, o.id) === zoneId) return true;
@@ -4497,9 +4533,10 @@ function zoneHasLegsInSnapshot(
 async function zoneHasLiveTrackedPositionsOnBroker(
   token: string, region: string, accountId: string, zoneId: string,
   opts?: { fresh?: boolean },
+  trackedIds?: Set<string>,
 ): Promise<boolean> {
   const snap = await getBrokerSnapshot(token, region, accountId, opts);
-  return zoneHasLegsInSnapshot(accountId, zoneId, snap.positions, snap.orders);
+  return zoneHasLegsInSnapshot(accountId, zoneId, snap.positions, snap.orders, trackedIds);
 }
 
 /** Close zone when MT5 has no open legs or pending limits for it (manual MT5 close, etc.). */
@@ -4514,7 +4551,11 @@ async function reconcileZoneFromBroker(
   if (!st || st.accountId !== accountId || st.status === "CLOSED") return;
   if (!syncReady.has(accountId)) return;
 
-  const stillOnBroker = await zoneHasLiveTrackedPositionsOnBroker(token, region, accountId, zoneId);
+  const trackedIds = await loadZoneTrackedPositionIds(zoneId);
+  for (const id of st.trackedPositions.keys()) trackedIds.add(id);
+  const stillOnBroker = await zoneHasLiveTrackedPositionsOnBroker(
+    token, region, accountId, zoneId, { fresh: true }, trackedIds,
+  );
   if (stillOnBroker) return;
 
   console.log(`[reconcile] ${zoneId} — no positions or orders in MT5, marking CLOSED`);
@@ -4746,13 +4787,15 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       console.warn(`[zone ${zoneId}] tracked-positions DB query failed, using in-memory cache (${trackedIds.size} ids): ${(e as Error).message}`);
     }
     const snap = opts?.brokerSnap;
+    const cachedTrackedIds = () => new Set([...trackedIds, ...st.trackedPositions.keys()]);
     if (zps.length === 0) {
       const pendingLeft = snap
         ? zoneHasPendingLimitsInSnapshot(st.accountId, zoneId, snap.orders)
         : await zoneHasLivePendingCascadeLimits(token, region, st.accountId, zoneId);
+      const trackedForBroker = cachedTrackedIds();
       const brokerLegs = snap
-        ? zoneHasLegsInSnapshot(st.accountId, zoneId, snap.positions, snap.orders)
-        : await brokerHasOpenLegsForZone(token, region, st.accountId, zoneId);
+        ? zoneHasLegsInSnapshot(st.accountId, zoneId, snap.positions, snap.orders, trackedForBroker)
+        : await brokerHasOpenLegsForZone(token, region, st.accountId, zoneId, { trackedIds: trackedForBroker });
       if (brokerLegs) {
         await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st);
         try {
@@ -4818,8 +4861,8 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
     let allLive = snap?.positions ?? await fetchOpenPositions(token, region, st.accountId);
     let live = mergeLiveZoneLegs(allLive, zoneId, trackedIds);
     const hasBrokerLegs = snap
-      ? zoneHasLegsInSnapshot(st.accountId, zoneId, snap.positions, snap.orders)
-      : await brokerHasOpenLegsForZone(token, region, st.accountId, zoneId);
+      ? zoneHasLegsInSnapshot(st.accountId, zoneId, snap.positions, snap.orders, trackedIds)
+      : await brokerHasOpenLegsForZone(token, region, st.accountId, zoneId, { trackedIds });
     const needsLegResolve =
       (live.length === 0 && hasBrokerLegs)
       || zoneLegsNeedFreshResolve(live, zoneId, trackedIds, allLive, zps.length);
@@ -4860,10 +4903,21 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
     // wrongly reconciled closed on every deployment/restart.
     if (live.length === 0 && !syncReady.has(st.accountId)) return;
     if (live.length === 0) {
+      // Batch snapshots can lag after limit cancel — fresh REST before we mark
+      // DB rows CLOSED or collapse the zone (MT5 one-click anchors lack tags).
+      const freshAll = await fetchOpenPositions(token, region, st.accountId, { fresh: true });
+      const freshLive = mergeLiveZoneLegs(freshAll, zoneId, trackedIds);
+      if (freshLive.length > 0) {
+        allLive = freshAll;
+        live = freshLive;
+      }
+    }
+    if (live.length === 0) {
       // Reconciliation: all tracked positions are gone (possibly closed during
       // a server restart — DEAL_ENTRY_OUT events from that window are lost
       // because the streaming connection starts from `new Date()`). Mark each
       // missing row CLOSED, then close the zone.
+      allLive = await fetchOpenPositions(token, region, st.accountId, { fresh: true });
       const allLiveIds = new Set(allLive.map(p => p.id));
       for (const zp of zps) {
         if (!allLiveIds.has(zp.positionId)) {
@@ -4886,9 +4940,14 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         const pendingLeft = snap
           ? zoneHasPendingLimitsInSnapshot(st.accountId, zoneId, snap.orders)
           : await zoneHasLivePendingCascadeLimits(token, region, st.accountId, zoneId);
+        const allTrackedIds = await loadZoneTrackedPositionIds(zoneId);
+        for (const id of trackedIds) allTrackedIds.add(id);
+        for (const id of st.trackedPositions.keys()) allTrackedIds.add(id);
         const brokerStillOpen = snap
-          ? zoneHasLegsInSnapshot(st.accountId, zoneId, snap.positions, snap.orders)
-          : await zoneHasLiveTrackedPositionsOnBroker(token, region, st.accountId, zoneId);
+          ? zoneHasLegsInSnapshot(st.accountId, zoneId, snap.positions, snap.orders, allTrackedIds)
+          : await zoneHasLiveTrackedPositionsOnBroker(
+            token, region, st.accountId, zoneId, { fresh: true }, allTrackedIds,
+          );
         if (brokerStillOpen) {
           console.log(`[zone ${zoneId}] reconcile: broker still has open legs — zone stays active`);
           return;
@@ -5168,7 +5227,10 @@ export function startZoneTpMonitor(): void {
           try {
             const snap = await getBrokerSnapshot(token, region, accountId);
             for (const zoneId of zoneIds) {
-              if (zoneHasLegsInSnapshot(accountId, zoneId, snap.positions, snap.orders)) continue;
+              const trackedIds = await loadZoneTrackedPositionIds(zoneId);
+              const st = zoneStates.get(zoneId);
+              if (st) for (const id of st.trackedPositions.keys()) trackedIds.add(id);
+              if (zoneHasLegsInSnapshot(accountId, zoneId, snap.positions, snap.orders, trackedIds)) continue;
               await reconcileZoneFromBroker(accountId, zoneId, token, region, "periodic_reconcile");
             }
           } catch (err) {
@@ -6176,62 +6238,72 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       res.status(409).json({ error: "Zone not active yet — wait for the first order to fill" });
       return;
     }
-    const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
-    if (live.length === 0) {
-      res.status(409).json({ error: "No open positions in this zone" }); return;
+    st.busy = true;
+    try {
+      const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+      if (live.length === 0) {
+        res.status(409).json({ error: "No open positions in this zone" }); return;
+      }
+      const sorted = [...live].sort((a, b) =>
+        st.direction === "buy"
+          ? a.openPrice - b.openPrice
+          : b.openPrice - a.openPrice,
+      );
+      const best = sorted[0]!;
+      const others = sorted.slice(1);
+      const closeResults = await Promise.all(
+        others.map(async (p) => {
+          try {
+            return { id: p.id, ok: await closeZonePosition(token, region, accountId, p.id) };
+          } catch (e) {
+            console.warn(`[zone ${zoneId}] risk-free close threw for posId=${p.id}:`, (e as Error).message);
+            return { id: p.id, ok: false };
+          }
+        }),
+      );
+      const failed: string[] = closeResults.filter((r) => !r.ok).map((r) => r.id);
+      const body = (req.body ?? {}) as { riskFreePips?: unknown };
+      const pips = body.riskFreePips !== undefined
+        ? sanitizeRiskFreePips(body.riskFreePips)
+        : (st.riskFreeOffset ?? ZONE_RISK_FREE_PIPS);
+      const sl = computeRiskFreeSl(st.direction, best.openPrice, pips);
+      const slOk = await modifyZonePositionSl(token, region, accountId, best.id, sl);
+      if (failed.length > 0 || !slOk) {
+        console.warn(`[zone ${zoneId}] risk-free partial: failedCloses=${failed.length} slOk=${slOk}`);
+        res.status(207).json({
+          ok: false,
+          bestPositionId: best.id,
+          sl, slOk,
+          closedCount: others.length - failed.length,
+          failedPositionIds: failed,
+          message: "Some operations failed. Retry to clear remaining issues.",
+        });
+        return;
+      }
+      for (const r of closeResults) {
+        if (!r.ok) continue;
+        await db.update(zonePositionsTable)
+          .set({ status: "CLOSED" })
+          .where(and(
+            eq(zonePositionsTable.zoneId, zoneId),
+            eq(zonePositionsTable.positionId, r.id),
+          ))
+          .catch((e: Error) => console.warn(`[zone ${zoneId}] risk-free mark closed ${r.id}:`, e.message));
+        st.trackedPositions.delete(r.id);
+      }
+      await cancelZoneLimits(token, region, accountId, zoneId);
+      await db.update(cascadeZonesTable)
+        .set({ status: "RISK_FREE", wentRiskFree: true, riskFreeOffset: pips })
+        .where(eq(cascadeZonesTable.zoneId, zoneId));
+      st.status = "RISK_FREE";
+      st.riskFreeOffset = pips;
+      broadcastZoneUpdate(zoneId);
+      broadcastToAccount(accountId, "deal", { type: "position_changed" });
+      console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl} (pips=${pips})`);
+      res.json({ ok: true, bestPositionId: best.id, sl, pips, closedCount: others.length });
+    } finally {
+      st.busy = false;
     }
-    const sorted = [...live].sort((a, b) =>
-      st.direction === "buy"
-        ? a.openPrice - b.openPrice
-        : b.openPrice - a.openPrice,
-    );
-    const best = sorted[0]!;
-    const others = sorted.slice(1);
-    const closeResults = await Promise.all(
-      others.map(async (p) => {
-        try {
-          return { id: p.id, ok: await closeZonePosition(token, region, accountId, p.id) };
-        } catch (e) {
-          console.warn(`[zone ${zoneId}] risk-free close threw for posId=${p.id}:`, (e as Error).message);
-          return { id: p.id, ok: false };
-        }
-      }),
-    );
-    const failed: string[] = closeResults.filter((r) => !r.ok).map((r) => r.id);
-    const body = (req.body ?? {}) as { riskFreePips?: unknown };
-    const pips = body.riskFreePips !== undefined
-      ? sanitizeRiskFreePips(body.riskFreePips)
-      : (st.riskFreeOffset ?? ZONE_RISK_FREE_PIPS);
-    const sl = computeRiskFreeSl(st.direction, best.openPrice, pips);
-    const slOk = await modifyZonePositionSl(token, region, accountId, best.id, sl);
-    if (failed.length > 0 || !slOk) {
-      console.warn(`[zone ${zoneId}] risk-free partial: failedCloses=${failed.length} slOk=${slOk}`);
-      res.status(207).json({
-        ok: false,
-        bestPositionId: best.id,
-        sl, slOk,
-        closedCount: others.length - failed.length,
-        failedPositionIds: failed,
-        message: "Some operations failed. Retry to clear remaining issues.",
-      });
-      return;
-    }
-    for (const r of closeResults) {
-      if (!r.ok) continue;
-      await db.update(zonePositionsTable)
-        .set({ status: "CLOSED" })
-        .where(and(
-          eq(zonePositionsTable.zoneId, zoneId),
-          eq(zonePositionsTable.positionId, r.id),
-        ))
-        .catch((e: Error) => console.warn(`[zone ${zoneId}] risk-free mark closed ${r.id}:`, e.message));
-      st.trackedPositions.delete(r.id);
-    }
-    await cancelZoneLimits(token, region, accountId, zoneId);
-    broadcastZoneUpdate(zoneId);
-    broadcastToAccount(accountId, "deal", { type: "position_changed" });
-    console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl} (pips=${pips})`);
-    res.json({ ok: true, bestPositionId: best.id, sl, pips, closedCount: others.length });
   } catch (err) {
     respondZoneActionError(res, "risk-free", err);
   }

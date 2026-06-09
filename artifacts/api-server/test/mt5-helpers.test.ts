@@ -50,6 +50,7 @@ import {
   orderIdsForZone,
   deleteZoneLimitOrder,
   mergeLiveZoneLegs,
+  zoneHasTrackedLegsInSnapshot,
   zoneLegsNeedFreshResolve,
   legNeedsTpSlice,
   computeNextTakeTpLevel,
@@ -1024,6 +1025,41 @@ describe("mergeLiveZoneLegs / zoneLegsNeedFreshResolve", () => {
     const tracked = new Set([anchorId, limitId]);
     const live = mergeLiveZoneLegs([anchor, limit], zoneId, tracked);
     expect(zoneLegsNeedFreshResolve(live, zoneId, tracked, [anchor, limit], 2)).toBe(false);
+  });
+});
+
+describe("zoneHasTrackedLegsInSnapshot", () => {
+  it("matches MT5 one-click anchor by raw position id without comment tag", () => {
+    const tracked = new Set(["88123"]);
+    const live = [{ id: "88123", comment: "", openPrice: 2400 }];
+    expect(zoneHasTrackedLegsInSnapshot(tracked, live)).toBe(true);
+  });
+
+  it("returns false when tracked ids are absent from broker snapshot", () => {
+    expect(zoneHasTrackedLegsInSnapshot(new Set(["88123"]), [{ id: "99999" }])).toBe(false);
+    expect(zoneHasTrackedLegsInSnapshot(new Set(), [{ id: "88123" }])).toBe(false);
+  });
+
+  it("finds risk-free survivor when tracked set still includes closed leg ids", () => {
+    // Risk-free closes losing legs; broker reconcile must match survivor by id even
+    // without comment tags — all historical zone_positions ids are checked.
+    const allTracked = new Set(["99001", "99002", "99003"]);
+    const live = [{ id: "99001", comment: "" }];
+    expect(zoneHasTrackedLegsInSnapshot(allTracked, live)).toBe(true);
+  });
+});
+
+describe("risk-free one-click mergeLiveZoneLegs", () => {
+  const zoneId = "z_rf_oc";
+
+  it("links untagged survivor to zone via tracked id only", () => {
+    const tracked = new Set(["88123"]);
+    const allLive = [{
+      id: "88123", comment: "", openPrice: 2400, volume: 0.01, symbol: "XAUUSD",
+    }];
+    const merged = mergeLiveZoneLegs(allLive, zoneId, tracked);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.id).toBe("88123");
   });
 });
 

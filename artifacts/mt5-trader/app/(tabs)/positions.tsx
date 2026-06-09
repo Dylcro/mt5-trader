@@ -363,10 +363,10 @@ export default function PositionsScreen() {
   const handleCancelZoneOrders = useCallback(
     async (zoneId: string) => {
       const result = await cancelZoneOrders(zoneId);
-      void refreshPendingOrders();
+      void Promise.all([refreshPendingOrders(), refreshZones(), refreshPositions()]);
       return result;
     },
-    [cancelZoneOrders, refreshPendingOrders],
+    [cancelZoneOrders, refreshPendingOrders, refreshZones, refreshPositions],
   );
 
   const handleCloseZone = useCallback(
@@ -408,6 +408,13 @@ export default function PositionsScreen() {
     if (!accountId) return;
     return subscribeAccountEvents(accountId, (type, data) => {
       if (type === "pending_order") void refreshPendingOrders();
+      if (type === "zone_update") {
+        const u = data as { status?: string };
+        if (u.status === "CLOSED") {
+          void Promise.all([refreshZones(), refreshPositions(), refreshPendingOrders()]);
+        }
+      }
+      if (type === "deal") void Promise.all([refreshZones(), refreshPositions()]);
       if (type === "runner_alert") {
         const d = data as {
           zoneId?: string;
@@ -429,7 +436,7 @@ export default function PositionsScreen() {
         }
       }
     });
-  }, [accountId, refreshPendingOrders]);
+  }, [accountId, refreshPendingOrders, refreshZones, refreshPositions]);
 
   // Light poll while focused — refresh fetches only, no session wake pings.
   useFocusEffect(

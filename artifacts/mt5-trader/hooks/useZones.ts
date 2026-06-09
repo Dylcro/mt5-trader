@@ -231,7 +231,11 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
           if (existing) {
             return prev.map((z) => {
               if (z.zoneId !== update.zoneId) return z;
-              return enrichZoneDisplayFields(withLatchedHits({ ...z, ...update }, hitLatch.current));
+              return enrichZoneDisplayFields(withLatchedHits({
+                ...z,
+                ...update,
+                trackedPositionIds: update.trackedPositionIds ?? z.trackedPositionIds,
+              }, hitLatch.current));
             });
           }
           return [...prev, enrichZoneDisplayFields(withLatchedHits(update as Zone, hitLatch.current))];
