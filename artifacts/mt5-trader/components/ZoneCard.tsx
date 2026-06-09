@@ -1,3 +1,4 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Feather } from "@expo/vector-icons";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -20,6 +21,7 @@ import type { Zone } from "@/hooks/useZones";
 const C = Colors.dark;
 const TP_BUFFER = 5.0;
 const LOT_STEP = 0.01;
+const limitsDeletedKey = (zoneId: string) => `zone_limits_deleted_${zoneId}`;
 
 function btnPressed(pressed: boolean) {
   return pressed ? { opacity: 0.72, transform: [{ scale: 0.97 }] } : null;
@@ -342,7 +344,15 @@ export default function ZoneCard({
   const [showRunnerPanel, setShowRunnerPanel] = useState(false);
   const [showEditRunners, setShowEditRunners] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [limitsDeleted, setLimitsDeleted] = useState(false);
   const flashAnim = useRef(new Animated.Value(flash ? 1 : 0)).current;
+  const riskFreeDone = zone.status === "RISK_FREE";
+
+  useEffect(() => {
+    void AsyncStorage.getItem(limitsDeletedKey(zone.zoneId)).then((v) => {
+      if (v === "true") setLimitsDeleted(true);
+    });
+  }, [zone.zoneId]);
 
   useEffect(() => {
     if (!flash) return;
@@ -407,16 +417,32 @@ export default function ZoneCard({
   );
 
   const canRiskFree =
-    !historical && (zone.status === "OPEN" || zone.status === "RISK_FREE") && zone.positionCount >= 1 && !!onRiskFree;
+    !historical && zone.status === "OPEN" && zone.positionCount >= 1 && !!onRiskFree && !riskFreeDone;
   const showCloseAllWorst = !historical && zone.status !== "CLOSED" && zone.status !== "ARMED" && !!onCloseAllWorst;
   const canCloseAllWorst = showCloseAllWorst && zone.positionCount >= 2;
   const canCloseZone = !historical && zone.status !== "CLOSED" && zone.positionCount >= 1 && !!onCloseZone;
-  const canCancelOrders = !historical && zone.status !== "CLOSED" && !!onCancelOrders;
+  const canCancelOrders = !historical && zone.status !== "CLOSED" && !!onCancelOrders && !limitsDeleted;
+  const tpLevels = useMemo(() => {
+    const rows: { key: string; label: string; price: number; hit: boolean }[] = [];
+    if (zone.tp1Enabled !== false && zone.tp1Price != null) {
+      rows.push({ key: "tp1", label: "TP1", price: zone.tp1Price, hit: Boolean(zone.tp1Hit) });
+    }
+    if (zone.tp2Enabled !== false && zone.tp2Price != null) {
+      rows.push({ key: "tp2", label: "TP2", price: zone.tp2Price, hit: Boolean(zone.tp2Hit) });
+    }
+    if (zone.tp3Enabled !== false && zone.tp3Price != null) {
+      rows.push({ key: "tp3", label: "TP3", price: zone.tp3Price, hit: Boolean(zone.tp3Hit) });
+    }
+    return rows;
+  }, [zone]);
   const runnerPanelOpen =
     !historical && showRunnerPanel && zone.tp3Hit && !runnerActive && zone.status !== "CLOSED";
   const editRunnerPanelOpen = !historical && showEditRunners && runnerActive && zone.status !== "CLOSED";
   const hasUnhitRunners = runners.some((r) => !r.hit);
-  const showMenuBtn = !runnerPanelOpen && !editRunnerPanelOpen && (canRiskFree || showCloseAllWorst || canCancelOrders);
+  const showMenuBtn = !runnerPanelOpen && !editRunnerPanelOpen && (
+    canRiskFree || showCloseAllWorst || canCancelOrders
+  );
+  const showActionTicks = !historical && (riskFreeDone || limitsDeleted);
   const runnerInitialTargets = {
     r1: zone.runner1Price != null && zone.runner1Lots != null
       ? { price: zone.runner1Price, lots: zone.runner1Lots } : undefined,
@@ -519,6 +545,39 @@ export default function ZoneCard({
           </View>
         </View>
       </View>
+
+      {tpLevels.length > 0 && !historical && (
+        <View style={styles.tpLevelsRow}>
+          {tpLevels.map((tp, i) => (
+            <React.Fragment key={tp.key}>
+              {i > 0 && <Text style={styles.tpLevelsSep}>·</Text>}
+              <View style={styles.tpLevelItem}>
+                <Text style={[styles.tpLevelLabel, tp.hit && styles.tpLevelLabelHit]}>{tp.label}</Text>
+                <Text style={[styles.tpLevelPrice, tp.hit && styles.tpLevelPriceHit]}>
+                  {formatPrice(tp.price)}
+                </Text>
+              </View>
+            </React.Fragment>
+          ))}
+        </View>
+      )}
+
+      {showActionTicks && (
+        <View style={styles.actionTicksRow}>
+          {riskFreeDone && (
+            <View style={styles.actionTick}>
+              <Feather name="check-circle" size={14} color={C.success} />
+              <Text style={styles.actionTickText}>Risk Free</Text>
+            </View>
+          )}
+          {limitsDeleted && (
+            <View style={styles.actionTick}>
+              <Feather name="check-circle" size={14} color={C.success} />
+              <Text style={styles.actionTickText}>Limits deleted</Text>
+            </View>
+          )}
+        </View>
+      )}
 
       {(showTp3Notif || runnerNotif) && (
         <View style={styles.notifBar}>
@@ -681,7 +740,12 @@ export default function ZoneCard({
                     await triggerAppHaptic(hapticEnabled, "light");
                     const result = await onCancelOrders(zone.zoneId);
                     setDelBusy(false);
-                    if (!result.ok) Alert.alert("Delete limits failed", result.message ?? "Try again");
+                    if (result.ok) {
+                      setLimitsDeleted(true);
+                      void AsyncStorage.setItem(limitsDeletedKey(zone.zoneId), "true");
+                    } else {
+                      Alert.alert("Delete limits failed", result.message ?? "Try again");
+                    }
                   }}
                   disabled={actionBusy}
                 >
@@ -917,6 +981,64 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.08,
     shadowRadius: 8,
     elevation: 4,
+  },
+  tpLevelsRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: 6,
+    paddingVertical: 4,
+    paddingHorizontal: 2,
+  },
+  tpLevelsSep: {
+    fontSize: 12,
+    color: C.specMuted,
+    fontFamily: "Inter_500Medium",
+  },
+  tpLevelItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+  },
+  tpLevelLabel: {
+    fontSize: 11,
+    fontFamily: "Inter_700Bold",
+    color: C.specMuted,
+    letterSpacing: 0.3,
+  },
+  tpLevelLabelHit: {
+    color: C.specGold,
+  },
+  tpLevelPrice: {
+    fontSize: 12,
+    fontFamily: "Inter_600SemiBold",
+    color: C.specText,
+  },
+  tpLevelPriceHit: {
+    color: C.specGold,
+    textDecorationLine: "line-through",
+    opacity: 0.75,
+  },
+  actionTicksRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 10,
+  },
+  actionTick: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    backgroundColor: "rgba(5,150,105,0.08)",
+    borderRadius: 100,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderWidth: 1,
+    borderColor: "rgba(5,150,105,0.2)",
+  },
+  actionTickText: {
+    fontSize: 11,
+    fontFamily: "Inter_600SemiBold",
+    color: C.success,
   },
   menuItem: {
     paddingVertical: 12,
