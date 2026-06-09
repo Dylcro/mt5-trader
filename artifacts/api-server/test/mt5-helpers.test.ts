@@ -1347,6 +1347,7 @@ describe("MetaAPI connect provisioning guards", () => {
 
   it("undeploys only for dead broker link or deploy failure", () => {
     expect(shouldUndeployBeforeDeploy({ state: "DEPLOYED", connectionStatus: "DISCONNECTED" })).toBe(true);
+    expect(shouldUndeployBeforeDeploy({ state: "DEPLOYED", connectionStatus: "DISCONNECTED_FROM_BROKER" })).toBe(true);
     expect(shouldUndeployBeforeDeploy({ state: "DEPLOY_FAILED", connectionStatus: "DISCONNECTED" })).toBe(true);
     expect(shouldUndeployBeforeDeploy({ state: "DEPLOYED", connectionStatus: "CONNECTED" })).toBe(false);
   });

@@ -66,7 +66,7 @@ function TabChrome({
   const onConnectMT5 = useCallback(
     async (creds: { login: string; password: string; server: string }) => {
       await connect(creds);
-      const deadline = Date.now() + 120_000;
+      const deadline = Date.now() + 300_000;
       while (Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 400));
         const s = statusRef.current;
@@ -289,7 +289,7 @@ function OnboardingOnly({ onComplete }: { onComplete: () => void }) {
   const onConnectMT5 = useCallback(
     async (creds: { login: string; password: string; server: string }) => {
       await connect(creds);
-      const deadline = Date.now() + 120_000;
+      const deadline = Date.now() + 300_000;
       while (Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 400));
         const s = statusRef.current;

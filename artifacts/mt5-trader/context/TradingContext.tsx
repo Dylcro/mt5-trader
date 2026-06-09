@@ -381,6 +381,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   // Poll /status until CONNECTED, then finalise the session
   const pollUntilConnected = useCallback(async (accId: string, accRegion: string, maxWaitMs = 300_000) => {
     const deadline = Date.now() + maxWaitMs;
+    let lastHint = "";
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 5000));
       try {
@@ -392,10 +393,17 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         const d = await safeJson<{
           connectionStatus?: string;
           error?: string;
+          hint?: string;
+          metaApiMessage?: string;
+          metaApiError?: string;
+          server?: string;
           accountId?: string;
           region?: string;
         } & Partial<AccountInfo>>(r);
         if (!r.ok && d.error) throw new Error(d.error);
+        if (d.hint || d.metaApiMessage || d.metaApiError) {
+          lastHint = d.hint ?? d.metaApiMessage ?? d.metaApiError ?? lastHint;
+        }
         if (d.connectionStatus === "CONNECTED") {
           const finalRegion = d.region ?? accRegion;
           setAccountIdState(accId);
@@ -419,7 +427,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         throw err;
       }
     }
-    throw new Error("Connection timed out. Please try again.");
+    throw new Error(
+      lastHint
+        ? `Connection timed out — ${lastHint}`
+        : "Connection timed out. Check your MT5 server name matches exactly (e.g. VantageInternational-Live 6) and try again.",
+    );
   }, []);
 
   const reconnectSaved = async (savedId: string) => {
@@ -457,9 +469,10 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
       // 404 = account deleted on MetaAPI side — must re-register
       if (res.status === 404) {
+        try { await authFetch(`${API_BASE}/mt5/unlink`, { method: "POST" }); } catch {}
         setStatus("disconnected");
         setAccountIdState("");
-        await AsyncStorage.removeItem("mt5_account_id");
+        await AsyncStorage.removeMany(["mt5_account_id", "mt5_region"]);
         return;
       }
       // 403 = stored account no longer linked to this user — need fresh credentials
@@ -986,6 +999,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         let res: Response | null = null;
         let data: ({
           status?: string; error?: string; accountId?: string; region?: string; retryAfterMs?: number;
+          diagnostic?: { hint?: string; server?: string; login?: string; connectionStatus?: string };
         } & Partial<AccountInfo>) | null = null;
         // Retry up to 8 times — autoscale cold-starts can take 20-30 s before serving JSON
         for (let attempt = 1; attempt <= 8; attempt++) {
@@ -1002,6 +1016,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
             }, 90_000);
             data = await safeJson<{
               status?: string; error?: string; accountId?: string; region?: string; retryAfterMs?: number;
+              diagnostic?: { hint?: string; server?: string; login?: string; connectionStatus?: string };
             } & Partial<AccountInfo>>(res);
             break; // success
           } catch (err) {
@@ -1051,6 +1066,10 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           return;
         }
 
+        if (data.diagnostic?.hint) {
+          setErrorMsg(data.diagnostic.hint);
+        }
+
         // status === "deploying" — poll until CONNECTED
         await pollUntilConnected(accId, accRegion);
       } catch (err) {
@@ -1067,6 +1086,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       try {
         await authFetch(`${API_BASE}/mt5/account/${accountId}/disconnect`, { method: "POST" });
       } catch {}
+    } else {
+      try { await authFetch(`${API_BASE}/mt5/unlink`, { method: "POST" }); } catch {}
     }
     await AsyncStorage.removeMany(["mt5_account_id", "mt5_region"]);
     await clearMt5Password();
@@ -1091,19 +1112,23 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     try {
       let targetAccountId: string | null = null;
       let targetRegion = DEFAULT_REGION;
+      let serverChecked = false;
       try {
         const res = await authFetch(`${API_BASE}/mt5/my-account`);
+        serverChecked = true;
         if (res.ok) {
           const data = await safeJson<{ accountId?: string; region?: string }>(res);
           if (data.accountId) {
             targetAccountId = data.accountId;
             targetRegion = data.region ?? DEFAULT_REGION;
           }
+        } else if (res.status === 404) {
+          await AsyncStorage.removeMany(["mt5_account_id", "mt5_region"]);
         }
       } catch {}
 
-      // Fall back to AsyncStorage if server has no record yet
-      if (!targetAccountId) {
+      // Fall back to AsyncStorage only when the server lookup failed (not when it returned 404).
+      if (!targetAccountId && !serverChecked) {
         const record = await AsyncStorage.getMany(["mt5_account_id", "mt5_region"]);
         targetAccountId = record["mt5_account_id"] ?? null;
         targetRegion = record["mt5_region"] ?? DEFAULT_REGION;

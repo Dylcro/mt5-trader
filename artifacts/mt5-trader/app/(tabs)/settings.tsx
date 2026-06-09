@@ -600,7 +600,10 @@ export default function SettingsScreen() {
           {/* Sign Out */}
           <Pressable
             style={({ pressed }) => [styles.disconnectBtn, { borderColor: "#333", marginTop: 6 }, pressed && { opacity: 0.7 }]}
-            onPress={() => signOut()}
+            onPress={async () => {
+              await disconnect();
+              await signOut();
+            }}
           >
             <Feather name="log-out" size={16} color={C.textSecondary} />
             <Text style={[styles.disconnectText, { color: C.textSecondary }]}>Sign Out</Text>
