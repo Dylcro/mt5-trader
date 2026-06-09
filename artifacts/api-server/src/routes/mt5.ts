@@ -1188,13 +1188,44 @@ function handleStreamingTick(accountId: string, price: any): void {
   void processStreamingTickBatch(accountId);
 }
 
+function protectStreamListener(
+  label: string,
+  fn: (...args: unknown[]) => Promise<void>,
+): (...args: unknown[]) => Promise<void> {
+  return async (...args: unknown[]) => {
+    try {
+      await fn(...args);
+    } catch (err) {
+      console.error(`[${label}] stream protected:`, err);
+    }
+  };
+}
+
+async function closeEmptyZonesAfterPositionRemoved(accountId: string): Promise<void> {
+  let token: string;
+  try { token = getToken(); } catch { return; }
+  const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
+  invalidateBrokerSnapshot(accountId);
+  const live = await fetchOpenPositions(token, region, accountId, { fresh: true });
+  const pending = await fetchLivePendingOrders(token, region, accountId);
+  for (const [zoneId, st] of zoneStates.entries()) {
+    if (st.accountId !== accountId || st.status === "CLOSED") continue;
+    const remaining = live.filter((p) => positionBelongsToZone(p, zoneId));
+    const pendingForZone = pending.filter((o) => orderBelongsToZone(o, accountId, zoneId));
+    if (remaining.length === 0 && pendingForZone.length === 0) {
+      console.log(`[position-removed] ${zoneId} empty — closing`);
+      await reconcileZoneFromBroker(accountId, zoneId, token, region, "position_removed");
+    }
+  }
+}
+
 function makeDealListener(accountId: string) {
   // The MetaAPI SDK calls many methods on every registered listener and throws
   // if any of them is missing — aborting the entire synchronization packet.
   // Rather than enumerating every possible method name, we use a Proxy to
   // silently no-op any method the SDK calls that we haven't explicitly defined.
   const handler = {
-    async onDisconnected(_instanceIndex: string): Promise<void> {
+    onDisconnected: protectStreamListener("onDisconnected", async (_instanceIndex: string) => {
       syncReady.delete(accountId); // reset — next reconnect must re-sync before cascading
       syncReadyAt.delete(accountId);
       skipLogged.delete(accountId);
@@ -1220,19 +1251,19 @@ function makeDealListener(accountId: string) {
           // getToken() can throw if env var missing — watchdog will retry
         }
       }, 3_000);
-    },
+    }),
     // onDealsSynchronized fires after all historical deals have been replayed.
-    async onDealsSynchronized(_instanceIndex: string, _synchronizationId: string): Promise<void> {
+    onDealsSynchronized: protectStreamListener("onDealsSynchronized", async (_instanceIndex: string, _synchronizationId: string) => {
       lastEventAt.set(accountId, Date.now());
       markStreamSyncReady(accountId, "deals");
-    },
+    }),
     // Positions can finish syncing before deals — arm auto-cascade without waiting.
-    async onPositionsSynchronized(_instanceIndex: string, _synchronizationId: string): Promise<void> {
+    onPositionsSynchronized: protectStreamListener("onPositionsSynchronized", async (_instanceIndex: string, _synchronizationId: string) => {
       lastEventAt.set(accountId, Date.now());
       markStreamSyncReady(accountId, "positions");
-    },
+    }),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    async onDealAdded(_instanceIndex: string, deal: any): Promise<void> {
+    onDealAdded: protectStreamListener("onDealAdded", async (_instanceIndex: string, deal: any) => {
       lastEventAt.set(accountId, Date.now());
       // Zone cleanup: an exit deal may be a partial or full close — the helper
       // re-checks live positions via REST before marking the row CLOSED.
@@ -1329,58 +1360,64 @@ function makeDealListener(accountId: string) {
           console.error(`[auto-cascade] onDealAdded failed accountId=${accountId}:`, (err as Error).message),
         );
       }
-    },
+    }),
     // Streaming tick handlers — drive evaluateZone off real broker ticks so
     // TPs fire within ~100ms of the level being touched (vs the 3 s timer's
     // worst-case 3 s lag). MetaAPI calls one or the other depending on SDK
     // version: `onSymbolPriceUpdated` (singular) on older builds,
     // `onSymbolPricesUpdated` (plural, batched) on newer.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    async onSymbolPriceUpdated(_instanceIndex: string, price: any): Promise<void> {
+    onSymbolPriceUpdated: protectStreamListener("onSymbolPriceUpdated", async (_instanceIndex: string, price: any) => {
       handleStreamingTick(accountId, price);
-    },
+    }),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    async onSymbolPricesUpdated(_instanceIndex: string, prices: any[]): Promise<void> {
+    onSymbolPricesUpdated: protectStreamListener("onSymbolPricesUpdated", async (_instanceIndex: string, prices: any[]) => {
       if (!Array.isArray(prices)) return;
       for (const p of prices) handleStreamingTick(accountId, p);
-    },
+    }),
     // Pending-order lifecycle — broadcast so the client can update its list
     // without waiting for a deal event or the next poll cycle.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    async onPendingOrderAdded(_instanceIndex: string, _order: any): Promise<void> {
+    onPendingOrderAdded: protectStreamListener("onPendingOrderAdded", async (_instanceIndex: string, _order: any) => {
       lastEventAt.set(accountId, Date.now());
       broadcastToAccount(accountId, "pending_order", {});
-    },
+    }),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    async onPendingOrderUpdated(_instanceIndex: string, _order: any): Promise<void> {
+    onPendingOrderUpdated: protectStreamListener("onPendingOrderUpdated", async (_instanceIndex: string, _order: any) => {
       lastEventAt.set(accountId, Date.now());
       broadcastToAccount(accountId, "pending_order", {});
-    },
+    }),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    async onPendingOrderCompleted(_instanceIndex: string, order: any): Promise<void> {
+    onOrderCompleted: protectStreamListener("onOrderCompleted", async (_instanceIndex: string, order: any) => {
+      lastEventAt.set(accountId, Date.now());
+      const oid = String(order?.id ?? order?._id ?? "");
+      markOrderCompleted(accountId, oid);
+      broadcastToAccount(accountId, "pending_order", {});
+    }),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    onPendingOrderCompleted: protectStreamListener("onPendingOrderCompleted", async (_instanceIndex: string, order: any) => {
       lastEventAt.set(accountId, Date.now());
       // Mark the order completed so the /orders endpoint can filter it out of
       // the MetaAPI REST response immediately (MetaAPI REST can lag minutes).
       const oid = String(order?.id ?? order?._id ?? "");
       markOrderCompleted(accountId, oid);
       broadcastToAccount(accountId, "pending_order", {});
-    },
+    }),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    async onPositionRemoved(_instanceIndex: string, position: any): Promise<void> {
+    onPositionRemoved: protectStreamListener("onPositionRemoved", async (_instanceIndex: string, position: any) => {
       lastEventAt.set(accountId, Date.now());
       const posId = String(position?.id ?? position?.positionId ?? "");
       if (!posId) return;
       invalidateBrokerSnapshot(accountId);
       void markZonePositionClosed(accountId, posId, position);
+      await closeEmptyZonesAfterPositionRemoved(accountId);
       broadcastToAccount(accountId, "deal", { type: "position_changed" });
-    },
+    }),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    async onPositionAdded(_instanceIndex: string, position: any): Promise<void> {
+    onPositionAdded: protectStreamListener("onPositionAdded", async (_instanceIndex: string, position: any) => {
       lastEventAt.set(accountId, Date.now());
-      void triggerMt5OneClickAutoCascade(accountId, position).catch((err) =>
-        console.error(`[auto-cascade] onPositionAdded failed accountId=${accountId}:`, (err as Error).message),
-      );
-    },
+      await triggerMt5OneClickAutoCascade(accountId, position);
+    }),
   };
 
   // Proxy: any property access that isn't `onDealAdded` returns a silent no-op.
@@ -1388,7 +1425,7 @@ function makeDealListener(accountId: string) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     get(target: any, prop: string) {
       if (prop in target) return target[prop];
-      return () => Promise.resolve();
+      return protectStreamListener(prop, async () => {});
     },
   });
 }
@@ -1558,23 +1595,39 @@ async function startStreaming(token: string, accountId: string, region: string =
 export async function startAutoConnect(): Promise<void> {
   try {
     const token = getToken();
-    const rows = await db
-      .select()
-      .from(storedAccountsTable)
-      .where(isNotNull(storedAccountsTable.userId));
+    const sdk = getSdk(token);
+    const rows = await db.select().from(storedAccountsTable);
     if (rows.length === 0) {
-      console.log("[auto-connect] no stored accounts with bound users — waiting for first app connect");
+      console.log("[startup] no stored accounts — waiting for first app connect");
       return;
     }
-    // Seed the in-memory registry NOW, before any streaming starts.
-    // This guarantees the watchdog and safety-net always have a non-empty
-    // account list even if the DB becomes unavailable during the first tick.
-    for (const { accountId, userId, region } of rows) {
-      knownAccounts.set(accountId, { accountId, userId: userId ?? undefined, region });
-    }
-    for (const { accountId, region, userId } of rows) {
-      console.log(`[auto-connect] reconnecting accountId=${accountId} region=${region}`);
-      void startStreaming(token, accountId, region, userId ?? undefined);
+    for (const account of rows) {
+      try {
+        console.log(`[startup] restoring ${account.accountId}`);
+        const metaAccount = await sdk.metatraderAccountApi
+          .getAccount(account.accountId)
+          .catch(() => null);
+        if (!metaAccount) {
+          await db.delete(storedAccountsTable)
+            .where(eq(storedAccountsTable.accountId, account.accountId));
+          knownAccounts.delete(account.accountId);
+          continue;
+        }
+        const region = normalizeRegion(account.region);
+        if (account.userId) {
+          knownAccounts.set(account.accountId, {
+            accountId: account.accountId,
+            userId: account.userId,
+            region,
+          });
+        }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await (metaAccount as any).waitConnected(60000).catch(() => null);
+        void startStreaming(token, account.accountId, region, account.userId ?? undefined);
+        console.log(`[startup] restored ${account.accountId}`);
+      } catch (err) {
+        console.error(`[startup] failed to restore ${account.accountId}:`, err);
+      }
     }
   } catch (err) {
     console.error("[auto-connect] failed:", (err as Error).message);
@@ -2284,6 +2337,20 @@ export function positionBelongsToZone(
     if (Number.isFinite(magic) && magic === zoneMagicNumber(zoneId)) return true;
   }
   return false;
+}
+
+function orderBelongsToZone(
+  o: { id: string; comment?: string; magic?: number },
+  accountId: string,
+  zoneId: string,
+): boolean {
+  if (getZoneLimitOrder(accountId, o.id) === zoneId) return true;
+  if (o.magic != null && o.magic === zoneMagicNumber(zoneId)) return true;
+  return commentBelongsToZone(o.comment, zoneId);
+}
+
+function normalizeServer(s: string): string {
+  return s.toLowerCase().trim().replace(/\s+/g, "");
 }
 
 /** DB-tracked ∪ comment/magic-tagged legs — same union as resolveLivePositionsForZoneAction. */
@@ -6624,6 +6691,63 @@ router.get("/mt5/my-account", async (req: Request, res: Response) => {
   }
 });
 
+async function reconnectExistingAccount(
+  token: string,
+  accountId: string,
+  password: string | undefined,
+  region: string,
+  userId: string | undefined,
+  login?: string,
+  server?: string,
+): Promise<Record<string, unknown> | null> {
+  const acct = await getProvisioningAccount(token, accountId).catch(() => null);
+  if (!acct) return null;
+  const effRegion = normalizeRegion(acct.region) || region;
+  if (password) {
+    await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
+      method: "PUT",
+      headers: authHeaders(token),
+      body: JSON.stringify({
+        password,
+        ...(login ? { login } : {}),
+        ...(server ? { server } : {}),
+      }),
+    }).catch(() => {});
+  }
+  if (userId) {
+    await upsertStoredAccount({
+      accountId,
+      region: effRegion,
+      userId,
+      mt5Login: login ?? (acct.login != null ? String(acct.login) : null),
+      mt5Server: server ?? acct.server ?? null,
+    }).catch(() => {});
+    userAccountCache.set(userId, accountId);
+  }
+  void startStreaming(token, accountId, effRegion, userId);
+  if (acct.connectionStatus === "CONNECTED") {
+    try {
+      const info = await getAccountInfo(token, accountId, effRegion) as Record<string, unknown>;
+      return {
+        status: "connected",
+        accountId,
+        region: effRegion,
+        name: info.name ?? "Account",
+        balance: info.balance ?? 0,
+        equity: info.equity ?? 0,
+        margin: info.margin ?? 0,
+        freeMargin: info.freeMargin ?? 0,
+        currency: info.currency ?? "USD",
+        leverage: info.leverage ?? 100,
+      };
+    } catch {
+      return { status: "reconnecting", accountId, region: effRegion };
+    }
+  }
+  await deployAccount(token, accountId);
+  return { status: "reconnecting", accountId, region: effRegion };
+}
+
 // POST /api/mt5/connect
 // Body: { login, password, server } — provision and deploy (returns immediately, client polls /status)
 // Body: { accountId } — reconnect stored account
@@ -6758,68 +6882,63 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "login, password and server are required." });
     }
 
-    // Check if this login+server is already provisioned on MetaAPI
+    const loginStr = String(login).trim();
+    const serverStr = String(server).trim();
+
+    const respondReconnect = async (accountId: string, regionHint: string): Promise<boolean> => {
+      try {
+        const result = await reconnectExistingAccount(
+          token, accountId, password, regionHint, userId, loginStr, serverStr,
+        );
+        if (result) {
+          res.json(result);
+          return true;
+        }
+      } catch (deployErr) {
+        const msg = (deployErr as Error).message ?? "Deploy failed";
+        const isBilling = msg.toLowerCase().includes("top up") || msg.toLowerCase().includes("forbidden");
+        res.status(503).json({
+          error: isBilling
+            ? "Connection limit reached. Please contact support."
+            : msg,
+        });
+        return true;
+      }
+      return false;
+    };
+
+    // Hard guard — DB first: never create if user already has a stored account.
+    if (userId) {
+      const [dbExisting] = await db.select().from(storedAccountsTable)
+        .where(eq(storedAccountsTable.userId, userId))
+        .limit(1);
+      if (dbExisting) {
+        console.log(`[connect] reusing ${dbExisting.accountId}`);
+        if (await respondReconnect(dbExisting.accountId, dbExisting.region)) return;
+      }
+    }
+
+    // Check MetaAPI for matching account — never create duplicates.
     const listRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
       headers: authHeaders(token),
     });
     const allAccounts = listRes.ok ? (await listRes.json() as ProvisioningAccount[]) : [];
     console.log(`[connect] found ${Array.isArray(allAccounts) ? allAccounts.length : 0} existing accounts`);
 
-    const existing = Array.isArray(allAccounts)
-      ? allAccounts.find((a) => a.login === login && a.server === server)
+    const match = Array.isArray(allAccounts)
+      ? allAccounts.find((a) =>
+          String(a.login).trim() === loginStr
+          && normalizeServer(String(a.server ?? "")) === normalizeServer(serverStr))
       : undefined;
-    const foundId = existing?._id ?? existing?.id;
+    const matchId = match?._id ?? match?.id;
 
-    if (existing && foundId) {
-      // Reuse existing account — update password just in case
-      console.log(`[connect] reusing ${foundId} status=${existing.connectionStatus}`);
-      await fetch(`${PROVISIONING_BASE}/users/current/accounts/${foundId}`, {
-        method: "PUT",
-        headers: authHeaders(token),
-        body: JSON.stringify({ password }),
-      }).catch(() => {});
-
-      // Eagerly transfer DB ownership to the current user so checkOwner
-      // passes immediately on subsequent requests (startStreaming also does
-      // this, but it runs asynchronously after this response returns).
-      const region = normalizeRegion(existing.region);
-      if (userId) {
-        await upsertStoredAccount({
-          accountId: foundId,
-          region,
-          userId,
-          mt5Login: login,
-          mt5Server: server,
-        }).catch((e: Error) => console.warn(`[connect] eager ownership transfer failed:`, e.message));
-        userAccountCache.set(userId, foundId);
-      }
-
-      if (existing.connectionStatus === "CONNECTED") {
-        try {
-          const info = await getAccountInfo(token, foundId, region) as Record<string, unknown>;
-          return res.json({
-            status: "connected",
-            accountId: foundId,
-            region,
-            name: info.name ?? "Account",
-            balance: info.balance ?? 0,
-            equity: info.equity ?? 0,
-            margin: info.margin ?? 0,
-            freeMargin: info.freeMargin ?? 0,
-            currency: info.currency ?? "USD",
-            leverage: info.leverage ?? 100,
-          });
-        } catch {
-          console.log(`[connect] client API not ready for ${foundId} — falling back to polling`);
-          return res.json({ status: "deploying", accountId: foundId, region });
-        }
-      }
-
-      await deployAccount(token, foundId);
-      return res.json({ status: "deploying", accountId: foundId, region });
+    if (match && matchId) {
+      console.log(`[connect] found on MetaAPI ${matchId}`);
+      if (await respondReconnect(matchId, normalizeRegion(match.region))) return;
     }
 
     // ── CREATE BRAND-NEW MetaAPI ACCOUNT ──────────────────────────────────────
+    console.log(`[connect] creating new account for ${loginStr}`);
     const createPayload = {
       login,
       password,

@@ -16,6 +16,9 @@ import {
 import Colors from "@/constants/colors";
 import { triggerAppHaptic, useHapticSettings } from "@/hooks/useHapticSettings";
 import type { Zone } from "@/hooks/useZones";
+import { executeTradeAction } from "@/utils/executeTradeAction";
+
+const API_BASE = process.env.EXPO_PUBLIC_API_URL ?? "";
 import {
   PIPELINE_DOT_POSITIONS,
   pipelineBarFill,
@@ -466,6 +469,10 @@ function RunnerSetupPanel({
 
 interface ZoneCardProps {
   zone: Zone;
+  accountId?: string;
+  region?: string;
+  riskFreePips?: number;
+  onActionComplete?: () => void;
   liveVolume?: number;
   floatingPnl?: number;
   flash?: boolean;
@@ -487,8 +494,12 @@ interface ZoneCardProps {
   historical?: boolean;
 }
 
-export default function ZoneCard({
+function ZoneCard({
   zone,
+  accountId,
+  region,
+  riskFreePips,
+  onActionComplete,
   liveVolume,
   floatingPnl,
   flash = false,
@@ -502,6 +513,26 @@ export default function ZoneCard({
   historical = false,
 }: ZoneCardProps) {
   const { hapticEnabled } = useHapticSettings();
+  const tradeRegion = region?.trim() || "london";
+  const zoneActionUrl = (action: string) =>
+    `${API_BASE}/mt5/account/${encodeURIComponent(accountId ?? "")}/zones/${encodeURIComponent(zone.zoneId)}/${action}?region=${encodeURIComponent(tradeRegion)}`;
+
+  const runTradeAction = (
+    url: string,
+    body: object,
+    setLoading: (v: boolean) => void,
+    errorTitle: string,
+  ) => {
+    void triggerAppHaptic(hapticEnabled, "medium");
+    void executeTradeAction(
+      url,
+      body,
+      () => { onActionComplete?.(); },
+      (msg) => { Alert.alert(errorTitle, msg); },
+      setLoading,
+    );
+  };
+
   const isBuy = zone.direction === "buy";
   const runnerActive = Boolean(zone.runnerActive);
   const [busy, setBusy] = useState(false);
@@ -573,13 +604,19 @@ export default function ZoneCard({
 
   const nextRunnerN = runners.find((r) => !r.hit)?.n;
 
-  const runCloseZone = async () => {
-    if (!onCloseZone || closeBusy) return;
+  const runCloseZone = () => {
+    if (closeBusy) return;
+    if (accountId) {
+      runTradeAction(zoneActionUrl("close"), {}, setCloseBusy, "Couldn't close zone");
+      return;
+    }
+    if (!onCloseZone) return;
     setCloseBusy(true);
-    await triggerAppHaptic(hapticEnabled, "heavy");
-    const result = await onCloseZone(zone.zoneId);
-    setCloseBusy(false);
-    if (!result.ok) Alert.alert("Couldn't close zone", result.message ?? "Try again");
+    void triggerAppHaptic(hapticEnabled, "heavy");
+    void onCloseZone(zone.zoneId).then((result) => {
+      setCloseBusy(false);
+      if (!result.ok) Alert.alert("Couldn't close zone", result.message ?? "Try again");
+    });
   };
 
   const actionBusy = busy || worstBusy || closeBusy || delBusy || runnerBusy || tpBusy != null || takeTpBusy;
@@ -806,12 +843,23 @@ export default function ZoneCard({
                   <Pressable
                     style={({ pressed }) => [{ alignItems: "center", flex: 1 }, btnPressed(pressed)]}
                     disabled={r.hit || !onClosePartial || tpBusy != null}
-                    onPress={async () => {
+                    onPress={() => {
+                      if (accountId) {
+                        setTpBusy(r.n);
+                        runTradeAction(
+                          zoneActionUrl("close-partial"),
+                          { lots: r.lots!, runnerN: r.n },
+                          (v) => { if (!v) setTpBusy(null); },
+                          "Close failed",
+                        );
+                        return;
+                      }
                       setTpBusy(r.n);
-                      await triggerAppHaptic(hapticEnabled, "medium");
-                      const result = await onClosePartial!(zone.zoneId, { lots: r.lots!, runnerN: r.n });
-                      setTpBusy(null);
-                      if (!result.ok) Alert.alert("Close failed", result.message ?? "Try again");
+                      void triggerAppHaptic(hapticEnabled, "medium");
+                      void onClosePartial!(zone.zoneId, { lots: r.lots!, runnerN: r.n }).then((result) => {
+                        setTpBusy(null);
+                        if (!result.ok) Alert.alert("Close failed", result.message ?? "Try again");
+                      });
                     }}
                   >
                     {notified && !r.hit && !autoOn && (
@@ -849,9 +897,27 @@ export default function ZoneCard({
         <Pressable
           style={({ pressed }) => [styles.takeTpBtn, takeTpBusy && { opacity: 0.6 }, btnPressed(pressed)]}
           disabled={actionBusy}
-          onPress={async () => {
+          onPress={() => {
+            if (!nextTpAction) return;
+            if (nextTpAction.label === "Set Runners") {
+              setShowRunnerPanel(true);
+              return;
+            }
+            if (accountId) {
+              setTakeTpBusy(true);
+              let body: Record<string, unknown> = {};
+              if (zone.tp1Enabled !== false && !zone.tp1Hit) {
+                body = { pct: zone.tp1Pct ?? 25, tpLevel: 1, emergency: true };
+              } else if (zone.tp2Enabled !== false && !zone.tp2Hit) {
+                body = { pct: zone.tp2Pct ?? 25, tpLevel: 2, emergency: true };
+              } else if (zone.tp3Enabled !== false && !zone.tp3Hit) {
+                body = { pct: zone.tp3Pct ?? 25, tpLevel: 3, emergency: true };
+              }
+              runTradeAction(zoneActionUrl("close-partial"), body, setTakeTpBusy, "Take TP failed");
+              return;
+            }
             setTakeTpBusy(true);
-            await triggerAppHaptic(hapticEnabled, "medium");
+            void triggerAppHaptic(hapticEnabled, "medium");
             nextTpAction.call();
             setTakeTpBusy(false);
           }}
@@ -866,13 +932,24 @@ export default function ZoneCard({
           {canRiskFree && (
             <Pressable
               style={({ pressed }) => [styles.rfBtn, btnPressed(pressed)]}
-              onPress={async () => {
-                if (!onRiskFree || busy) return;
+              onPress={() => {
+                if (busy) return;
+                if (accountId) {
+                  runTradeAction(
+                    zoneActionUrl("risk-free"),
+                    riskFreePips != null ? { riskFreePips } : {},
+                    setBusy,
+                    "Risk Free Failed",
+                  );
+                  return;
+                }
+                if (!onRiskFree) return;
                 setBusy(true);
-                await triggerAppHaptic(hapticEnabled, "medium");
-                const result = await onRiskFree(zone.zoneId);
-                setBusy(false);
-                if (!result.ok) Alert.alert("Risk Free failed", result.message ?? "Try again");
+                void triggerAppHaptic(hapticEnabled, "medium");
+                void onRiskFree(zone.zoneId).then((result) => {
+                  setBusy(false);
+                  if (!result.ok) Alert.alert("Risk Free failed", result.message ?? "Try again");
+                });
               }}
               disabled={actionBusy}
             >
@@ -883,13 +960,19 @@ export default function ZoneCard({
           {showCloseAllWorst && (
             <Pressable
               style={({ pressed }) => [styles.secureBtn, !canCloseAllWorst && { opacity: 0.45 }, btnPressed(pressed)]}
-              onPress={async () => {
-                if (!onCloseAllWorst || worstBusy || !canCloseAllWorst) return;
+              onPress={() => {
+                if (worstBusy || !canCloseAllWorst) return;
+                if (accountId) {
+                  runTradeAction(zoneActionUrl("close-worst"), {}, setWorstBusy, "Secure failed");
+                  return;
+                }
+                if (!onCloseAllWorst) return;
                 setWorstBusy(true);
-                await triggerAppHaptic(hapticEnabled, "medium");
-                const result = await onCloseAllWorst(zone.zoneId);
-                setWorstBusy(false);
-                if (!result.ok) Alert.alert("Secure failed", result.message ?? "Try again");
+                void triggerAppHaptic(hapticEnabled, "medium");
+                void onCloseAllWorst(zone.zoneId).then((result) => {
+                  setWorstBusy(false);
+                  if (!result.ok) Alert.alert("Secure failed", result.message ?? "Try again");
+                });
               }}
               disabled={actionBusy || !canCloseAllWorst}
             >
@@ -899,13 +982,19 @@ export default function ZoneCard({
           {canCancelOrders && (
             <Pressable
               style={({ pressed }) => [styles.delBtn, btnPressed(pressed)]}
-              onPress={async () => {
-                if (!onCancelOrders || delBusy) return;
+              onPress={() => {
+                if (delBusy) return;
+                if (accountId) {
+                  runTradeAction(zoneActionUrl("cancel-pending"), {}, setDelBusy, "Delete limits failed");
+                  return;
+                }
+                if (!onCancelOrders) return;
                 setDelBusy(true);
-                await triggerAppHaptic(hapticEnabled, "light");
-                const result = await onCancelOrders(zone.zoneId);
-                setDelBusy(false);
-                if (!result.ok) Alert.alert("Delete limits failed", result.message ?? "Try again");
+                void triggerAppHaptic(hapticEnabled, "light");
+                void onCancelOrders(zone.zoneId).then((result) => {
+                  setDelBusy(false);
+                  if (!result.ok) Alert.alert("Delete limits failed", result.message ?? "Try again");
+                });
               }}
               disabled={actionBusy}
             >
@@ -917,6 +1006,17 @@ export default function ZoneCard({
     </Animated.View>
   );
 }
+
+export default React.memo(ZoneCard, (prev, next) => {
+  return (
+    prev.zone.status === next.zone.status &&
+    prev.floatingPnl === next.floatingPnl &&
+    prev.zone.tp1Hit === next.zone.tp1Hit &&
+    prev.zone.tp2Hit === next.zone.tp2Hit &&
+    prev.zone.tp3Hit === next.zone.tp3Hit &&
+    prev.zone.runnerActive === next.zone.runnerActive
+  );
+});
 
 const styles = StyleSheet.create({
   card: {

@@ -109,11 +109,7 @@ function withLatchedHits(
 }
 
 export function useZones(accountId: string, options: UseZonesOptions = {}) {
-  const { includeClosed = false, pollIntervalMs = 5_000, sseConnected = false, region } = options;
-  // SSE zone_update events are the primary source of zone changes.
-  // When connected: 60 s safety net (SSE handles all real-time updates).
-  // When disconnected: 15 s fallback cadence (aligned with SSE fallback contract).
-  const effectivePollMs = sseConnected ? 60_000 : 15_000;
+  const { includeClosed = false, sseConnected = false, region } = options;
   const [zones, setZones] = useState<Zone[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -162,6 +158,25 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     }
   }, [accountId, includeClosed, applyZonesFromApi]);
 
+  const pruneStaleFromServer = useCallback(async () => {
+    if (!API_BASE || !accountId) return;
+    try {
+      const qs = includeClosed ? "?includeClosed=true" : "";
+      const res = await authFetch(`${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones${qs}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const list = Array.isArray(data) ? (data as Zone[]) : [];
+      const activeIds = new Set(list.map((z) => z.zoneId));
+      setZones((prev) => {
+        const pruned = prev.filter((z) => activeIds.has(z.zoneId));
+        for (const id of hitLatch.current.keys()) {
+          if (!activeIds.has(id)) hitLatch.current.delete(id);
+        }
+        return pruned.length === prev.length ? prev : pruned;
+      });
+    } catch { /* non-fatal */ }
+  }, [accountId, includeClosed]);
+
   useEffect(() => {
     if (!API_BASE || !accountId) {
       setZones([]);
@@ -169,33 +184,10 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     }
     setLoading(true);
     void refresh().finally(() => setLoading(false));
-    const id = setInterval(() => void refresh(), effectivePollMs);
+    if (sseConnected) return;
+    const id = setInterval(() => void pruneStaleFromServer(), 30_000);
     return () => clearInterval(id);
-  }, [accountId, effectivePollMs, refresh]);
-
-  // Prune zones the server no longer reports (e.g. closed externally in MT5).
-  useEffect(() => {
-    if (!API_BASE || !accountId || sseConnected) return;
-    const prune = async () => {
-      try {
-        const qs = includeClosed ? "?includeClosed=true" : "";
-        const res = await authFetch(`${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones${qs}`);
-        if (!res.ok) return;
-        const data = await res.json();
-        const list = Array.isArray(data) ? (data as Zone[]) : [];
-        const activeIds = new Set(list.map((z) => z.zoneId));
-        setZones((prev) => {
-          const pruned = prev.filter((z) => activeIds.has(z.zoneId));
-          for (const id of hitLatch.current.keys()) {
-            if (!activeIds.has(id)) hitLatch.current.delete(id);
-          }
-          return pruned.length === prev.length ? prev : pruned;
-        });
-      } catch { /* non-fatal */ }
-    };
-    const id = setInterval(() => void prune(), 60_000);
-    return () => clearInterval(id);
-  }, [accountId, includeClosed, sseConnected]);
+  }, [accountId, sseConnected, refresh, pruneStaleFromServer]);
 
   // Subscribe to SSE-driven zone events via the module-level accountEventBus.
   // zone_update → patch the matching zone in-place for instant TP/status changes.
@@ -207,36 +199,22 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
         const update = data as Partial<Zone> & { zoneId?: string };
         if (!update.zoneId) return;
         if (update.status === "CLOSED") {
-          hitLatch.current.delete(update.zoneId!);
-          if (includeClosed) {
-            setZones((prev) => {
-              const existing = prev.find((z) => z.zoneId === update.zoneId);
-              const merged = {
-                ...existing,
-                ...update,
-                status: "CLOSED" as const,
-                closedAt: update.closedAt ?? existing?.closedAt ?? Date.now(),
-              } as Zone;
-              if (!merged.zoneId) return prev;
-              const without = prev.filter((z) => z.zoneId !== update.zoneId);
-              return [...without, enrichZoneDisplayFields(withLatchedHits(merged, hitLatch.current))];
-            });
-          } else {
-            setZones((prev) => prev.filter((z) => z.zoneId !== update.zoneId));
-          }
+          hitLatch.current.delete(update.zoneId);
+          setZones((prev) => prev.filter((z) => z.zoneId !== update.zoneId));
           return;
         }
         setZones((prev) => {
           const existing = prev.find((z) => z.zoneId === update.zoneId);
           if (existing) {
-            return prev.map((z) => {
-              if (z.zoneId !== update.zoneId) return z;
-              return enrichZoneDisplayFields(withLatchedHits({
-                ...z,
-                ...update,
-                trackedPositionIds: update.trackedPositionIds ?? z.trackedPositionIds,
-              }, hitLatch.current));
-            });
+            return prev.map((z) =>
+              z.zoneId === update.zoneId
+                ? enrichZoneDisplayFields(withLatchedHits({
+                    ...z,
+                    ...update,
+                    trackedPositionIds: update.trackedPositionIds ?? z.trackedPositionIds,
+                  }, hitLatch.current))
+                : z,
+            );
           }
           return [...prev, enrichZoneDisplayFields(withLatchedHits(update as Zone, hitLatch.current))];
         });
@@ -361,7 +339,7 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     }
   }, [accountId, region, refresh]);
 
-  return { zones, loading, error, refresh, riskFree, closeZone, closeAllWorst, cancelZoneOrders };
+  return { zones, loading, error, refresh, pruneStaleFromServer, riskFree, closeZone, closeAllWorst, cancelZoneOrders };
 }
 
 export function sortZonesRunnerLast(zones: Zone[]): Zone[] {
