@@ -354,8 +354,9 @@ export default function SettingsScreen() {
   const webTopPad = Platform.OS === "web" ? 67 : 0;
 
   const handleConnect = async () => {
-    if (!login.trim() || !password.trim() || !server.trim()) return;
+    if (!login.trim() || !server.trim()) return;
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    // Password may be loaded from SecureStore if the field is empty (saved from last connect).
     await connect({ login: login.trim(), password: password.trim(), server: server.trim() });
   };
 
@@ -420,7 +421,7 @@ export default function SettingsScreen() {
                     style={[styles.input, { flex: 1 }]}
                     value={password}
                     onChangeText={setPassword}
-                    placeholder="MT5 account password"
+                    placeholder="MT5 password (saved after first connect)"
                     placeholderTextColor={C.textMuted}
                     secureTextEntry={!showPassword}
                     autoCapitalize="none"
@@ -501,10 +502,10 @@ export default function SettingsScreen() {
                 style={({ pressed }) => [
                   styles.connectBtn,
                   pressed && { opacity: 0.85, transform: [{ scale: 0.99 }] },
-                  (isConnecting || !login.trim() || !password.trim() || !server.trim()) && { opacity: 0.5 },
+                  (isConnecting || !login.trim() || !server.trim()) && { opacity: 0.5 },
                 ]}
                 onPress={handleConnect}
-                disabled={isConnecting || !login.trim() || !password.trim() || !server.trim()}
+                disabled={isConnecting || !login.trim() || !server.trim()}
               >
                 {isConnecting ? (
                   <View style={styles.connectingRow}>

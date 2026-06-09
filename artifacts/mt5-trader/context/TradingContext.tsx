@@ -23,7 +23,12 @@ const MT5_PASSWORD_KEY = "mt5_password_v1";
 const _secureAvailable = Platform.OS === "ios" || Platform.OS === "android";
 async function saveMt5Password(password: string): Promise<void> {
   if (!_secureAvailable || !password) return;
-  try { await SecureStore.setItemAsync(MT5_PASSWORD_KEY, password); } catch (e) {
+  try {
+    await SecureStore.setItemAsync(MT5_PASSWORD_KEY, password, {
+      // Survives app background/kill; readable after first device unlock.
+      keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK,
+    });
+  } catch (e) {
     console.warn("[secureCreds] save failed:", (e as Error).message);
   }
 }
@@ -319,9 +324,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const priceFailCountRef = useRef(0);
   const startPollingRef = useRef<((accId: string, accRegion: string) => void) | null>(null);
   const reconnectInProgressRef = useRef(false);
+  const foregroundResumeInProgressRef = useRef(false);
+  const sseWakeRef = useRef<(() => void) | null>(null);
   const priceRef = useRef(price);
   const prevStatusRef = useRef<ConnectionStatus>(status);
+  const statusRef = useRef<ConnectionStatus>(status);
   useEffect(() => { priceRef.current = price; }, [price]);
+  useEffect(() => { statusRef.current = status; }, [status]);
 
   const applyLivePrice = useCallback((p: Price) => {
     lastPriceAtRef.current = Date.now();
@@ -792,13 +801,6 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       const prev = appStateRef.current;
       appStateRef.current = next;
       if (prev.match(/inactive|background/) && next === "active") {
-        if (
-          !priceRef.current
-          || lastPriceAtRef.current === 0
-          || Date.now() - lastPriceAtRef.current > PRICE_STALE_MS
-        ) {
-          syncSessionRef.current();
-        }
         startHeartbeat();
       }
       if (next.match(/inactive|background/)) {
@@ -864,14 +866,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     const onForeground = () => {
       retryDelay = 2_000;
       wakeNow();
-      if (
-        !priceRef.current
-        || lastPriceAtRef.current === 0
-        || Date.now() - lastPriceAtRef.current > PRICE_STALE_MS
-      ) {
-        syncSessionRef.current();
-      }
     };
+    sseWakeRef.current = wakeNow;
     const appStateSub = AppState.addEventListener("change", state => {
       if (state === "active") onForeground();
     });
@@ -972,6 +968,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       mounted = false;
       controller.abort();
       wakeNow();
+      sseWakeRef.current = null;
       clearFallbackIntervals();
       setSseConnected(false);
       appStateSub.remove();
@@ -984,8 +981,14 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
 
   const connect = useCallback(
     async (creds?: Mt5Credentials) => {
-      const useCreds = creds ?? credentials;
-      if (!useCreds.login.trim() || !useCreds.password.trim() || !useCreds.server.trim()) {
+      const base = creds ?? credentials;
+      const cachedPassword = (await loadMt5Password())?.trim() ?? "";
+      const resolved: Mt5Credentials = {
+        login: base.login.trim(),
+        password: base.password.trim() || cachedPassword,
+        server: base.server.trim(),
+      };
+      if (!resolved.login || !resolved.password || !resolved.server) {
         setErrorMsg("Please fill in your MT5 account number, password, and server.");
         setStatus("error");
         return;
@@ -993,7 +996,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       if (creds) setCredentials(creds);
       // Persist password securely so we can transparently re-establish the
       // MetaAPI account if it gets orphaned (no re-typing the password).
-      void saveMt5Password(useCreds.password.trim());
+      await saveMt5Password(resolved.password);
       setStatus("connecting");
       setErrorMsg("");
       try {
@@ -1011,9 +1014,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
-                login: useCreds.login.trim(),
-                password: useCreds.password.trim(),
-                server: useCreds.server.trim(),
+                login: resolved.login,
+                password: resolved.password,
+                server: resolved.server,
                 forceReconnect: true,
               }),
             }, 120_000);
@@ -1047,7 +1050,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           console.log(`[connect] broker detection in progress, retrying in ${waitMs}ms`);
           await new Promise((r) => setTimeout(r, waitMs));
           // Retry recursively (without re-setting creds to avoid loop with setCredentials)
-          return connect(useCreds);
+          return connect(resolved);
         }
 
         const accId = data.accountId;
@@ -1176,6 +1179,64 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  /** Foreground resume: verify /my-account, wake SSE — full /connect only when binding is gone or broker is down. */
+  const resumeFromForeground = useCallback(async () => {
+    if (foregroundResumeInProgressRef.current || reconnectInProgressRef.current) return;
+    foregroundResumeInProgressRef.current = true;
+    try {
+      const res = await authFetch(`${API_BASE}/mt5/my-account`);
+      if (res.status === 404) {
+        setStatus("disconnected");
+        await reconnectFromServer();
+        return;
+      }
+      if (!res.ok) {
+        if (statusRef.current === "connected" && accountId) {
+          sseWakeRef.current?.();
+          await syncSession(true);
+        }
+        return;
+      }
+      const data = await safeJson<{
+        accountId?: string;
+        region?: string;
+        connectionStatus?: string;
+      }>(res);
+      const brokerLive = data.connectionStatus === "CONNECTED";
+      if (!data.accountId || !brokerLive) {
+        setStatus("disconnected");
+        await reconnectFromServer();
+        return;
+      }
+      const accRegion = data.region ?? DEFAULT_REGION;
+      setAccountIdState(data.accountId);
+      setRegionState(accRegion);
+      await AsyncStorage.setMany({ mt5_account_id: data.accountId, mt5_region: accRegion });
+      setStatus("connected");
+      setErrorMsg("");
+      startPollingRef.current?.(data.accountId, accRegion);
+      sseWakeRef.current?.();
+      await syncSession(true);
+    } catch (err) {
+      console.warn("[foreground] resume failed:", (err as Error).message);
+    } finally {
+      foregroundResumeInProgressRef.current = false;
+    }
+  }, [accountId, reconnectFromServer, syncSession]);
+
+  // AppState: returning from background — do not POST /connect unless /my-account says session is dead.
+  useEffect(() => {
+    const onChange = (next: AppStateStatus) => {
+      const prev = appStateRef.current;
+      appStateRef.current = next;
+      if (prev.match(/inactive|background/) && next === "active") {
+        void resumeFromForeground();
+      }
+    };
+    const sub = AppState.addEventListener("change", onChange);
+    return () => sub.remove();
+  }, [resumeFromForeground]);
 
   const refreshPrice = useCallback(async () => {
     if (status !== "connected" || !accountId) return;
