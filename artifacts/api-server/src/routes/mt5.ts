@@ -2137,7 +2137,7 @@ function buildMetaApiCreatePayload(creds: {
     server: creds.server,
     platform: "mt5",
     type: "cloud-g2",
-    reliability: "regular",
+    reliability: "high",
     magic: 47182,
     region: creds.region ?? NEW_ACCOUNT_REGION,
   };
