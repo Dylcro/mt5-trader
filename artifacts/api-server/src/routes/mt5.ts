@@ -2265,8 +2265,8 @@ async function fetchAccountInfoSafe(
 }
 
 const deployKickAt = new Map<string, number>();
-/** Gentle redeploy only — never undeploy on status poll (that prevented CONNECTED during client poll). */
-const STUCK_REDEPLOY_MS = 180_000;
+/** Full broker relink (undeploy→deploy) when DEPLOYED but DISCONNECTED — rate-limited on status poll. */
+const STUCK_REDEPLOY_MS = 90_000;
 const startingStreams = new Set<string>();
 
 async function deployAccount(token: string, accountId: string): Promise<void> {
@@ -2296,6 +2296,43 @@ async function undeployAccount(token: string, accountId: string): Promise<void> 
     console.warn(`[undeploy] ${accountId} failed ${res.status}: ${msg}`);
     throw new Error(msg);
   }
+}
+
+async function deleteMetaApiAccount(token: string, accountId: string): Promise<void> {
+  await stopStreaming(accountId).catch(() => {});
+  activeStreams.delete(accountId);
+  await undeployAccount(token, accountId).catch((e: Error) =>
+    console.warn(`[delete] undeploy ${accountId}:`, e.message),
+  );
+  const undeployStart = Date.now();
+  while (Date.now() - undeployStart < 60_000) {
+    await new Promise((r) => setTimeout(r, 2_000));
+    const a = await getProvisioningAccount(token, accountId).catch(() => null);
+    if (!a || a.state === "UNDEPLOYED" || a.state === "DELETING") break;
+  }
+  const delRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
+    method: "DELETE",
+    headers: authHeaders(token),
+  });
+  if (!delRes.ok && delRes.status !== 204 && delRes.status !== 404) {
+    const body = await delRes.json().catch(() => ({})) as { message?: string };
+    throw new Error(body.message ?? `Delete failed (HTTP ${delRes.status})`);
+  }
+}
+
+async function updateMetaApiCredentials(
+  token: string,
+  accountId: string,
+  creds: { password: string; login?: string | number; server?: string },
+): Promise<void> {
+  const body: Record<string, string> = { password: creds.password };
+  if (creds.login != null) body.login = String(creds.login).trim();
+  if (creds.server) body.server = creds.server.trim();
+  await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
+    method: "PUT",
+    headers: authHeaders(token),
+    body: JSON.stringify(body),
+  }).catch(() => {});
 }
 
 /** MetaAPI is mid-deploy or mid-broker-handshake — never interrupt with undeploy. */
@@ -6890,6 +6927,13 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         mt5Login: acct.login ?? storedRow.mt5Login,
         mt5Server: acct.server ?? storedRow.mt5Server,
       });
+      if (password) {
+        await updateMetaApiCredentials(token, existingId, {
+          password,
+          login: storedRow.mt5Login ?? acct.login,
+          server: storedRow.mt5Server ?? acct.server,
+        });
+      }
       console.log(`[connect] reconnect status=${acct.connectionStatus} region=${region}`);
 
       if (acct.connectionStatus === "CONNECTED") {
@@ -6925,19 +6969,32 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
     const allAccounts = listRes.ok ? (await listRes.json() as ProvisioningAccount[]) : [];
     console.log(`[connect] found ${Array.isArray(allAccounts) ? allAccounts.length : 0} existing accounts`);
 
+    const loginStr = String(login).trim();
+    const serverStr = String(server).trim();
     const existing = Array.isArray(allAccounts)
-      ? allAccounts.find((a) => a.login === login && a.server === server)
+      ? allAccounts.find((a) => String(a.login).trim() === loginStr && String(a.server).trim() === serverStr)
       : undefined;
     const foundId = existing?._id ?? existing?.id;
 
     if (existing && foundId) {
-      // Reuse existing account — update password just in case
       console.log(`[connect] reusing ${foundId} status=${existing.connectionStatus}`);
-      await fetch(`${PROVISIONING_BASE}/users/current/accounts/${foundId}`, {
-        method: "PUT",
-        headers: authHeaders(token),
-        body: JSON.stringify({ password }),
-      }).catch(() => {});
+
+      // Stale DEPLOYED/DISCONNECTED survives manual undeploy→deploy — delete and reprovision.
+      if (
+        forceBrokerReset
+        && existing.connectionStatus === "DISCONNECTED"
+        && existing.state === "DEPLOYED"
+        && !isMetaApiProvisioningInProgress(existing)
+      ) {
+        console.log(`[connect] recreating stale ${foundId} (DEPLOYED/DISCONNECTED)`);
+        await deleteMetaApiAccount(token, foundId).catch((e: Error) =>
+          console.warn(`[connect] delete stale ${foundId}:`, e.message),
+        );
+        await db.delete(storedAccountsTable).where(eq(storedAccountsTable.accountId, foundId)).catch(() => {});
+        if (userId) userAccountCache.delete(userId);
+        // Fall through to CREATE path below (existing cleared).
+      } else {
+      await updateMetaApiCredentials(token, foundId, { password, login: loginStr, server: serverStr });
 
       // Eagerly transfer DB ownership to the current user so checkOwner
       // passes immediately on subsequent requests (startStreaming also does
@@ -6972,14 +7029,15 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         });
       }
       return res.json({ status: "deploying", accountId: foundId, region });
+      }
     }
 
     // ── CREATE BRAND-NEW MetaAPI ACCOUNT ──────────────────────────────────────
     const createPayload = {
-      login,
+      login: loginStr,
       password,
-      name: `MT5 ${login}`,
-      server,
+      name: `MT5 ${loginStr}`,
+      server: serverStr,
       platform: "mt5",
       type: "cloud-g2",
       reliability: "regular",
@@ -7043,7 +7101,9 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
     if (createTimedOut || fetchRes?.status === 202) {
       const listR = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, { headers: authHeaders(token) });
       const accts = listR.ok ? (await listR.json() as ProvisioningAccount[]) : [];
-      const queued = Array.isArray(accts) ? accts.find((a) => a.login === login && a.server === server) : undefined;
+      const queued = Array.isArray(accts)
+        ? accts.find((a) => String(a.login).trim() === loginStr && String(a.server).trim() === serverStr)
+        : undefined;
       const queuedId = queued?._id ?? queued?.id;
       if (queued && queuedId) {
         console.log(`[connect] found queued account ${queuedId} — deploying`);
@@ -7146,7 +7206,8 @@ router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, re
 
     // DEPLOYING/CONNECTING: let MetaAPI finish — do NOT undeploy here (client polls every 5s;
     // force-undeploy every 90s was the root cause of permanent connect timeouts today).
-    // Only gentle redeploy when DEPLOYED but broker DISCONNECTED, and at most every 3 min.
+    // DEPLOYED+DISCONNECTED: MetaAPI cloud terminal is up but broker link is dead — POST /deploy
+    // alone does nothing; cycle undeploy→deploy (rate-limited) while the client polls.
     const lastKick = deployKickAt.get(accountId) ?? 0;
     if (
       Date.now() - lastKick >= STUCK_REDEPLOY_MS
@@ -7154,9 +7215,9 @@ router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, re
       && acct.connectionStatus === "DISCONNECTED"
     ) {
       deployKickAt.set(accountId, Date.now());
-      console.log(`[status] ${accountId} DEPLOYED/DISCONNECTED — gentle redeploy`);
-      await deployAccount(token, accountId).catch((e: Error) =>
-        console.warn(`[status] gentle redeploy failed for ${accountId}:`, e.message),
+      console.log(`[status] ${accountId} DEPLOYED/DISCONNECTED — cycling undeploy→deploy`);
+      await prepareAccountForConnect(token, accountId).catch((e: Error) =>
+        console.warn(`[status] broker relink failed for ${accountId}:`, e.message),
       );
     }
 
@@ -7164,6 +7225,9 @@ router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, re
       connectionStatus: acct.connectionStatus ?? "DEPLOYING",
       state: acct.state,
       region: normalizeRegion(acct.region) || region,
+      ...(acct.connectionStatus === "DISCONNECTED"
+        ? { hint: "MetaAPI broker link down — relinking. This can take 1–3 minutes after Vantage reconnects." }
+        : {}),
     });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Status check failed" });

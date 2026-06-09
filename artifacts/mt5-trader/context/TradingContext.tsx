@@ -379,7 +379,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // Poll /status until CONNECTED, then finalise the session
-  const pollUntilConnected = useCallback(async (accId: string, accRegion: string, maxWaitMs = 240_000) => {
+  const pollUntilConnected = useCallback(async (accId: string, accRegion: string, maxWaitMs = 300_000) => {
     const deadline = Date.now() + maxWaitMs;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 5000));
@@ -425,6 +425,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   const reconnectSaved = async (savedId: string) => {
     setStatus("connecting");
     try {
+      const cachedPassword = (await loadMt5Password())?.trim();
       // Retry up to 8 times — autoscale cold-starts can take 20-30 s before serving JSON
       let res: Response | null = null;
       let data: ({ status?: string; error?: string; accountId?: string; region?: string } & Partial<AccountInfo>) | null = null;
@@ -433,7 +434,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           res = await authFetchWithTimeout(`${API_BASE}/mt5/connect`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ accountId: savedId, forceReconnect: true }),
+            body: JSON.stringify({
+              accountId: savedId,
+              forceReconnect: true,
+              ...(cachedPassword ? { password: cachedPassword } : {}),
+            }),
           }, 90_000);
           data = await safeJson<{ status?: string; error?: string; accountId?: string; region?: string } & Partial<AccountInfo>>(res);
           break; // success — exit retry loop
@@ -992,6 +997,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
                 login: useCreds.login.trim(),
                 password: useCreds.password.trim(),
                 server: useCreds.server.trim(),
+                forceReconnect: true,
               }),
             }, 90_000);
             data = await safeJson<{
