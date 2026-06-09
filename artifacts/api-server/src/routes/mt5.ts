@@ -2111,7 +2111,7 @@ function buildCandles(accountId: string, timeframe: string, limit: number): Ohlc
 const PROVISIONING_BASE = "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai";
 const CLIENT_DOMAIN = "agiliumtrade.ai";
 /** Vantage executes from Equinix NY4 — new MetaAPI accounts must provision in new-york. */
-const NEW_ACCOUNT_REGION = "new-york";
+export const NEW_ACCOUNT_REGION = "new-york";
 const DEFAULT_REGION = NEW_ACCOUNT_REGION;
 
 function getToken(): string {
