@@ -249,23 +249,6 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     }
   }, [accountId, region, refresh]);
 
-  const zoneClosedOnServer = useCallback(async (zoneId: string): Promise<boolean> => {
-    if (!API_BASE || !accountId) return false;
-    try {
-      const qs = includeClosed ? "?includeClosed=true" : "";
-      const res = await authFetch(
-        `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zones${qs}`,
-      );
-      if (!res.ok) return false;
-      const list = await res.json().catch(() => []) as Zone[];
-      if (!Array.isArray(list)) return false;
-      const z = list.find((row) => row.zoneId === zoneId);
-      return z?.status === "CLOSED";
-    } catch {
-      return false;
-    }
-  }, [accountId, includeClosed]);
-
   const closeZone = useCallback(async (
     zoneId: string,
   ): Promise<{ ok: boolean; message?: string; closedCount?: number }> => {
@@ -276,23 +259,15 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
       );
       const data = await res.json().catch(() => ({})) as {
-        ok?: boolean; message?: string; error?: string; closedCount?: number; alreadyClosed?: boolean;
+        ok?: boolean; message?: string; error?: string; closedCount?: number;
       };
-      await refresh();
+      void refresh();
       if (res.ok && data.ok) return { ok: true, closedCount: data.closedCount };
-      if (data.alreadyClosed || await zoneClosedOnServer(zoneId)) {
-        await refresh();
-        return { ok: true, closedCount: data.closedCount ?? 0 };
-      }
       return { ok: false, message: data.message ?? data.error ?? `HTTP ${res.status}` };
     } catch (e) {
-      if (await zoneClosedOnServer(zoneId)) {
-        await refresh();
-        return { ok: true, closedCount: 0 };
-      }
       return { ok: false, message: (e as Error).message };
     }
-  }, [accountId, region, refresh, zoneClosedOnServer]);
+  }, [accountId, region, refresh]);
 
   // Cancel pending cascade limit orders for the zone without touching open
   // positions. Powers the "Delete Orders" button on each zone card.
