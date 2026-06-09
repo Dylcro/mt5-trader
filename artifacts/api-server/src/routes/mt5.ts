@@ -929,6 +929,20 @@ export interface StreamHealthAccount {
 /** Returns the health of every currently-tracked streaming account.
  *  Empty map (no accounts) → healthy.
  *  Any account silent for > STREAM_FRESHNESS_MS → unhealthy. */
+export function getConnectionDiagnostics(): {
+  activeStreamCount: number;
+  syncReadyCount: number;
+  knownAccountCount: number;
+  sseClientAccounts: number;
+} {
+  return {
+    activeStreamCount: activeStreams.size,
+    syncReadyCount: syncReady.size,
+    knownAccountCount: knownAccounts.size,
+    sseClientAccounts: sseClients.size,
+  };
+}
+
 export function getStreamHealth(): { healthy: boolean; accounts: StreamHealthAccount[] } {
   if (lastEventAt.size === 0) return { healthy: true, accounts: [] };
   const now = Date.now();
@@ -1424,6 +1438,21 @@ export async function disconnectUserMt5(userId: string): Promise<number> {
   }
   userAccountCache.delete(userId);
   return rows.length;
+}
+
+/** Kick off MetaAPI streaming if not already active (idempotent). */
+function ensureAccountStreaming(
+  token: string,
+  accountId: string,
+  region?: string,
+  userId?: string,
+): void {
+  const r = region
+    ?? activeRegions.get(accountId)
+    ?? knownAccounts.get(accountId)?.region
+    ?? DEFAULT_REGION;
+  const uid = userId ?? knownAccounts.get(accountId)?.userId;
+  void startStreaming(token, accountId, r, uid);
 }
 
 async function startStreaming(token: string, accountId: string, region: string = DEFAULT_REGION, userId?: string): Promise<void> {
@@ -5812,6 +5841,13 @@ router.put("/mt5/notifications/prefs", async (req: Request, res: Response) => {
 // a heartbeat comment every 15 s to keep connections alive through proxies.
 router.get("/mt5/account/:accountId/stream", checkOwner, (req: Request, res: Response) => {
   const { accountId } = req.params as { accountId: string };
+  const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
+  const eventsUserId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
+  try {
+    ensureAccountStreaming(getToken(), accountId, region, eventsUserId);
+  } catch {
+    // getToken() can throw if env missing — watchdog will retry
+  }
 
   res.setHeader("Content-Type",   "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control",  "no-cache, no-store");
@@ -6795,6 +6831,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       }
 
       if (existing.connectionStatus === "CONNECTED") {
+        ensureAccountStreaming(token, foundId, region, userId);
         try {
           const info = await getAccountInfo(token, foundId, region) as Record<string, unknown>;
           return res.json({
@@ -6954,16 +6991,17 @@ router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, re
     console.log(`[status] accountId=${accountId} state=${acct.state} connectionStatus=${acct.connectionStatus}`);
 
     if (acct.connectionStatus === "CONNECTED") {
+      const effectiveRegion = normalizeRegion(acct.region) || region;
+      const statusUserId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
+      ensureAccountStreaming(token, accountId, effectiveRegion, statusUserId);
       let info: Record<string, unknown> = {};
       try {
-        const effectiveRegion = normalizeRegion(acct.region) || region;
         info = await getAccountInfo(token, accountId, effectiveRegion) as Record<string, unknown>;
       } catch (infoErr) {
         // Client API not yet ready — report still connecting to keep polling
         console.warn(`[status] getAccountInfo failed for ${accountId}:`, (infoErr as Error).message);
         return res.json({ connectionStatus: "CONNECTING", state: acct.state });
       }
-      const effectiveRegion = normalizeRegion(acct.region) || region;
       return res.json({
         connectionStatus: "CONNECTED",
         accountId,

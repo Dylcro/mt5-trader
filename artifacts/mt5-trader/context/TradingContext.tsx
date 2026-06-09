@@ -434,6 +434,14 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         await AsyncStorage.removeItem("mt5_account_id");
         return;
       }
+      // 403 = stored account no longer linked to this user — need fresh credentials
+      if (res.status === 403) {
+        setStatus("disconnected");
+        setAccountIdState("");
+        await AsyncStorage.removeItem("mt5_account_id");
+        setErrorMsg(data?.error ?? "Please connect with your MT5 credentials in Settings.");
+        return;
+      }
       if (!res.ok || data.error) throw new Error(data.error ?? "Reconnect failed");
 
       const accId = data.accountId ?? savedId;
