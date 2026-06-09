@@ -16,12 +16,6 @@ import {
 import Colors from "@/constants/colors";
 import { triggerAppHaptic, useHapticSettings } from "@/hooks/useHapticSettings";
 import type { Zone } from "@/hooks/useZones";
-import {
-  PIPELINE_DOT_POSITIONS,
-  pipelineBarFill,
-  pipelineEnabledTps,
-  pipelineSegmentProgress,
-} from "@/lib/zoneDisplay";
 
 const C = Colors.dark;
 const TP_BUFFER = 5.0;
@@ -108,172 +102,6 @@ function getNextTpAction(
     }
   }
   return null;
-}
-
-function computeTpLot(originalVol: number, tpPct: number): number | null {
-  const snapped = Math.round((originalVol * tpPct / 100) / LOT_STEP) * LOT_STEP;
-  return snapped >= LOT_STEP ? snapped : null;
-}
-
-function PipelineTrack({
-  zone,
-  currentPrice,
-}: {
-  zone: Zone;
-  currentPrice: number;
-}) {
-  const [trackWidth, setTrackWidth] = useState(0);
-  const steps = pipelineEnabledTps(zone);
-
-  const toPos = (price: number): number => {
-    const allPrices = [zone.anchorPrice, ...steps.map((s) => s.price)];
-    const min = Math.min(...allPrices);
-    const max = Math.max(...allPrices);
-    const buf = (max - min) * 0.15;
-    const raw = Math.min(Math.max(
-      ((price - (min - buf)) / ((max + buf) - (min - buf))) * 100, 0), 100);
-    return zone.direction === "sell" ? 100 - raw : raw;
-  };
-
-  const { progressPct, nextStep, nextPrice: segNextPrice, allHit: allTpHit } =
-    pipelineSegmentProgress(zone, steps, currentPrice);
-  const nextPrice = allTpHit
-    ? (zone.runner1Price ?? (zone.tp3Price != null
-      ? zone.direction === "buy" ? zone.tp3Price + 10 : zone.tp3Price - 10
-      : null))
-    : segNextPrice;
-  const atLevel = nextPrice != null && (
-    zone.direction === "buy"
-      ? currentPrice >= nextPrice - 0.5
-      : currentPrice <= nextPrice + 0.5
-  );
-
-  const fillPct = pipelineBarFill(steps, progressPct);
-  const needlePct = toPos(currentPrice);
-  const fillAnim = useRef(new Animated.Value(fillPct)).current;
-  const progAnim = useRef(new Animated.Value(progressPct)).current;
-
-  useEffect(() => {
-    Animated.timing(fillAnim, {
-      toValue: fillPct,
-      duration: 150,
-      easing: Easing.out(Easing.quad),
-      useNativeDriver: false,
-    }).start();
-    Animated.timing(progAnim, {
-      toValue: progressPct,
-      duration: 150,
-      easing: Easing.out(Easing.quad),
-      useNativeDriver: false,
-    }).start();
-  }, [fillPct, progressPct, fillAnim, progAnim]);
-
-  const dotDefs = steps.map((s) => ({
-    key: `tp${s.level}` as const,
-    pos: s.dotPos,
-    hit: s.hit,
-    isNext: nextStep?.level === s.level,
-  }));
-
-  return (
-    <View style={{ marginBottom: 12 }}>
-      <View
-        style={{ height: 24, position: "relative" }}
-        onLayout={(e) => setTrackWidth(e.nativeEvent.layout.width)}
-      >
-        <View style={[styles.pipeTrack, { width: trackWidth || "100%" }]} />
-        {trackWidth > 0 && (
-          <Animated.View
-            style={[
-              styles.pipeFill,
-              {
-                width: fillAnim.interpolate({
-                  inputRange: [0, 100],
-                  outputRange: ["0%", "100%"],
-                  extrapolate: "clamp",
-                }),
-                backgroundColor: atLevel ? C.greenProgress : C.goldProgress,
-              },
-            ]}
-          />
-        )}
-        {trackWidth > 0 && dotDefs.map((d) => (
-          <View
-            key={d.key}
-            style={[
-              styles.pipeDot,
-              { left: trackWidth * d.pos / 100 - 7 },
-              d.hit && styles.pipeDotHit,
-              d.isNext && styles.pipeDotNext,
-            ]}
-          >
-            {d.hit && <Feather name="check" size={7} color="#fff" strokeWidth={3} />}
-          </View>
-        ))}
-        {trackWidth > 0 && (
-          <View
-            style={[
-              styles.pipeDot,
-              styles.pipeDotRunner,
-              {
-                left: trackWidth * PIPELINE_DOT_POSITIONS.runner / 100 - 7,
-                backgroundColor: zone.runnerActive ? C.tealBg : "#fff",
-                borderColor: zone.runnerActive ? C.teal : "#D1D5DB",
-              },
-            ]}
-          />
-        )}
-        {trackWidth > 0 && (
-          <View style={[styles.pipeNeedle, { left: Math.max(0, trackWidth * needlePct / 100 - 1) }]} />
-        )}
-      </View>
-      <View style={{ position: "relative", height: 16, marginTop: 4 }}>
-        <Text style={[styles.pipeLabel, { position: "absolute", left: `${PIPELINE_DOT_POSITIONS.sl}%`, transform: [{ translateX: -12 }], color: C.specSell }]}>SL</Text>
-        {zone.tp1Enabled !== false && (
-          <Text style={[styles.pipeLabel, { position: "absolute", left: `${PIPELINE_DOT_POSITIONS.tp1}%`, transform: [{ translateX: -12 }], color: zone.tp1Hit ? C.specGold : C.specMuted }]}>TP1</Text>
-        )}
-        {zone.tp2Enabled !== false && (
-          <Text style={[styles.pipeLabel, { position: "absolute", left: `${PIPELINE_DOT_POSITIONS.tp2}%`, transform: [{ translateX: -12 }], color: zone.tp2Hit ? C.specGold : C.specMuted }]}>TP2</Text>
-        )}
-        {zone.tp3Enabled !== false && (
-          <Text style={[styles.pipeLabel, { position: "absolute", left: `${PIPELINE_DOT_POSITIONS.tp3}%`, transform: [{ translateX: -12 }], color: zone.tp3Hit ? C.specGold : C.specMuted }]}>TP3</Text>
-        )}
-        <Text style={[styles.pipeLabel, { position: "absolute", left: `${PIPELINE_DOT_POSITIONS.runner}%`, transform: [{ translateX: -20 }], color: zone.runnerActive ? C.teal : C.specMuted }]}>Runner</Text>
-      </View>
-      {nextPrice != null && (
-        <View style={{ marginTop: 10 }}>
-          <View style={styles.progressHeader}>
-            <Text style={styles.progressPrice}>{formatPrice(currentPrice)}</Text>
-            <Text style={styles.progressTarget}>
-              → {allTpHit ? "Runner" : `TP${nextStep!.level}`} {formatPrice(nextPrice)}
-            </Text>
-            <Text style={[styles.progressDist, atLevel && { color: C.specBuy }]}>
-              {atLevel
-                ? "ready ✓"
-                : nextPrice != null
-                  ? `${Math.abs((nextPrice - currentPrice) / 0.1).toFixed(1)}p away`
-                  : "—"}
-            </Text>
-          </View>
-          <View style={styles.progressTrack}>
-            <Animated.View
-              style={[
-                styles.progressFill,
-                {
-                  width: progAnim.interpolate({
-                    inputRange: [0, 100],
-                    outputRange: ["0%", "100%"],
-                    extrapolate: "clamp",
-                  }),
-                  backgroundColor: atLevel ? C.greenProgress : C.goldProgress,
-                },
-              ]}
-            />
-          </View>
-        </View>
-      )}
-    </View>
-  );
 }
 
 function RunnerAutoChip({
@@ -513,8 +341,8 @@ export default function ZoneCard({
   const [runnerBusy, setRunnerBusy] = useState(false);
   const [showRunnerPanel, setShowRunnerPanel] = useState(false);
   const [showEditRunners, setShowEditRunners] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
   const flashAnim = useRef(new Animated.Value(flash ? 1 : 0)).current;
-  const pulseAnim = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
     if (!flash) return;
@@ -526,17 +354,6 @@ export default function ZoneCard({
       useNativeDriver: false,
     }).start();
   }, [flash, flashAnim]);
-
-  useEffect(() => {
-    const loop = Animated.loop(
-      Animated.sequence([
-        Animated.timing(pulseAnim, { toValue: 0.3, duration: 600, useNativeDriver: true }),
-        Animated.timing(pulseAnim, { toValue: 1, duration: 600, useNativeDriver: true }),
-      ]),
-    );
-    loop.start();
-    return () => loop.stop();
-  }, [pulseAnim]);
 
   useEffect(() => {
     if (zone.tp3Hit && !zone.runnerActive) {
@@ -599,7 +416,7 @@ export default function ZoneCard({
     !historical && showRunnerPanel && zone.tp3Hit && !runnerActive && zone.status !== "CLOSED";
   const editRunnerPanelOpen = !historical && showEditRunners && runnerActive && zone.status !== "CLOSED";
   const hasUnhitRunners = runners.some((r) => !r.hit);
-  const showActionRow = !runnerPanelOpen && !editRunnerPanelOpen && (canRiskFree || showCloseAllWorst || canCancelOrders);
+  const showMenuBtn = !runnerPanelOpen && !editRunnerPanelOpen && (canRiskFree || showCloseAllWorst || canCancelOrders);
   const runnerInitialTargets = {
     r1: zone.runner1Price != null && zone.runner1Lots != null
       ? { price: zone.runner1Price, lots: zone.runner1Lots } : undefined,
@@ -703,17 +520,6 @@ export default function ZoneCard({
         </View>
       </View>
 
-      <View style={[styles.pnlStrip, { backgroundColor: isBuy ? C.specBuyBg : "rgba(220,38,38,0.07)" }]}>
-        <Text style={styles.pnlLeft}>
-          {vol > 0.001 ? `${vol.toFixed(2)} lots running` : "position complete"}
-        </Text>
-        {floatingPnl != null && (
-          <Text style={[styles.pnlRight, { color: floatingPnl >= 0 ? C.specBuy : C.specSell }]}>
-            {floatingPnl >= 0 ? "+" : ""}{floatingPnl.toFixed(2)}
-          </Text>
-        )}
-      </View>
-
       {(showTp3Notif || runnerNotif) && (
         <View style={styles.notifBar}>
           <Feather name="zap" size={14} color={C.teal} />
@@ -733,8 +539,6 @@ export default function ZoneCard({
           <Text style={styles.warnText}>SL not at break-even — protective level applied</Text>
         </View>
       )}
-
-      <PipelineTrack zone={zone} currentPrice={cmp} />
 
       {runnerPanelOpen && onActivateRunner && (
         <RunnerSetupPanel
@@ -784,68 +588,36 @@ export default function ZoneCard({
       )}
 
       {runnerActive && runners.length > 0 && (
-        <View style={{ marginBottom: 8 }}>
-          <Text style={styles.runnerSectionLabel}>RUNNER TARGETS · tap AUTO to bank while you sleep</Text>
-          <View style={styles.tpBtnRow}>
-            {runners.map((r) => {
-              const isNext = !r.hit && r.n === nextRunnerN;
-              const notified = Boolean(zone[`runner${r.n}Notified`]);
-              const autoOn = Boolean(zone[`runner${r.n}Auto`]);
-              return (
-                <View
-                  key={r.n}
-                  style={[
-                    styles.tpBtn,
-                    styles.tpBtnRunner,
-                    r.hit && styles.tpBtnHit,
-                    isNext && styles.tpBtnRunnerNext,
-                    autoOn && !r.hit && styles.tpBtnRunnerAuto,
-                    r.hit && { opacity: 0.75 },
-                  ]}
-                >
-                  <Pressable
-                    style={({ pressed }) => [{ alignItems: "center", flex: 1 }, btnPressed(pressed)]}
-                    disabled={r.hit || !onClosePartial || tpBusy != null}
-                    onPress={async () => {
-                      setTpBusy(r.n);
-                      await triggerAppHaptic(hapticEnabled, "medium");
-                      const result = await onClosePartial!(zone.zoneId, { lots: r.lots!, runnerN: r.n });
-                      setTpBusy(null);
-                      if (!result.ok) Alert.alert("Close failed", result.message ?? "Try again");
-                    }}
-                  >
-                    {notified && !r.hit && !autoOn && (
-                      <Animated.View
-                        style={[styles.runnerPulseDot, { opacity: pulseAnim }]}
-                      />
-                    )}
-                    <Text style={[styles.tpBtnSub, (r.hit || isNext) && { color: r.hit ? C.specGold : C.teal }]}>
-                      {r.hit ? "✓ HIT" : `R${r.n}`}
-                    </Text>
-                    <Text style={[styles.tpBtnPrice, r.hit && { color: C.specGold }, isNext && { color: C.teal }]}>
-                      {formatPrice(r.price!)}
-                    </Text>
-                  </Pressable>
-                  <View style={styles.runnerLotsRow}>
-                    {onSetRunnerAuto && !r.hit && (
-                      <RunnerAutoChip
-                        active={autoOn}
-                        disabled={tpBusy != null}
-                        onPress={() => {
-                          void onSetRunnerAuto(zone.zoneId, r.n, !autoOn);
-                        }}
-                      />
-                    )}
-                    <Text style={[styles.tpBtnLots, r.hit && { color: C.specGold }]}>{r.lots!.toFixed(2)} lots</Text>
-                  </View>
+        <View style={styles.runnerTargetsBox}>
+          {runners.map((r) => {
+            const isNext = !r.hit && r.n === nextRunnerN;
+            const statusLabel = r.hit ? "✓ banked" : isNext ? "watching" : "pending";
+            const statusColor = r.hit ? C.specGold : isNext ? C.teal : C.specMuted;
+            return (
+              <View key={r.n} style={[styles.runnerTargetRow, isNext && styles.runnerTargetRowNext]}>
+                <Text style={[styles.runnerTargetLabel, { color: r.hit ? C.specGold : C.teal }]}>
+                  R{r.n}
+                </Text>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.runnerTargetPrice}>{formatPrice(r.price!)}</Text>
+                  <Text style={[styles.runnerTargetSub, { color: statusColor }]}>
+                    {r.lots!.toFixed(2)} lots · {statusLabel}
+                  </Text>
                 </View>
-              );
-            })}
-          </View>
+                {!r.hit && onSetRunnerAuto && (
+                  <RunnerAutoChip
+                    active={Boolean(zone[`runner${r.n}Auto`])}
+                    disabled={tpBusy != null}
+                    onPress={() => void onSetRunnerAuto(zone.zoneId, r.n, !zone[`runner${r.n}Auto`])}
+                  />
+                )}
+              </View>
+            );
+          })}
         </View>
       )}
 
-      {nextTpAction && !runnerPanelOpen && !editRunnerPanelOpen && (
+      {nextTpAction && !runnerActive && !runnerPanelOpen && !editRunnerPanelOpen && (
         <Pressable
           style={({ pressed }) => [styles.takeTpBtn, takeTpBusy && { opacity: 0.6 }, btnPressed(pressed)]}
           disabled={actionBusy}
@@ -856,62 +628,75 @@ export default function ZoneCard({
             setTakeTpBusy(false);
           }}
         >
-          <Text style={styles.takeTpLabel}>{nextTpAction.label}</Text>
-          <Text style={styles.takeTpSub}>{nextTpAction.sub}</Text>
+          <Text style={styles.takeTpLabel}>Take TP NOW</Text>
+          <Text style={styles.takeTpSub}>{nextTpAction.label} · {nextTpAction.sub}</Text>
         </Pressable>
       )}
 
-      {showActionRow && (
-        <View style={styles.actionRow}>
-          {canRiskFree && (
-            <Pressable
-              style={({ pressed }) => [styles.rfBtn, btnPressed(pressed)]}
-              onPress={async () => {
-                if (!onRiskFree || busy) return;
-                setBusy(true);
-                await triggerAppHaptic(hapticEnabled, "medium");
-                const result = await onRiskFree(zone.zoneId);
-                setBusy(false);
-                if (!result.ok) Alert.alert("Risk Free failed", result.message ?? "Try again");
-              }}
-              disabled={actionBusy}
-            >
-              <Feather name="shield" size={12} color={C.specGold} />
-              <Text style={styles.rfBtnText}>Risk Free</Text>
-            </Pressable>
+      {showMenuBtn && (
+        <View style={styles.menuWrap}>
+          {menuOpen && (
+            <View style={styles.menuDropdown}>
+              {canRiskFree && (
+                <Pressable
+                  style={({ pressed }) => [styles.menuItem, btnPressed(pressed)]}
+                  onPress={async () => {
+                    setMenuOpen(false);
+                    if (!onRiskFree || busy) return;
+                    setBusy(true);
+                    await triggerAppHaptic(hapticEnabled, "medium");
+                    const result = await onRiskFree(zone.zoneId);
+                    setBusy(false);
+                    if (!result.ok) Alert.alert("Risk Free failed", result.message ?? "Try again");
+                  }}
+                  disabled={actionBusy}
+                >
+                  <Text style={styles.menuItemText}>🛡 Risk Free</Text>
+                </Pressable>
+              )}
+              {showCloseAllWorst && (
+                <Pressable
+                  style={({ pressed }) => [styles.menuItem, !canCloseAllWorst && { opacity: 0.45 }, btnPressed(pressed)]}
+                  onPress={async () => {
+                    setMenuOpen(false);
+                    if (!onCloseAllWorst || worstBusy || !canCloseAllWorst) return;
+                    setWorstBusy(true);
+                    await triggerAppHaptic(hapticEnabled, "medium");
+                    const result = await onCloseAllWorst(zone.zoneId);
+                    setWorstBusy(false);
+                    if (!result.ok) Alert.alert("Secure failed", result.message ?? "Try again");
+                  }}
+                  disabled={actionBusy || !canCloseAllWorst}
+                >
+                  <Text style={styles.menuItemText}>Secure Profits</Text>
+                </Pressable>
+              )}
+              {canCancelOrders && (
+                <Pressable
+                  style={({ pressed }) => [styles.menuItem, btnPressed(pressed)]}
+                  onPress={async () => {
+                    setMenuOpen(false);
+                    if (!onCancelOrders || delBusy) return;
+                    setDelBusy(true);
+                    await triggerAppHaptic(hapticEnabled, "light");
+                    const result = await onCancelOrders(zone.zoneId);
+                    setDelBusy(false);
+                    if (!result.ok) Alert.alert("Delete limits failed", result.message ?? "Try again");
+                  }}
+                  disabled={actionBusy}
+                >
+                  <Text style={styles.menuItemText}>🗑 Delete Limits</Text>
+                </Pressable>
+              )}
+            </View>
           )}
-          {showCloseAllWorst && (
-            <Pressable
-              style={({ pressed }) => [styles.secureBtn, !canCloseAllWorst && { opacity: 0.45 }, btnPressed(pressed)]}
-              onPress={async () => {
-                if (!onCloseAllWorst || worstBusy || !canCloseAllWorst) return;
-                setWorstBusy(true);
-                await triggerAppHaptic(hapticEnabled, "medium");
-                const result = await onCloseAllWorst(zone.zoneId);
-                setWorstBusy(false);
-                if (!result.ok) Alert.alert("Secure failed", result.message ?? "Try again");
-              }}
-              disabled={actionBusy || !canCloseAllWorst}
-            >
-              <Text style={styles.secureBtnText}>Secure</Text>
-            </Pressable>
-          )}
-          {canCancelOrders && (
-            <Pressable
-              style={({ pressed }) => [styles.delBtn, btnPressed(pressed)]}
-              onPress={async () => {
-                if (!onCancelOrders || delBusy) return;
-                setDelBusy(true);
-                await triggerAppHaptic(hapticEnabled, "light");
-                const result = await onCancelOrders(zone.zoneId);
-                setDelBusy(false);
-                if (!result.ok) Alert.alert("Delete limits failed", result.message ?? "Try again");
-              }}
-              disabled={actionBusy}
-            >
-              <Text style={styles.delBtnText}>Del Limits</Text>
-            </Pressable>
-          )}
+          <Pressable
+            style={({ pressed }) => [styles.menuBtn, btnPressed(pressed)]}
+            onPress={() => setMenuOpen((v) => !v)}
+            disabled={actionBusy}
+          >
+            <Text style={styles.menuBtnText}>···</Text>
+          </Pressable>
         </View>
       )}
     </Animated.View>
@@ -969,16 +754,6 @@ const styles = StyleSheet.create({
   statusActiveSell: { borderColor: C.specSell },
   statusRunner: { borderColor: C.teal, backgroundColor: C.tealBg, borderStyle: "dashed" },
   statusText: { fontSize: 9, fontFamily: "Inter_700Bold", color: C.specBuy, letterSpacing: 0.8 },
-  pnlStrip: {
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-  },
-  pnlLeft: { fontSize: 11, fontFamily: "Inter_500Medium", color: C.specMuted },
-  pnlRight: { fontSize: 18, fontFamily: "Inter_700Bold" },
   notifBar: {
     backgroundColor: C.tealBg,
     borderWidth: 1,
@@ -1001,70 +776,43 @@ const styles = StyleSheet.create({
     borderColor: "rgba(230,162,60,0.45)",
   },
   warnText: { flex: 1, fontSize: 11, fontFamily: "Inter_500Medium", color: "#E6A23C" },
-  pipeTrack: {
-    position: "absolute",
-    top: 10,
-    left: 0,
-    height: 4,
-    backgroundColor: "#F3F4F6",
-    borderRadius: 4,
-  },
-  pipeFill: { position: "absolute", top: 10, left: 0, height: 4, borderRadius: 4 },
-  pipeDot: {
-    position: "absolute",
-    top: 4,
-    width: 14,
-    height: 14,
-    borderRadius: 7,
-    backgroundColor: "#fff",
-    borderWidth: 2,
-    borderColor: "#D1D5DB",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  pipeDotHit: { backgroundColor: C.specGold, borderColor: C.specGold },
-  pipeDotNext: { borderColor: C.specGold },
-  pipeDotRunner: { borderStyle: "dashed" },
-  pipeNeedle: {
-    position: "absolute",
-    top: 6,
-    width: 2,
-    height: 12,
-    backgroundColor: C.specText,
-    borderRadius: 1,
-  },
-  pipeLabels: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    paddingHorizontal: 4,
-    marginTop: 4,
-  },
-  pipeLabel: { fontSize: 8, fontFamily: "Inter_600SemiBold", color: C.specMuted },
-  progressHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 4 },
-  progressPrice: { fontSize: 11, fontFamily: "Inter_600SemiBold", color: C.specMuted },
-  progressTarget: { fontSize: 11, fontFamily: "Inter_500Medium", color: C.specMuted },
-  progressDist: { fontSize: 11, fontFamily: "Inter_700Bold", color: C.specText },
-  progressTrack: { height: 5, backgroundColor: "#F3F4F6", borderRadius: 4, overflow: "hidden" },
-  progressFill: { height: "100%", borderRadius: 4 },
-  tpBtnRow: { flexDirection: "row", gap: 7 },
-  tpBtn: {
-    flex: 1,
-    paddingVertical: 10,
-    paddingHorizontal: 4,
-    borderRadius: 12,
-    alignItems: "center",
+  runnerTargetsBox: {
+    backgroundColor: C.tealBg,
     borderWidth: 1.5,
-    borderColor: C.specBorder,
-    backgroundColor: C.cardAlt,
+    borderColor: C.tealBdr,
+    borderRadius: 12,
+    padding: 10,
+    gap: 8,
+    marginBottom: 4,
   },
-  tpBtnHit: { borderColor: C.specGoldBdr, backgroundColor: C.specGoldBg },
-  tpBtnDone: { borderColor: "#D1D5DB", backgroundColor: "#F3F4F6" },
-  tpBtnNext: { borderColor: C.specGoldBdr, backgroundColor: "rgba(201,137,46,0.05)" },
-  tpBtnManual: { borderStyle: "dashed" },
-  tpBtnRunner: { borderStyle: "dashed" },
-  tpBtnRunnerNext: { borderColor: C.tealBdr, backgroundColor: C.tealBg },
-  tpBtnRunnerAuto: { borderColor: C.teal, backgroundColor: "rgba(14,116,144,0.12)" },
-  runnerLotsRow: { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 2 },
+  runnerTargetRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingVertical: 4,
+  },
+  runnerTargetRowNext: {
+    borderWidth: 1,
+    borderColor: C.tealBdr,
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    backgroundColor: "rgba(14,116,144,0.06)",
+  },
+  runnerTargetLabel: {
+    fontSize: 12,
+    fontFamily: "Inter_700Bold",
+    width: 24,
+  },
+  runnerTargetPrice: {
+    fontSize: 13,
+    fontFamily: "Inter_700Bold",
+    color: C.specText,
+  },
+  runnerTargetSub: {
+    fontSize: 10,
+    fontFamily: "Inter_500Medium",
+    marginTop: 1,
+  },
   runnerAutoChip: {
     paddingHorizontal: 5,
     paddingVertical: 2,
@@ -1076,11 +824,6 @@ const styles = StyleSheet.create({
   runnerAutoChipOn: { borderColor: C.teal, backgroundColor: C.tealBg },
   runnerAutoChipText: { fontSize: 7, fontFamily: "Inter_700Bold", color: C.specMuted, letterSpacing: 0.5 },
   runnerAutoChipTextOn: { color: C.teal },
-  tpBtnSub: { fontSize: 8.5, fontFamily: "Inter_700Bold", color: C.specMuted, letterSpacing: 0.7, marginBottom: 2 },
-  tpBtnMain: { fontSize: 13, fontFamily: "Inter_700Bold", color: C.specText },
-  tpBtnManualText: { fontSize: 11, fontFamily: "Inter_600SemiBold", color: C.specMuted },
-  tpBtnPrice: { fontSize: 11, fontFamily: "Inter_600SemiBold", color: C.specText },
-  tpBtnLots: { fontSize: 9, color: C.specMuted, marginTop: 1 },
   runnerPanel: {
     backgroundColor: C.tealBg,
     borderWidth: 1.5,
@@ -1121,17 +864,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   runnerSkipText: { fontSize: 12, fontFamily: "Inter_600SemiBold", color: C.specMuted },
-  runnerSectionLabel: {
-    fontSize: 10,
-    fontFamily: "Inter_700Bold",
-    color: C.teal,
-    letterSpacing: 0.7,
-    marginBottom: 8,
-    paddingBottom: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: C.tealBdr,
-  },
-  actionRow: { flexDirection: "row", gap: 8 },
   takeTpBtn: {
     width: "100%",
     alignItems: "center",
@@ -1168,50 +900,46 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_700Bold",
     color: C.teal,
   },
-  runnerPulseDot: {
-    position: "absolute",
-    top: -4,
-    right: -4,
-    width: 10,
-    height: 10,
-    borderRadius: 5,
-    backgroundColor: C.specGold,
-  },
-  rfBtn: {
-    flex: 1,
-    flexDirection: "row",
+  menuWrap: {
     alignItems: "center",
-    justifyContent: "center",
-    gap: 5,
-    paddingVertical: 9,
-    borderRadius: 11,
-    borderWidth: 1,
-    borderColor: C.specGoldBdr,
-    backgroundColor: C.specGoldBg,
+    marginTop: 2,
   },
-  rfBtnText: { fontSize: 11, fontFamily: "Inter_700Bold", color: C.specGold },
-  secureBtn: {
-    flex: 1,
+  menuDropdown: {
+    width: "100%",
+    backgroundColor: C.card,
+    borderWidth: 1,
+    borderColor: C.specBorder,
+    borderRadius: 12,
+    marginBottom: 6,
+    overflow: "hidden",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  menuItem: {
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: C.specBorder,
+  },
+  menuItemText: {
+    fontSize: 13,
+    fontFamily: "Inter_600SemiBold",
+    color: C.specText,
+  },
+  menuBtn: {
+    width: "100%",
     alignItems: "center",
-    justifyContent: "center",
-    paddingVertical: 9,
-    borderRadius: 11,
-    borderWidth: 1,
-    borderColor: "rgba(99,179,237,0.45)",
-    backgroundColor: "rgba(99,179,237,0.08)",
+    paddingVertical: 8,
   },
-  secureBtnText: { fontSize: 11, fontFamily: "Inter_700Bold", color: "#2B6CB0" },
-  delBtn: {
-    flex: 1,
-    alignItems: "center",
-    justifyContent: "center",
-    paddingVertical: 9,
-    borderRadius: 11,
-    borderWidth: 1,
-    borderColor: "rgba(124,58,237,0.3)",
-    backgroundColor: "rgba(124,58,237,0.06)",
+  menuBtnText: {
+    fontSize: 20,
+    fontFamily: "Inter_700Bold",
+    color: C.specMuted,
+    letterSpacing: 2,
   },
-  delBtnText: { fontSize: 11, fontFamily: "Inter_700Bold", color: "#7C3AED" },
   histRow: { flexDirection: "row", justifyContent: "space-between" },
   histText: { fontSize: 11, fontFamily: "Inter_500Medium", color: C.textMuted },
 });

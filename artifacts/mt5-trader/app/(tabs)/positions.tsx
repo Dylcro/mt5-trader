@@ -1,3 +1,4 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Feather } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -19,7 +20,6 @@ import Colors from "@/constants/colors";
 import { useTrading, type PendingOrder, type Position } from "@/context/TradingContext";
 import { useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useZones } from "@/hooks/useZones";
-import LivePriceStrip from "@/components/LivePriceStrip";
 import ZoneCard from "@/components/ZoneCard";
 import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
 import { subscribeAccountEvents } from "@/lib/accountEventBus";
@@ -31,6 +31,7 @@ import {
 } from "@/lib/zoneDisplay";
 
 const C = Colors.dark;
+const LOT_SIZE_CASCADE_KEY = "lot_size_cascade";
 
 function SectionHeader({ label, count, color }: { label: string; count: number; color: string }) {
   return (
@@ -277,7 +278,7 @@ export default function PositionsScreen() {
     refreshPositions, refreshPendingOrders, refreshAccountInfo,
     closePosition, cancelOrder, accountId, region, sseConnected, price,
     priceError, priceStale, syncSession, ensureSessionForTrade,
-    closeZonePartial, activateRunner, setRunnerAuto,
+    closeZonePartial, activateRunner, setRunnerAuto, placeTrade,
   } = useTrading();
   const {
     zones, loading: zonesLoading, refresh: refreshZones, pruneStaleFromServer,
@@ -348,6 +349,15 @@ export default function PositionsScreen() {
   const [pastExpanded, setPastExpanded] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [cascadeLotSize, setCascadeLotSize] = useState(0.04);
+  const [tradeFeedback, setTradeFeedback] = useState<"buy" | "sell" | null>(null);
+
+  useEffect(() => {
+    void AsyncStorage.getItem(LOT_SIZE_CASCADE_KEY).then((v) => {
+      const parsed = v ? parseFloat(v) : NaN;
+      if (Number.isFinite(parsed) && parsed >= 0.01) setCascadeLotSize(parsed);
+    });
+  }, []);
 
   useEffect(() => {
     zonesEverShownRef.current = false;
@@ -479,9 +489,16 @@ export default function PositionsScreen() {
     }, [status, accountId, sseConnected, price, priceError, priceStale, syncSession, refreshZones, refreshPositions, refreshPendingOrders]),
   );
 
-  const handlePriceSync = useCallback(() => {
-    void syncSession(true);
-  }, [syncSession]);
+  const handleQuickTrade = useCallback(
+    async (direction: "buy" | "sell") => {
+      if (tradeFeedback) return;
+      setTradeFeedback(direction);
+      await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      void placeTrade({ direction, volume: cascadeLotSize });
+      setTimeout(() => setTradeFeedback(null), 2500);
+    },
+    [tradeFeedback, placeTrade, cascadeLotSize],
+  );
 
   const handleCancelOrder = useCallback(
     async (order: PendingOrder) => {
@@ -573,10 +590,6 @@ export default function PositionsScreen() {
     );
   };
 
-  const totalPL =
-    accountInfo != null
-      ? accountInfo.equity - accountInfo.balance
-      : positions.reduce((sum, p) => sum + p.profit, 0);
   const webTopPad = Platform.OS === "web" ? 67 : 0;
   const showStandalone = standalonePositions.length > 0;
   const hasAnything =
@@ -586,38 +599,41 @@ export default function PositionsScreen() {
     <View style={[styles.container, { paddingTop: insets.top + webTopPad }]}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Positions</Text>
-        <Text style={styles.openCount}>{positions.length} open</Text>
+        <View style={styles.openBadge}>
+          <Text style={styles.openBadgeText}>{displayActiveZones.length} open</Text>
+        </View>
       </View>
 
-      <LivePriceStrip
-        price={price}
-        priceError={priceError}
-        priceStale={priceStale}
-        connected={status === "connected"}
-        onSync={handlePriceSync}
-      />
-
-      {positions.length > 0 && (
-        <View
-          style={[
-            styles.plBanner,
-            totalPL >= 0 ? styles.plBannerPositive : styles.plBannerNegative,
+      <View style={styles.tradeRow}>
+        <Pressable
+          style={({ pressed }) => [
+            styles.tradeBtn,
+            styles.sellBtn,
+            (pressed || tradeFeedback === "sell") && styles.tradeBtnMuted,
+            tradeFeedback === "sell" && { backgroundColor: C.textMuted },
           ]}
+          onPress={() => void handleQuickTrade("sell")}
+          disabled={!!tradeFeedback}
         >
-          <View>
-            <Text style={styles.plBannerLabel}>TOTAL FLOATING P&L</Text>
-            <Text style={styles.plBannerSub}>
-              {accountInfo != null ? "Account floating" : `${positions.length} position${positions.length === 1 ? "" : "s"} open`}
-              {displayActiveZones.length > 0
-                ? ` · ${displayActiveZones.length} zone${displayActiveZones.length === 1 ? "" : "s"}`
-                : ""}
-            </Text>
-          </View>
-          <Text style={[styles.plBannerValue, { color: totalPL >= 0 ? C.buy : C.sell }]}>
-            {formatMoney(totalPL, { signed: true })}
+          <Text style={styles.tradeBtnText}>
+            {tradeFeedback === "sell" ? "✓ Trade Activated" : "SELL"}
           </Text>
-        </View>
-      )}
+        </Pressable>
+        <Pressable
+          style={({ pressed }) => [
+            styles.tradeBtn,
+            styles.buyBtn,
+            (pressed || tradeFeedback === "buy") && styles.tradeBtnMuted,
+            tradeFeedback === "buy" && { backgroundColor: C.textMuted },
+          ]}
+          onPress={() => void handleQuickTrade("buy")}
+          disabled={!!tradeFeedback}
+        >
+          <Text style={styles.tradeBtnText}>
+            {tradeFeedback === "buy" ? "✓ Trade Activated" : "BUY"}
+          </Text>
+        </Pressable>
+      </View>
 
       {runnerAlert && (
         <Pressable
@@ -671,7 +687,7 @@ export default function PositionsScreen() {
           <View style={styles.emptyState}>
             <Feather name="inbox" size={40} color={C.textMuted} />
             <Text style={styles.emptyTitle}>No Open Positions</Text>
-            <Text style={styles.emptyText}>Head to the Trade tab to place your first XAUUSD trade</Text>
+            <Text style={styles.emptyText}>Tap BUY or SELL above to place your first XAUUSD trade</Text>
           </View>
         ) : (
           <>
@@ -828,46 +844,46 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_700Bold",
     color: C.text,
   },
-  openCount: {
-    fontSize: 14,
-    fontFamily: "Inter_500Medium",
-    color: C.textMuted,
-  },
-  plBanner: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginHorizontal: 16,
-    marginBottom: 12,
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    borderRadius: 14,
-  },
-  plBannerPositive: {
-    backgroundColor: C.buyDim,
+  openBadge: {
+    backgroundColor: C.buyLight,
+    borderRadius: 100,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
     borderWidth: 1,
     borderColor: C.buyBorder,
   },
-  plBannerNegative: {
-    backgroundColor: C.sellDim,
-    borderWidth: 1,
-    borderColor: C.sellBorder,
-  },
-  plBannerLabel: {
-    fontSize: 9,
+  openBadgeText: {
+    fontSize: 12,
     fontFamily: "Inter_700Bold",
-    color: C.textSecondary,
-    letterSpacing: 0.8,
+    color: C.buy,
   },
-  plBannerSub: {
-    fontSize: 11,
-    fontFamily: "Inter_400Regular",
-    color: C.textMuted,
-    marginTop: 2,
+  tradeRow: {
+    flexDirection: "row",
+    gap: 10,
+    paddingHorizontal: 16,
+    paddingBottom: 12,
   },
-  plBannerValue: {
-    fontSize: 24,
+  tradeBtn: {
+    flex: 1,
+    height: 46,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  sellBtn: {
+    backgroundColor: C.sell,
+  },
+  buyBtn: {
+    backgroundColor: C.buyButton,
+  },
+  tradeBtnMuted: {
+    opacity: 0.75,
+  },
+  tradeBtnText: {
+    fontSize: 14,
     fontFamily: "Inter_700Bold",
+    color: "#fff",
+    letterSpacing: 1.12,
   },
   runnerBanner: {
     backgroundColor: "#0E7490",

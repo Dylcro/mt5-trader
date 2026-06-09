@@ -108,26 +108,17 @@ function NativeTabLayout({
   return (
     <TabChrome showOnboarding={showOnboarding} onOnboardingComplete={onOnboardingComplete}>
       <NativeTabs>
-        <NativeTabs.Trigger name="index">
-          <NativeTabs.Trigger.Icon sf={{ default: "chart.line.uptrend.xyaxis", selected: "chart.line.uptrend.xyaxis.circle.fill" }} />
-          <NativeTabs.Trigger.Label>Trade</NativeTabs.Trigger.Label>
-        </NativeTabs.Trigger>
-        <NativeTabs.Trigger name="dashboard">
-          <NativeTabs.Trigger.Icon sf={{ default: "square.grid.2x2", selected: "square.grid.2x2.fill" }} />
-          <NativeTabs.Trigger.Label>Dashboard</NativeTabs.Trigger.Label>
-        </NativeTabs.Trigger>
         <NativeTabs.Trigger name="positions">
           <NativeTabs.Trigger.Icon sf={{ default: "list.bullet.rectangle", selected: "list.bullet.rectangle.fill" }} />
           <NativeTabs.Trigger.Label>Positions</NativeTabs.Trigger.Label>
-        </NativeTabs.Trigger>
-        <NativeTabs.Trigger name="history">
-          <NativeTabs.Trigger.Icon sf={{ default: "clock", selected: "clock.fill" }} />
-          <NativeTabs.Trigger.Label>History</NativeTabs.Trigger.Label>
         </NativeTabs.Trigger>
         <NativeTabs.Trigger name="settings">
           <NativeTabs.Trigger.Icon sf={{ default: "gearshape", selected: "gearshape.fill" }} />
           <NativeTabs.Trigger.Label>Settings</NativeTabs.Trigger.Label>
         </NativeTabs.Trigger>
+        <NativeTabs.Trigger name="index" hidden />
+        <NativeTabs.Trigger name="dashboard" hidden />
+        <NativeTabs.Trigger name="history" hidden />
       </NativeTabs>
     </TabChrome>
   );
@@ -176,29 +167,26 @@ function ClassicTabLayout({
         <Tabs.Screen
           name="index"
           options={{
-            title: "Trade",
-            tabBarIcon: ({ focused }) => <TabEmoji emoji="📈" focused={focused} />,
+            href: null,
           }}
         />
         <Tabs.Screen
           name="positions"
           options={{
             title: "Positions",
-            tabBarIcon: ({ focused }) => <TabEmoji emoji="📋" focused={focused} />,
+            tabBarIcon: ({ focused }) => <TabEmoji emoji="📊" focused={focused} />,
           }}
         />
         <Tabs.Screen
           name="dashboard"
           options={{
-            title: "Dashboard",
-            tabBarIcon: ({ focused }) => <TabEmoji emoji="📊" focused={focused} />,
+            href: null,
           }}
         />
         <Tabs.Screen
           name="history"
           options={{
-            title: "History",
-            tabBarIcon: ({ focused }) => <TabEmoji emoji="🕐" focused={focused} />,
+            href: null,
           }}
         />
         <Tabs.Screen

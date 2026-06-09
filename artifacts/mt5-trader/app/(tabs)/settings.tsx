@@ -1,18 +1,15 @@
 import { useAuth } from "@/context/AuthContext";
 import { Feather } from "@expo/vector-icons";
-import Slider from "@react-native-community/slider";
 import * as Haptics from "expo-haptics";
 import { useRouter } from "expo-router";
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
-  Keyboard,
   KeyboardAvoidingView,
   Platform,
   Pressable,
   ScrollView,
   StyleSheet,
-  Switch,
   Text,
   TextInput,
   View,
@@ -21,18 +18,19 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
-import CurrencyPicker from "@/components/CurrencyPicker";
+import Stepper from "@/components/ui/Stepper";
+import Toggle from "@/components/ui/Toggle";
 import Colors from "@/constants/colors";
 import { useTrading } from "@/context/TradingContext";
 import { useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
-import { triggerAppHaptic, useHapticSettings } from "@/hooks/useHapticSettings";
-import { useNotificationSettings } from "@/hooks/useNotificationSettings";
-
 const C = Colors.dark;
 
-const LOT_SIZE_SINGLE_KEY = "lot_size_single";
 const LOT_SIZE_CASCADE_KEY = "lot_size_cascade";
+const NOTIFY_TP3_KEY = "notify_tp3";
+const NOTIFY_R1_KEY = "notify_r1";
+const NOTIFY_R2_KEY = "notify_r2";
+const NOTIFY_R3_KEY = "notify_r3";
 
 const POPULAR_SERVERS = [
   "VantageInternational-Live",
@@ -79,134 +77,69 @@ function StatusDot({ status }: { status: string }) {
   );
 }
 
-function SettingRow({
-  label,
-  hint,
-  value,
-  onDec,
-  onInc,
-  display,
-}: {
-  label: string;
-  hint: string;
-  value: number;
-  onDec: () => void;
-  onInc: () => void;
-  display: string;
-}) {
+function SectionTitle({ title }: { title: string }) {
   return (
-    <View style={styles.settingRow}>
-      <View style={styles.settingRowLeft}>
-        <Text style={styles.settingLabel}>{label}</Text>
-        <Text style={styles.settingHint}>{hint}</Text>
-      </View>
-      <View style={styles.settingControls}>
-        <Pressable style={styles.settingBtn} onPress={onDec} hitSlop={8}>
-          <Feather name="minus" size={14} color={C.text} />
-        </Pressable>
-        <Text style={styles.settingValue}>{display}</Text>
-        <Pressable style={styles.settingBtn} onPress={onInc} hitSlop={8}>
-          <Feather name="plus" size={14} color={C.text} />
-        </Pressable>
-      </View>
+    <Text style={styles.sectionTitle}>{title}</Text>
+  );
+}
+
+function PctBar({ pct }: { pct: number }) {
+  return (
+    <View style={styles.pctBarTrack}>
+      <View style={[styles.pctBarFill, { width: `${Math.min(100, Math.max(0, pct))}%` }]} />
     </View>
   );
 }
 
-function PillSelector({
+function TpLevelRow({
   label,
-  hint,
-  options,
-  value,
-  onChange,
-  suffix = "pips",
-  labels,
+  enabled,
+  pct,
+  pips,
+  onToggle,
+  onPctChange,
+  onPipsChange,
 }: {
   label: string;
-  hint: string;
-  options: number[];
-  value: number;
-  onChange: (v: number) => void;
-  suffix?: string;
-  labels?: Record<number, string>;
+  enabled: boolean;
+  pct: number;
+  pips: number;
+  onToggle: (v: boolean) => void;
+  onPctChange: (v: number) => void;
+  onPipsChange: (v: number) => void;
 }) {
   return (
-    <View style={styles.pillSelectorColumn}>
-      <View style={styles.settingRowLeft}>
+    <View style={styles.tpLevelBlock}>
+      <View style={styles.tpLevelHeader}>
         <Text style={styles.settingLabel}>{label}</Text>
-        <Text style={styles.settingHint}>{hint}</Text>
+        <Toggle value={enabled} onValueChange={onToggle} color={C.gold} />
       </View>
-      <View style={styles.pillGroup}>
-        {options.map((opt) => {
-          const selected = opt === value;
-          const display = labels?.[opt] ?? `${opt}${suffix}`;
-          return (
-            <Pressable
-              key={opt}
-              style={[styles.pill, selected && styles.pillActive]}
-              onPress={() => {
-                Haptics.selectionAsync();
-                onChange(opt);
-              }}
-              hitSlop={4}
-            >
-              <Text style={[styles.pillText, selected && styles.pillTextActive]}>
-                {display}
-              </Text>
-            </Pressable>
-          );
-        })}
-      </View>
-    </View>
-  );
-}
-
-function SliderSetting({
-  label,
-  value,
-  min,
-  max,
-  step,
-  onChange,
-  displayValue,
-  hint,
-}: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  step: number;
-  onChange: (v: number) => void;
-  displayValue: string;
-  hint: string;
-}) {
-  return (
-    <View style={styles.sliderSetting}>
-      <View style={styles.sliderHeader}>
-        <Text style={styles.settingLabel}>{label}</Text>
-        <View style={styles.sliderValueBadge}>
-          <Text style={styles.sliderValueText}>{displayValue}</Text>
+      {enabled && (
+        <View style={styles.tpLevelExpanded}>
+          <View style={styles.tpLevelRow}>
+            <Text style={styles.tpLevelRowLabel}>Close %</Text>
+            <PctBar pct={pct} />
+            <Stepper
+              value={pct}
+              onChange={onPctChange}
+              step={5}
+              min={5}
+              max={100}
+              display={`${pct}%`}
+            />
+          </View>
+          <View style={styles.tpLevelRow}>
+            <Text style={styles.tpLevelRowLabel}>Distance</Text>
+            <Stepper
+              value={pips}
+              onChange={onPipsChange}
+              step={5}
+              min={5}
+              display={`${pips}p`}
+            />
+          </View>
         </View>
-      </View>
-      <Slider
-        style={styles.slider}
-        minimumValue={min}
-        maximumValue={max}
-        step={step}
-        value={value}
-        onValueChange={(v) => {
-          onChange(Math.round(v / step) * step);
-        }}
-        onSlidingComplete={() => Haptics.selectionAsync()}
-        minimumTrackTintColor={C.gold}
-        maximumTrackTintColor={C.border}
-        thumbTintColor={C.gold}
-      />
-      <View style={styles.sliderRange}>
-        <Text style={styles.sliderRangeText}>{min} pips</Text>
-        <Text style={styles.sliderHint}>{hint}</Text>
-        <Text style={styles.sliderRangeText}>{max} pips</Text>
-      </View>
+      )}
     </View>
   );
 }
@@ -216,132 +149,46 @@ export default function SettingsScreen() {
   const router = useRouter();
   const { signOut } = useAuth();
   const { credentials, status, errorMsg, accountInfo, connect, disconnect, accountId } = useTrading();
-  const { currency: displayCurrency, brokerCurrency, setCurrency, formatMoney } = useDisplayCurrency();
+  const { formatMoney } = useDisplayCurrency();
   const { settings: cs, updateSettings, saveToServer } = useCascadeSettings();
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
-  const [tpDraft, setTpDraft] = useState({
-    tp1: String(cs.tp1Pips),
-    tp2: String(cs.tp2Pips),
-    tp3: String(cs.tp3Pips),
-    tp4: String(cs.tp4Pips),
-  });
-  const [tpSaveState, setTpSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
-  const [rfDraft, setRfDraft] = useState<number>(cs.riskFreePips);
-  const [rfSaveState, setRfSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
-  useEffect(() => { setRfDraft(cs.riskFreePips); }, [cs.riskFreePips]);
+  const [cascadeLotSize, setCascadeLotSize] = useState(0.04);
 
-  const rfDirty = rfDraft !== cs.riskFreePips;
   useEffect(() => {
-    setTpDraft({
-      tp1: String(cs.tp1Pips),
-      tp2: String(cs.tp2Pips),
-      tp3: String(cs.tp3Pips),
-      tp4: String(cs.tp4Pips),
-    });
-  }, [cs.tp1Pips, cs.tp2Pips, cs.tp3Pips, cs.tp4Pips]);
-
-  const parsedTp = {
-    tp1: parseFloat(tpDraft.tp1),
-    tp2: parseFloat(tpDraft.tp2),
-    tp3: parseFloat(tpDraft.tp3),
-    tp4: tpDraft.tp4.trim() === "" ? 0 : parseFloat(tpDraft.tp4),
-  };
-  const tpDraftValid =
-    Number.isFinite(parsedTp.tp1) && parsedTp.tp1 > 0 &&
-    Number.isFinite(parsedTp.tp2) && parsedTp.tp2 > parsedTp.tp1 &&
-    Number.isFinite(parsedTp.tp3) && parsedTp.tp3 > parsedTp.tp2 &&
-    Number.isFinite(parsedTp.tp4) && (parsedTp.tp4 === 0 || parsedTp.tp4 > parsedTp.tp3);
-  const tpDraftDirty =
-    parsedTp.tp1 !== cs.tp1Pips ||
-    parsedTp.tp2 !== cs.tp2Pips ||
-    parsedTp.tp3 !== cs.tp3Pips ||
-    parsedTp.tp4 !== cs.tp4Pips;
-
-  // Lot sizes — shared with the trade tab via AsyncStorage
-  const [singleLotDraft, setSingleLotDraft] = useState("0.01");
-  const [cascadeLotDraft, setCascadeLotDraft] = useState("0.04");
-  const [lotSaveState, setLotSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
-  useEffect(() => {
-    AsyncStorage.getMany([LOT_SIZE_SINGLE_KEY, LOT_SIZE_CASCADE_KEY]).then((r) => {
-      const s = r[LOT_SIZE_SINGLE_KEY];
-      const c = r[LOT_SIZE_CASCADE_KEY];
-      if (s) setSingleLotDraft(parseFloat(s).toFixed(2));
-      if (c) setCascadeLotDraft(parseFloat(c).toFixed(2));
+    void AsyncStorage.getItem(LOT_SIZE_CASCADE_KEY).then((v) => {
+      const parsed = v ? parseFloat(v) : NaN;
+      if (Number.isFinite(parsed) && parsed >= 0.01) setCascadeLotSize(parsed);
     });
   }, []);
-  const parsedSingleLot = parseFloat(singleLotDraft);
-  const parsedCascadeLot = parseFloat(cascadeLotDraft);
-  const lotDraftsValid = Number.isFinite(parsedSingleLot) && parsedSingleLot >= 0.01;
 
-  // TP split % per level
-  const [splitDraft, setSplitDraft] = useState({
-    tp1: String(cs.tp1Pct),
-    tp2: String(cs.tp2Pct),
-    tp3: String(cs.tp3Pct),
-    tp4: String(cs.tp4Pct),
-  });
+  const persistLotSize = useCallback((lots: number) => {
+    const v = Math.max(0.01, Math.round(lots * 100) / 100);
+    setCascadeLotSize(v);
+    void AsyncStorage.setItem(LOT_SIZE_CASCADE_KEY, String(v));
+  }, []);
+
+  const [notifyTp3, setNotifyTp3] = useState(true);
+  const [notifyR1, setNotifyR1] = useState(true);
+  const [notifyR2, setNotifyR2] = useState(true);
+  const [notifyR3, setNotifyR3] = useState(true);
+
   useEffect(() => {
-    setSplitDraft({ tp1: String(cs.tp1Pct), tp2: String(cs.tp2Pct), tp3: String(cs.tp3Pct), tp4: String(cs.tp4Pct) });
-  }, [cs.tp1Pct, cs.tp2Pct, cs.tp3Pct, cs.tp4Pct]);
-  const parsedSplit = {
-    tp1: parseInt(splitDraft.tp1, 10) || 0,
-    tp2: parseInt(splitDraft.tp2, 10) || 0,
-    tp3: parseInt(splitDraft.tp3, 10) || 0,
-    tp4: parseInt(splitDraft.tp4, 10) || 0,
-  };
-  const activeSplitSum =
-    (cs.tp1Enabled ? parsedSplit.tp1 : 0) +
-    (cs.tp2Enabled ? parsedSplit.tp2 : 0) +
-    (cs.tp3Enabled ? parsedSplit.tp3 : 0) +
-    (cs.tp4Enabled ? parsedSplit.tp4 : 0);
-  const splitValid = activeSplitSum === 100 &&
-    (!cs.tp1Enabled || parsedSplit.tp1 > 0) &&
-    (!cs.tp2Enabled || parsedSplit.tp2 > 0) &&
-    (!cs.tp3Enabled || parsedSplit.tp3 > 0) &&
-    (!cs.tp4Enabled || parsedSplit.tp4 > 0);
+    void AsyncStorage.getMany([NOTIFY_TP3_KEY, NOTIFY_R1_KEY, NOTIFY_R2_KEY, NOTIFY_R3_KEY]).then((r) => {
+      if (r[NOTIFY_TP3_KEY] != null) setNotifyTp3(r[NOTIFY_TP3_KEY] === "true");
+      if (r[NOTIFY_R1_KEY] != null) setNotifyR1(r[NOTIFY_R1_KEY] === "true");
+      if (r[NOTIFY_R2_KEY] != null) setNotifyR2(r[NOTIFY_R2_KEY] === "true");
+      if (r[NOTIFY_R3_KEY] != null) setNotifyR3(r[NOTIFY_R3_KEY] === "true");
+    });
+  }, []);
 
-  // Lot-size constraint: each partial close must be >= 0.01 lots (MT5 minimum)
-  const enabledTpCount = [cs.tp1Enabled, cs.tp2Enabled, cs.tp3Enabled, cs.tp4Enabled].filter(Boolean).length;
-  const maxActiveTPs = Number.isFinite(parsedCascadeLot) && parsedCascadeLot >= 0.01
-    ? Math.min(4, Math.round(parsedCascadeLot * 100))
-    : 0;
-  const tooManyTPs = enabledTpCount > maxActiveTPs;
-  type TpLotErr = { label: string; lots: number };
-  const tpLotErrors: TpLotErr[] = (
-    [
-      { label: "TP1", enabled: cs.tp1Enabled, pct: parsedSplit.tp1 },
-      { label: "TP2", enabled: cs.tp2Enabled, pct: parsedSplit.tp2 },
-      { label: "TP3", enabled: cs.tp3Enabled, pct: parsedSplit.tp3 },
-      { label: "Runner", enabled: cs.tp4Enabled, pct: parsedSplit.tp4 },
-    ]
-      .filter((t) => t.enabled && t.pct > 0 && Number.isFinite(parsedCascadeLot) && parsedCascadeLot >= 0.01)
-      .map((t) => {
-        const lots = Math.round(parsedCascadeLot * t.pct / 100 * 100) / 100;
-        return lots < 0.01 ? { label: t.label, lots } : null;
-      })
-      .filter((x): x is TpLotErr => x !== null)
-  );
-  const tpCardValid =
-    Number.isFinite(parsedCascadeLot) && parsedCascadeLot >= 0.01 &&
-    (enabledTpCount === 0 || splitValid) &&
-    tpDraftValid &&
-    !tooManyTPs &&
-    tpLotErrors.length === 0;
+  const persistNotify = useCallback((key: string, value: boolean) => {
+    void AsyncStorage.setItem(key, String(value));
+  }, []);
 
-  const { hapticEnabled, setHapticEnabled } = useHapticSettings();
-  const { prefs: notif, loading: notifLoading, updatePrefs: updateNotif } = useNotificationSettings();
-  const [notifBusy, setNotifBusy] = useState(false);
-  const [notifError, setNotifError] = useState<string | null>(null);
-
-  const handleNotifUpdate = async (
-    patch: Partial<{ nearEnabled: boolean; hitEnabled: boolean; thresholdPips: number }>,
-  ) => {
-    setNotifBusy(true);
-    setNotifError(null);
-    const result = await updateNotif(patch);
-    setNotifBusy(false);
-    if (!result.ok) setNotifError(result.message ?? "Couldn't save");
-  };
+  const rfColor =
+    cs.riskFreePips > 0 ? C.gold : cs.riskFreePips < 0 ? C.sell : C.textMuted;
+  const rfDisplay =
+    cs.riskFreePips > 0 ? `+${cs.riskFreePips}p` : cs.riskFreePips < 0 ? `${cs.riskFreePips}p` : "0p";
 
   const [login, setLogin] = useState(credentials.login);
   const [password, setPassword] = useState("");
@@ -606,211 +453,38 @@ export default function SettingsScreen() {
             <Text style={[styles.disconnectText, { color: C.textSecondary }]}>Sign Out</Text>
           </Pressable>
 
-          {/* Preferences */}
+          {/* Section 1 — Take Profit Levels */}
           <View style={styles.cascadeCard}>
-            <View style={styles.cascadeCardHeader}>
-              <Feather name="sliders" size={16} color={C.gold} />
-              <Text style={styles.cascadeCardTitle}>Preferences</Text>
-            </View>
-
-            <View style={styles.settingRow}>
-              <Switch
-                value={hapticEnabled}
-                onValueChange={(v) => {
-                  setHapticEnabled(v);
-                  if (v) void triggerAppHaptic(true, "success");
-                  else void triggerAppHaptic(true, "selection");
-                }}
-                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
-                thumbColor={hapticEnabled ? C.gold : C.textMuted}
-              />
-              <View style={{ marginLeft: 10, flex: 1 }}>
-                <Text style={styles.settingLabel}>Haptic feedback</Text>
-                <Text style={styles.settingHint}>
-                  Vibrate when a cascade toast notification appears.
-                </Text>
-              </View>
-            </View>
-          </View>
-
-          {/* Display currency */}
-          <View style={styles.cascadeCard}>
-            <View style={styles.cascadeCardHeader}>
-              <Feather name="dollar-sign" size={16} color={C.gold} />
-              <Text style={styles.cascadeCardTitle}>Display currency</Text>
-            </View>
-            <Text style={styles.cascadeCardDesc}>
-              Choose how balances and P&L are shown in the app. Amounts are still in your MT5 account currency
-              {brokerCurrency ? ` (${brokerCurrency})` : ""} — only the symbol changes.
-            </Text>
-            <View style={styles.cascadeDivider} />
-            <CurrencyPicker
-              value={displayCurrency}
-              onChange={(c) => { void setCurrency(c); }}
+            <SectionTitle title="TAKE PROFIT LEVELS" />
+            <TpLevelRow
+              label="TP1"
+              enabled={cs.tp1Enabled}
+              pct={cs.tp1Pct}
+              pips={cs.tp1Pips}
+              onToggle={(v) => updateSettings({ tp1Enabled: v })}
+              onPctChange={(v) => updateSettings({ tp1Pct: v })}
+              onPipsChange={(v) => updateSettings({ tp1Pips: v })}
             />
-          </View>
-
-          {/* TP Alerts */}
-          <View style={styles.cascadeCard}>
-            <View style={styles.cascadeCardHeader}>
-              <Feather name="bell" size={16} color={C.gold} />
-              <Text style={styles.cascadeCardTitle}>TP Alerts</Text>
-            </View>
-            <Text style={styles.cascadeCardDesc}>
-              Push alerts work while the app is closed. Allow notifications when iOS asks — TP3 runner alerts always push once permission is granted.
-            </Text>
-
             <View style={styles.cascadeDivider} />
-
-            <View style={styles.settingRow}>
-              <Switch
-                value={notif.nearEnabled}
-                disabled={notifBusy || notifLoading}
-                onValueChange={(v) => { void handleNotifUpdate({ nearEnabled: v }); }}
-                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
-                thumbColor={notif.nearEnabled ? C.gold : C.textMuted}
-              />
-              <View style={{ marginLeft: 10, flex: 1 }}>
-                <Text style={styles.settingLabel}>Alert when near next TP</Text>
-                <Text style={styles.settingHint}>
-                  Fires once per TP level when price gets within the threshold below.
-                </Text>
-              </View>
-            </View>
-
-            <View style={styles.cascadeDivider} />
-
-            <View style={styles.settingRow}>
-              <Switch
-                value={notif.hitEnabled}
-                disabled={notifBusy || notifLoading}
-                onValueChange={(v) => { void handleNotifUpdate({ hitEnabled: v }); }}
-                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
-                thumbColor={notif.hitEnabled ? C.gold : C.textMuted}
-              />
-              <View style={{ marginLeft: 10, flex: 1 }}>
-                <Text style={styles.settingLabel}>Alert when TP hits</Text>
-                <Text style={styles.settingHint}>
-                  Fires the moment a TP is reached and your zone advances.
-                </Text>
-              </View>
-            </View>
-
-            {notif.nearEnabled && (
-              <>
-                <View style={styles.cascadeDivider} />
-                <SliderSetting
-                  label="Near-TP threshold"
-                  value={notif.thresholdPips}
-                  min={1}
-                  max={20}
-                  step={1}
-                  onChange={(v) => { void handleNotifUpdate({ thresholdPips: v }); }}
-                  displayValue={`${notif.thresholdPips} pips`}
-                  hint="distance before alert"
-                />
-              </>
-            )}
-
-            {notifError && (
-              <View style={styles.cascadeWarningBox}>
-                <Feather name="alert-triangle" size={14} color="#f59e0b" />
-                <Text style={styles.cascadeWarningText}>{notifError}</Text>
-              </View>
-            )}
-            {notifBusy && (
-              <View style={styles.settingRow}>
-                <ActivityIndicator size="small" color={C.gold} />
-                <Text style={[styles.settingHint, { marginLeft: 10 }]}>Saving…</Text>
-              </View>
-            )}
-          </View>
-
-          {/* In-app cascade settings */}
-          <View style={styles.cascadeCard}>
-            <View style={styles.cascadeCardHeader}>
-              <Feather name="layers" size={16} color={C.gold} />
-              <Text style={styles.cascadeCardTitle}>Cascade Orders</Text>
-              <View style={styles.sourceBadge}>
-                <Text style={styles.sourceBadgeText}>IN-APP</Text>
-              </View>
-            </View>
-            <Text style={styles.cascadeCardDesc}>
-              Controls the ladder of orders placed when you tap Buy or Sell on the Trade screen. Enable auto-cascade below to apply the same ladder when you one-click in MT5.
-            </Text>
-
-            <View style={styles.cascadeDivider} />
-
-            <PillSelector
-              label="Number of positions"
-              hint="Total orders per cascade (1 market + limits)"
-              options={[1, 2, 3, 4, 5]}
-              value={cs.numPositions}
-              onChange={(v) => updateSettings({ numPositions: v })}
-              suffix=""
+            <TpLevelRow
+              label="TP2"
+              enabled={cs.tp2Enabled}
+              pct={cs.tp2Pct}
+              pips={cs.tp2Pips}
+              onToggle={(v) => updateSettings({ tp2Enabled: v })}
+              onPctChange={(v) => updateSettings({ tp2Pct: v })}
+              onPipsChange={(v) => updateSettings({ tp2Pips: v })}
             />
-
             <View style={styles.cascadeDivider} />
-
-            <PillSelector
-              label="Pips between orders"
-              hint={`${(cs.pipsBetween * 0.10).toFixed(2)} price gap between each level`}
-              options={[5, 10, 15, 20]}
-              value={cs.pipsBetween}
-              onChange={(v) => updateSettings({ pipsBetween: v })}
+            <TpLevelRow
+              label="TP3"
+              enabled={cs.tp3Enabled}
+              pct={cs.tp3Pct}
+              pips={cs.tp3Pips}
+              onToggle={(v) => updateSettings({ tp3Enabled: v })}
+              onPctChange={(v) => updateSettings({ tp3Pct: v })}
+              onPipsChange={(v) => updateSettings({ tp3Pips: v })}
             />
-
-            <View style={styles.cascadeDivider} />
-
-            <SliderSetting
-              label="Stop loss (from entry)"
-              value={cs.slPips}
-              min={10}
-              max={500}
-              step={5}
-              onChange={(v) => updateSettings({ slPips: v })}
-              displayValue={`${cs.slPips} pips`}
-              hint={`${(cs.slPips * 0.10).toFixed(2)} below market entry — shared by all orders`}
-            />
-
-            {cs.numPositions > 1 && cs.slPips <= (cs.numPositions - 1) * cs.pipsBetween && (
-              <View style={styles.cascadeWarningBox}>
-                <Feather name="alert-triangle" size={14} color="#f59e0b" />
-                <Text style={styles.cascadeWarningText}>
-                  {`SL (${cs.slPips} pips) is too tight — limit ${Math.ceil(cs.slPips / cs.pipsBetween) + 1}+ will be rejected by MT5. Increase SL to at least ${(cs.numPositions - 1) * cs.pipsBetween + 5} pips, or reduce pips between orders.`}
-                </Text>
-              </View>
-            )}
-
-            <View style={styles.cascadePreviewBox}>
-              <Text style={styles.cascadePreviewTitle}>Preview with current settings (buy example)</Text>
-              <Text style={styles.cascadePreviewText}>
-                {`#1  Market  @ 5058.00  ← instant\n`}
-                {Array.from({ length: cs.numPositions - 1 }, (_, i) =>
-                  `#${i + 2}  Limit   @ ${(5058 - (i + 1) * cs.pipsBetween * 0.10).toFixed(2)}`
-                ).join("\n")}
-                {cs.numPositions > 1 ? "\n" : ""}
-                {`SL  ${(5058 - cs.slPips * 0.10).toFixed(2)}  ← all orders (${cs.slPips} pips from entry)`}
-              </Text>
-            </View>
-
-            <View style={styles.cascadeDivider} />
-
-            <View style={styles.settingRow}>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.settingLabel}>Auto-cascade on MT5 one-click</Text>
-                <Text style={styles.settingHint}>
-                  Tap buy/sell in MT5 and the cascade fires automatically
-                </Text>
-              </View>
-              <Switch
-                value={cs.autoCascadeEnabled}
-                onValueChange={(val) => updateSettings({ autoCascadeEnabled: val })}
-                trackColor={{ false: C.border, true: "rgba(201,168,76,0.5)" }}
-                thumbColor={cs.autoCascadeEnabled ? C.gold : C.textMuted}
-              />
-            </View>
-
             <Pressable
               style={({ pressed }) => [
                 styles.saveBtn,
@@ -846,407 +520,173 @@ export default function SettingsScreen() {
             </Pressable>
           </View>
 
-          {/* Lot Sizes */}
+          {/* Section 2 — Stop Loss */}
           <View style={styles.cascadeCard}>
-            <View style={styles.cascadeCardHeader}>
-              <Feather name="layers" size={16} color={C.gold} />
-              <Text style={styles.cascadeCardTitle}>Lot Sizes</Text>
-              <View style={styles.sourceBadge}>
-                <Text style={styles.sourceBadgeText}>IN-APP</Text>
+            <SectionTitle title="STOP LOSS" />
+            <View style={styles.settingRow}>
+              <View style={styles.settingRowLeft}>
+                <Text style={styles.settingLabel}>Move SL to BE at TP2</Text>
+                <Text style={styles.settingHint}>Protects remaining position automatically</Text>
               </View>
+              <Toggle
+                value={cs.autoBeAtTp === 2}
+                onValueChange={(v) => updateSettings({ autoBeAtTp: v ? 2 : 3 })}
+                color={C.buy}
+              />
             </View>
-            <Text style={styles.cascadeCardDesc}>
-              Default lot size for single trades and cascade orders. Changes take effect immediately on the trade screen.
-            </Text>
-
             <View style={styles.cascadeDivider} />
-
-            <View style={styles.tpRow}>
-              <Text style={styles.tpRowLabel}>Single Trade</Text>
-              <View style={styles.tpInputWrap}>
-                <TextInput
-                  style={styles.tpInput}
-                  value={singleLotDraft}
-                  onChangeText={(v) => {
-                    setSingleLotDraft(v.replace(/[^0-9.]/g, ""));
-                    if (lotSaveState !== "idle") setLotSaveState("idle");
-                  }}
-                  placeholder="0.01"
-                  placeholderTextColor={C.textMuted}
-                  keyboardType="decimal-pad"
-                  inputMode="decimal"
-                />
-                <Text style={styles.tpInputSuffix}>lot</Text>
+            <View style={styles.settingRow}>
+              <View style={styles.settingRowLeft}>
+                <Text style={styles.settingLabel}>Cancel limits at TP2</Text>
+                <Text style={styles.settingHint}>Removes unfilled cascade orders</Text>
               </View>
+              <Toggle
+                value={cs.takeProfitEnabled}
+                onValueChange={(v) => updateSettings({ takeProfitEnabled: v })}
+                color={C.teal}
+              />
             </View>
-
-            {!lotDraftsValid && (
-              <View style={styles.cascadeWarningBox}>
-                <Feather name="alert-triangle" size={14} color="#f59e0b" />
-                <Text style={styles.cascadeWarningText}>
-                  Minimum lot size is 0.01.
-                </Text>
+            <View style={styles.cascadeDivider} />
+            <View style={styles.settingRow}>
+              <View style={styles.settingRowLeft}>
+                <Text style={styles.settingLabel}>Risk Free offset</Text>
+                <Text style={styles.settingHint}>Pips from entry for risk free SL</Text>
               </View>
-            )}
+              <Stepper
+                value={cs.riskFreePips}
+                onChange={(v) => updateSettings({ riskFreePips: v })}
+                step={5}
+                min={-50}
+                max={50}
+                display={rfDisplay}
+                valueColor={rfColor}
+              />
+            </View>
+          </View>
 
+          {/* Section 3 — Cascade Settings */}
+          <View style={styles.cascadeCard}>
+            <SectionTitle title="CASCADE SETTINGS" />
+            <View style={styles.settingRow}>
+              <View style={styles.settingRowLeft}>
+                <Text style={styles.settingLabel}>Lot size</Text>
+              </View>
+              <Stepper
+                value={cascadeLotSize}
+                onChange={persistLotSize}
+                step={0.01}
+                min={0.01}
+                display={cascadeLotSize.toFixed(2)}
+              />
+            </View>
+            <View style={styles.cascadeDivider} />
+            <View style={styles.settingRow}>
+              <View style={styles.settingRowLeft}>
+                <Text style={styles.settingLabel}>Number of limits</Text>
+              </View>
+              <Stepper
+                value={cs.numPositions}
+                onChange={(v) => updateSettings({ numPositions: v })}
+                step={1}
+                min={1}
+                max={5}
+              />
+            </View>
+            <View style={styles.cascadeDivider} />
+            <View style={styles.settingRow}>
+              <View style={styles.settingRowLeft}>
+                <Text style={styles.settingLabel}>Limit spacing</Text>
+                <Text style={styles.settingHint}>Pips between each limit order</Text>
+              </View>
+              <Stepper
+                value={cs.pipsBetween}
+                onChange={(v) => updateSettings({ pipsBetween: v })}
+                step={5}
+                min={5}
+                display={`${cs.pipsBetween}p`}
+              />
+            </View>
             <Pressable
               style={({ pressed }) => [
                 styles.saveBtn,
                 pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
-                (!lotDraftsValid || lotSaveState === "saving") && { opacity: 0.5 },
+                saveState === "saving" && { opacity: 0.6 },
               ]}
-              disabled={!lotDraftsValid || lotSaveState === "saving"}
+              disabled={saveState === "saving"}
               onPress={async () => {
-                Keyboard.dismiss();
+                setSaveState("saving");
                 void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                setLotSaveState("saving");
-                try {
-                  const sLot = parseFloat(parsedSingleLot.toFixed(2));
-                  const cLot = Math.max(0.01, parseFloat(parsedCascadeLot.toFixed(2)));
-                  await AsyncStorage.setMany({
-                    [LOT_SIZE_SINGLE_KEY]: String(sLot),
-                    [LOT_SIZE_CASCADE_KEY]: String(cLot),
-                  });
-                  setSingleLotDraft(sLot.toFixed(2));
-                  setCascadeLotDraft(cLot.toFixed(2));
-                  setLotSaveState("saved");
-                  void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-                  setTimeout(() => setLotSaveState("idle"), 2500);
-                } catch {
-                  setLotSaveState("error");
-                  void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-                  setTimeout(() => setLotSaveState("idle"), 3000);
-                }
+                const ok = await saveToServer();
+                setSaveState(ok ? "saved" : "error");
+                if (ok) void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                else void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+                setTimeout(() => setSaveState("idle"), 3000);
               }}
             >
-              {lotSaveState === "saving" ? (
+              {saveState === "saving" ? (
                 <ActivityIndicator size="small" color="#000" />
               ) : (
                 <Feather
-                  name={lotSaveState === "saved" ? "check" : lotSaveState === "error" ? "alert-circle" : "save"}
+                  name={saveState === "saved" ? "check" : saveState === "error" ? "alert-circle" : "upload-cloud"}
                   size={15}
-                  color={lotSaveState === "error" ? C.sell : "#000"}
+                  color={saveState === "error" ? C.sell : "#000"}
                 />
               )}
-              <Text style={[styles.saveBtnText, lotSaveState === "error" && { color: C.sell }]}>
-                {lotSaveState === "saving" ? "Saving…"
-                  : lotSaveState === "saved" ? "Lot Sizes Saved"
-                  : lotSaveState === "error" ? "Save failed"
-                  : "Save Lot Sizes"}
+              <Text style={[styles.saveBtnText, saveState === "error" && { color: C.sell }]}>
+                {saveState === "saving" ? "Saving…"
+                  : saveState === "saved" ? "Saved to server"
+                  : saveState === "error" ? "Save failed — check connection"
+                  : "Save Settings to Server"}
               </Text>
             </Pressable>
           </View>
 
-          {/* Auto SL→break-even — which TP triggers the engine move (new zones only). */}
+          {/* Section 4 — Notifications */}
           <View style={styles.cascadeCard}>
-            <View style={styles.cascadeCardHeader}>
-              <Feather name="lock" size={16} color={C.gold} />
-              <Text style={styles.cascadeCardTitle}>Auto break-even</Text>
-              <View style={styles.sourceBadge}>
-                <Text style={styles.sourceBadgeText}>IN-APP</Text>
+            <SectionTitle title="NOTIFICATIONS" />
+            <View style={styles.settingRow}>
+              <View style={styles.settingRowLeft}>
+                <Text style={styles.settingLabel}>TP3 hit — set runners</Text>
               </View>
+              <Toggle
+                value={notifyTp3}
+                onValueChange={(v) => { setNotifyTp3(v); persistNotify(NOTIFY_TP3_KEY, v); }}
+                color={C.gold}
+              />
             </View>
-            <Text style={styles.cascadeCardDesc}>
-              After this take-profit partial closes, the app moves stop loss to break-even on remaining entries. Applies to new cascades you place after saving.
-            </Text>
             <View style={styles.cascadeDivider} />
-            <PillSelector
-              label="Move SL to BE after"
-              hint={
-                cs.autoBeAtTp === 3 ? "Later — after TP3 partial"
-                : "Default — after TP2 partial"
-              }
-              options={[2, 3]}
-              value={cs.autoBeAtTp === 3 ? 3 : 2}
-              onChange={(v) => updateSettings({ autoBeAtTp: v as 2 | 3 })}
-              suffix=""
-              labels={{ 2: "TP2", 3: "TP3" }}
-            />
-          </View>
-
-          {/* Risk Free SL placement — signed pip offset from the surviving entry. */}
-          <View style={styles.cascadeCard}>
-            <View style={styles.cascadeCardHeader}>
-              <Feather name="shield" size={16} color={C.gold} />
-              <Text style={styles.cascadeCardTitle}>Risk Free SL</Text>
-              <View style={styles.sourceBadge}>
-                <Text style={styles.sourceBadgeText}>IN-APP</Text>
+            <View style={styles.settingRow}>
+              <View style={styles.settingRowLeft}>
+                <Text style={styles.settingLabel}>Runner 1 hit</Text>
               </View>
+              <Toggle
+                value={notifyR1}
+                onValueChange={(v) => { setNotifyR1(v); persistNotify(NOTIFY_R1_KEY, v); }}
+                color={C.teal}
+              />
             </View>
-            <Text style={styles.cascadeCardDesc}>
-              Where to place the protective stop when you tap Risk Free on a zone.
-            </Text>
-
             <View style={styles.cascadeDivider} />
-
-            <PillSelector
-              label="SL offset from entry"
-              hint={
-                rfDraft < 0 ? `${Math.abs(rfDraft)} pips of drawdown protection`
-                : rfDraft > 0 ? `Locks in ${rfDraft} pips of profit`
-                : "Break-even — SL exactly at entry"
-              }
-              options={[-30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30]}
-              value={rfDraft}
-              onChange={(v) => {
-                setRfDraft(v);
-                if (rfSaveState !== "idle") setRfSaveState("idle");
-              }}
-              suffix=""
-              labels={{
-                [-30]: "-30", [-25]: "-25", [-20]: "-20", [-15]: "-15",
-                [-10]: "-10", [-5]: "-5", 0: "0",
-                5: "+5", 10: "+10", 15: "+15", 20: "+20", 25: "+25", 30: "+30",
-              }}
-            />
-
-            <Pressable
-              style={({ pressed }) => [
-                styles.saveBtn,
-                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
-                (!rfDirty || rfSaveState === "saving") && { opacity: 0.5 },
-              ]}
-              disabled={!rfDirty || rfSaveState === "saving"}
-              onPress={async () => {
-                void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                setRfSaveState("saving");
-                try {
-                  updateSettings({ riskFreePips: rfDraft });
-                  setRfSaveState("saved");
-                  void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-                  setTimeout(() => setRfSaveState("idle"), 2500);
-                } catch {
-                  setRfSaveState("error");
-                  void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-                  setTimeout(() => setRfSaveState("idle"), 3000);
-                }
-              }}
-            >
-              {rfSaveState === "saving" ? (
-                <ActivityIndicator size="small" color="#000" />
-              ) : (
-                <Feather
-                  name={rfSaveState === "saved" ? "check" : rfSaveState === "error" ? "alert-circle" : "save"}
-                  size={15}
-                  color={rfSaveState === "error" ? C.sell : "#000"}
-                />
-              )}
-              <Text style={[styles.saveBtnText, rfSaveState === "error" && { color: C.sell }]}>
-                {rfSaveState === "saving" ? "Saving…"
-                  : rfSaveState === "saved" ? "Risk Free SL Saved"
-                  : rfSaveState === "error" ? "Save failed"
-                  : "Save Risk Free SL"}
-              </Text>
-            </Pressable>
-          </View>
-
-          {/* Merged Zone Take Profit card — lot size + per-TP pip/% + on/off */}
-          <View style={styles.cascadeCard}>
-            <View style={styles.cascadeCardHeader}>
-              <Feather name="target" size={16} color={C.gold} />
-              <Text style={styles.cascadeCardTitle}>TP Levels</Text>
-              <View style={styles.sourceBadge}>
-                <Text style={styles.sourceBadgeText}>IN-APP</Text>
+            <View style={styles.settingRow}>
+              <View style={styles.settingRowLeft}>
+                <Text style={styles.settingLabel}>Runner 2 hit</Text>
               </View>
+              <Toggle
+                value={notifyR2}
+                onValueChange={(v) => { setNotifyR2(v); persistNotify(NOTIFY_R2_KEY, v); }}
+                color={C.teal}
+              />
             </View>
-            <Text style={styles.cascadeCardDesc}>
-              Set your TP targets and suggested close amounts. You&apos;ll be notified when each level is reached — tap a close button to bank profit.
-            </Text>
-
             <View style={styles.cascadeDivider} />
-
-            {/* Cascade lot size */}
-            <View style={styles.tpRow}>
-              <Text style={[styles.tpRowLabel, { flex: 1, marginRight: 12 }]}>Cascade Lot Size</Text>
-              <View style={styles.tpInputWrap}>
-                <TextInput
-                  style={styles.tpInput}
-                  value={cascadeLotDraft}
-                  onChangeText={(v) => {
-                    setCascadeLotDraft(v.replace(/[^0-9.]/g, ""));
-                    if (tpSaveState !== "idle") setTpSaveState("idle");
-                  }}
-                  placeholder="0.04"
-                  placeholderTextColor={C.textMuted}
-                  keyboardType="decimal-pad"
-                  inputMode="decimal"
-                />
-                <Text style={styles.tpInputSuffix}>lot</Text>
+            <View style={styles.settingRow}>
+              <View style={styles.settingRowLeft}>
+                <Text style={styles.settingLabel}>Runner 3 hit</Text>
               </View>
+              <Toggle
+                value={notifyR3}
+                onValueChange={(v) => { setNotifyR3(v); persistNotify(NOTIFY_R3_KEY, v); }}
+                color={C.teal}
+              />
             </View>
-
-            <View style={styles.cascadeDivider} />
-
-            {/* Per-TP blocks */}
-            {([
-              { key: "tp1" as const, label: "TP1", placeholder: "20",         enKey: "tp1Enabled" as const },
-              { key: "tp2" as const, label: "TP2", placeholder: "60",         enKey: "tp2Enabled" as const },
-              { key: "tp3" as const, label: "TP3", placeholder: "100",        enKey: "tp3Enabled" as const },
-              { key: "tp4" as const, label: "Runner", placeholder: "0 = skip",   enKey: "tp4Enabled" as const },
-            ]).map((tp, idx) => {
-              const enabled = cs[tp.enKey];
-              return (
-                <View key={tp.key} style={[styles.tpBlock, idx > 0 && { borderTopWidth: 1, borderTopColor: C.border }]}>
-                  {/* Header row: label + toggle */}
-                  <View style={styles.tpBlockHeader}>
-                    <Text style={[styles.tpBlockTitle, !enabled && { color: C.textMuted }]}>{tp.label}</Text>
-                    {!enabled && (
-                      <Text style={styles.tpOffBadge}>OFF</Text>
-                    )}
-                    <View style={{ flex: 1 }} />
-                    <Switch
-                      value={enabled}
-                      onValueChange={(v) => {
-                        updateSettings({ [tp.enKey]: v });
-                        void Haptics.selectionAsync();
-                      }}
-                      trackColor={{ false: C.border, true: C.buy }}
-                      thumbColor="#fff"
-                      style={{ transform: [{ scaleX: 0.85 }, { scaleY: 0.85 }] }}
-                    />
-                  </View>
-
-                  {/* Pip distance row */}
-                  <View style={[styles.tpSubRow, !enabled && { opacity: 0.35 }]}>
-                    <Text style={[styles.tpSubLabel, { width: 88 }]}>Pip distance</Text>
-                    <View style={[styles.tpInputWrap, { flex: 1 }]}>
-                      <TextInput
-                        style={styles.tpInput}
-                        value={tpDraft[tp.key]}
-                        onChangeText={(v) => {
-                          setTpDraft((d) => ({ ...d, [tp.key]: v.replace(/[^0-9.]/g, "") }));
-                          if (tpSaveState !== "idle") setTpSaveState("idle");
-                        }}
-                        placeholder={tp.placeholder}
-                        placeholderTextColor={C.textMuted}
-                        keyboardType="number-pad"
-                        inputMode="numeric"
-                        editable={enabled}
-                      />
-                      <Text style={styles.tpInputSuffix}>pips</Text>
-                    </View>
-                  </View>
-
-                  {/* Close % row */}
-                  <View style={[styles.tpSubRow, !enabled && { opacity: 0.35 }]}>
-                    <Text style={[styles.tpSubLabel, { width: 88 }]}>Suggest close %</Text>
-                    <View style={[styles.tpInputWrap, { flex: 1 }]}>
-                      <TextInput
-                        style={styles.tpInput}
-                        value={enabled ? splitDraft[tp.key] : "0"}
-                        onChangeText={(v) => {
-                          setSplitDraft((d) => ({ ...d, [tp.key]: v.replace(/[^0-9]/g, "") }));
-                          if (tpSaveState !== "idle") setTpSaveState("idle");
-                        }}
-                        placeholder="25"
-                        placeholderTextColor={C.textMuted}
-                        keyboardType="number-pad"
-                        inputMode="numeric"
-                        editable={enabled}
-                      />
-                      <Text style={styles.tpInputSuffix}>{enabled ? "%" : "off"}</Text>
-                    </View>
-                  </View>
-                </View>
-              );
-            })}
-
-            <View style={styles.cascadeDivider} />
-
-            {/* Running total */}
-            <View style={[styles.infoRow, { marginTop: 4 }]}>
-              <Text style={styles.infoLabel}>Total close %</Text>
-              <Text style={[styles.infoValue, { color: enabledTpCount === 0 || activeSplitSum === 100 ? C.buy : C.sell }]}>
-                {enabledTpCount === 0 ? "—" : `${activeSplitSum}%`}
-              </Text>
-            </View>
-
-            {/* Validation warnings */}
-            {!tpDraftValid && (
-              <View style={styles.cascadeWarningBox}>
-                <Feather name="alert-triangle" size={14} color="#f59e0b" />
-                <Text style={styles.cascadeWarningText}>
-                  TP pip distances must be strictly increasing for enabled TPs (Runner can be 0 to skip).
-                </Text>
-              </View>
-            )}
-            {enabledTpCount > 0 && !splitValid && tpLotErrors.length === 0 && !tooManyTPs && (
-              <View style={styles.cascadeWarningBox}>
-                <Feather name="alert-triangle" size={14} color="#f59e0b" />
-                <Text style={styles.cascadeWarningText}>
-                  {activeSplitSum !== 100
-                    ? `Close % for enabled TPs must sum to 100 (currently ${activeSplitSum}%).`
-                    : "Each enabled TP must have a close % greater than 0."}
-                </Text>
-              </View>
-            )}
-            {tooManyTPs && (
-              <View style={styles.cascadeWarningBox}>
-                <Feather name="alert-triangle" size={14} color="#f59e0b" />
-                <Text style={styles.cascadeWarningText}>
-                  {`${cascadeLotDraft} lot only supports ${maxActiveTPs} active TP${maxActiveTPs === 1 ? "" : "s"} — each partial close needs at least 0.01 lot. Disable ${enabledTpCount - maxActiveTPs} TP${enabledTpCount - maxActiveTPs === 1 ? "" : "s"} or increase the lot size.`}
-                </Text>
-              </View>
-            )}
-            {tpLotErrors.map((e) => (
-              <View key={e.label} style={styles.cascadeWarningBox}>
-                <Feather name="alert-triangle" size={14} color="#f59e0b" />
-                <Text style={styles.cascadeWarningText}>
-                  {`${e.label} would close ${e.lots.toFixed(2)} lot — below the 0.01 minimum. Increase its % or the lot size.`}
-                </Text>
-              </View>
-            ))}
-
-            <Pressable
-              style={({ pressed }) => [
-                styles.saveBtn,
-                pressed && { opacity: 0.85, transform: [{ scale: 0.98 }] },
-                (!tpCardValid || tpSaveState === "saving") && { opacity: 0.5 },
-              ]}
-              disabled={!tpCardValid || tpSaveState === "saving"}
-              onPress={async () => {
-                Keyboard.dismiss();
-                void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                setTpSaveState("saving");
-                try {
-                  const cLot = Math.max(0.01, parseFloat(parsedCascadeLot.toFixed(2)));
-                  await AsyncStorage.setItem(LOT_SIZE_CASCADE_KEY, String(cLot));
-                  setCascadeLotDraft(cLot.toFixed(2));
-                  updateSettings({
-                    tp1Pips: parsedTp.tp1, tp2Pips: parsedTp.tp2,
-                    tp3Pips: parsedTp.tp3, tp4Pips: parsedTp.tp4,
-                    tp1Pct: parsedSplit.tp1, tp2Pct: parsedSplit.tp2,
-                    tp3Pct: parsedSplit.tp3, tp4Pct: parsedSplit.tp4,
-                  });
-                  const ok = await saveToServer();
-                  setTpSaveState(ok ? "saved" : "error");
-                  void Haptics.notificationAsync(
-                    ok ? Haptics.NotificationFeedbackType.Success : Haptics.NotificationFeedbackType.Error
-                  );
-                  setTimeout(() => setTpSaveState("idle"), ok ? 2500 : 3000);
-                } catch {
-                  setTpSaveState("error");
-                  void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-                  setTimeout(() => setTpSaveState("idle"), 3000);
-                }
-              }}
-            >
-              {tpSaveState === "saving" ? (
-                <ActivityIndicator size="small" color="#000" />
-              ) : (
-                <Feather
-                  name={tpSaveState === "saved" ? "check" : tpSaveState === "error" ? "alert-circle" : "save"}
-                  size={15}
-                  color={tpSaveState === "error" ? C.sell : "#000"}
-                />
-              )}
-              <Text style={[styles.saveBtnText, tpSaveState === "error" && { color: C.sell }]}>
-                {tpSaveState === "saving" ? "Saving…"
-                  : tpSaveState === "saved" ? "Zone TP Saved"
-                  : tpSaveState === "error" ? "Save failed — check connection"
-                  : "Save Zone TP Settings"}
-              </Text>
-            </Pressable>
           </View>
 
           {/* Help & Support */}
@@ -1799,8 +1239,46 @@ const styles = StyleSheet.create({
   settingRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 },
   pillSelectorColumn: { flexDirection: "column", gap: 10 },
   settingRowLeft: { flex: 1, gap: 2 },
-  settingLabel: { fontSize: 14, fontFamily: "Inter_600SemiBold", color: C.text },
-  settingHint: { fontSize: 11, fontFamily: "Inter_400Regular", color: C.textSecondary },
+  settingLabel: { fontSize: 13, fontFamily: "Inter_600SemiBold", color: C.text },
+  settingHint: { fontSize: 11, fontFamily: "Inter_400Regular", color: C.textMuted },
+  sectionTitle: {
+    fontSize: 11,
+    fontFamily: "Inter_700Bold",
+    color: C.textMuted,
+    letterSpacing: 1.32,
+    textTransform: "uppercase",
+    marginBottom: 4,
+  },
+  tpLevelBlock: { gap: 8 },
+  tpLevelHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  tpLevelExpanded: { gap: 10, paddingLeft: 4 },
+  tpLevelRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  tpLevelRowLabel: {
+    fontSize: 12,
+    fontFamily: "Inter_500Medium",
+    color: C.textMuted,
+    width: 64,
+  },
+  pctBarTrack: {
+    flex: 1,
+    height: 6,
+    backgroundColor: C.surface,
+    borderRadius: 3,
+    overflow: "hidden",
+  },
+  pctBarFill: {
+    height: "100%",
+    backgroundColor: C.gold,
+    borderRadius: 3,
+  },
   settingControls: {
     flexDirection: "row",
     alignItems: "center",
