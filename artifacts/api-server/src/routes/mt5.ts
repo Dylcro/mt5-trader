@@ -85,6 +85,7 @@ async function checkOwner(req: Request, res: Response, next: NextFunction): Prom
 // not require a JWT (it has its own x-admin-key check). The handler is a
 // hoisted async function declared further down in this file.
 router.post("/mt5/admin/migrate-region", (req, res) => { void migrateRegionHandler(req, res); });
+router.post("/mt5/admin/clear-account", (req, res) => { void clearAccountHandler(req, res); });
 
 router.use(requireAuth);
 
@@ -7401,6 +7402,40 @@ router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, re
 // real multi-instance deploy would need a DB lock, but this server is
 // single-instance on Replit.
 const migrationLocks = new Set<string>();
+
+// POST /api/mt5/admin/clear-account
+// Body: { userId }
+// Header: x-admin-key
+// One-time cleanup: drop all stored_accounts rows (and streams) for a user so they
+// can reconnect fresh (e.g. stale london region binding after migrate to new-york).
+async function clearAccountHandler(req: Request, res: Response): Promise<void> {
+  const ADMIN_KEY = process.env["ADMIN_KEY"];
+  if (!ADMIN_KEY) {
+    res.status(500).json({ error: "ADMIN_KEY not configured on server" }); return;
+  }
+  const key = (req.headers["x-admin-key"] as string | undefined) ?? "";
+  if (key !== ADMIN_KEY) { res.status(401).json({ error: "admin key required (x-admin-key header)" }); return; }
+
+  const { userId } = (req.body ?? {}) as { userId?: string };
+  const uid = userId?.trim();
+  if (!uid) {
+    res.status(400).json({ error: "userId required" }); return;
+  }
+
+  try {
+    const rows = await db.select().from(storedAccountsTable).where(eq(storedAccountsTable.userId, uid));
+    const cleared = await disconnectUserMt5(uid);
+    console.log(`[admin/clear-account] userId=${uid} cleared=${cleared}`);
+    res.json({
+      ok: true,
+      userId: uid,
+      cleared,
+      accounts: rows.map((r) => ({ accountId: r.accountId, region: r.region, mt5Login: r.mt5Login, mt5Server: r.mt5Server })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : "Clear failed" });
+  }
+}
 
 // POST /api/mt5/admin/migrate-region
 // Body: { login, password, server, targetRegion? }
