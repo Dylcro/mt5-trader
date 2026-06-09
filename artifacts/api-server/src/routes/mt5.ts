@@ -1850,9 +1850,6 @@ async function triggerMt5OneClickAutoCascadeInner(
   const { limitEntries, stopLoss } = buildCascadeLevels(anchorPrice, direction!, config);
   const total = 1 + limitEntries.length;
 
-  // Match app cascade: anchor carries its own SL + zone tag (not borrowed from pending limits).
-  await tagMt5AnchorForZone(token, region, accountId, posId, zoneState.zoneId, stopLoss, total);
-
   let placedCount = 0;
 
   for (let i = 0; i < limitEntries.length; i++) {
@@ -1883,6 +1880,10 @@ async function triggerMt5OneClickAutoCascadeInner(
       console.error(`[auto-cascade] limit ${legNum}/${total} failed for zone ${zoneState.zoneId}:`, (e as Error).message);
     }
   }
+
+  // Tag anchor after limits — limits reach MT5 first; each limit already carries SL.
+  // Anchor SL + comment still required so the leg survives limit-cancel housekeeping.
+  await tagMt5AnchorForZone(token, region, accountId, posId, zoneState.zoneId, stopLoss, total);
 
   recordCascade(accountId, anchorPrice);
   scheduleCascadeReconcile(accountId, region, token);
