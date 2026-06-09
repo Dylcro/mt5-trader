@@ -1394,8 +1394,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         errors.push(err instanceof Error ? err.message : "Unknown error");
       }
 
-      // Refresh in background — don't delay success feedback
+      // Refresh in background — don't delay success feedback; poll pending again for slow MetaAPI.
       void Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
+      setTimeout(() => {
+        void Promise.all([refreshPositions(), refreshPendingOrders()]);
+      }, 2000);
 
       if (placed === 0) {
         return { success: false, placed, failed, message: errors[0] ?? "All orders failed to place", zoneId };

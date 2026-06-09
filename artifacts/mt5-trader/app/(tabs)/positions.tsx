@@ -401,10 +401,10 @@ export default function PositionsScreen() {
   const handleCloseZone = useCallback(
     async (zoneId: string) => {
       const result = await closeZone(zoneId);
-      void Promise.all([refreshPendingOrders(), refreshZones()]);
+      await Promise.all([refreshZones(), refreshPositions(), refreshPendingOrders()]);
       return result;
     },
-    [closeZone, refreshPendingOrders, refreshZones],
+    [closeZone, refreshZones, refreshPositions, refreshPendingOrders],
   );
 
   const handleClosePartial = useCallback(
@@ -550,6 +550,7 @@ export default function PositionsScreen() {
           await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
           setTradeFeedback(dir);
           setTimeout(() => setTradeFeedback(null), 2500);
+          void Promise.all([refreshZones(), refreshPositions(), refreshPendingOrders()]);
         } else {
           await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
           Alert.alert("Trade Failed", result.message);
@@ -563,7 +564,7 @@ export default function PositionsScreen() {
     },
     [
       status, platformStatus, price, cs, cascadeLotSize,
-      placeCascadeOrders,
+      placeCascadeOrders, refreshZones, refreshPositions, refreshPendingOrders,
     ],
   );
 
