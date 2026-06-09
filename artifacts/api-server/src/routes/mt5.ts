@@ -2284,6 +2284,20 @@ async function fetchAccountInfoSafe(
   }
 }
 
+function buildConnectDiagnostic(acct: ProvisioningAccount | null) {
+  if (!acct) return undefined;
+  return {
+    connectionStatus: acct.connectionStatus,
+    state: acct.state,
+    server: acct.server,
+    login: acct.login,
+    hint: isBrokerDisconnected(acct)
+      ? `MetaAPI is using server "${acct.server}" for login ${acct.login}. If this matches MT5, wait 2–3 minutes for the broker link — the app will keep polling.`
+      : undefined,
+  };
+}
+
+/** Return quickly — Railway/proxy drops long /connect requests; client polls /status. */
 async function respondAfterDeploy(
   res: Response,
   token: string,
@@ -2291,25 +2305,14 @@ async function respondAfterDeploy(
   region: string,
   userId?: string,
 ): Promise<void> {
-  const acct = await waitForBrokerConnected(token, accountId, 90_000);
+  const acct = await getProvisioningAccount(token, accountId).catch(() => null);
   if (acct?.connectionStatus === "CONNECTED") {
     ensureAccountStreaming(token, accountId, region, userId);
     const info = await fetchAccountInfoSafe(token, accountId, region);
     res.json({ status: "connected", ...brokerConnectedFields(accountId, region, info) });
     return;
   }
-  const diagnostic = acct
-    ? {
-        connectionStatus: acct.connectionStatus,
-        state: acct.state,
-        server: acct.server,
-        login: acct.login,
-        hint: isBrokerDisconnected(acct)
-          ? `MetaAPI is using server "${acct.server}" for login ${acct.login}. Copy the server name exactly from MT5 and use your trading password.`
-          : undefined,
-      }
-    : undefined;
-  res.json({ status: "deploying", accountId, region, diagnostic });
+  res.json({ status: "deploying", accountId, region, diagnostic: buildConnectDiagnostic(acct) });
 }
 
 const deployKickAt = new Map<string, number>();
@@ -2363,7 +2366,7 @@ async function deleteMetaApiAccount(token: string, accountId: string): Promise<v
     console.warn(`[delete] undeploy ${accountId}:`, e.message),
   );
   const undeployStart = Date.now();
-  while (Date.now() - undeployStart < 60_000) {
+  while (Date.now() - undeployStart < 25_000) {
     await new Promise((r) => setTimeout(r, 2_000));
     const a = await getProvisioningAccount(token, accountId).catch(() => null);
     if (!a || a.state === "UNDEPLOYED" || a.state === "DELETING") break;
@@ -2451,11 +2454,32 @@ async function prepareAccountForConnect(
     );
     await stopStreaming(accountId).catch(() => {});
     activeStreams.delete(accountId);
-    await redeployAccount(token, accountId);
+    // Cap wait so /connect returns before Railway/proxy idle-timeout (~60s).
+    try {
+      await Promise.race([
+        redeployAccount(token, accountId),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("redeploy still running")), 40_000),
+        ),
+      ]);
+    } catch (e) {
+      console.warn(`[prepare] ${accountId} redeploy slow or failed — client will poll /status:`, (e as Error).message);
+      void redeployAccount(token, accountId).catch(() => {});
+    }
     return;
   }
 
-  await deployAccount(token, accountId);
+  try {
+    await Promise.race([
+      deployAccount(token, accountId),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("deploy still running")), 40_000),
+      ),
+    ]);
+  } catch (e) {
+    console.warn(`[prepare] ${accountId} deploy slow or failed — client will poll /status:`, (e as Error).message);
+    void deployAccount(token, accountId).catch(() => {});
+  }
 }
 
 // ── Stuck-sync recovery ────────────────────────────────────────────────────

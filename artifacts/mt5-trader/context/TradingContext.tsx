@@ -256,7 +256,10 @@ async function authFetchWithTimeout(
     return await authFetch(url, { ...options, signal: controller.signal });
   } catch (e) {
     if (e instanceof Error && e.name === "AbortError") {
-      throw new Error("Connection timed out — open Settings and reconnect with your MT5 password.");
+      throw new Error("Server is still connecting your MT5 account — wait a moment and check Settings for status.");
+    }
+    if (e instanceof Error && /fetch failed|network request failed|network connection timed out/i.test(e.message)) {
+      throw new Error("Could not reach server — check your internet connection. If MT5 is connecting, wait 2 minutes and reopen the app.");
     }
     throw e;
   } finally {
@@ -451,7 +454,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
               forceReconnect: true,
               ...(cachedPassword ? { password: cachedPassword } : {}),
             }),
-          }, 90_000);
+          }, 120_000);
           data = await safeJson<{ status?: string; error?: string; accountId?: string; region?: string } & Partial<AccountInfo>>(res);
           break; // success — exit retry loop
         } catch (err) {
@@ -1013,7 +1016,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
                 server: useCreds.server.trim(),
                 forceReconnect: true,
               }),
-            }, 90_000);
+            }, 120_000);
             data = await safeJson<{
               status?: string; error?: string; accountId?: string; region?: string; retryAfterMs?: number;
               diagnostic?: { hint?: string; server?: string; login?: string; connectionStatus?: string };
@@ -1021,7 +1024,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
             break; // success
           } catch (err) {
             const msg = err instanceof Error ? err.message : "";
-            const isTransient = msg.includes("not ready") || msg.includes("Unexpected server");
+            const isTransient =
+              msg.includes("not ready")
+              || msg.includes("Unexpected server")
+              || msg.includes("Could not reach server")
+              || msg.includes("still connecting");
             if (attempt < 8 && isTransient) {
               console.warn(`[connect] attempt ${attempt} failed (${msg}) — retrying in 4s`);
               await new Promise((r) => setTimeout(r, 4000));
@@ -1073,8 +1080,24 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         // status === "deploying" — poll until CONNECTED
         await pollUntilConnected(accId, accRegion);
       } catch (err) {
+        const msg = err instanceof Error ? err.message : "Connection failed";
+        // /connect can outlive the HTTP socket (Railway ~60s) while MetaAPI still provisions — recover via /my-account.
+        if (/Could not reach server|still connecting|fetch failed|network connection timed out/i.test(msg)) {
+          try {
+            const myRes = await authFetch(`${API_BASE}/mt5/my-account`);
+            if (myRes.ok) {
+              const my = await safeJson<{ accountId?: string; region?: string }>(myRes);
+              if (my.accountId) {
+                setStatus("connecting");
+                setErrorMsg("Still connecting to Vantage — please wait…");
+                await pollUntilConnected(my.accountId, my.region ?? DEFAULT_REGION);
+                return;
+              }
+            }
+          } catch {}
+        }
         setStatus("error");
-        setErrorMsg(err instanceof Error ? err.message : "Connection failed");
+        setErrorMsg(msg);
       }
     },
     [credentials, setCredentials, startPolling, pollUntilConnected]
