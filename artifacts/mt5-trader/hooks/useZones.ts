@@ -88,7 +88,7 @@ interface UseZonesOptions {
 }
 
 function zoneTradeQuery(region?: string): string {
-  const r = (region?.trim() || "new-york");
+  const r = (region?.trim() || "london");
   return `?region=${encodeURIComponent(r)}`;
 }
 

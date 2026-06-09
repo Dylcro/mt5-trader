@@ -55,8 +55,6 @@ import {
   legNeedsTpSlice,
   computeNextTakeTpLevel,
   stopLossToRestoreForZoneLeg,
-  isMetaApiProvisioningInProgress,
-  shouldUndeployBeforeDeploy,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
@@ -1330,25 +1328,5 @@ describe("sumDealPnlForPositions (zone closed P&L)", () => {
       { positionId: "p1", profit: 2.5, commission: 0, swap: 0 },
     ];
     expect(sumDealPnlForPositions(deals, ids)).toBe(16.8);
-  });
-});
-
-describe("MetaAPI connect provisioning guards", () => {
-  it("treats DEPLOYING and CONNECTING as in-progress", () => {
-    expect(isMetaApiProvisioningInProgress({ state: "DEPLOYING", connectionStatus: "DISCONNECTED" })).toBe(true);
-    expect(isMetaApiProvisioningInProgress({ state: "DEPLOYED", connectionStatus: "CONNECTING" })).toBe(true);
-    expect(isMetaApiProvisioningInProgress({ state: "DEPLOYED", connectionStatus: "CONNECTED" })).toBe(false);
-  });
-
-  it("never undeploys during in-progress states (even when DEPLOYED)", () => {
-    expect(shouldUndeployBeforeDeploy({ state: "DEPLOYED", connectionStatus: "CONNECTING" })).toBe(false);
-    expect(shouldUndeployBeforeDeploy({ state: "DEPLOYING", connectionStatus: "DISCONNECTED" })).toBe(false);
-  });
-
-  it("undeploys only for dead broker link or deploy failure", () => {
-    expect(shouldUndeployBeforeDeploy({ state: "DEPLOYED", connectionStatus: "DISCONNECTED" })).toBe(true);
-    expect(shouldUndeployBeforeDeploy({ state: "DEPLOYED", connectionStatus: "DISCONNECTED_FROM_BROKER" })).toBe(true);
-    expect(shouldUndeployBeforeDeploy({ state: "DEPLOY_FAILED", connectionStatus: "DISCONNECTED" })).toBe(true);
-    expect(shouldUndeployBeforeDeploy({ state: "DEPLOYED", connectionStatus: "CONNECTED" })).toBe(false);
   });
 });

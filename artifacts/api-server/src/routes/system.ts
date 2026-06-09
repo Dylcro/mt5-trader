@@ -1,7 +1,7 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import { pool } from "@workspace/db";
 import { countRealUsers, getPlatformFlags, getTradingStatus, loadPlatformFlags } from "../lib/platformFlags";
-import { getConnectionDiagnostics, getStreamHealth, NEW_ACCOUNT_REGION } from "./mt5";
+import { getStreamHealth } from "./mt5";
 
 const router: IRouter = Router();
 
@@ -32,20 +32,13 @@ router.get("/health", async (_req: Request, res: Response) => {
     dbOk = false;
   }
   const streams = getStreamHealth();
-  const conn = getConnectionDiagnostics();
   const metaConfigured = Boolean(process.env.METAAPI_TOKEN ?? process.env.META_API_TOKEN);
   res.json({
     backend: true,
     database: dbOk,
     metaapi_configured: metaConfigured,
-    new_account_region: NEW_ACCOUNT_REGION,
-    deploy_commit: process.env.RAILWAY_GIT_COMMIT_SHA ?? process.env.GIT_COMMIT ?? null,
     streams_healthy: streams.healthy,
     live_stream_count: streams.accounts.filter((a) => !a.stale).length,
-    active_metaapi_streams: conn.activeStreamCount,
-    sync_ready_streams: conn.syncReadyCount,
-    known_accounts: conn.knownAccountCount,
-    sse_clients: conn.sseClientAccounts,
   });
 });
 

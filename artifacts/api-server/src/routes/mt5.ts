@@ -85,7 +85,6 @@ async function checkOwner(req: Request, res: Response, next: NextFunction): Prom
 // not require a JWT (it has its own x-admin-key check). The handler is a
 // hoisted async function declared further down in this file.
 router.post("/mt5/admin/migrate-region", (req, res) => { void migrateRegionHandler(req, res); });
-router.post("/mt5/admin/clear-account", (req, res) => { void clearAccountHandler(req, res); });
 
 router.use(requireAuth);
 
@@ -688,11 +687,6 @@ function markStreamSyncReady(accountId: string, source: "deals" | "positions"): 
     clearTimeout(pending);
     recoveryTimers.delete(accountId);
   }
-  const syncFallback = syncFallbackTimers.get(accountId);
-  if (syncFallback) {
-    clearTimeout(syncFallback);
-    syncFallbackTimers.delete(accountId);
-  }
   console.log(`[stream ${accountId}] ${source} sync complete`);
 }
 
@@ -935,20 +929,6 @@ export interface StreamHealthAccount {
 /** Returns the health of every currently-tracked streaming account.
  *  Empty map (no accounts) → healthy.
  *  Any account silent for > STREAM_FRESHNESS_MS → unhealthy. */
-export function getConnectionDiagnostics(): {
-  activeStreamCount: number;
-  syncReadyCount: number;
-  knownAccountCount: number;
-  sseClientAccounts: number;
-} {
-  return {
-    activeStreamCount: activeStreams.size,
-    syncReadyCount: syncReady.size,
-    knownAccountCount: knownAccounts.size,
-    sseClientAccounts: sseClients.size,
-  };
-}
-
 export function getStreamHealth(): { healthy: boolean; accounts: StreamHealthAccount[] } {
   if (lastEventAt.size === 0) return { healthy: true, accounts: [] };
   const now = Date.now();
@@ -1053,7 +1033,6 @@ const syncReady = new Set<string>();
 // timer scheduled by an old stream cannot fire against a future fresh stream
 // (which would tear down a perfectly healthy new connection).
 const recoveryTimers = new Map<string, NodeJS.Timeout>();
-const syncFallbackTimers = new Map<string, NodeJS.Timeout>();
 // Records the server-side ms timestamp when each account's sync completed.
 // Used to filter out historical deal events that the SDK delivers AFTER
 // onDealsSynchronized fires (a known SDK buffering quirk).
@@ -1433,11 +1412,6 @@ async function stopStreaming(accountId: string): Promise<void> {
     clearTimeout(pending);
     recoveryTimers.delete(accountId);
   }
-  const syncFallback = syncFallbackTimers.get(accountId);
-  if (syncFallback) {
-    clearTimeout(syncFallback);
-    syncFallbackTimers.delete(accountId);
-  }
   console.log(`[stream ${accountId}] stopped and cleaned up`);
 }
 
@@ -1452,24 +1426,9 @@ export async function disconnectUserMt5(userId: string): Promise<number> {
   return rows.length;
 }
 
-/** Kick off MetaAPI streaming if not already active (idempotent). */
-function ensureAccountStreaming(
-  token: string,
-  accountId: string,
-  region?: string,
-  userId?: string,
-): void {
-  const r = region
-    ?? activeRegions.get(accountId)
-    ?? knownAccounts.get(accountId)?.region
-    ?? DEFAULT_REGION;
-  const uid = userId ?? knownAccounts.get(accountId)?.userId;
-  void startStreaming(token, accountId, r, uid);
-}
-
 async function startStreaming(token: string, accountId: string, region: string = DEFAULT_REGION, userId?: string): Promise<void> {
-  if (activeStreams.has(accountId) || startingStreams.has(accountId)) return;
-  startingStreams.add(accountId);
+  if (activeStreams.has(accountId)) return;
+  activeStreams.add(accountId);
   // Load persisted cascade history BEFORE sync so post-sync catch-up
   // sees already-cascaded positions and skips re-cascading them.
   await loadCascadeHistory(accountId);
@@ -1515,7 +1474,6 @@ async function startStreaming(token: string, accountId: string, region: string =
     // instead of making new HTTP calls to MetaAPI REST for every order.
     activeConnections.set(accountId, conn);
     activeRegions.set(accountId, region);
-    activeStreams.add(accountId);
     // Keep the in-memory registry current so the watchdog/safety-net can work
     // even when the DB is temporarily unavailable.
     knownAccounts.set(accountId, { accountId, userId, region });
@@ -1543,18 +1501,6 @@ async function startStreaming(token: string, accountId: string, region: string =
       void recoverStuckSync(token, accountId);
     }, 240_000);
     recoveryTimers.set(accountId, timer);
-    // Empty-history connects (startTime = now) should sync in seconds. Some
-    // MetaAPI accounts never emit onDealsSynchronized — arm sync after 30 s so
-    // trading isn't blocked while the 240 s full recovery timer waits.
-    const syncFallback = setTimeout(() => {
-      syncFallbackTimers.delete(accountId);
-      if (syncReady.has(accountId)) return;
-      const current = activeConnections.get(accountId);
-      if (!current || current !== myConn) return;
-      markStreamSyncReady(accountId, "positions");
-      console.log(`[stream ${accountId}] sync fallback — armed after 30s (empty-history connect)`);
-    }, 30_000);
-    syncFallbackTimers.set(accountId, syncFallback);
     // Persist credentials so the server can auto-reconnect after a restart
     // without waiting for the app to call /connect again.
     // userId is included when available so /my-account lookups work reliably.
@@ -1573,7 +1519,7 @@ async function startStreaming(token: string, accountId: string, region: string =
       console.warn(`[stream ${accountId}] failed to persist account to DB:`, (dbErr as Error).message);
     }
   } catch (err) {
-    activeStreams.delete(accountId);
+    activeStreams.delete(accountId); // allow retry on next poll
     activeConnections.delete(accountId);
     const msg = (err as Error).message ?? "";
     // MetaAPI auto-undeploys accounts during inactivity. Detect the error and
@@ -1601,8 +1547,6 @@ async function startStreaming(token: string, accountId: string, region: string =
     } else {
       console.error(`[stream ${accountId}] streaming start failed:`, msg);
     }
-  } finally {
-    startingStreams.delete(accountId);
   }
 }
 
@@ -1662,15 +1606,7 @@ export function startConnectionWatchdog(): void {
         }
       }
       for (const { accountId, region } of accounts) {
-        const lastTick = lastEventAt.get(accountId) ?? 0;
-        const wedged = activeStreams.has(accountId)
-          && !syncReady.has(accountId)
-          && Date.now() - lastTick > 120_000;
-        if (wedged) {
-          console.warn(`[watchdog] ${accountId} stream wedged (no sync/ticks) — resetting`);
-          await stopStreaming(accountId);
-        }
-        if (!activeStreams.has(accountId) && !startingStreams.has(accountId)) {
+        if (!activeStreams.has(accountId)) {
           console.log(`[watchdog] ${accountId} not streaming — reconnecting`);
           void startStreaming(token, accountId, region);
         }
@@ -2110,9 +2046,7 @@ function buildCandles(accountId: string, timeframe: string, limit: number): Ohlc
 
 const PROVISIONING_BASE = "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai";
 const CLIENT_DOMAIN = "agiliumtrade.ai";
-/** Vantage executes from Equinix NY4 — new MetaAPI accounts must provision in new-york. */
-export const NEW_ACCOUNT_REGION = "new-york";
-const DEFAULT_REGION = NEW_ACCOUNT_REGION;
+const DEFAULT_REGION = "london";
 
 function getToken(): string {
   const token = process.env.METAAPI_TOKEN;
@@ -2124,45 +2058,13 @@ function authHeaders(token: string) {
   return { "auth-token": token, "Content-Type": "application/json" };
 }
 
-function buildMetaApiCreatePayload(creds: {
-  login: string;
-  password: string;
-  server: string;
-  region?: string;
-}): Record<string, string | number> {
-  return {
-    login: creds.login,
-    password: creds.password,
-    name: `MT5 ${creds.login}`,
-    server: creds.server,
-    platform: "mt5",
-    type: "cloud-g2",
-    reliability: "high",
-    magic: 47182,
-    region: creds.region ?? NEW_ACCOUNT_REGION,
-  };
-}
-
-async function createMetaApiAccount(
-  token: string,
-  creds: { login: string; password: string; server: string },
-  opts?: { signal?: AbortSignal; region?: string },
-): Promise<Response> {
-  return fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
-    method: "POST",
-    headers: authHeaders(token),
-    body: JSON.stringify(buildMetaApiCreatePayload({ ...creds, region: opts?.region })),
-    signal: opts?.signal,
-  });
-}
-
-// Normalise whatever MetaAPI returns as "region" to the short subdomain form (e.g. "new-york").
-// MetaAPI may return the full host like "mt-client-api-v1.new-york.agiliumtrade.ai".
+// Normalise whatever MetaAPI returns as "region" to the short subdomain form (e.g. "london").
+// MetaAPI may return the full host like "mt-client-api-v1.london.agiliumtrade.ai".
 function normalizeRegion(region: string | undefined): string {
   if (!region) return DEFAULT_REGION;
-  // Already short form: "new-york", etc.
+  // Already short form: "london", "new-york", etc.
   if (!region.includes(".")) return region;
-  // Full host: "mt-client-api-v1.new-york.agiliumtrade.ai" → extract "new-york"
+  // Full host: "mt-client-api-v1.london.agiliumtrade.ai" → extract "london"
   const m = region.match(/^mt-client-api-v1\.(.+?)\.agiliumtrade\.ai$/);
   if (m?.[1]) return m[1];
   // Fallback: use as-is and let MetaAPI reject it with a clear error
@@ -2195,54 +2097,12 @@ interface ProvisioningAccount {
   reliability?: string;
   error?: string;
   details?: string;
-  connections?: Array<{ application?: string; region?: string; status?: string }>;
-}
-
-function isBrokerDisconnected(acct: { connectionStatus?: string }): boolean {
-  const s = acct.connectionStatus ?? "";
-  return s === "DISCONNECTED" || s === "DISCONNECTED_FROM_BROKER";
-}
-
-function accountProvisionedRegion(acct: { region?: string }): string {
-  return normalizeRegion(acct.region);
-}
-
-/** MetaAPI region cannot be changed in-place — delete and recreate in NEW_ACCOUNT_REGION. */
-function isWrongMetaApiRegion(acct: { region?: string }): boolean {
-  return accountProvisionedRegion(acct) !== NEW_ACCOUNT_REGION;
-}
-
-function formatMetaApiAuthError(body: { message?: string; details?: string }): string {
-  if (body.details === "E_AUTH") {
-    return "MetaAPI could not log in to Vantage — check account number, trading password (not investor), and server name copied exactly from MT5.";
-  }
-  return body.message ?? "MetaAPI broker authentication failed.";
-}
-
-async function parseProvisioningError(res: Response, action: string): Promise<never> {
-  const body = await res.json().catch(() => ({})) as { message?: string; details?: string };
-  const msg = body.details === "E_AUTH" ? formatMetaApiAuthError(body) : (body.message ?? `${action} failed (HTTP ${res.status})`);
-  console.warn(`[metaapi] ${action} ${res.status}: ${msg}`);
-  throw new Error(msg);
 }
 
 async function getProvisioningAccount(token: string, accountId: string): Promise<ProvisioningAccount> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 30_000);
-  let res: Response;
-  try {
-    res = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
-      headers: authHeaders(token),
-      signal: ctrl.signal,
-    });
-  } catch (e) {
-    if (e instanceof Error && e.name === "AbortError") {
-      throw new Error("MetaAPI account lookup timed out — please retry.");
-    }
-    throw e;
-  } finally {
-    clearTimeout(timer);
-  }
+  const res = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
+    headers: authHeaders(token),
+  });
   if (!res.ok) {
     const err = await res.json().catch(() => ({})) as { message?: string };
     throw new Error(err.message ?? `Account lookup failed: ${res.status}`);
@@ -2288,105 +2148,16 @@ async function getAccountInfo(token: string, accountId: string, region: string |
   return res.json() as Promise<Record<string, unknown>>;
 }
 
-/** Broker is CONNECTED — account-information can lag; never block the client on it. */
-function brokerConnectedFields(
-  accountId: string,
-  region: string,
-  info: Record<string, unknown> | null | undefined,
-): {
-  accountId: string;
-  region: string;
-  name: string;
-  balance: number;
-  equity: number;
-  margin: number;
-  freeMargin: number;
-  currency: string;
-  leverage: number;
-} {
-  return {
-    accountId,
-    region,
-    name: String(info?.name ?? "Account"),
-    balance: Number(info?.balance ?? 0),
-    equity: Number(info?.equity ?? 0),
-    margin: Number(info?.margin ?? 0),
-    freeMargin: Number(info?.freeMargin ?? 0),
-    currency: String(info?.currency ?? "USD"),
-    leverage: Number(info?.leverage ?? 100),
-  };
-}
-
-async function fetchAccountInfoSafe(
-  token: string, accountId: string, region: string,
-): Promise<Record<string, unknown> | null> {
-  try {
-    return await getAccountInfo(token, accountId, region);
-  } catch (e) {
-    console.warn(`[account-info] ${accountId} (${region}) failed:`, (e as Error).message);
-    return null;
-  }
-}
-
-function buildConnectDiagnostic(acct: ProvisioningAccount | null) {
-  if (!acct) return undefined;
-  return {
-    connectionStatus: acct.connectionStatus,
-    state: acct.state,
-    server: acct.server,
-    login: acct.login,
-    hint: isBrokerDisconnected(acct)
-      ? `MetaAPI is using server "${acct.server}" for login ${acct.login}. If this matches MT5, wait 2–3 minutes for the broker link — the app will keep polling.`
-      : undefined,
-  };
-}
-
-/** Return quickly — Railway/proxy drops long /connect requests; client polls /status. */
-async function respondAfterDeploy(
-  res: Response,
-  token: string,
-  accountId: string,
-  region: string,
-  userId?: string,
-): Promise<void> {
-  const acct = await getProvisioningAccount(token, accountId).catch(() => null);
-  if (acct?.connectionStatus === "CONNECTED") {
-    ensureAccountStreaming(token, accountId, region, userId);
-    const info = await fetchAccountInfoSafe(token, accountId, region);
-    res.json({ status: "connected", ...brokerConnectedFields(accountId, region, info) });
-    return;
-  }
-  res.json({ status: "deploying", accountId, region, diagnostic: buildConnectDiagnostic(acct) });
-}
-
-const deployKickAt = new Map<string, number>();
-/** Full broker relink (undeploy→deploy) when DEPLOYED but DISCONNECTED — rate-limited on status poll. */
-const STUCK_REDEPLOY_MS = 90_000;
-const startingStreams = new Set<string>();
-
 async function deployAccount(token: string, accountId: string): Promise<void> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 45_000);
   const res = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}/deploy`, {
     method: "POST",
     headers: authHeaders(token),
-    signal: ctrl.signal,
-  }).finally(() => clearTimeout(timer));
-  if (!res.ok && res.status !== 204) {
-    await parseProvisioningError(res, `deploy ${accountId}`);
-  }
-}
-
-async function redeployAccount(token: string, accountId: string): Promise<void> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 60_000);
-  const res = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}/redeploy`, {
-    method: "POST",
-    headers: authHeaders(token),
-    signal: ctrl.signal,
-  }).finally(() => clearTimeout(timer));
-  if (!res.ok && res.status !== 204) {
-    await parseProvisioningError(res, `redeploy ${accountId}`);
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({})) as { message?: string };
+    const msg = body.message ?? `Deploy failed (HTTP ${res.status})`;
+    console.warn(`[deploy] ${accountId} failed ${res.status}: ${msg}`);
+    throw new Error(msg);
   }
 }
 
@@ -2400,129 +2171,6 @@ async function undeployAccount(token: string, accountId: string): Promise<void> 
     const msg = body.message ?? `Undeploy failed (HTTP ${res.status})`;
     console.warn(`[undeploy] ${accountId} failed ${res.status}: ${msg}`);
     throw new Error(msg);
-  }
-}
-
-async function deleteMetaApiAccount(token: string, accountId: string): Promise<void> {
-  await stopStreaming(accountId).catch(() => {});
-  activeStreams.delete(accountId);
-  await undeployAccount(token, accountId).catch((e: Error) =>
-    console.warn(`[delete] undeploy ${accountId}:`, e.message),
-  );
-  const undeployStart = Date.now();
-  while (Date.now() - undeployStart < 25_000) {
-    await new Promise((r) => setTimeout(r, 2_000));
-    const a = await getProvisioningAccount(token, accountId).catch(() => null);
-    if (!a || a.state === "UNDEPLOYED" || a.state === "DELETING") break;
-  }
-  const delRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
-    method: "DELETE",
-    headers: authHeaders(token),
-  });
-  if (!delRes.ok && delRes.status !== 204 && delRes.status !== 404) {
-    const body = await delRes.json().catch(() => ({})) as { message?: string };
-    throw new Error(body.message ?? `Delete failed (HTTP ${delRes.status})`);
-  }
-}
-
-async function updateMetaApiCredentials(
-  token: string,
-  accountId: string,
-  creds: { password: string; login?: string | number; server?: string },
-): Promise<void> {
-  const body: Record<string, string> = { password: creds.password };
-  if (creds.login != null) body.login = String(creds.login).trim();
-  if (creds.server) body.server = creds.server.trim();
-  const res = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
-    method: "PUT",
-    headers: authHeaders(token),
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    await parseProvisioningError(res, `update credentials ${accountId}`);
-  }
-}
-
-/** Poll MetaAPI until broker CONNECTED or timeout (used after deploy/redeploy). */
-async function waitForBrokerConnected(
-  token: string,
-  accountId: string,
-  maxWaitMs = 120_000,
-): Promise<ProvisioningAccount | null> {
-  const deadline = Date.now() + maxWaitMs;
-  while (Date.now() < deadline) {
-    const acct = await getProvisioningAccount(token, accountId).catch(() => null);
-    if (!acct) return null;
-    if (acct.connectionStatus === "CONNECTED") return acct;
-    if (acct.state === "DEPLOY_FAILED") {
-      throw new Error(acct.message ?? "MetaAPI deployment failed. Check credentials and server name.");
-    }
-    if (isBrokerDisconnected(acct) && acct.details === "E_AUTH") {
-      throw new Error(formatMetaApiAuthError(acct));
-    }
-    await new Promise((r) => setTimeout(r, 3_000));
-  }
-  return getProvisioningAccount(token, accountId).catch(() => null);
-}
-
-/** MetaAPI is mid-deploy or mid-broker-handshake — never interrupt with undeploy. */
-export function isMetaApiProvisioningInProgress(acct: {
-  state?: string;
-  connectionStatus?: string;
-}): boolean {
-  return acct.state === "DEPLOYING" || acct.connectionStatus === "CONNECTING";
-}
-
-/** Whether to undeploy→deploy before deploy. Never during DEPLOYING/CONNECTING. */
-export function shouldUndeployBeforeDeploy(
-  acct: { state?: string; connectionStatus?: string },
-): boolean {
-  if (isMetaApiProvisioningInProgress(acct)) return false;
-  return isBrokerDisconnected(acct) || acct.state === "DEPLOY_FAILED";
-}
-
-/** Undeploy→deploy when MetaAPI is DEPLOYED but broker link is dead (common after server restarts). */
-async function prepareAccountForConnect(
-  token: string,
-  accountId: string,
-  opts?: { force?: boolean },
-): Promise<void> {
-  const acct = await getProvisioningAccount(token, accountId);
-  if (acct.connectionStatus === "CONNECTED" && !opts?.force) return;
-
-  const shouldCycle = shouldUndeployBeforeDeploy(acct);
-
-  if (shouldCycle) {
-    console.log(
-      `[prepare] ${accountId} redeploying (force=${Boolean(opts?.force)} ${acct.state}/${acct.connectionStatus})`,
-    );
-    await stopStreaming(accountId).catch(() => {});
-    activeStreams.delete(accountId);
-    // Cap wait so /connect returns before Railway/proxy idle-timeout (~60s).
-    try {
-      await Promise.race([
-        redeployAccount(token, accountId),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("redeploy still running")), 40_000),
-        ),
-      ]);
-    } catch (e) {
-      console.warn(`[prepare] ${accountId} redeploy slow or failed — client will poll /status:`, (e as Error).message);
-      void redeployAccount(token, accountId).catch(() => {});
-    }
-    return;
-  }
-
-  try {
-    await Promise.race([
-      deployAccount(token, accountId),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("deploy still running")), 40_000),
-      ),
-    ]);
-  } catch (e) {
-    console.warn(`[prepare] ${accountId} deploy slow or failed — client will poll /status:`, (e as Error).message);
-    void deployAccount(token, accountId).catch(() => {});
   }
 }
 
@@ -6164,13 +5812,6 @@ router.put("/mt5/notifications/prefs", async (req: Request, res: Response) => {
 // a heartbeat comment every 15 s to keep connections alive through proxies.
 router.get("/mt5/account/:accountId/stream", checkOwner, (req: Request, res: Response) => {
   const { accountId } = req.params as { accountId: string };
-  const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
-  const eventsUserId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
-  try {
-    ensureAccountStreaming(getToken(), accountId, region, eventsUserId);
-  } catch {
-    // getToken() can throw if env missing — watchdog will retry
-  }
 
   res.setHeader("Content-Type",   "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control",  "no-cache, no-store");
@@ -6977,33 +6618,7 @@ router.get("/mt5/my-account", async (req: Request, res: Response) => {
   try {
     const [row] = await db.select().from(storedAccountsTable).where(eq(storedAccountsTable.userId, userId)).limit(1);
     if (!row) { res.status(404).json({ error: "No account linked" }); return; }
-    const token = getToken();
-    const acct = await getProvisioningAccount(token, row.accountId).catch(() => null);
-    if (!acct) {
-      console.log(`[my-account] stale binding ${row.accountId} for userId=${userId} — clearing`);
-      await stopStreaming(row.accountId).catch(() => {});
-      await db.delete(storedAccountsTable).where(eq(storedAccountsTable.accountId, row.accountId)).catch(() => {});
-      userAccountCache.delete(userId);
-      res.status(404).json({ error: "No account linked" }); return;
-    }
-    res.json({
-      accountId: row.accountId,
-      region: normalizeRegion(acct.region) || row.region,
-      connectionStatus: acct.connectionStatus,
-      state: acct.state,
-    });
-  } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
-  }
-});
-
-// POST /api/mt5/unlink — drop server-side MT5 binding (e.g. after MetaAPI account deleted)
-router.post("/mt5/unlink", async (req: Request, res: Response) => {
-  const userId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
-  if (!userId) { res.status(401).json({ error: "Unauthorized" }); return; }
-  try {
-    const cleared = await disconnectUserMt5(userId);
-    res.json({ ok: true, cleared });
+    res.json({ accountId: row.accountId, region: row.region });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }
@@ -7062,14 +6677,12 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       return _origJson(body);
     };
 
-    const { login, password, server, accountId: existingId, forceReconnect } = req.body as {
+    const { login, password, server, accountId: existingId } = req.body as {
       login?: string;
       password?: string;
       server?: string;
       accountId?: string;
-      forceReconnect?: boolean;
     };
-    const forceBrokerReset = Boolean(forceReconnect);
 
     console.log(`[connect] userId=${userId} login=${login} server=${server} existingId=${existingId}`);
 
@@ -7087,17 +6700,9 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
 
       const acct = await getProvisioningAccount(token, existingId).catch(() => null);
       if (!acct) {
-        if (userId) await disconnectUserMt5(userId);
-        return res.status(404).json({ error: "Account not found on MetaAPI. Connect again with your MT5 credentials." });
+        return res.status(404).json({ error: "Account not found. Please log in again with your credentials." });
       }
-      if (isWrongMetaApiRegion(acct)) {
-        console.log(`[connect] ${existingId} in ${accountProvisionedRegion(acct)} — requires credential reconnect for ${NEW_ACCOUNT_REGION}`);
-        if (userId) await disconnectUserMt5(userId);
-        return res.status(409).json({
-          error: `MT5 account is in ${accountProvisionedRegion(acct)} region. Use Settings → Connect with your MT5 credentials to recreate in ${NEW_ACCOUNT_REGION}.`,
-        });
-      }
-      const region = NEW_ACCOUNT_REGION;
+      const region = normalizeRegion(acct.region);
       void upsertStoredAccount({
         accountId: existingId,
         region,
@@ -7105,24 +6710,37 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         mt5Login: acct.login ?? storedRow.mt5Login,
         mt5Server: acct.server ?? storedRow.mt5Server,
       });
-      if (password) {
-        await updateMetaApiCredentials(token, existingId, {
-          password,
-          login: storedRow.mt5Login ?? acct.login,
-          server: storedRow.mt5Server ?? acct.server,
-        });
-      }
       console.log(`[connect] reconnect status=${acct.connectionStatus} region=${region}`);
 
       if (acct.connectionStatus === "CONNECTED") {
-        ensureAccountStreaming(token, existingId, region, userId ?? undefined);
-        const info = await fetchAccountInfoSafe(token, existingId, region);
-        return res.json({ status: "connected", ...brokerConnectedFields(existingId, region, info) });
+        // Already connected — fetch info and return immediately.
+        // If the client API isn't warm yet (just redeployed), fall back to polling.
+        // Kick off streaming in background so deal events (and auto-cascade) work
+        // even though the app never polls the /events endpoint directly.
+        void startStreaming(token, existingId, region, userId ?? undefined);
+        try {
+          const info = await getAccountInfo(token, existingId, region) as Record<string, unknown>;
+          return res.json({
+            status: "connected",
+            accountId: existingId,
+            region,
+            name: info.name ?? "Account",
+            balance: info.balance ?? 0,
+            equity: info.equity ?? 0,
+            margin: info.margin ?? 0,
+            freeMargin: info.freeMargin ?? 0,
+            currency: info.currency ?? "USD",
+            leverage: info.leverage ?? 100,
+          });
+        } catch {
+          console.log(`[connect] client API not ready yet for ${existingId} — falling back to polling`);
+          return res.json({ status: "deploying", accountId: existingId, region });
+        }
       }
 
-      // Not connected — cycle undeploy→deploy when broker link is dead
+      // Not connected — trigger deploy and return "deploying" immediately
       try {
-        await prepareAccountForConnect(token, existingId, { force: forceBrokerReset });
+        await deployAccount(token, existingId);
       } catch (deployErr) {
         const msg = (deployErr as Error).message ?? "Deploy failed";
         const isBilling = msg.toLowerCase().includes("top up") || msg.toLowerCase().includes("forbidden");
@@ -7132,19 +6750,12 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
             : msg,
         });
       }
-      await respondAfterDeploy(res, token, existingId, region, userId);
-      return;
+      return res.json({ status: "deploying", accountId: existingId, region });
     }
 
     // ── FRESH LOGIN PATH: credentials provided ────────────────────────────────
     if (!login || !password || !server) {
       return res.status(400).json({ error: "login, password and server are required." });
-    }
-
-    // Clear any stale server binding (e.g. user deleted the MetaAPI cloud account).
-    if (userId) {
-      const cleared = await disconnectUserMt5(userId);
-      if (cleared > 0) console.log(`[connect] cleared ${cleared} stale binding(s) for userId=${userId}`);
     }
 
     // Check if this login+server is already provisioned on MetaAPI
@@ -7154,80 +6765,77 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
     const allAccounts = listRes.ok ? (await listRes.json() as ProvisioningAccount[]) : [];
     console.log(`[connect] found ${Array.isArray(allAccounts) ? allAccounts.length : 0} existing accounts`);
 
-    const loginStr = String(login).trim();
-    const serverStr = String(server).trim();
     const existing = Array.isArray(allAccounts)
-      ? allAccounts.find((a) => String(a.login).trim() === loginStr && String(a.server).trim() === serverStr)
+      ? allAccounts.find((a) => a.login === login && a.server === server)
       : undefined;
     const foundId = existing?._id ?? existing?.id;
 
     if (existing && foundId) {
-      console.log(`[connect] reusing ${foundId} status=${existing.connectionStatus} region=${accountProvisionedRegion(existing)}`);
-
-      // MetaAPI cannot move an account between regions — delete london (etc.) and recreate in new-york.
-      if (isWrongMetaApiRegion(existing)) {
-        console.log(`[connect] deleting ${foundId} in ${accountProvisionedRegion(existing)} for ${NEW_ACCOUNT_REGION} recreate`);
-        await deleteMetaApiAccount(token, foundId).catch((e: Error) =>
-          console.warn(`[connect] delete wrong-region ${foundId}:`, e.message),
-        );
-        await db.delete(storedAccountsTable).where(eq(storedAccountsTable.accountId, foundId)).catch(() => {});
-        if (userId) userAccountCache.delete(userId);
-        // Fall through to CREATE path below.
-      } else if (
-        forceBrokerReset
-        && isBrokerDisconnected(existing)
-        && existing.state === "DEPLOYED"
-        && !isMetaApiProvisioningInProgress(existing)
-      ) {
-        console.log(`[connect] recreating stale ${foundId} (DEPLOYED/DISCONNECTED)`);
-        await deleteMetaApiAccount(token, foundId).catch((e: Error) =>
-          console.warn(`[connect] delete stale ${foundId}:`, e.message),
-        );
-        await db.delete(storedAccountsTable).where(eq(storedAccountsTable.accountId, foundId)).catch(() => {});
-        if (userId) userAccountCache.delete(userId);
-        // Fall through to CREATE path below (existing cleared).
-      } else {
-      await updateMetaApiCredentials(token, foundId, { password, login: loginStr, server: serverStr });
+      // Reuse existing account — update password just in case
+      console.log(`[connect] reusing ${foundId} status=${existing.connectionStatus}`);
+      await fetch(`${PROVISIONING_BASE}/users/current/accounts/${foundId}`, {
+        method: "PUT",
+        headers: authHeaders(token),
+        body: JSON.stringify({ password }),
+      }).catch(() => {});
 
       // Eagerly transfer DB ownership to the current user so checkOwner
       // passes immediately on subsequent requests (startStreaming also does
       // this, but it runs asynchronously after this response returns).
-      const region = NEW_ACCOUNT_REGION;
+      const region = normalizeRegion(existing.region);
       if (userId) {
         await upsertStoredAccount({
           accountId: foundId,
           region,
           userId,
-          mt5Login: loginStr,
-          mt5Server: serverStr,
+          mt5Login: login,
+          mt5Server: server,
         }).catch((e: Error) => console.warn(`[connect] eager ownership transfer failed:`, e.message));
         userAccountCache.set(userId, foundId);
       }
 
       if (existing.connectionStatus === "CONNECTED") {
-        ensureAccountStreaming(token, foundId, region, userId);
-        const info = await fetchAccountInfoSafe(token, foundId, region);
-        return res.json({ status: "connected", ...brokerConnectedFields(foundId, region, info) });
+        try {
+          const info = await getAccountInfo(token, foundId, region) as Record<string, unknown>;
+          return res.json({
+            status: "connected",
+            accountId: foundId,
+            region,
+            name: info.name ?? "Account",
+            balance: info.balance ?? 0,
+            equity: info.equity ?? 0,
+            margin: info.margin ?? 0,
+            freeMargin: info.freeMargin ?? 0,
+            currency: info.currency ?? "USD",
+            leverage: info.leverage ?? 100,
+          });
+        } catch {
+          console.log(`[connect] client API not ready for ${foundId} — falling back to polling`);
+          return res.json({ status: "deploying", accountId: foundId, region });
+        }
       }
 
-      try {
-        await prepareAccountForConnect(token, foundId, { force: forceBrokerReset });
-      } catch (deployErr) {
-        const msg = (deployErr as Error).message ?? "Deploy failed";
-        const isBilling = msg.toLowerCase().includes("top up") || msg.toLowerCase().includes("forbidden");
-        return res.status(503).json({
-          error: isBilling
-            ? "Connection limit reached. Please contact support."
-            : msg,
-        });
-      }
-      await respondAfterDeploy(res, token, foundId, region, userId);
-      return;
-      }
+      await deployAccount(token, foundId);
+      return res.json({ status: "deploying", accountId: foundId, region });
     }
 
     // ── CREATE BRAND-NEW MetaAPI ACCOUNT ──────────────────────────────────────
-    console.log(`[connect] creating new account login=${login} server=${server} region=${NEW_ACCOUNT_REGION}`);
+    const createPayload = {
+      login,
+      password,
+      name: `MT5 ${login}`,
+      server,
+      platform: "mt5",
+      type: "cloud-g2",
+      reliability: "regular",
+      magic: 47182,
+      // Vantage Markets executes from Equinix NY4 — provisioning the MetaAPI
+      // account in new-york minimises broker round-trip latency, which is the
+      // dominant cost when cascading limit orders.
+      region: "new-york",
+    };
+
+    console.log(`[connect] creating new account login=${login} server=${server}`);
 
     // MetaAPI provisioning can take 30-40s for unknown brokers (it downloads the broker .dat file).
     // Use a 38-second abort signal to capture the 202 response, then handle it.
@@ -7239,11 +6847,12 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
     let fetchRes: any = null;
     let createTimedOut = false;
     try {
-      fetchRes = await createMetaApiAccount(
-        token,
-        { login: loginStr, password, server: serverStr },
-        { signal: ctrl.signal, region: NEW_ACCOUNT_REGION },
-      );
+      fetchRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
+        method: "POST",
+        headers: authHeaders(token),
+        body: JSON.stringify(createPayload),
+        signal: ctrl.signal,
+      });
       clearTimeout(createTimer);
       console.log(`[connect] create status=${fetchRes.status}`);
     } catch (fetchErr) {
@@ -7279,27 +6888,22 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
     if (createTimedOut || fetchRes?.status === 202) {
       const listR = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, { headers: authHeaders(token) });
       const accts = listR.ok ? (await listR.json() as ProvisioningAccount[]) : [];
-      const queued = Array.isArray(accts)
-        ? accts.find((a) => String(a.login).trim() === loginStr && String(a.server).trim() === serverStr)
-        : undefined;
+      const queued = Array.isArray(accts) ? accts.find((a) => a.login === login && a.server === server) : undefined;
       const queuedId = queued?._id ?? queued?.id;
       if (queued && queuedId) {
         console.log(`[connect] found queued account ${queuedId} — deploying`);
-        const region = normalizeRegion(queued.region) || NEW_ACCOUNT_REGION;
+        const region = normalizeRegion(queued.region);
         if (userId) {
           await upsertStoredAccount({
             accountId: queuedId,
             region,
             userId,
-            mt5Login: loginStr,
-            mt5Server: serverStr,
+            mt5Login: login,
+            mt5Server: server,
           }).catch((e: Error) => console.warn(`[connect] queued account persist failed:`, e.message));
         }
-        if (queued.connectionStatus !== "CONNECTED") {
-          await prepareAccountForConnect(token, queuedId, { force: forceBrokerReset });
-        }
-        await respondAfterDeploy(res, token, queuedId, region, userId);
-        return;
+        if (queued.connectionStatus !== "CONNECTED") await deployAccount(token, queuedId);
+        return res.json({ status: "deploying", accountId: queuedId, region });
       }
       // Account not visible yet — tell client to retry in 70s (MetaAPI says wait 60s)
       console.log(`[connect] account not yet visible, asking client to retry in 70s`);
@@ -7314,7 +6918,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       return res.status(500).json({ error: "Unexpected error establishing connection. Please try again." });
     }
 
-    const region = NEW_ACCOUNT_REGION;
+    const region = normalizeRegion(created.region);
     console.log(`[connect] created accountId=${newId} region=${region} — deploying`);
 
     if (userId) {
@@ -7322,15 +6926,14 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         accountId: newId,
         region,
         userId,
-        mt5Login: loginStr,
-        mt5Server: serverStr,
+        mt5Login: login,
+        mt5Server: server,
       }).catch((e: Error) => console.warn(`[connect] new account persist failed:`, e.message));
     }
 
     // Kick off deploy and return immediately — client will poll /status
-    await prepareAccountForConnect(token, newId, { force: forceBrokerReset });
-    await respondAfterDeploy(res, token, newId, region, userId);
-    return;
+    await deployAccount(token, newId);
+    return res.json({ status: "deploying", accountId: newId, region });
 
   } catch (err) {
     const message = err instanceof Error ? err.message : "Connection failed";
@@ -7351,13 +6954,27 @@ router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, re
     console.log(`[status] accountId=${accountId} state=${acct.state} connectionStatus=${acct.connectionStatus}`);
 
     if (acct.connectionStatus === "CONNECTED") {
+      let info: Record<string, unknown> = {};
+      try {
+        const effectiveRegion = normalizeRegion(acct.region) || region;
+        info = await getAccountInfo(token, accountId, effectiveRegion) as Record<string, unknown>;
+      } catch (infoErr) {
+        // Client API not yet ready — report still connecting to keep polling
+        console.warn(`[status] getAccountInfo failed for ${accountId}:`, (infoErr as Error).message);
+        return res.json({ connectionStatus: "CONNECTING", state: acct.state });
+      }
       const effectiveRegion = normalizeRegion(acct.region) || region;
-      const statusUserId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
-      ensureAccountStreaming(token, accountId, effectiveRegion, statusUserId);
-      const info = await fetchAccountInfoSafe(token, accountId, effectiveRegion);
       return res.json({
         connectionStatus: "CONNECTED",
-        ...brokerConnectedFields(accountId, effectiveRegion, info),
+        accountId,
+        region: effectiveRegion,
+        name: info.name ?? "Account",
+        balance: info.balance ?? 0,
+        equity: info.equity ?? 0,
+        margin: info.margin ?? 0,
+        freeMargin: info.freeMargin ?? 0,
+        currency: info.currency ?? "USD",
+        leverage: info.leverage ?? 100,
       });
     }
 
@@ -7384,38 +7001,7 @@ router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, re
       }
     }
 
-    // DEPLOYING/CONNECTING: let MetaAPI finish — do NOT undeploy here (client polls every 5s;
-    // force-undeploy every 90s was the root cause of permanent connect timeouts today).
-    // DEPLOYED+DISCONNECTED: MetaAPI cloud terminal is up but broker link is dead — POST /deploy
-    // alone does nothing; cycle undeploy→deploy (rate-limited) while the client polls.
-    const lastKick = deployKickAt.get(accountId) ?? 0;
-    if (
-      Date.now() - lastKick >= STUCK_REDEPLOY_MS
-      && acct.state === "DEPLOYED"
-      && isBrokerDisconnected(acct)
-    ) {
-      deployKickAt.set(accountId, Date.now());
-      console.log(`[status] ${accountId} DEPLOYED/DISCONNECTED — cycling undeploy→deploy`);
-      await prepareAccountForConnect(token, accountId).catch((e: Error) =>
-        console.warn(`[status] broker relink failed for ${accountId}:`, e.message),
-      );
-    }
-
-    return res.json({
-      connectionStatus: acct.connectionStatus ?? "DEPLOYING",
-      state: acct.state,
-      region: normalizeRegion(acct.region) || region,
-      server: acct.server,
-      login: acct.login,
-      ...(acct.message ? { metaApiMessage: acct.message } : {}),
-      ...(acct.error ? { metaApiError: acct.error } : {}),
-      ...(isBrokerDisconnected(acct)
-        ? {
-            hint: acct.message
-              ?? `MetaAPI broker link down for server "${acct.server ?? "unknown"}". Verify server name matches MT5 exactly and use trading password.`,
-          }
-        : {}),
-    });
+    return res.json({ connectionStatus: acct.connectionStatus ?? "DEPLOYING", state: acct.state });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Status check failed" });
   }
@@ -7426,40 +7012,6 @@ router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, re
 // real multi-instance deploy would need a DB lock, but this server is
 // single-instance on Replit.
 const migrationLocks = new Set<string>();
-
-// POST /api/mt5/admin/clear-account
-// Body: { userId }
-// Header: x-admin-key
-// One-time cleanup: drop all stored_accounts rows (and streams) for a user so they
-// can reconnect fresh (e.g. stale london region binding after migrate to new-york).
-async function clearAccountHandler(req: Request, res: Response): Promise<void> {
-  const ADMIN_KEY = process.env["ADMIN_KEY"];
-  if (!ADMIN_KEY) {
-    res.status(500).json({ error: "ADMIN_KEY not configured on server" }); return;
-  }
-  const key = (req.headers["x-admin-key"] as string | undefined) ?? "";
-  if (key !== ADMIN_KEY) { res.status(401).json({ error: "admin key required (x-admin-key header)" }); return; }
-
-  const { userId } = (req.body ?? {}) as { userId?: string };
-  const uid = userId?.trim();
-  if (!uid) {
-    res.status(400).json({ error: "userId required" }); return;
-  }
-
-  try {
-    const rows = await db.select().from(storedAccountsTable).where(eq(storedAccountsTable.userId, uid));
-    const cleared = await disconnectUserMt5(uid);
-    console.log(`[admin/clear-account] userId=${uid} cleared=${cleared}`);
-    res.json({
-      ok: true,
-      userId: uid,
-      cleared,
-      accounts: rows.map((r) => ({ accountId: r.accountId, region: r.region, mt5Login: r.mt5Login, mt5Server: r.mt5Server })),
-    });
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : "Clear failed" });
-  }
-}
 
 // POST /api/mt5/admin/migrate-region
 // Body: { login, password, server, targetRegion? }
@@ -7588,11 +7140,14 @@ async function migrateRegionHandler(req: Request, res: Response): Promise<void> 
     }
 
     // 7. Provision fresh account in target region
-    const createR = await createMetaApiAccount(
-      token,
-      { login: loginStr, password, server },
-      { region: target },
-    );
+    const createPayload = {
+      login: loginStr, password, name: `MT5 ${loginStr}`, server,
+      platform: "mt5", type: "cloud-g2", reliability: "regular", magic: 47182,
+      region: target,
+    };
+    const createR = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
+      method: "POST", headers: authHeaders(token), body: JSON.stringify(createPayload),
+    });
     if (!createR.ok && createR.status !== 202) {
       const errBody = await createR.json().catch(() => ({})) as { message?: string; details?: string };
       const msg = errBody.message ?? `create failed: ${createR.status}`;
@@ -7650,21 +7205,17 @@ router.post("/mt5/account/:accountId/disconnect", checkOwner, async (req: Reques
   try {
     const token = getToken();
     const { accountId } = req.params;
-    const userId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
-    await stopStreaming(accountId).catch(() => {});
     await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}/undeploy`, {
       method: "POST",
       headers: authHeaders(token),
-    }).catch(() => {});
-    await db.delete(storedAccountsTable).where(eq(storedAccountsTable.accountId, accountId)).catch(() => {});
-    if (userId) userAccountCache.delete(userId);
+    });
     return res.json({ success: true });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Disconnect failed" });
   }
 });
 
-// GET /api/mt5/account/:accountId/realized-pnl?since=<ms>&region=new-york
+// GET /api/mt5/account/:accountId/realized-pnl?since=<ms>&region=london
 // Sums profit+commission+swap on closed trade deals (DEAL_ENTRY_OUT) since `since` (ms epoch).
 router.get("/mt5/account/:accountId/realized-pnl", checkOwner, async (req: Request, res: Response) => {
   try {
@@ -7679,7 +7230,7 @@ router.get("/mt5/account/:accountId/realized-pnl", checkOwner, async (req: Reque
   }
 });
 
-// GET /api/mt5/account/:accountId/info?region=new-york
+// GET /api/mt5/account/:accountId/info?region=london
 router.get("/mt5/account/:accountId/info", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
@@ -7691,7 +7242,7 @@ router.get("/mt5/account/:accountId/info", checkOwner, async (req: Request, res:
   }
 });
 
-// GET /api/mt5/account/:accountId/candles?region=new-york&timeframe=5m&limit=150
+// GET /api/mt5/account/:accountId/candles?region=london&timeframe=5m&limit=150
 // Candles are built from live price ticks accumulated by the /price endpoint.
 router.get("/mt5/account/:accountId/candles", checkOwner, (req: Request, res: Response) => {
   const timeframe = qstr(req.query.timeframe) || "5m";
@@ -7700,23 +7251,19 @@ router.get("/mt5/account/:accountId/candles", checkOwner, (req: Request, res: Re
   return res.json(candles);
 });
 
-// GET /api/mt5/account/:accountId/price?region=new-york
+// GET /api/mt5/account/:accountId/price?region=london
 router.get("/mt5/account/:accountId/price", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
-    const accountId = String(req.params.accountId);
-    const region = qstr(req.query.region)
-      || activeRegions.get(accountId)
-      || knownAccounts.get(accountId)?.region
-      || DEFAULT_REGION;
+    const region = qstr(req.query.region) || DEFAULT_REGION;
     const priceRes = await fetch(
-      `${clientBase(region)}/users/current/accounts/${accountId}/symbols/XAUUSD/current-price`,
+      `${clientBase(region)}/users/current/accounts/${req.params.accountId}/symbols/XAUUSD/current-price`,
       { headers: authHeaders(token) }
     );
     if (!priceRes.ok) return res.status(priceRes.status).json({ error: "Price fetch failed" });
     const priceData = await priceRes.json() as { bid?: number; ask?: number };
     // Accumulate tick for chart history
-    if (priceData.bid && priceData.ask) storeTick(accountId, priceData.bid, priceData.ask);
+    if (priceData.bid && priceData.ask) storeTick(req.params.accountId as string, priceData.bid, priceData.ask);
     return res.json(priceData);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
@@ -7741,7 +7288,7 @@ router.get("/mt5/account/:accountId/display-fx", checkOwner, async (req: Request
   }
 });
 
-// GET /api/mt5/account/:accountId/positions?region=new-york
+// GET /api/mt5/account/:accountId/positions?region=london
 router.get("/mt5/account/:accountId/positions", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
@@ -7783,7 +7330,7 @@ router.get("/mt5/account/:accountId/positions", checkOwner, async (req: Request,
   }
 });
 
-// GET /api/mt5/account/:accountId/orders?region=new-york  (pending orders)
+// GET /api/mt5/account/:accountId/orders?region=london  (pending orders)
 router.get("/mt5/account/:accountId/orders", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
@@ -7808,7 +7355,7 @@ router.get("/mt5/account/:accountId/orders", checkOwner, async (req: Request, re
   }
 });
 
-// DELETE /api/mt5/account/:accountId/order/:orderId?region=new-york  (cancel pending order)
+// DELETE /api/mt5/account/:accountId/order/:orderId?region=london  (cancel pending order)
 router.delete("/mt5/account/:accountId/order/:orderId", checkOwner, async (req: Request, res: Response) => {
   try {
     const token = getToken();
@@ -7879,7 +7426,7 @@ const TRADE_ERROR_MESSAGES: Record<number, string> = {
   10045: "Positions can only be closed in FIFO order.",
 };
 
-// POST /api/mt5/account/:accountId/trade?region=new-york
+// POST /api/mt5/account/:accountId/trade?region=london
 // Tries the SDK WebSocket path first (reuses existing stream connection → no new TCP/TLS to MetaAPI).
 // Falls back to REST if the connection is unavailable or the SDK call throws.
 router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, res: Response) => {
