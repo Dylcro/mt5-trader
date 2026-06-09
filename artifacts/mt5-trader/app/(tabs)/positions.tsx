@@ -18,7 +18,8 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import Colors from "@/constants/colors";
 import { useTrading, type PendingOrder, type Position } from "@/context/TradingContext";
-import { useCascadeSettings } from "@/hooks/useCascadeSettings";
+import { buildCascadeLevels, useCascadeSettings } from "@/hooks/useCascadeSettings";
+import { usePlatformStatus } from "@/hooks/usePlatformStatus";
 import { useZones } from "@/hooks/useZones";
 import ZoneCard from "@/components/ZoneCard";
 import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
@@ -278,8 +279,9 @@ export default function PositionsScreen() {
     refreshPositions, refreshPendingOrders, refreshAccountInfo,
     closePosition, cancelOrder, accountId, region, sseConnected, price,
     priceError, priceStale, syncSession, ensureSessionForTrade,
-    closeZonePartial, activateRunner, setRunnerAuto, placeTrade,
+    closeZonePartial, activateRunner, setRunnerAuto, placeCascadeOrders,
   } = useTrading();
+  const { status: platformStatus } = usePlatformStatus();
   const {
     zones, loading: zonesLoading, refresh: refreshZones, pruneStaleFromServer,
     riskFree, closeZone, closeAllWorst, cancelZoneOrders,
@@ -351,6 +353,8 @@ export default function PositionsScreen() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [cascadeLotSize, setCascadeLotSize] = useState(0.04);
   const [tradeFeedback, setTradeFeedback] = useState<"buy" | "sell" | null>(null);
+  const [isPlacing, setIsPlacing] = useState(false);
+  const isPlacingRef = useRef(false);
 
   useEffect(() => {
     void AsyncStorage.getItem(LOT_SIZE_CASCADE_KEY).then((v) => {
@@ -489,15 +493,78 @@ export default function PositionsScreen() {
     }, [status, accountId, sseConnected, price, priceError, priceStale, syncSession, refreshZones, refreshPositions, refreshPendingOrders]),
   );
 
-  const handleQuickTrade = useCallback(
-    async (direction: "buy" | "sell") => {
-      if (tradeFeedback) return;
-      setTradeFeedback(direction);
-      await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-      void placeTrade({ direction, volume: cascadeLotSize });
-      setTimeout(() => setTradeFeedback(null), 2500);
+  const handleCascadeTrade = useCallback(
+    async (dir: "buy" | "sell") => {
+      if (isPlacingRef.current) return;
+      if (status !== "connected") {
+        Alert.alert("Not Connected", "Please connect your MT5 account in Settings first.");
+        return;
+      }
+      if (!platformStatus.trading_enabled) {
+        Alert.alert("Trading paused", platformStatus.message || "Trading is temporarily paused.");
+        return;
+      }
+      const mktPrice = dir === "buy" ? (price?.ask ?? 0) : (price?.bid ?? 0);
+      if (!price || mktPrice <= 0) {
+        Alert.alert("No Price Yet", "Waiting for a live price from your broker. Please wait a moment, then try again.");
+        return;
+      }
+      const levels = buildCascadeLevels(mktPrice, dir, cs);
+      isPlacingRef.current = true;
+      setIsPlacing(true);
+      void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+      try {
+        const { tp1Pips, tp2Pips, tp3Pips, tp4Pips } = cs;
+        const pipsOk =
+          tp1Pips > 0 && tp2Pips > tp1Pips && tp3Pips > tp2Pips &&
+          (tp4Pips === 0 || tp4Pips > tp3Pips);
+        if (!pipsOk) {
+          Alert.alert("Invalid TP Settings", "Open Settings and make sure TP1 < TP2 < TP3 (and TP4 if used).");
+          return;
+        }
+        if (cascadeLotSize < 0.01) {
+          Alert.alert("Lot Too Small", "Minimum cascade lot size is 0.01.");
+          return;
+        }
+        const PIP = 0.10;
+        const sign = dir === "buy" ? 1 : -1;
+        const round2 = (v: number) => parseFloat(v.toFixed(2));
+        const tp1Price = round2(mktPrice + sign * tp1Pips * PIP);
+        const tp2Price = round2(mktPrice + sign * tp2Pips * PIP);
+        const tp3Price = round2(mktPrice + sign * tp3Pips * PIP);
+        const tp4Price = tp4Pips > 0 ? round2(mktPrice + sign * tp4Pips * PIP) : undefined;
+        const result = await placeCascadeOrders({
+          direction: dir,
+          volume: cascadeLotSize,
+          limitEntries: levels.limitEntries,
+          stopLoss: levels.stopLoss,
+          tp1Price, tp2Price, tp3Price, tp4Price,
+          anchorPrice: mktPrice,
+          tp1Pct: cs.tp1Enabled ? cs.tp1Pct : 0,
+          tp2Pct: cs.tp2Enabled ? cs.tp2Pct : 0,
+          tp3Pct: cs.tp3Enabled ? cs.tp3Pct : 0,
+          tp4Pct: cs.tp4Enabled ? cs.tp4Pct : 0,
+          autoBeAtTp: cs.autoBeAtTp,
+        });
+        if (result.success) {
+          await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+          setTradeFeedback(dir);
+          setTimeout(() => setTradeFeedback(null), 2500);
+        } else {
+          await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+          Alert.alert("Trade Failed", result.message);
+        }
+      } catch (err) {
+        Alert.alert("Trade Failed", err instanceof Error ? err.message : "Cascade failed");
+      } finally {
+        isPlacingRef.current = false;
+        setIsPlacing(false);
+      }
     },
-    [tradeFeedback, placeTrade, cascadeLotSize],
+    [
+      status, platformStatus, price, cs, cascadeLotSize,
+      placeCascadeOrders,
+    ],
   );
 
   const handleCancelOrder = useCallback(
@@ -612,8 +679,8 @@ export default function PositionsScreen() {
             (pressed || tradeFeedback === "sell") && styles.tradeBtnMuted,
             tradeFeedback === "sell" && { backgroundColor: C.textMuted },
           ]}
-          onPress={() => void handleQuickTrade("sell")}
-          disabled={!!tradeFeedback}
+          onPress={() => void handleCascadeTrade("sell")}
+          disabled={isPlacing || !!tradeFeedback}
         >
           <Text style={styles.tradeBtnText}>
             {tradeFeedback === "sell" ? "✓ Trade Activated" : "SELL"}
@@ -626,8 +693,8 @@ export default function PositionsScreen() {
             (pressed || tradeFeedback === "buy") && styles.tradeBtnMuted,
             tradeFeedback === "buy" && { backgroundColor: C.textMuted },
           ]}
-          onPress={() => void handleQuickTrade("buy")}
-          disabled={!!tradeFeedback}
+          onPress={() => void handleCascadeTrade("buy")}
+          disabled={isPlacing || !!tradeFeedback}
         >
           <Text style={styles.tradeBtnText}>
             {tradeFeedback === "buy" ? "✓ Trade Activated" : "BUY"}
