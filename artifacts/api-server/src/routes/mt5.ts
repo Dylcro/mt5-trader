@@ -2262,6 +2262,40 @@ async function undeployAccount(token: string, accountId: string): Promise<void> 
   }
 }
 
+/** Undeploy→deploy when MetaAPI is DEPLOYED but broker link is dead (common after server restarts). */
+async function prepareAccountForConnect(
+  token: string,
+  accountId: string,
+  opts?: { force?: boolean },
+): Promise<void> {
+  const acct = await getProvisioningAccount(token, accountId);
+  if (acct.connectionStatus === "CONNECTED" && !opts?.force) return;
+
+  const shouldCycle = Boolean(opts?.force)
+    || acct.state === "DEPLOYED"
+    || acct.connectionStatus === "DISCONNECTED"
+    || acct.state === "DEPLOY_FAILED";
+
+  if (shouldCycle) {
+    console.log(
+      `[prepare] ${accountId} cycling undeploy→deploy (force=${Boolean(opts?.force)} ${acct.state}/${acct.connectionStatus})`,
+    );
+    await stopStreaming(accountId).catch(() => {});
+    activeStreams.delete(accountId);
+    await undeployAccount(token, accountId).catch((e: Error) =>
+      console.warn(`[prepare] undeploy ${accountId}:`, e.message),
+    );
+    const undeployStart = Date.now();
+    while (Date.now() - undeployStart < 45_000) {
+      await new Promise((r) => setTimeout(r, 2_000));
+      const a = await getProvisioningAccount(token, accountId).catch(() => null);
+      if (!a || a.state === "UNDEPLOYED" || a.state === "DELETING") break;
+    }
+  }
+
+  await deployAccount(token, accountId);
+}
+
 // ── Stuck-sync recovery ────────────────────────────────────────────────────
 // Some MetaAPI accounts (Gethin's is the canonical example) get into a state
 // where every subscribe call fails with "synchronization with this id is
@@ -6772,12 +6806,14 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       return _origJson(body);
     };
 
-    const { login, password, server, accountId: existingId } = req.body as {
+    const { login, password, server, accountId: existingId, forceReconnect } = req.body as {
       login?: string;
       password?: string;
       server?: string;
       accountId?: string;
+      forceReconnect?: boolean;
     };
+    const forceBrokerReset = Boolean(forceReconnect);
 
     console.log(`[connect] userId=${userId} login=${login} server=${server} existingId=${existingId}`);
 
@@ -6813,9 +6849,9 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         return res.json({ status: "connected", ...brokerConnectedFields(existingId, region, info) });
       }
 
-      // Not connected — trigger deploy and return "deploying" immediately
+      // Not connected — cycle undeploy→deploy when broker link is dead
       try {
-        await deployAccount(token, existingId);
+        await prepareAccountForConnect(token, existingId, { force: forceBrokerReset || true });
       } catch (deployErr) {
         const msg = (deployErr as Error).message ?? "Deploy failed";
         const isBilling = msg.toLowerCase().includes("top up") || msg.toLowerCase().includes("forbidden");
@@ -6875,7 +6911,17 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         return res.json({ status: "connected", ...brokerConnectedFields(foundId, region, info) });
       }
 
-      await deployAccount(token, foundId);
+      try {
+        await prepareAccountForConnect(token, foundId, { force: forceBrokerReset });
+      } catch (deployErr) {
+        const msg = (deployErr as Error).message ?? "Deploy failed";
+        const isBilling = msg.toLowerCase().includes("top up") || msg.toLowerCase().includes("forbidden");
+        return res.status(503).json({
+          error: isBilling
+            ? "Connection limit reached. Please contact support."
+            : msg,
+        });
+      }
       return res.json({ status: "deploying", accountId: foundId, region });
     }
 
@@ -6962,7 +7008,9 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
             mt5Server: server,
           }).catch((e: Error) => console.warn(`[connect] queued account persist failed:`, e.message));
         }
-        if (queued.connectionStatus !== "CONNECTED") await deployAccount(token, queuedId);
+        if (queued.connectionStatus !== "CONNECTED") {
+          await prepareAccountForConnect(token, queuedId, { force: forceBrokerReset });
+        }
         return res.json({ status: "deploying", accountId: queuedId, region });
       }
       // Account not visible yet — tell client to retry in 70s (MetaAPI says wait 60s)
@@ -6992,7 +7040,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
     }
 
     // Kick off deploy and return immediately — client will poll /status
-    await deployAccount(token, newId);
+    await prepareAccountForConnect(token, newId, { force: forceBrokerReset });
     return res.json({ status: "deploying", accountId: newId, region });
 
   } catch (err) {
@@ -7033,7 +7081,7 @@ router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, re
     if (acct.state === "UNDEPLOYED") {
       console.log(`[status] account ${accountId} is UNDEPLOYED — re-triggering deploy`);
       try {
-        await deployAccount(token, accountId);
+        await prepareAccountForConnect(token, accountId);
         return res.json({ connectionStatus: "DEPLOYING", state: "DEPLOYING" });
       } catch (deployErr) {
         const msg = (deployErr as Error).message ?? "Deploy failed";
@@ -7052,7 +7100,7 @@ router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, re
     if (Date.now() - lastKick >= DEPLOY_KICK_INTERVAL_MS) {
       deployKickAt.set(accountId, Date.now());
       console.log(`[status] ${accountId} stuck at ${acct.connectionStatus}/${acct.state} — re-kicking deploy`);
-      await deployAccount(token, accountId).catch((e: Error) =>
+      await prepareAccountForConnect(token, accountId, { force: true }).catch((e: Error) =>
         console.warn(`[status] deploy re-kick failed for ${accountId}:`, e.message),
       );
     }

@@ -379,7 +379,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // Poll /status until CONNECTED, then finalise the session
-  const pollUntilConnected = useCallback(async (accId: string, accRegion: string, maxWaitMs = 180_000) => {
+  const pollUntilConnected = useCallback(async (accId: string, accRegion: string, maxWaitMs = 240_000) => {
     const deadline = Date.now() + maxWaitMs;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 5000));
@@ -433,8 +433,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
           res = await authFetchWithTimeout(`${API_BASE}/mt5/connect`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ accountId: savedId }),
-          }, 60_000);
+            body: JSON.stringify({ accountId: savedId, forceReconnect: true }),
+          }, 90_000);
           data = await safeJson<{ status?: string; error?: string; accountId?: string; region?: string } & Partial<AccountInfo>>(res);
           break; // success — exit retry loop
         } catch (err) {
@@ -992,8 +992,9 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
                 login: useCreds.login.trim(),
                 password: useCreds.password.trim(),
                 server: useCreds.server.trim(),
+                forceReconnect: true,
               }),
-            }, 60_000);
+            }, 90_000);
             data = await safeJson<{
               status?: string; error?: string; accountId?: string; region?: string; retryAfterMs?: number;
             } & Partial<AccountInfo>>(res);
@@ -1103,6 +1104,15 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         targetRegion = record["mt5_region"] ?? DEFAULT_REGION;
       }
 
+      // Prefer full credential reconnect (forces MetaAPI undeploy→deploy) when password is cached.
+      const map = await AsyncStorage.getMany(["mt5_login", "mt5_server"]);
+      const login = map["mt5_login"]?.trim();
+      const server = map["mt5_server"]?.trim();
+      const password = (await loadMt5Password())?.trim();
+      if (login && server && password) {
+        await connect({ login, password, server });
+        return;
+      }
       if (targetAccountId) {
         setAccountIdState(targetAccountId);
         setRegionState(targetRegion);
@@ -1155,11 +1165,11 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
         return null;
       }
       console.log("[silentReconnect] re-provisioning account for login=" + login);
-      const res = await authFetch(`${API_BASE}/mt5/connect`, {
+      const res = await authFetchWithTimeout(`${API_BASE}/mt5/connect`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ login, password, server }),
-      });
+        body: JSON.stringify({ login, password, server, forceReconnect: true }),
+      }, 90_000);
       const data = await safeJson<{ status?: string; accountId?: string; region?: string; error?: string }>(res);
       if (!res.ok || data.error || !data.accountId) {
         console.warn("[silentReconnect] connect failed:", data.error ?? res.status);
