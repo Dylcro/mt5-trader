@@ -263,6 +263,7 @@ export default function PositionsScreen() {
     || null;
   const scrollViewRef = useRef<ScrollView>(null);
   const zoneRefs = useRef(new Map<string, View>());
+  const zonesEverShownRef = useRef(false);
   const [flashZone, setFlashZone] = useState<string | null>(null);
   const [runnerAlert, setRunnerAlert] = useState<{
     zoneId: string;
@@ -347,6 +348,17 @@ export default function PositionsScreen() {
   const [pastExpanded, setPastExpanded] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+
+  useEffect(() => {
+    zonesEverShownRef.current = false;
+  }, [accountId]);
+
+  useEffect(() => {
+    if (zones.length > 0) zonesEverShownRef.current = true;
+  }, [zones.length]);
+
+  const showInitialZoneSpinner =
+    zones.length === 0 && zonesLoading && !zonesEverShownRef.current;
 
   const withSessionReady = useCallback(
     async <T extends { ok: boolean; message?: string }>(run: () => Promise<T>): Promise<T> => {
@@ -603,7 +615,7 @@ export default function PositionsScreen() {
             <Text style={styles.emptyTitle}>Not Connected</Text>
             <Text style={styles.emptyText}>Connect your MT5 account in Settings to see positions</Text>
           </View>
-        ) : zones.length === 0 && zonesLoading ? (
+        ) : showInitialZoneSpinner ? (
           <View style={styles.emptyState}>
             <ActivityIndicator size="large" color={C.gold} />
           </View>
@@ -723,13 +735,17 @@ export default function PositionsScreen() {
             onPress={handleRefresh}
             disabled={refreshing}
           >
-            {refreshing ? (
+            {refreshing && !sseConnected ? (
               <ActivityIndicator size={12} color={C.textMuted} />
             ) : (
               <Feather name="refresh-cw" size={12} color={C.textMuted} />
             )}
             <Text style={styles.syncText}>
-              {refreshing ? "Refreshing…" : sseConnected ? "Live sync" : "Polling · refresh"}
+              {refreshing && !sseConnected
+                ? "Refreshing…"
+                : sseConnected
+                  ? "Live sync"
+                  : "Polling · refresh"}
             </Text>
           </Pressable>
         )}
