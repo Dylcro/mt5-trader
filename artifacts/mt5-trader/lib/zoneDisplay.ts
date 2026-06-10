@@ -280,6 +280,7 @@ export function buildDisplayActiveZones(
   cs: CascadeSettings,
   price: Price | null,
   pendingOrders: PendingOrder[] = [],
+  excludeZoneIds: ReadonlySet<string> = new Set(),
 ): Zone[] {
   const apiById = new Map(apiZones.map((z) => [z.zoneId, z]));
   const closedIds = new Set(
@@ -301,6 +302,7 @@ export function buildDisplayActiveZones(
   const out: Zone[] = [];
 
   for (const z of active) {
+    if (excludeZoneIds.has(z.zoneId)) continue;
     seen.add(z.zoneId);
     const linked = getLinkedPositionsForZone(z.zoneId, z, positions);
     const merged: Zone = enrichZoneDisplayFields({
@@ -311,6 +313,7 @@ export function buildDisplayActiveZones(
   }
 
   const discoverFromMt5 = (zoneId: string, linked: Position[]) => {
+    if (excludeZoneIds.has(zoneId)) return;
     if (seen.has(zoneId)) return;
     const apiRow = apiById.get(zoneId);
     if (apiRow && (apiRow.status === "OPEN" || apiRow.status === "RISK_FREE" || apiRow.status === "ARMED")) {
@@ -334,7 +337,7 @@ export function buildDisplayActiveZones(
   }
 
   for (const zoneId of byPending.keys()) {
-    if (seen.has(zoneId) || closedIds.has(zoneId)) continue;
+    if (excludeZoneIds.has(zoneId) || seen.has(zoneId) || closedIds.has(zoneId)) continue;
     const apiRow = apiById.get(zoneId);
     if (apiRow?.status === "OPEN" || apiRow?.status === "RISK_FREE" || apiRow?.status === "ARMED") continue;
     const syn = syntheticZoneFromPositions(zoneId, [], cs);

@@ -288,9 +288,21 @@ export default function PositionsScreen() {
     includeClosed: true, sseConnected, region,
   });
   const { settings: cs, cascadeLotSize } = useCascadeSettings();
+  const dismissedZoneIdsRef = useRef(new Set<string>());
+  const [dismissedZoneTick, setDismissedZoneTick] = useState(0);
+  const dismissZoneFromDisplay = useCallback((zoneId: string) => {
+    dismissedZoneIdsRef.current.add(zoneId);
+    setDismissedZoneTick((n) => n + 1);
+  }, []);
+  const restoreZoneOnDisplay = useCallback((zoneId: string) => {
+    if (!dismissedZoneIdsRef.current.delete(zoneId)) return;
+    setDismissedZoneTick((n) => n + 1);
+  }, []);
   const displayActiveZones = useMemo(
-    () => buildDisplayActiveZones(zones, positions, cs, price, pendingOrders),
-    [zones, positions, cs, price, pendingOrders],
+    () => buildDisplayActiveZones(
+      zones, positions, cs, price, pendingOrders, dismissedZoneIdsRef.current,
+    ),
+    [zones, positions, cs, price, pendingOrders, dismissedZoneTick],
   );
 
   const scrollToZone = useCallback((zoneId: string) => {
@@ -356,6 +368,8 @@ export default function PositionsScreen() {
 
   useEffect(() => {
     zonesEverShownRef.current = false;
+    dismissedZoneIdsRef.current.clear();
+    setDismissedZoneTick((n) => n + 1);
   }, [accountId]);
 
   useEffect(() => {
@@ -391,13 +405,16 @@ export default function PositionsScreen() {
 
   const handleCloseZone = useCallback(
     async (zoneId: string) => {
+      dismissZoneFromDisplay(zoneId);
       const result = await closeZone(zoneId);
       if (result.ok) {
         void Promise.all([refreshZones(), refreshPositions(), refreshPendingOrders()]);
+        return result;
       }
+      restoreZoneOnDisplay(zoneId);
       return result;
     },
-    [closeZone, refreshZones, refreshPositions, refreshPendingOrders],
+    [closeZone, dismissZoneFromDisplay, restoreZoneOnDisplay, refreshZones, refreshPositions, refreshPendingOrders],
   );
 
   const handleClosePartial = useCallback(
@@ -433,8 +450,9 @@ export default function PositionsScreen() {
     return subscribeAccountEvents(accountId, (type, data) => {
       if (type === "pending_order") void refreshPendingOrders();
       if (type === "zone_update") {
-        const u = data as { status?: string };
-        if (u.status === "CLOSED") {
+        const u = data as { zoneId?: string; status?: string };
+        if (u.status === "CLOSED" && u.zoneId) {
+          dismissZoneFromDisplay(u.zoneId);
           void refreshPositions();
         }
       }
@@ -463,7 +481,7 @@ export default function PositionsScreen() {
         }
       }
     });
-  }, [accountId, sseConnected, refreshPendingOrders, refreshZones, refreshPositions]);
+  }, [accountId, sseConnected, refreshPendingOrders, refreshZones, refreshPositions, dismissZoneFromDisplay]);
 
   useFocusEffect(
     useCallback(() => {
