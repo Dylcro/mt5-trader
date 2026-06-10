@@ -6224,23 +6224,25 @@ router.post("/mt5/account/:accountId/zones/:zoneId/runner-auto", checkOwner, asy
 // Close all but the best entry; move best entry's SL by signed pip offset.
 router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async (req: Request, res: Response) => {
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
+  let st: ZoneState | null = null;
   try {
     if (rejectIfPriceNotReady(res, accountId)) return;
     await ensureCascadeZoneRfColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
-    const st = await loadZone(zoneId);
+    st = await loadZone(zoneId);
     if (!st || st.accountId !== accountId || st.status === "CLOSED") { res.status(404).json({ error: "Zone not found" }); return; }
     if (st.status === "ARMED") {
       res.status(409).json({ error: "Zone not active yet — wait for the first order to fill" });
       return;
     }
+    st.busy = true;
     const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
     if (live.length === 0) {
       res.status(409).json({ error: "No open positions in this zone" }); return;
     }
     const sorted = [...live].sort((a, b) =>
-      st.direction === "buy"
+      st!.direction === "buy"
         ? a.openPrice - b.openPrice
         : b.openPrice - a.openPrice,
     );
@@ -6257,21 +6259,14 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       }),
     );
     const failed: string[] = closeResults.filter((r) => !r.ok).map((r) => r.id);
-    const body = (req.body ?? {}) as { riskFreePips?: unknown };
-    const pips = body.riskFreePips !== undefined
-      ? sanitizeRiskFreePips(body.riskFreePips)
-      : (st.riskFreeOffset ?? ZONE_RISK_FREE_PIPS);
-    const sl = computeRiskFreeSl(st.direction, best.openPrice, pips);
-    const slOk = await modifyZonePositionSl(token, region, accountId, best.id, sl);
-    if (failed.length > 0 || !slOk) {
-      console.warn(`[zone ${zoneId}] risk-free partial: failedCloses=${failed.length} slOk=${slOk}`);
+    if (failed.length > 0) {
+      console.warn(`[zone ${zoneId}] risk-free partial: failedCloses=${failed.length}`);
       res.status(207).json({
         ok: false,
         bestPositionId: best.id,
-        sl, slOk,
         closedCount: others.length - failed.length,
         failedPositionIds: failed,
-        message: "Some operations failed. Retry to clear remaining issues.",
+        message: "Some positions failed to close. Retry to clear remaining issues.",
       });
       return;
     }
@@ -6287,12 +6282,36 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       st.trackedPositions.delete(r.id);
     }
     await cancelZoneLimits(token, region, accountId, zoneId);
+    const body = (req.body ?? {}) as { riskFreePips?: unknown };
+    const pips = body.riskFreePips !== undefined
+      ? sanitizeRiskFreePips(body.riskFreePips)
+      : (st.riskFreeOffset ?? ZONE_RISK_FREE_PIPS);
+    const sl = computeRiskFreeSl(st.direction, best.openPrice, pips);
+    const slOk = await modifyZonePositionSl(token, region, accountId, best.id, sl);
+    if (!slOk) {
+      console.warn(`[zone ${zoneId}] risk-free partial: slOk=${slOk}`);
+      res.status(207).json({
+        ok: false,
+        bestPositionId: best.id,
+        sl, slOk,
+        closedCount: others.length,
+        message: "Positions closed and limits cancelled but SL move failed. Retry to set SL.",
+      });
+      return;
+    }
+    await db.update(cascadeZonesTable)
+      .set({ status: "RISK_FREE", wentRiskFree: true, riskFreeOffset: pips })
+      .where(eq(cascadeZonesTable.zoneId, zoneId));
+    st.status = "RISK_FREE";
+    st.riskFreeOffset = pips;
     broadcastZoneUpdate(zoneId);
     broadcastToAccount(accountId, "deal", { type: "position_changed" });
     console.log(`[zone ${zoneId}] risk-free: kept posId=${best.id} @${best.openPrice} sl=${sl} (pips=${pips})`);
     res.json({ ok: true, bestPositionId: best.id, sl, pips, closedCount: others.length });
   } catch (err) {
     respondZoneActionError(res, "risk-free", err);
+  } finally {
+    if (st) st.busy = false;
   }
 });
 
