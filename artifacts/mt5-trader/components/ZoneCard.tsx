@@ -331,6 +331,7 @@ interface ZoneCardProps {
   onRiskFree?: (zoneId: string) => Promise<{ ok: boolean; message?: string }>;
   onCloseAllWorst?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
   onCloseZone?: (zoneId: string) => Promise<{ ok: boolean; message?: string; closedCount?: number }>;
+  onZoneComplete?: (zoneId: string) => void;
   onClosePartial?: (zoneId: string, opts: ClosePartialOpts) => Promise<{ ok: boolean; message?: string }>;
   onActivateRunner?: (
     zoneId: string,
@@ -354,6 +355,7 @@ export default function ZoneCard({
   onRiskFree,
   onCloseAllWorst,
   onCloseZone,
+  onZoneComplete,
   onClosePartial,
   onActivateRunner,
   onSetRunnerAuto,
@@ -555,20 +557,31 @@ export default function ZoneCard({
         </View>
         <View style={styles.topRight}>
           {canCloseZone && (
-            <Pressable
-              style={({ pressed }) => [styles.closeZoneTopBtn, btnPressed(pressed)]}
-              onPress={() => void runCloseZone()}
-              disabled={actionBusy}
-            >
-              {closeBusy ? (
-                <ActivityIndicator size="small" color={C.specSell} />
-              ) : (
-                <>
-                  <Feather name="x" size={10} color={C.specSell} />
-                  <Text style={styles.closeZoneTopText}>Close Zone</Text>
-                </>
+            <View style={styles.topActionRow}>
+              {onZoneComplete && (
+                <Pressable
+                  style={({ pressed }) => [styles.zoneCompleteBtn, btnPressed(pressed)]}
+                  onPress={() => onZoneComplete(zone.zoneId)}
+                  disabled={actionBusy}
+                >
+                  <Text style={styles.zoneCompleteText}>Zone Complete</Text>
+                </Pressable>
               )}
-            </Pressable>
+              <Pressable
+                style={({ pressed }) => [styles.closeZoneTopBtn, btnPressed(pressed)]}
+                onPress={() => void runCloseZone()}
+                disabled={actionBusy}
+              >
+                {closeBusy ? (
+                  <ActivityIndicator size="small" color={C.specSell} />
+                ) : (
+                  <>
+                    <Feather name="x" size={10} color={C.specSell} />
+                    <Text style={styles.closeZoneTopText}>Close Zone</Text>
+                  </>
+                )}
+              </Pressable>
+            </View>
           )}
           <View style={[styles.statusBadge, runnerActive ? styles.statusRunner : isBuy ? styles.statusActiveBuy : styles.statusActiveSell]}>
             <Text style={[styles.statusText, runnerActive && { color: C.teal }]}>
@@ -837,6 +850,24 @@ const styles = StyleSheet.create({
   dirPillText: { fontSize: 11, fontFamily: "Inter_700Bold", color: "#fff", letterSpacing: 0.7 },
   anchorLabel: { fontSize: 9, fontFamily: "Inter_700Bold", color: C.specMuted, letterSpacing: 1 },
   anchorPrice: { fontSize: 19, fontFamily: "Inter_700Bold", color: C.specText },
+  topActionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  zoneCompleteBtn: {
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+    borderRadius: 7,
+    borderWidth: 1.5,
+    borderColor: "rgba(220,38,38,0.2)",
+    backgroundColor: "rgba(220,38,38,0.05)",
+  },
+  zoneCompleteText: {
+    fontSize: 9,
+    fontFamily: "Inter_700Bold",
+    color: "rgba(220,38,38,0.5)",
+  },
   closeZoneTopBtn: {
     flexDirection: "row",
     alignItems: "center",

@@ -23,6 +23,7 @@ import { usePlatformStatus } from "@/hooks/usePlatformStatus";
 import { useZones } from "@/hooks/useZones";
 import ZoneCard from "@/components/ZoneCard";
 import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
+import { authFetch } from "@/lib/authFetch";
 import { subscribeAccountEvents } from "@/lib/accountEventBus";
 import {
   buildDisplayActiveZones,
@@ -32,6 +33,7 @@ import {
 } from "@/lib/zoneDisplay";
 
 const C = Colors.dark;
+const API_BASE = process.env.EXPO_PUBLIC_API_URL ?? "";
 
 function SectionHeader({ label, count, color }: { label: string; count: number; color: string }) {
   return (
@@ -360,6 +362,13 @@ export default function PositionsScreen() {
     .sort((a, b) => (b.closedAt ?? b.createdAt) - (a.closedAt ?? a.createdAt))
     .slice(0, 25);
   const [pastExpanded, setPastExpanded] = useState(false);
+  const [toast, setToast] = useState("");
+  const [toastVisible, setToastVisible] = useState(false);
+  const showToast = useCallback((msg: string) => {
+    setToast(msg);
+    setToastVisible(true);
+    setTimeout(() => setToastVisible(false), 3000);
+  }, []);
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [tradeFeedback, setTradeFeedback] = useState<"buy" | "sell" | null>(null);
@@ -417,6 +426,23 @@ export default function PositionsScreen() {
     [closeZone, dismissZoneFromDisplay, restoreZoneOnDisplay, refreshZones, refreshPositions, refreshPendingOrders],
   );
 
+  const handleZoneComplete = useCallback(
+    async (zoneId: string) => {
+      dismissZoneFromDisplay(zoneId);
+      showToast("Zone removed — restores in 10s if still active");
+      try {
+        await authFetch(
+          `${API_BASE}/mt5/account/${encodeURIComponent(accountId)}/zone/${encodeURIComponent(zoneId)}/force-close?region=${encodeURIComponent(region ?? "london")}`,
+          { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+        );
+        void refreshZones();
+      } catch (err) {
+        console.error("[zone-complete] failed:", err);
+      }
+    },
+    [accountId, region, dismissZoneFromDisplay, showToast, refreshZones],
+  );
+
   const handleClosePartial = useCallback(
     async (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number; runnerN?: number; emergency?: boolean }) => {
       const result = await closeZonePartial(zoneId, opts);
@@ -451,9 +477,14 @@ export default function PositionsScreen() {
       if (type === "pending_order") void refreshPendingOrders();
       if (type === "zone_update") {
         const u = data as { zoneId?: string; status?: string };
-        if (u.status === "CLOSED" && u.zoneId) {
-          dismissZoneFromDisplay(u.zoneId);
-          void refreshPositions();
+        if (u.zoneId) {
+          if (u.status === "CLOSED") {
+            dismissZoneFromDisplay(u.zoneId);
+            void refreshPositions();
+          } else if (u.status) {
+            restoreZoneOnDisplay(u.zoneId);
+            void refreshZones();
+          }
         }
       }
       if (type === "deal") {
@@ -481,7 +512,7 @@ export default function PositionsScreen() {
         }
       }
     });
-  }, [accountId, sseConnected, refreshPendingOrders, refreshZones, refreshPositions, dismissZoneFromDisplay]);
+  }, [accountId, sseConnected, refreshPendingOrders, refreshZones, refreshPositions, dismissZoneFromDisplay, restoreZoneOnDisplay]);
 
   useFocusEffect(
     useCallback(() => {
@@ -660,6 +691,7 @@ export default function PositionsScreen() {
             withSessionReady(() => closeAllWorst(zoneId))
           }
           onCloseZone={handleCloseZone}
+          onZoneComplete={handleZoneComplete}
           onClosePartial={(zoneId, opts) =>
             withSessionReady(() => handleClosePartial(zoneId, opts))
           }
@@ -909,11 +941,32 @@ export default function PositionsScreen() {
           </View>
         )}
       </ScrollView>
+      {toastVisible && (
+        <View style={styles.toast}>
+          <Text style={styles.toastText}>{toast}</Text>
+        </View>
+      )}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
+  toast: {
+    position: "absolute",
+    bottom: 90,
+    left: 20,
+    right: 20,
+    backgroundColor: "#111827",
+    borderRadius: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    alignItems: "center",
+  },
+  toastText: {
+    color: "#fff",
+    fontSize: 13,
+    fontFamily: "Inter_600SemiBold",
+  },
   container: {
     flex: 1,
     backgroundColor: C.background,
