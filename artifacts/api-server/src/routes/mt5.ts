@@ -9,6 +9,7 @@ import { logEvent } from "../logger";
 import { usdToTargetRate } from "../lib/usdFx.js";
 import { type ExecutionAdapter, NotReadyError } from "../lib/execution/types";
 import { MetaApiAdapter } from "../lib/execution/metaApiAdapter";
+import { EaAdapter } from "../lib/execution/eaAdapter";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
 // In dev (tsx/ESM) import.meta.url is the real file URL.
 // In production (esbuild CJS) build.ts injects a __importMetaUrl banner and
@@ -120,6 +121,9 @@ const activeRegions = new Map<string, string>();  // accountId → region (used 
 // this as their primary source so a DB blip can NEVER knock out SL coverage.
 interface KnownAccount { accountId: string; userId?: string; region: string; }
 const knownAccounts = new Map<string, KnownAccount>(); // accountId → KnownAccount
+// Mirrors execution_backend column — populated at startup and on watchdog refresh.
+// Defaults to 'metaapi' when absent so live accounts are never accidentally switched.
+const executionBackends = new Map<string, string>(); // accountId → 'metaapi' | 'ea'
 let sdkInstance: InstanceType<typeof MetaApi> | null = null;
 
 /** Idempotent — safe when drizzle push was skipped (RF history columns). */
@@ -1647,6 +1651,7 @@ export async function startAutoConnect(): Promise<void> {
             region,
           });
         }
+        executionBackends.set(account.accountId, account.executionBackend);
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         await (metaAccount as any).waitConnected(60000).catch(() => null);
         void startStreaming(token, account.accountId, region, account.userId ?? undefined);
@@ -1674,8 +1679,9 @@ export function startConnectionWatchdog(): void {
           .from(storedAccountsTable)
           .where(isNotNull(storedAccountsTable.userId));
         // Refresh cache with latest DB state while we have it.
-        for (const { accountId, userId, region } of rows) {
+        for (const { accountId, userId, region, executionBackend } of rows) {
           knownAccounts.set(accountId, { accountId, userId: userId ?? undefined, region });
+          executionBackends.set(accountId, executionBackend);
         }
         accounts = rows.map(r => ({ accountId: r.accountId, userId: r.userId ?? undefined, region: r.region }));
       } catch {
@@ -2127,6 +2133,9 @@ function getToken(): string {
 }
 
 function getAdapter(accountId: string): ExecutionAdapter {
+  if ((executionBackends.get(accountId) ?? "metaapi") === "ea") {
+    return new EaAdapter(accountId);
+  }
   return new MetaApiAdapter({
     accountId,
     getToken,

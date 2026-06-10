@@ -1,6 +1,7 @@
 import app from "./app";
 import { ensureTables } from "./ensureTables";
 import { loadCascadeConfig, startAutoConnect, startConnectionWatchdog, loadZoneState, startZoneTpMonitor, loadNotificationPrefs } from "./routes/mt5";
+import { startEaCommandSweeper } from "./lib/execution/eaAdapter";
 import { loadPlatformFlags } from "./lib/platformFlags";
 
 process.on("uncaughtException", (err) => {
@@ -36,6 +37,7 @@ async function main() {
   await loadZoneState();
   await loadNotificationPrefs();
   startZoneTpMonitor();
+  startEaCommandSweeper();
 
 }
 
