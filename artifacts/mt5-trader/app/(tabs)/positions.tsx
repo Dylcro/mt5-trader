@@ -1,4 +1,3 @@
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Feather } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -19,6 +18,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Colors from "@/constants/colors";
 import { useTrading, type PendingOrder, type Position } from "@/context/TradingContext";
 import { buildCascadeLevels, useCascadeSettings } from "@/hooks/useCascadeSettings";
+import { lotsToPct, validateEnabledTpPips, validateTpLots } from "@/lib/cascadeTpLots";
 import { usePlatformStatus } from "@/hooks/usePlatformStatus";
 import { useZones } from "@/hooks/useZones";
 import ZoneCard from "@/components/ZoneCard";
@@ -32,7 +32,6 @@ import {
 } from "@/lib/zoneDisplay";
 
 const C = Colors.dark;
-const LOT_SIZE_CASCADE_KEY = "lot_size_cascade";
 
 function SectionHeader({ label, count, color }: { label: string; count: number; color: string }) {
   return (
@@ -288,7 +287,7 @@ export default function PositionsScreen() {
   } = useZones(accountId, {
     includeClosed: true, sseConnected, region,
   });
-  const { settings: cs } = useCascadeSettings();
+  const { settings: cs, cascadeLotSize } = useCascadeSettings();
   const displayActiveZones = useMemo(
     () => buildDisplayActiveZones(zones, positions, cs, price, pendingOrders),
     [zones, positions, cs, price, pendingOrders],
@@ -351,17 +350,9 @@ export default function PositionsScreen() {
   const [pastExpanded, setPastExpanded] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
-  const [cascadeLotSize, setCascadeLotSize] = useState(0.04);
   const [tradeFeedback, setTradeFeedback] = useState<"buy" | "sell" | null>(null);
   const [isPlacing, setIsPlacing] = useState(false);
   const isPlacingRef = useRef(false);
-
-  useEffect(() => {
-    void AsyncStorage.getItem(LOT_SIZE_CASCADE_KEY).then((v) => {
-      const parsed = v ? parseFloat(v) : NaN;
-      if (Number.isFinite(parsed) && parsed >= 0.01) setCascadeLotSize(parsed);
-    });
-  }, []);
 
   useEffect(() => {
     zonesEverShownRef.current = false;
@@ -514,12 +505,16 @@ export default function PositionsScreen() {
       setIsPlacing(true);
       void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
       try {
-        const { tp1Pips, tp2Pips, tp3Pips, tp4Pips } = cs;
-        const pipsOk =
-          tp1Pips > 0 && tp2Pips > tp1Pips && tp3Pips > tp2Pips &&
-          (tp4Pips === 0 || tp4Pips > tp3Pips);
-        if (!pipsOk) {
-          Alert.alert("Invalid TP Settings", "Open Settings and make sure TP1 < TP2 < TP3 (and TP4 if used).");
+        const lotsCheck = validateTpLots(cs, cascadeLotSize);
+        if (!lotsCheck.ok) {
+          Alert.alert("Invalid TP Lots", lotsCheck.message);
+          return;
+        }
+        if (!validateEnabledTpPips(cs)) {
+          Alert.alert(
+            "Invalid TP Settings",
+            "Open Settings — enabled take-profit levels need increasing pip distances.",
+          );
           return;
         }
         if (cascadeLotSize < 0.01) {
@@ -529,10 +524,14 @@ export default function PositionsScreen() {
         const PIP = 0.10;
         const sign = dir === "buy" ? 1 : -1;
         const round2 = (v: number) => parseFloat(v.toFixed(2));
-        const tp1Price = round2(mktPrice + sign * tp1Pips * PIP);
-        const tp2Price = round2(mktPrice + sign * tp2Pips * PIP);
-        const tp3Price = round2(mktPrice + sign * tp3Pips * PIP);
-        const tp4Price = tp4Pips > 0 ? round2(mktPrice + sign * tp4Pips * PIP) : undefined;
+        const tp1Price = round2(mktPrice + sign * cs.tp1Pips * PIP);
+        const tp2Price = round2(mktPrice + sign * cs.tp2Pips * PIP);
+        const tp3Price = round2(mktPrice + sign * cs.tp3Pips * PIP);
+        const tp4Price = cs.tp4Pips > 0 ? round2(mktPrice + sign * cs.tp4Pips * PIP) : undefined;
+        const tp1Pct = cs.tp1Enabled ? lotsToPct(cs.tp1Lots, cascadeLotSize) : 0;
+        const tp2Pct = cs.tp2Enabled ? lotsToPct(cs.tp2Lots, cascadeLotSize) : 0;
+        const tp3Pct = cs.tp3Enabled ? lotsToPct(cs.tp3Lots, cascadeLotSize) : 0;
+        const tp4Pct = 0;
         const result = await placeCascadeOrders({
           direction: dir,
           volume: cascadeLotSize,
@@ -540,10 +539,10 @@ export default function PositionsScreen() {
           stopLoss: levels.stopLoss,
           tp1Price, tp2Price, tp3Price, tp4Price,
           anchorPrice: mktPrice,
-          tp1Pct: cs.tp1Enabled ? cs.tp1Pct : 0,
-          tp2Pct: cs.tp2Enabled ? cs.tp2Pct : 0,
-          tp3Pct: cs.tp3Enabled ? cs.tp3Pct : 0,
-          tp4Pct: cs.tp4Enabled ? cs.tp4Pct : 0,
+          tp1Pct,
+          tp2Pct,
+          tp3Pct,
+          tp4Pct,
           autoBeAtTp: cs.autoBeAtTp,
         });
         if (result.success) {

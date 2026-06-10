@@ -5,6 +5,7 @@ import { useRouter } from "expo-router";
 import React, { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -24,9 +25,12 @@ import Colors from "@/constants/colors";
 import { useTrading } from "@/context/TradingContext";
 import { useCascadeSettings } from "@/hooks/useCascadeSettings";
 import { useDisplayCurrency } from "@/hooks/useDisplayCurrency";
+import {
+  runnerRemainderLots,
+  validateEnabledTpPips,
+  validateTpLots,
+} from "@/lib/cascadeTpLots";
 const C = Colors.dark;
-
-const LOT_SIZE_CASCADE_KEY = "lot_size_cascade";
 const NOTIFY_TP3_KEY = "notify_tp3";
 const NOTIFY_R1_KEY = "notify_r1";
 const NOTIFY_R2_KEY = "notify_r2";
@@ -83,29 +87,23 @@ function SectionTitle({ title }: { title: string }) {
   );
 }
 
-function PctBar({ pct }: { pct: number }) {
-  return (
-    <View style={styles.pctBarTrack}>
-      <View style={[styles.pctBarFill, { width: `${Math.min(100, Math.max(0, pct))}%` }]} />
-    </View>
-  );
-}
-
 function TpLevelRow({
   label,
   enabled,
-  pct,
+  lots,
+  maxLots,
   pips,
   onToggle,
-  onPctChange,
+  onLotsChange,
   onPipsChange,
 }: {
   label: string;
   enabled: boolean;
-  pct: number;
+  lots: number;
+  maxLots: number;
   pips: number;
   onToggle: (v: boolean) => void;
-  onPctChange: (v: number) => void;
+  onLotsChange: (v: number) => void;
   onPipsChange: (v: number) => void;
 }) {
   return (
@@ -117,15 +115,14 @@ function TpLevelRow({
       {enabled && (
         <View style={styles.tpLevelExpanded}>
           <View style={styles.tpLevelRow}>
-            <Text style={styles.tpLevelRowLabel}>Close %</Text>
-            <PctBar pct={pct} />
+            <Text style={styles.tpLevelRowLabel}>Close lots</Text>
             <Stepper
-              value={pct}
-              onChange={onPctChange}
-              step={5}
-              min={5}
-              max={100}
-              display={`${pct}%`}
+              value={lots}
+              onChange={onLotsChange}
+              step={0.01}
+              min={0.01}
+              max={maxLots}
+              display={`${lots.toFixed(2)}`}
             />
           </View>
           <View style={styles.tpLevelRow}>
@@ -150,22 +147,45 @@ export default function SettingsScreen() {
   const { signOut } = useAuth();
   const { credentials, status, errorMsg, accountInfo, connect, disconnect, accountId } = useTrading();
   const { formatMoney } = useDisplayCurrency();
-  const { settings: cs, updateSettings, saveToServer } = useCascadeSettings();
+  const {
+    settings: cs,
+    cascadeLotSize,
+    setCascadeLotSize,
+    updateSettings,
+    saveToServer,
+  } = useCascadeSettings();
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
-  const [cascadeLotSize, setCascadeLotSize] = useState(0.04);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
-  useEffect(() => {
-    void AsyncStorage.getItem(LOT_SIZE_CASCADE_KEY).then((v) => {
-      const parsed = v ? parseFloat(v) : NaN;
-      if (Number.isFinite(parsed) && parsed >= 0.01) setCascadeLotSize(parsed);
-    });
-  }, []);
+  const runnerLots = runnerRemainderLots(cs, cascadeLotSize);
 
-  const persistLotSize = useCallback((lots: number) => {
-    const v = Math.max(0.01, Math.round(lots * 100) / 100);
-    setCascadeLotSize(v);
-    void AsyncStorage.setItem(LOT_SIZE_CASCADE_KEY, String(v));
-  }, []);
+  const handleSaveSettings = useCallback(async () => {
+    const lotsCheck = validateTpLots(cs, cascadeLotSize);
+    if (!lotsCheck.ok) {
+      Alert.alert("Invalid TP Lots", lotsCheck.message);
+      return;
+    }
+    if (!validateEnabledTpPips(cs)) {
+      Alert.alert(
+        "Invalid TP Distances",
+        "Enabled take-profit levels need increasing pip distances (e.g. TP2 farther than TP1).",
+      );
+      return;
+    }
+    setSaveState("saving");
+    setSaveError(null);
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    const result = await saveToServer();
+    if (result.ok) {
+      setSaveState("saved");
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } else {
+      setSaveState("error");
+      setSaveError(result.message);
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    }
+    setTimeout(() => setSaveState("idle"), 4000);
+  }, [cs, cascadeLotSize, saveToServer]);
 
   const [notifyTp3, setNotifyTp3] = useState(true);
   const [notifyR1, setNotifyR1] = useState(true);
@@ -456,35 +476,58 @@ export default function SettingsScreen() {
           {/* Section 1 — Take Profit Levels */}
           <View style={styles.cascadeCard}>
             <SectionTitle title="TAKE PROFIT LEVELS" />
+            <View style={styles.settingRow}>
+              <View style={styles.settingRowLeft}>
+                <Text style={styles.settingLabel}>Cascade lot size</Text>
+                <Text style={styles.settingHint}>Total size — split across TPs below</Text>
+              </View>
+              <Stepper
+                value={cascadeLotSize}
+                onChange={setCascadeLotSize}
+                step={0.01}
+                min={0.01}
+                display={cascadeLotSize.toFixed(2)}
+              />
+            </View>
+            <View style={styles.cascadeDivider} />
             <TpLevelRow
               label="TP1"
               enabled={cs.tp1Enabled}
-              pct={cs.tp1Pct}
+              lots={cs.tp1Lots}
+              maxLots={cascadeLotSize}
               pips={cs.tp1Pips}
               onToggle={(v) => updateSettings({ tp1Enabled: v })}
-              onPctChange={(v) => updateSettings({ tp1Pct: v })}
+              onLotsChange={(v) => updateSettings({ tp1Lots: v })}
               onPipsChange={(v) => updateSettings({ tp1Pips: v })}
             />
             <View style={styles.cascadeDivider} />
             <TpLevelRow
               label="TP2"
               enabled={cs.tp2Enabled}
-              pct={cs.tp2Pct}
+              lots={cs.tp2Lots}
+              maxLots={cascadeLotSize}
               pips={cs.tp2Pips}
               onToggle={(v) => updateSettings({ tp2Enabled: v })}
-              onPctChange={(v) => updateSettings({ tp2Pct: v })}
+              onLotsChange={(v) => updateSettings({ tp2Lots: v })}
               onPipsChange={(v) => updateSettings({ tp2Pips: v })}
             />
             <View style={styles.cascadeDivider} />
             <TpLevelRow
               label="TP3"
               enabled={cs.tp3Enabled}
-              pct={cs.tp3Pct}
+              lots={cs.tp3Lots}
+              maxLots={cascadeLotSize}
               pips={cs.tp3Pips}
               onToggle={(v) => updateSettings({ tp3Enabled: v })}
-              onPctChange={(v) => updateSettings({ tp3Pct: v })}
+              onLotsChange={(v) => updateSettings({ tp3Lots: v })}
               onPipsChange={(v) => updateSettings({ tp3Pips: v })}
             />
+            <View style={styles.runnerRemainderRow}>
+              <Text style={styles.settingLabel}>Runners</Text>
+              <Text style={[styles.runnerRemainderValue, runnerLots < 0.01 && { color: C.textMuted }]}>
+                {runnerLots >= 0.01 ? `${runnerLots.toFixed(2)} lots remaining` : "No remainder — zone closes at last TP"}
+              </Text>
+            </View>
             <Pressable
               style={({ pressed }) => [
                 styles.saveBtn,
@@ -492,15 +535,7 @@ export default function SettingsScreen() {
                 saveState === "saving" && { opacity: 0.6 },
               ]}
               disabled={saveState === "saving"}
-              onPress={async () => {
-                setSaveState("saving");
-                void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                const ok = await saveToServer();
-                setSaveState(ok ? "saved" : "error");
-                if (ok) void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-                else void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-                setTimeout(() => setSaveState("idle"), 3000);
-              }}
+              onPress={() => { void handleSaveSettings(); }}
             >
               {saveState === "saving" ? (
                 <ActivityIndicator size="small" color="#000" />
@@ -514,7 +549,7 @@ export default function SettingsScreen() {
               <Text style={[styles.saveBtnText, saveState === "error" && { color: C.sell }]}>
                 {saveState === "saving" ? "Saving…"
                   : saveState === "saved" ? "Saved to server"
-                  : saveState === "error" ? "Save failed — check connection"
+                  : saveState === "error" ? (saveError ?? "Save failed")
                   : "Save Settings to Server"}
               </Text>
             </Pressable>
@@ -569,19 +604,6 @@ export default function SettingsScreen() {
             <SectionTitle title="CASCADE SETTINGS" />
             <View style={styles.settingRow}>
               <View style={styles.settingRowLeft}>
-                <Text style={styles.settingLabel}>Lot size</Text>
-              </View>
-              <Stepper
-                value={cascadeLotSize}
-                onChange={persistLotSize}
-                step={0.01}
-                min={0.01}
-                display={cascadeLotSize.toFixed(2)}
-              />
-            </View>
-            <View style={styles.cascadeDivider} />
-            <View style={styles.settingRow}>
-              <View style={styles.settingRowLeft}>
                 <Text style={styles.settingLabel}>Number of limits</Text>
               </View>
               <Stepper
@@ -613,15 +635,7 @@ export default function SettingsScreen() {
                 saveState === "saving" && { opacity: 0.6 },
               ]}
               disabled={saveState === "saving"}
-              onPress={async () => {
-                setSaveState("saving");
-                void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                const ok = await saveToServer();
-                setSaveState(ok ? "saved" : "error");
-                if (ok) void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-                else void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-                setTimeout(() => setSaveState("idle"), 3000);
-              }}
+              onPress={() => { void handleSaveSettings(); }}
             >
               {saveState === "saving" ? (
                 <ActivityIndicator size="small" color="#000" />
@@ -635,7 +649,7 @@ export default function SettingsScreen() {
               <Text style={[styles.saveBtnText, saveState === "error" && { color: C.sell }]}>
                 {saveState === "saving" ? "Saving…"
                   : saveState === "saved" ? "Saved to server"
-                  : saveState === "error" ? "Save failed — check connection"
+                  : saveState === "error" ? (saveError ?? "Save failed")
                   : "Save Settings to Server"}
               </Text>
             </Pressable>
@@ -1278,6 +1292,20 @@ const styles = StyleSheet.create({
     height: "100%",
     backgroundColor: C.gold,
     borderRadius: 3,
+  },
+  runnerRemainderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: C.border,
+  },
+  runnerRemainderValue: {
+    fontSize: 13,
+    fontFamily: "Inter_700Bold",
+    color: C.gold,
   },
   settingControls: {
     flexDirection: "row",

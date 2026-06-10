@@ -2,7 +2,10 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 
 import { getAuthToken } from "@/lib/authToken";
+import { lotsToPct, pctToLots } from "@/lib/cascadeTpLots";
 import { useTrading } from "@/context/TradingContext";
+
+export const LOT_SIZE_CASCADE_KEY = "lot_size_cascade";
 
 async function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
   const token = await getAuthToken();
@@ -34,8 +37,11 @@ export interface CascadeSettings {
   riskFreePips: number;
   /** Auto SL→break-even after TP1, TP2, or TP3 partial (default TP2). */
   autoBeAtTp: 1 | 2 | 3;
-  // Per-TP close percentages. Each is the % of the original best-entry volume
-  // closed at that TP. Must sum to 100 across active TPs. Default: 25 each.
+  /** Lots to close at each TP (preferred). Remainder stays for runners. */
+  tp1Lots: number;
+  tp2Lots: number;
+  tp3Lots: number;
+  /** Legacy % — derived from lots for server sync; do not edit in UI. */
   tp1Pct: number;
   tp2Pct: number;
   tp3Pct: number;
@@ -61,6 +67,9 @@ const DEFAULTS: CascadeSettings = {
   tp4Pips: 0,
   riskFreePips: -10,
   autoBeAtTp: 2,
+  tp1Lots: 0.01,
+  tp2Lots: 0.01,
+  tp3Lots: 0.01,
   tp1Pct: 25,
   tp2Pct: 25,
   tp3Pct: 25,
@@ -91,6 +100,9 @@ function storageKeys(accountId: string) {
     tp4Pips:           `${prefix}zone_tp4_pips`,
     riskFreePips:      `${prefix}risk_free_pips`,
     autoBeAtTp:        `${prefix}auto_be_at_tp`,
+    tp1Lots:           `${prefix}zone_tp1_lots`,
+    tp2Lots:           `${prefix}zone_tp2_lots`,
+    tp3Lots:           `${prefix}zone_tp3_lots`,
     tp1Pct:            `${prefix}zone_tp1_pct`,
     tp2Pct:            `${prefix}zone_tp2_pct`,
     tp3Pct:            `${prefix}zone_tp3_pct`,
@@ -108,7 +120,12 @@ function cascadeConfigUrl(accountId: string): string {
     : `${API_BASE}/cascade-config`;
 }
 
-function buildServerPayload(s: CascadeSettings): Record<string, unknown> {
+function buildServerPayload(s: CascadeSettings, cascadeLot: number): Record<string, unknown> {
+  const tp1Pct = s.tp1Enabled ? lotsToPct(s.tp1Lots, cascadeLot) : 0;
+  const tp2Pct = s.tp2Enabled ? lotsToPct(s.tp2Lots, cascadeLot) : 0;
+  const tp3Pct = s.tp3Enabled ? lotsToPct(s.tp3Lots, cascadeLot) : 0;
+  const usedPct = tp1Pct + tp2Pct + tp3Pct;
+  const tp4Pct = s.tp4Enabled ? Math.max(0, 100 - usedPct) : 0;
   return {
     enabled: s.autoCascadeEnabled,
     numPositions: s.numPositions,
@@ -118,10 +135,10 @@ function buildServerPayload(s: CascadeSettings): Record<string, unknown> {
     tp2Pips: s.tp2Pips,
     tp3Pips: s.tp3Pips,
     tp4Pips: s.tp4Pips,
-    tp1Pct: s.tp1Pct,
-    tp2Pct: s.tp2Pct,
-    tp3Pct: s.tp3Pct,
-    tp4Pct: s.tp4Pct,
+    tp1Pct,
+    tp2Pct,
+    tp3Pct,
+    tp4Pct,
     tp1Enabled: s.tp1Enabled,
     tp2Enabled: s.tp2Enabled,
     tp3Enabled: s.tp3Enabled,
@@ -133,7 +150,11 @@ function buildServerPayload(s: CascadeSettings): Record<string, unknown> {
   };
 }
 
-function mergeServerConfig(local: CascadeSettings, raw: Record<string, unknown>): CascadeSettings {
+function mergeServerConfig(
+  local: CascadeSettings,
+  raw: Record<string, unknown>,
+  cascadeLot: number,
+): CascadeSettings {
   const pickNum = (key: string, cur: number) =>
     typeof raw[key] === "number" && Number.isFinite(raw[key] as number) ? (raw[key] as number) : cur;
   const pickBool = (key: string, cur: boolean) =>
@@ -141,6 +162,16 @@ function mergeServerConfig(local: CascadeSettings, raw: Record<string, unknown>)
   const autoBe = pickNum("autoBeAtTp", local.autoBeAtTp);
   const storedPips = pickNum("pipsBetween", local.pipsBetween);
   const riskFree = pickNum("riskFreePips", local.riskFreePips);
+  const tp1Pct = pickNum("tp1Pct", local.tp1Pct);
+  const tp2Pct = pickNum("tp2Pct", local.tp2Pct);
+  const tp3Pct = pickNum("tp3Pct", local.tp3Pct);
+  const tp4Pct = pickNum("tp4Pct", local.tp4Pct);
+  const tp1Enabled = pickBool("tp1Enabled", local.tp1Enabled);
+  const tp2Enabled = pickBool("tp2Enabled", local.tp2Enabled);
+  const tp3Enabled = pickBool("tp3Enabled", local.tp3Enabled);
+  const tp4Enabled = pickBool("tp4Enabled", local.tp4Enabled);
+  const hasLots = (key: string) =>
+    typeof raw[key] === "number" && Number.isFinite(raw[key] as number);
   return {
     ...local,
     autoCascadeEnabled: pickBool("enabled", local.autoCascadeEnabled),
@@ -155,14 +186,20 @@ function mergeServerConfig(local: CascadeSettings, raw: Record<string, unknown>)
     tp4Pips: pickNum("tp4Pips", local.tp4Pips),
     riskFreePips: VALID_RISK_FREE_PIPS.includes(riskFree) ? riskFree : local.riskFreePips,
     autoBeAtTp: autoBe === 3 ? 3 : autoBe === 1 || autoBe === 2 ? 2 : local.autoBeAtTp,
-    tp1Pct: pickNum("tp1Pct", local.tp1Pct),
-    tp2Pct: pickNum("tp2Pct", local.tp2Pct),
-    tp3Pct: pickNum("tp3Pct", local.tp3Pct),
-    tp4Pct: pickNum("tp4Pct", local.tp4Pct),
-    tp1Enabled: pickBool("tp1Enabled", local.tp1Enabled),
-    tp2Enabled: pickBool("tp2Enabled", local.tp2Enabled),
-    tp3Enabled: pickBool("tp3Enabled", local.tp3Enabled),
-    tp4Enabled: pickBool("tp4Enabled", local.tp4Enabled),
+    tp1Pct,
+    tp2Pct,
+    tp3Pct,
+    tp4Pct,
+    tp1Lots: hasLots("tp1Lots") ? (raw.tp1Lots as number)
+      : tp1Enabled ? pctToLots(cascadeLot, tp1Pct) : 0,
+    tp2Lots: hasLots("tp2Lots") ? (raw.tp2Lots as number)
+      : tp2Enabled ? pctToLots(cascadeLot, tp2Pct) : 0,
+    tp3Lots: hasLots("tp3Lots") ? (raw.tp3Lots as number)
+      : tp3Enabled ? pctToLots(cascadeLot, tp3Pct) : 0,
+    tp1Enabled,
+    tp2Enabled,
+    tp3Enabled,
+    tp4Enabled,
   };
 }
 
@@ -179,7 +216,7 @@ async function fetchFromServer(accountId: string): Promise<Record<string, unknow
   }
 }
 
-async function pushToServer(s: CascadeSettings, accountId: string): Promise<void> {
+async function pushToServer(s: CascadeSettings, accountId: string, cascadeLot: number): Promise<void> {
   if (!API_BASE) return;
   const token = await getAuthToken();
   if (!token) return;
@@ -187,17 +224,21 @@ async function pushToServer(s: CascadeSettings, accountId: string): Promise<void
     await authFetch(cascadeConfigUrl(accountId), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(buildServerPayload(s)),
+      body: JSON.stringify(buildServerPayload(s, cascadeLot)),
     });
   } catch {
     // Non-fatal — server may be unreachable
   }
 }
 
+export type SaveToServerResult = { ok: true } | { ok: false; message: string };
+
 interface CascadeSettingsContextValue {
   settings: CascadeSettings;
+  cascadeLotSize: number;
+  setCascadeLotSize: (lots: number) => void;
   updateSettings: (partial: Partial<CascadeSettings>) => void;
-  saveToServer: () => Promise<boolean>;
+  saveToServer: () => Promise<SaveToServerResult>;
 }
 
 const CascadeSettingsContext = createContext<CascadeSettingsContextValue | null>(null);
@@ -205,16 +246,37 @@ const CascadeSettingsContext = createContext<CascadeSettingsContextValue | null>
 export function CascadeSettingsProvider({ children }: { children: React.ReactNode }) {
   const { accountId } = useTrading();
   const [settings, setSettings] = useState<CascadeSettings>(DEFAULTS);
+  const [cascadeLotSize, setCascadeLotSizeState] = useState(0.04);
   const pushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cascadeLotRef = useRef(cascadeLotSize);
+  cascadeLotRef.current = cascadeLotSize;
+
+  const setCascadeLotSize = useCallback((lots: number) => {
+    const v = Math.max(0.01, Math.round(lots * 100) / 100);
+    setCascadeLotSizeState(v);
+    void AsyncStorage.setItem(LOT_SIZE_CASCADE_KEY, String(v));
+  }, []);
+
+  useEffect(() => {
+    void AsyncStorage.getItem(LOT_SIZE_CASCADE_KEY).then((v) => {
+      const parsed = v ? parseFloat(v) : NaN;
+      if (Number.isFinite(parsed) && parsed >= 0.01) setCascadeLotSizeState(parsed);
+    });
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
       try {
         const keys = storageKeys(accountId);
-        const allKeys = [...Object.values(keys), GLOBAL_AUTO_CASCADE_KEY];
+        const allKeys = [...Object.values(keys), GLOBAL_AUTO_CASCADE_KEY, LOT_SIZE_CASCADE_KEY];
         const record = await AsyncStorage.getMany(allKeys);
-        const [num, between, sl, tpEnabled, tpPips, tp1, tp2, tp3, tp4, riskFree, autoBe, tp1Pct, tp2Pct, tp3Pct, tp4Pct, tp1En, tp2En, tp3En, tp4En, globalAutoEnabled] = allKeys.map((k) => record[k]);
+        const lotRaw = record[LOT_SIZE_CASCADE_KEY];
+        const cascadeLot = lotRaw != null && Number.isFinite(parseFloat(lotRaw))
+          ? Math.max(0.01, parseFloat(lotRaw))
+          : cascadeLotRef.current;
+
+        const [num, between, sl, tpEnabled, tpPips, tp1, tp2, tp3, tp4, riskFree, autoBe, tp1Lots, tp2Lots, tp3Lots, tp1Pct, tp2Pct, tp3Pct, tp4Pct, tp1En, tp2En, tp3En, tp4En, globalAutoEnabled] = allKeys.map((k) => record[k]);
 
         let autoCascadeEnabled = DEFAULTS.autoCascadeEnabled;
         if (globalAutoEnabled !== null) {
@@ -254,6 +316,12 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
           tp2Pct: tp2Pct != null ? parseFloat(tp2Pct) : DEFAULTS.tp2Pct,
           tp3Pct: tp3Pct != null ? parseFloat(tp3Pct) : DEFAULTS.tp3Pct,
           tp4Pct: tp4Pct != null ? parseFloat(tp4Pct) : DEFAULTS.tp4Pct,
+          tp1Lots: tp1Lots != null ? parseFloat(tp1Lots)
+            : pctToLots(cascadeLot, tp1Pct != null ? parseFloat(tp1Pct) : DEFAULTS.tp1Pct),
+          tp2Lots: tp2Lots != null ? parseFloat(tp2Lots)
+            : pctToLots(cascadeLot, tp2Pct != null ? parseFloat(tp2Pct) : DEFAULTS.tp2Pct),
+          tp3Lots: tp3Lots != null ? parseFloat(tp3Lots)
+            : pctToLots(cascadeLot, tp3Pct != null ? parseFloat(tp3Pct) : DEFAULTS.tp3Pct),
           tp1Enabled: tp1En != null ? tp1En === "true" : DEFAULTS.tp1Enabled,
           tp2Enabled: tp2En != null ? tp2En === "true" : DEFAULTS.tp2Enabled,
           tp3Enabled: tp3En != null ? tp3En === "true" : DEFAULTS.tp3Enabled,
@@ -262,10 +330,11 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
 
         const serverCfg = await fetchFromServer(accountId);
         if (serverCfg) {
-          local = mergeServerConfig(local, serverCfg);
+          local = mergeServerConfig(local, serverCfg, cascadeLot);
         }
 
         if (cancelled) return;
+        setCascadeLotSizeState(cascadeLot);
         setSettings(local);
       } catch (e) {
         console.warn("[CascadeSettings] failed to load from storage:", e);
@@ -289,6 +358,9 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
       [keys.tp4Pips]: String(next.tp4Pips),
       [keys.riskFreePips]: String(next.riskFreePips),
       [keys.autoBeAtTp]: String(next.autoBeAtTp),
+      [keys.tp1Lots]: String(next.tp1Lots),
+      [keys.tp2Lots]: String(next.tp2Lots),
+      [keys.tp3Lots]: String(next.tp3Lots),
       [keys.tp1Pct]: String(next.tp1Pct),
       [keys.tp2Pct]: String(next.tp2Pct),
       [keys.tp3Pct]: String(next.tp3Pct),
@@ -304,7 +376,7 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
   const schedulePush = useCallback((next: CascadeSettings) => {
     if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
     pushTimerRef.current = setTimeout(() => {
-      void pushToServer(next, accountId);
+      void pushToServer(next, accountId, cascadeLotRef.current);
     }, 400);
   }, [accountId]);
 
@@ -317,21 +389,27 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
     });
   }, [accountId, persistLocal, schedulePush]);
 
-  const saveToServer = useCallback(async (): Promise<boolean> => {
-    if (!API_BASE) return false;
+  const saveToServer = useCallback(async (): Promise<SaveToServerResult> => {
+    if (!API_BASE) {
+      return { ok: false, message: "API URL not configured." };
+    }
     const token = await getAuthToken();
-    if (!token) return false;
+    if (!token) {
+      return { ok: false, message: "Sign in to save settings to the server." };
+    }
     try {
       const res = await authFetch(cascadeConfigUrl(accountId), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(buildServerPayload(settings)),
+        body: JSON.stringify(buildServerPayload(settings, cascadeLotSize)),
       });
-      return res.ok;
-    } catch {
-      return false;
+      if (res.ok) return { ok: true };
+      const body = await res.json().catch(() => ({})) as { error?: string };
+      return { ok: false, message: body.error ?? `Server rejected settings (${res.status})` };
+    } catch (e) {
+      return { ok: false, message: e instanceof Error ? e.message : "Network error" };
     }
-  }, [accountId, settings]);
+  }, [accountId, settings, cascadeLotSize]);
 
   useEffect(() => () => {
     if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
@@ -339,7 +417,7 @@ export function CascadeSettingsProvider({ children }: { children: React.ReactNod
 
   return React.createElement(
     CascadeSettingsContext.Provider,
-    { value: { settings, updateSettings, saveToServer } },
+    { value: { settings, cascadeLotSize, setCascadeLotSize, updateSettings, saveToServer } },
     children
   );
 }
