@@ -177,9 +177,16 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     } catch { /* non-fatal */ }
   }, [accountId, includeClosed]);
 
+  const prevAccountIdRef = useRef(accountId);
+
   useEffect(() => {
+    const prev = prevAccountIdRef.current;
+    prevAccountIdRef.current = accountId;
+
     if (!API_BASE || !accountId) {
-      setZones([]);
+      // Only clear zones on a real accountId → empty transition (logout).
+      // Don't clear on the initial "" while AsyncStorage hasn't loaded yet.
+      if (prev) setZones([]);
       return;
     }
     setLoading(true);

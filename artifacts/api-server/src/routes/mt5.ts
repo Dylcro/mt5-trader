@@ -1604,13 +1604,31 @@ export async function startAutoConnect(): Promise<void> {
     for (const account of rows) {
       try {
         console.log(`[startup] restoring ${account.accountId}`);
-        const metaAccount = await sdk.metatraderAccountApi
-          .getAccount(account.accountId)
-          .catch(() => null);
-        if (!metaAccount) {
-          await db.delete(storedAccountsTable)
-            .where(eq(storedAccountsTable.accountId, account.accountId));
-          knownAccounts.delete(account.accountId);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let metaAccount: any | null = null;
+        let definitivelyGone = false;
+        try {
+          metaAccount = await sdk.metatraderAccountApi.getAccount(account.accountId);
+        } catch (e) {
+          const msg = String((e as { message?: string }).message ?? "").toLowerCase();
+          const httpStatus = (e as { status?: number }).status;
+          // Only evict on a definitive "account doesn't exist" response.
+          // Any transient error (network blip, rate limit, cold-start timeout)
+          // must NOT delete the stored account — that orphans every zone created
+          // under this accountId and causes "zone not found" on all actions.
+          definitivelyGone = httpStatus === 404 || msg.includes("not found");
+          if (!definitivelyGone) {
+            console.warn(`[startup] getAccount ${account.accountId} transient error — skipping without eviction:`, msg);
+            continue;
+          }
+        }
+        if (!metaAccount || definitivelyGone) {
+          if (definitivelyGone) {
+            await db.delete(storedAccountsTable)
+              .where(eq(storedAccountsTable.accountId, account.accountId));
+            knownAccounts.delete(account.accountId);
+            console.log(`[startup] evicted definitively-gone account ${account.accountId}`);
+          }
           continue;
         }
         const region = normalizeRegion(account.region);
@@ -4345,6 +4363,7 @@ async function cancelZoneLimits(
   try {
     const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`, {
       headers: authHeaders(token),
+      signal: AbortSignal.timeout(10_000),
     });
     if (r.ok) {
       const raw = await r.json() as Array<{ id?: string; _id?: string; comment?: string }>;

@@ -472,8 +472,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     AsyncStorage.setMany({ "mt5_login": c.login, "mt5_server": c.server });
   }, []);
 
-  const fetchPriceData = useCallback(async (accId: string, accRegion: string): Promise<Price> => {
-    const res = await authFetch(`${API_BASE}/mt5/account/${accId}/price?region=${accRegion}`);
+  const fetchPriceData = useCallback(async (accId: string, accRegion: string, signal?: AbortSignal): Promise<Price> => {
+    const res = await authFetch(`${API_BASE}/mt5/account/${accId}/price?region=${accRegion}`, signal ? { signal } : {});
     if (!res.ok) throw new Error(`Price fetch failed: ${res.status}`);
     const data = await safeJson<{ bid?: number; ask?: number; time?: string }>(res);
     const bid = data.bid ?? 0;
@@ -486,8 +486,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
-  const fetchPositionsData = useCallback(async (accId: string, accRegion: string): Promise<Position[]> => {
-    const res = await authFetch(`${API_BASE}/mt5/account/${accId}/positions?region=${accRegion}`);
+  const fetchPositionsData = useCallback(async (accId: string, accRegion: string, signal?: AbortSignal): Promise<Position[]> => {
+    const res = await authFetch(`${API_BASE}/mt5/account/${accId}/positions?region=${accRegion}`, signal ? { signal } : {});
     if (!res.ok) throw new Error(`Positions fetch failed: ${res.status}`);
     const data = await safeJson<unknown[]>(res);
     return (Array.isArray(data) ? data : []).map((p) => {
@@ -509,8 +509,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
-  const fetchAccountInfoData = useCallback(async (accId: string, accRegion: string): Promise<AccountInfo> => {
-    const res = await authFetch(`${API_BASE}/mt5/account/${accId}/info?region=${accRegion}`);
+  const fetchAccountInfoData = useCallback(async (accId: string, accRegion: string, signal?: AbortSignal): Promise<AccountInfo> => {
+    const res = await authFetch(`${API_BASE}/mt5/account/${accId}/info?region=${accRegion}`, signal ? { signal } : {});
     if (!res.ok) throw new Error(`Account info failed: ${res.status}`);
     const data = await safeJson(res);
     return {
@@ -524,8 +524,8 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
-  const fetchPendingOrdersData = useCallback(async (accId: string, accRegion: string): Promise<PendingOrder[]> => {
-    const res = await authFetch(`${API_BASE}/mt5/account/${accId}/orders?region=${accRegion}`);
+  const fetchPendingOrdersData = useCallback(async (accId: string, accRegion: string, signal?: AbortSignal): Promise<PendingOrder[]> => {
+    const res = await authFetch(`${API_BASE}/mt5/account/${accId}/orders?region=${accRegion}`, signal ? { signal } : {});
     if (!res.ok) throw new Error(`Orders fetch failed: ${res.status}`);
     const data = await safeJson<unknown[]>(res);
     return (Array.isArray(data) ? data : []).map((o) => {
@@ -644,20 +644,24 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       && Date.now() - lastPriceAtRef.current <= PRICE_STALE_MS;
     if (!force && priceFresh()) return;
     const r = regionRef.current;
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(), 8_000);
     try {
       await Promise.all([
-        fetchPriceData(accountId, r).then((p) => {
+        fetchPriceData(accountId, r, controller.signal).then((p) => {
           applyLivePrice(p);
           priceFailCountRef.current = 0;
           setPriceError(false);
         }).catch(() => {}),
-        fetchPositionsData(accountId, r).then(setPositions).catch(() => {}),
-        fetchPendingOrdersData(accountId, r).then(setPendingOrders).catch(() => {}),
-        fetchAccountInfoData(accountId, r).then(setAccountInfo).catch(() => {}),
+        fetchPositionsData(accountId, r, controller.signal).then(setPositions).catch(() => {}),
+        fetchPendingOrdersData(accountId, r, controller.signal).then(setPendingOrders).catch(() => {}),
+        fetchAccountInfoData(accountId, r, controller.signal).then(setAccountInfo).catch(() => {}),
       ]);
     } catch {
       // Trade path will auto-retry if still stale.
     } finally {
+      clearTimeout(abortTimer);
+      controller.abort();
       const fresh =
         priceRef.current != null &&
         lastPriceAtRef.current > 0 &&
