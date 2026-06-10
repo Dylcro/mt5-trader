@@ -7,6 +7,8 @@ import { JWT_SECRET } from "./auth";
 import { getTradingStatus } from "../lib/platformFlags";
 import { logEvent } from "../logger";
 import { usdToTargetRate } from "../lib/usdFx.js";
+import { type ExecutionAdapter, NotReadyError } from "../lib/execution/types";
+import { MetaApiAdapter } from "../lib/execution/metaApiAdapter";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
 // In dev (tsx/ESM) import.meta.url is the real file URL.
 // In production (esbuild CJS) build.ts injects a __importMetaUrl banner and
@@ -1803,23 +1805,18 @@ async function executeTradeRequest(
 // produce a duplicate — nothing is racing it.
 const STREAMING_CASCADE_TIMEOUT_MS = 30_000;
 async function placeCascadeLimitFast(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  conn: any | undefined,
-  region: string,
   accountId: string,
-  token: string,
   body: Record<string, unknown>,
-  limitNum: number,
-  total: number,
 ): Promise<string | undefined> {
-  if (!conn) {
-    console.warn(`[auto-cascade] no streaming connection for limit ${limitNum}/${total} — using REST (single-channel, no duplicate risk)`);
-  }
-  const result = await executeTradeRequest(conn, region, accountId, token, body);
-  if (!TRADE_SUCCESS_CODES.has(result.code)) {
-    throw new Error(userFacingTradeMessage(result.code, result.data.message));
-  }
-  return result.data.orderId;
+  const direction = String(body.actionType ?? '').includes('BUY') ? 'buy' as const : 'sell' as const;
+  const symbol = String(body.symbol ?? '');
+  const volume = Number(body.volume ?? 0);
+  const openPrice = Number(body.openPrice ?? 0);
+  const sl = body.stopLoss !== undefined ? Number(body.stopLoss) : undefined;
+  const comment = body.comment !== undefined ? String(body.comment) : undefined;
+  const r = await getAdapter(accountId).placeLimitOrder(direction, symbol, volume, openPrice, sl, undefined, { comment });
+  if (!r.ok) throw new Error(userFacingTradeMessage(r.numericCode, r.message));
+  return r.orderId;
 }
 
 async function triggerMt5OneClickAutoCascade(
@@ -1941,7 +1938,7 @@ async function triggerMt5OneClickAutoCascadeInner(
     const actionType = direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT";
     try {
       const orderId = await placeCascadeLimitFast(
-        conn, region, accountId, token,
+        accountId,
         {
           actionType,
           symbol,
@@ -1950,8 +1947,6 @@ async function triggerMt5OneClickAutoCascadeInner(
           stopLoss,
           comment: cascadeComment,
         },
-        legNum,
-        total,
       );
       if (orderId) {
         placedCount++;
@@ -1965,7 +1960,7 @@ async function triggerMt5OneClickAutoCascadeInner(
 
   // Tag anchor after limits — limits reach MT5 first; each limit already carries SL.
   // Anchor SL + comment still required so the leg survives limit-cancel housekeeping.
-  await tagMt5AnchorForZone(token, region, accountId, posId, zoneState.zoneId, stopLoss, total);
+  await tagMt5AnchorForZone(accountId, posId, zoneState.zoneId, stopLoss, total);
 
   recordCascade(accountId, anchorPrice);
   scheduleCascadeReconcile(accountId, region, token);
@@ -2129,6 +2124,15 @@ function getToken(): string {
   const token = process.env.METAAPI_TOKEN;
   if (!token) throw new Error("METAAPI_TOKEN is not configured on the server.");
   return token;
+}
+
+function getAdapter(accountId: string): ExecutionAdapter {
+  return new MetaApiAdapter({
+    accountId,
+    getToken,
+    getRegion: () => activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION,
+    getConnection: () => activeConnections.get(accountId),
+  });
 }
 
 function authHeaders(token: string) {
@@ -3728,7 +3732,7 @@ async function applyZoneTp2Housekeeping(
 ): Promise<void> {
   try {
     if (opts.isFirstZoneTp2 && !st.tp2HousekeepingDone) {
-      await cancelZoneLimits(token, region, st.accountId, zoneId);
+      await cancelZoneLimits(st.accountId, zoneId);
       st.tp2HousekeepingDone = true;
       console.log(`[tp2] cancelled unfilled limits for ${zoneId}`);
     }
@@ -3746,7 +3750,7 @@ async function applyZoneTp2Housekeeping(
     const results = await Promise.all(legs.map(async (p) => {
       const { sl, isBestEffort } = computeBrokerSafeBeSl(st.direction, p.openPrice, price);
       if (isBestEffort) allTrueBe = false;
-      const ok = await modifyZonePositionSl(token, region, st.accountId, p.id, sl);
+      const ok = await modifyZonePositionSl(st.accountId, p.id, sl);
       return { ok, isBestEffort };
     }));
     const allOk = results.every((r) => r.ok);
@@ -3793,8 +3797,6 @@ async function markPositionTpLevelHit(
 
 /** Close this zone's configured tpPct from each leg that still needs level `lvl`. */
 async function closeTpSliceOnEveryLiveLeg(
-  token: string,
-  region: string,
   st: ZoneState,
   zoneId: string,
   legs: LivePosition[],
@@ -3819,8 +3821,8 @@ async function closeTpSliceOnEveryLiveLeg(
     const toClose = Math.min(slice.closeVol, leg.volume);
     let closed = 0;
     if (toClose >= leg.volume - 1e-9) {
-      if (await closeZonePosition(token, region, st.accountId, leg.id)) closed = leg.volume;
-    } else if (await closeZonePosition(token, region, st.accountId, leg.id, toClose)) {
+      if (await closeZonePosition(st.accountId, leg.id)) closed = leg.volume;
+    } else if (await closeZonePosition(st.accountId, leg.id, toClose)) {
       closed = toClose;
     }
     if (closed > 0) {
@@ -3931,8 +3933,6 @@ async function markZonePositionsClosedInDb(zoneId: string, positionIds: string[]
 }
 
 async function closeLiveZoneLegs(
-  token: string,
-  region: string,
   accountId: string,
   zoneId: string,
   live: LivePosition[],
@@ -3940,7 +3940,7 @@ async function closeLiveZoneLegs(
   const closeResults = await Promise.all(
     live.map(async (p) => {
       try {
-        return { id: p.id, ok: await closeZonePosition(token, region, accountId, p.id) };
+        return { id: p.id, ok: await closeZonePosition(accountId, p.id) };
       } catch (e) {
         console.warn(`[zone ${zoneId}] close threw for posId=${p.id}:`, (e as Error).message);
         return { id: p.id, ok: false };
@@ -4057,19 +4057,12 @@ async function markZonePositionClosed(
       });
       void settleZoneClosedPnl(accountId, zoneId);
       logEvent("zone.close", { accountId, zoneId, trigger: "position.closed" });
-      try {
-        const tkn = getToken();
-        const rgn = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
-        cancelZoneLimits(tkn, rgn, accountId, zoneId)
-          .catch((e: Error) => console.warn(`[zone ${zoneId}] cancelZoneLimits error:`, e.message))
-          .finally(() => {
-            broadcastToAccount(accountId, "deal", { type: "position_changed" });
-            broadcastZoneUpdate(zoneId);
-          });
-      } catch {
-        broadcastToAccount(accountId, "deal", { type: "position_changed" });
-        broadcastZoneUpdate(zoneId);
-      }
+      cancelZoneLimits(accountId, zoneId)
+        .catch((e: Error) => console.warn(`[zone ${zoneId}] cancelZoneLimits error:`, e.message))
+        .finally(() => {
+          broadcastToAccount(accountId, "deal", { type: "position_changed" });
+          broadcastZoneUpdate(zoneId);
+        });
     }
   } catch (e) {
     console.error(`[zone] markZonePositionClosed error posId=${positionId}:`, (e as Error).message);
@@ -4096,16 +4089,15 @@ const CLOSE_POSITION_IDEMPOTENT_CODES = new Set([10036, 10039]);
 const CANCEL_ORDER_IDEMPOTENT_CODES = new Set([10036, 4754]);
 
 async function closeZonePosition(
-  token: string, region: string, accountId: string, positionId: string, volume?: number,
+  accountId: string, positionId: string, volume?: number,
 ): Promise<boolean> {
   invalidateBrokerSnapshot(accountId);
-  const body: Record<string, unknown> = volume !== undefined && volume > 0
-    ? { actionType: "POSITION_PARTIAL", positionId, volume }
-    : { actionType: "POSITION_CLOSE_ID", positionId };
   return closeWithRetry(async () => {
-    const r = await tradeAction(token, region, accountId, body);
-    if (r.ok || CLOSE_POSITION_IDEMPOTENT_CODES.has(r.code)) return true;
-    console.warn(`[zone] close posId=${positionId} vol=${volume ?? "full"} failed code=${r.code} msg="${r.message ?? ""}"`);
+    const r = volume !== undefined && volume > 0
+      ? await getAdapter(accountId).closePositionPartial(positionId, volume)
+      : await getAdapter(accountId).closePositionFull(positionId);
+    if (r.ok || CLOSE_POSITION_IDEMPOTENT_CODES.has(r.numericCode)) return true;
+    console.warn(`[zone] close posId=${positionId} vol=${volume ?? "full"} failed code=${r.numericCode} msg="${r.message ?? ""}"`);
     return false;
   });
 }
@@ -4192,7 +4184,7 @@ async function handleClosePartial(
     if (pendingLegs.length === 0) {
       return { ok: false, message: `TP${tpLevel} already taken on all open legs` };
     }
-    const closeLots = await closeTpSliceOnEveryLiveLeg(token, region, st, zoneId, pendingLegs, tpLevel);
+    const closeLots = await closeTpSliceOnEveryLiveLeg(st, zoneId, pendingLegs, tpLevel);
     if (closeLots < 0.01) return { ok: false, message: "Lot too small" };
     // MetaAPI close confirmed — persist the leg-pointer to Postgres.
     // Failure here means broker and DB are desynced; surface a distinct error
@@ -4250,16 +4242,16 @@ async function handleClosePartial(
   for (const leg of sorted) {
     if (remaining <= 0) break;
     if (leg.volume <= remaining + 1e-9) {
-      await closeZonePosition(token, region, accountId, leg.id);
+      await closeZonePosition(accountId, leg.id);
       remaining = Math.round((remaining - leg.volume) / LOT_STEP) * LOT_STEP;
     } else if (remaining >= LOT_STEP) {
-      await closeZonePosition(token, region, accountId, leg.id, remaining);
+      await closeZonePosition(accountId, leg.id, remaining);
       remaining = 0;
     }
   }
 
   if ((body.pct ?? 0) >= 100 || (body.lots != null && targetLot >= totalVol - 1e-9)) {
-    await cancelZoneLimits(token, region, accountId, zoneId);
+    await cancelZoneLimits(accountId, zoneId);
   }
 
   const stAfter = zoneStates.get(zoneId) ?? st;
@@ -4279,12 +4271,10 @@ async function handleClosePartial(
 }
 
 async function modifyZonePositionSl(
-  token: string, region: string, accountId: string, positionId: string, sl: number,
+  accountId: string, positionId: string, sl: number,
 ): Promise<boolean> {
-  const r = await tradeAction(token, region, accountId, {
-    actionType: "POSITION_MODIFY", positionId, stopLoss: sl,
-  });
-  if (!r.ok) console.warn(`[zone] modify-sl posId=${positionId} sl=${sl} failed code=${r.code} msg="${r.message ?? ""}"`);
+  const r = await getAdapter(accountId).modifyPosition(positionId, { stopLoss: sl });
+  if (!r.ok) console.warn(`[zone] modify-sl posId=${positionId} sl=${sl} failed code=${r.numericCode} msg="${r.message ?? ""}"`);
   return r.ok;
 }
 
@@ -4305,7 +4295,7 @@ export function stopLossToRestoreForZoneLeg(
 
 /** Re-attach SL on open zone legs after limit cancel (MT5 can clear position SL with the orders). */
 async function restoreZoneStopLossAfterLimitCancel(
-  token: string, region: string, accountId: string, zoneId: string,
+  accountId: string, zoneId: string,
 ): Promise<void> {
   let st = zoneStates.get(zoneId);
   if (!st) st = (await loadZone(zoneId)) ?? undefined;
@@ -4313,6 +4303,8 @@ async function restoreZoneStopLossAfterLimitCancel(
 
   invalidateBrokerSnapshot(accountId);
   const config = getCascadeConfig(accountId, zoneIdToUserId.get(zoneId));
+  const token = getToken();
+  const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
   const legs = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st, { fresh: true });
   if (legs.length === 0) return;
 
@@ -4327,7 +4319,7 @@ async function restoreZoneStopLossAfterLimitCancel(
       sl = stopLossToRestoreForZoneLeg(st, leg, config);
     }
     if (sl == null) continue;
-    if (await modifyZonePositionSl(token, region, accountId, leg.id, sl)) restored++;
+    if (await modifyZonePositionSl(accountId, leg.id, sl)) restored++;
   }
   if (restored > 0) {
     console.log(`[zone ${zoneId}] restored SL on ${restored} open leg(s) after limit cancel`);
@@ -4337,21 +4329,18 @@ async function restoreZoneStopLossAfterLimitCancel(
 
 /** Tag an existing MT5 anchor leg like an app cascade market entry (SL + zone comment + magic). */
 async function tagMt5AnchorForZone(
-  token: string, region: string, accountId: string,
-  positionId: string, zoneId: string, stopLoss: number, total: number,
+  accountId: string, positionId: string, zoneId: string, stopLoss: number, total: number,
 ): Promise<void> {
   // SL first — in-app market entries carry SL at open; some brokers drop position SL
   // when sibling pending limits are cancelled unless the anchor owns its own SL.
-  const slOk = await modifyZonePositionSl(token, region, accountId, positionId, stopLoss);
-  const r = await tradeAction(token, region, accountId, {
-    actionType: "POSITION_MODIFY",
-    positionId,
+  const slOk = await modifyZonePositionSl(accountId, positionId, stopLoss);
+  const r = await getAdapter(accountId).modifyPosition(positionId, {
     comment: buildCascadeComment(zoneId, 1, total),
     magic: zoneMagicNumber(zoneId),
   });
   if (!r.ok) {
     console.warn(
-      `[auto-cascade] anchor comment/magic posId=${positionId} zone=${zoneId} failed code=${r.code} msg="${r.message ?? ""}"`,
+      `[auto-cascade] anchor comment/magic posId=${positionId} zone=${zoneId} failed code=${r.numericCode} msg="${r.message ?? ""}"`,
     );
   }
   if (!slOk) {
@@ -4362,8 +4351,10 @@ async function tagMt5AnchorForZone(
 }
 
 async function cancelZoneLimits(
-  token: string, region: string, accountId: string, zoneId: string,
+  accountId: string, zoneId: string,
 ): Promise<void> {
+  const token = getToken();
+  const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
   const orderIds: string[] = orderIdsForZone(accountId, zoneId);
   // DB fallback: the in-memory map can be empty if entries were never populated
   // (race on zone creation), lost during a server restart gap, or already
@@ -4415,14 +4406,14 @@ async function cancelZoneLimits(
       `[zone ${zoneId}] cancelZoneLimits accountId=${accountId} blind-cancel ${cascadeLive.length} untracked cascade limit(s)`,
     );
     await Promise.all(cascadeLive.map(async (o) => {
-      const r = await tradeAction(token, region, accountId, { actionType: "ORDER_CANCEL", orderId: o.id });
+      const r = await getAdapter(accountId).cancelOrder(o.id);
       // Mark completed regardless of result — 4754 means already gone, which is
       // still a signal the order is no longer live. Ensures MetaAPI REST filter fires.
       markOrderCompleted(accountId, o.id);
-      if (r.ok || CANCEL_ORDER_IDEMPOTENT_CODES.has(r.code)) {
+      if (r.ok) {
         console.log(`[zone ${zoneId}] blind-cancelled cascade orderId=${o.id}`);
       } else {
-        console.warn(`[zone ${zoneId}] blind-cancel orderId=${o.id} failed code=${r.code}`);
+        console.warn(`[zone ${zoneId}] blind-cancel orderId=${o.id} failed code=${r.numericCode}`);
       }
     }));
     return;
@@ -4443,15 +4434,15 @@ async function cancelZoneLimits(
       markOrderCompleted(accountId, oid);
       await forget(); return;
     }
-    const r = await tradeAction(token, region, accountId, { actionType: "ORDER_CANCEL", orderId: oid });
+    const r = await getAdapter(accountId).cancelOrder(oid);
     // Mark completed regardless of outcome: success = cancelled now, 4754 = already
     // gone, 10036 = already closed — in all cases the order is no longer pending.
     markOrderCompleted(accountId, oid);
-    if (r.ok || CANCEL_ORDER_IDEMPOTENT_CODES.has(r.code)) {
+    if (r.ok) {
       await forget();
       console.log(`[zone ${zoneId}] cancelled limit orderId=${oid}`);
     } else {
-      console.warn(`[zone ${zoneId}] cancel limit orderId=${oid} failed code=${r.code}`);
+      console.warn(`[zone ${zoneId}] cancel limit orderId=${oid} failed code=${r.numericCode}`);
     }
   }));
 }
@@ -4524,10 +4515,6 @@ function isCloseAllowed(zoneId: string): boolean {
 
 function markCloseAttempt(zoneId: string): void {
   zoneCloseCooldown.set(zoneId, Date.now());
-}
-
-class NotReadyError extends Error {
-  constructor() { super("Server not ready — broker connection not yet synchronized"); }
 }
 
 async function ensureConnectionReady(conn: unknown | undefined, timeoutMs = 8_000): Promise<void> {
@@ -4732,13 +4719,9 @@ async function reconcileZoneFromBroker(
   ));
   void settleZoneClosedPnl(accountId, zoneId);
   logEvent("zone.close", { accountId, zoneId, trigger });
-  try {
-    cancelZoneLimits(token, region, accountId, zoneId)
-      .catch((e: Error) => console.warn(`[zone ${zoneId}] reconcile cancelZoneLimits:`, e.message))
-      .finally(() => broadcastZoneUpdate(zoneId));
-  } catch {
-    broadcastZoneUpdate(zoneId);
-  }
+  cancelZoneLimits(accountId, zoneId)
+    .catch((e: Error) => console.warn(`[zone ${zoneId}] reconcile cancelZoneLimits:`, e.message))
+    .finally(() => broadcastZoneUpdate(zoneId));
 }
 
 // Live bid/ask straight from MetaAPI — independent of tickStore (which only
@@ -5005,14 +4988,9 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
           ));
           void settleZoneClosedPnl(st.accountId, zoneId);
           logEvent("zone.close", { accountId: st.accountId, zoneId, trigger: "empty_reconcile" });
-          try {
-            const tkn = getToken();
-            cancelZoneLimits(tkn, region, st.accountId, zoneId)
-              .catch((e: Error) => console.warn(`[zone ${zoneId}] empty reconcile cancelZoneLimits:`, e.message))
-              .finally(() => broadcastZoneUpdate(zoneId));
-          } catch {
-            broadcastZoneUpdate(zoneId);
-          }
+          cancelZoneLimits(st.accountId, zoneId)
+            .catch((e: Error) => console.warn(`[zone ${zoneId}] empty reconcile cancelZoneLimits:`, e.message))
+            .finally(() => broadcastZoneUpdate(zoneId));
         }
         return;
       }
@@ -5133,15 +5111,9 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         // Cancel any outstanding cascade limit orders so they don't orphan on
         // MT5 and flash as individual pending cards on the client. Broadcast
         // AFTER cancellation so the client only redraws once limits are gone.
-        try {
-          const tkn = getToken();
-          cancelZoneLimits(tkn, region, st.accountId, zoneId)
-            .catch((e: Error) => console.warn(`[zone ${zoneId}] reconciliation cancelZoneLimits error:`, e.message))
-            .finally(() => broadcastZoneUpdate(zoneId));
-        } catch {
-          // Token unavailable — still broadcast so client refreshes.
-          broadcastZoneUpdate(zoneId);
-        }
+        cancelZoneLimits(st.accountId, zoneId)
+          .catch((e: Error) => console.warn(`[zone ${zoneId}] reconciliation cancelZoneLimits error:`, e.message))
+          .finally(() => broadcastZoneUpdate(zoneId));
       }
       return;
     }
@@ -5245,7 +5217,7 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         if (pendingLegs.length === 0) continue;
 
         const closeLots = await closeTpSliceOnEveryLiveLeg(
-          token, region, st, zoneId, pendingLegs, lvl,
+          st, zoneId, pendingLegs, lvl,
         );
         if (closeLots < 0.01) continue;
 
@@ -6447,7 +6419,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       const closeResults = await Promise.all(
         others.map(async (p) => {
           try {
-            return { id: p.id, ok: await closeZonePosition(token, region, accountId, p.id) };
+            return { id: p.id, ok: await closeZonePosition(accountId, p.id) };
           } catch (e) {
             console.warn(`[zone ${zoneId}] risk-free close threw for posId=${p.id}:`, (e as Error).message);
             return { id: p.id, ok: false };
@@ -6460,7 +6432,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
         ? sanitizeRiskFreePips(body.riskFreePips)
         : (st.riskFreeOffset ?? ZONE_RISK_FREE_PIPS);
       const sl = computeRiskFreeSl(st.direction, best.openPrice, pips);
-      const slOk = await modifyZonePositionSl(token, region, accountId, best.id, sl);
+      const slOk = await modifyZonePositionSl(accountId, best.id, sl);
       if (failed.length > 0 || !slOk) {
         console.warn(`[zone ${zoneId}] risk-free partial: failedCloses=${failed.length} slOk=${slOk}`);
         res.status(207).json({
@@ -6484,7 +6456,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
           .catch((e: Error) => console.warn(`[zone ${zoneId}] risk-free mark closed ${r.id}:`, e.message));
         st.trackedPositions.delete(r.id);
       }
-      await cancelZoneLimits(token, region, accountId, zoneId);
+      await cancelZoneLimits(accountId, zoneId);
       await db.update(cascadeZonesTable)
         .set({ status: "RISK_FREE", wentRiskFree: true, riskFreeOffset: pips })
         .where(eq(cascadeZonesTable.zoneId, zoneId));
@@ -6538,7 +6510,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
       res.status(409).json({ ok: false, message: "Only one position left — nothing to secure" });
       return;
     }
-    const { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, [toClose]);
+    const { failed } = await closeLiveZoneLegs(accountId, zoneId, [toClose]);
     if (!failed.includes(toClose.id)) st.trackedPositions.delete(toClose.id);
     if (failed.length > 0) {
       console.warn(`[zone ${zoneId}] secure-profits close failed posId=${toClose.id}`);
@@ -6594,7 +6566,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
       const liveOrphans = await fetchOpenPositions(token, region, accountId);
       const orphans = liveOrphans.filter((p) => positionBelongsToZone(p, zoneId));
       if (orphans.length > 0) {
-        let { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, orphans);
+        let { failed } = await closeLiveZoneLegs(accountId, zoneId, orphans);
         if (failed.length > 0) {
           invalidateBrokerSnapshot(accountId);
           const stillOpen = await fetchOpenPositions(token, region, accountId, { fresh: true });
@@ -6626,7 +6598,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
     markCloseAttempt(zoneId);
 
     if (orderIdsForZone(accountId, zoneId).length > 0) {
-      await cancelZoneLimits(token, region, accountId, zoneId);
+      await cancelZoneLimits(accountId, zoneId);
     }
 
     const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
@@ -6637,7 +6609,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
         res.json({ ok: true, closedCount: 0, alreadyClosed: true });
         return;
       }
-      let { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, live);
+      let { failed } = await closeLiveZoneLegs(accountId, zoneId, live);
       for (const id of live.map((p) => p.id)) st.trackedPositions.delete(id);
       if (failed.length > 0) {
         invalidateBrokerSnapshot(accountId);
@@ -6672,7 +6644,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
       return;
     }
 
-    let { failed } = await closeLiveZoneLegs(token, region, accountId, zoneId, live);
+    let { failed } = await closeLiveZoneLegs(accountId, zoneId, live);
     for (const id of live.map((p) => p.id)) st.trackedPositions.delete(id);
 
     if (failed.length > 0) {
@@ -6810,13 +6782,13 @@ router.post("/mt5/account/:accountId/zones/:zoneId/cancel-pending", checkOwner, 
       await loadZone(zoneId);
     }
     const pendingBefore = orderIdsForZone(accountId, zoneId).length;
-    await cancelZoneLimits(token, region, accountId, zoneId);
+    await cancelZoneLimits(accountId, zoneId);
     // Respond before SL restore — MetaAPI cancel is done; SL modify is slow and non-blocking for UI.
     broadcastToAccount(accountId, "pending_order", {});
     broadcastZoneUpdate(zoneId);
     console.log(`[zone ${zoneId}] cancel-pending: user-initiated, cancelled=${pendingBefore}`);
     res.json({ ok: true, cancelledCount: pendingBefore });
-    void restoreZoneStopLossAfterLimitCancel(token, region, accountId, zoneId)
+    void restoreZoneStopLossAfterLimitCancel(accountId, zoneId)
       .then(() => broadcastToAccount(accountId, "pending_order", {}))
       .catch((e: Error) => console.warn(`[zone ${zoneId}] post-cancel SL restore:`, e.message));
   } catch (err) {

@@ -20,13 +20,14 @@ export async function ensureTables(): Promise<void> {
     );
 
     CREATE TABLE IF NOT EXISTS stored_accounts (
-      id          SERIAL PRIMARY KEY,
-      account_id  TEXT NOT NULL UNIQUE,
-      region      TEXT NOT NULL DEFAULT 'london',
-      stored_at   BIGINT,
-      user_id     TEXT,
-      mt5_login   TEXT,
-      mt5_server  TEXT
+      id                  SERIAL PRIMARY KEY,
+      account_id          TEXT NOT NULL UNIQUE,
+      region              TEXT NOT NULL DEFAULT 'london',
+      stored_at           BIGINT,
+      user_id             TEXT,
+      mt5_login           TEXT,
+      mt5_server          TEXT,
+      execution_backend   TEXT NOT NULL DEFAULT 'metaapi'
     );
 
     CREATE TABLE IF NOT EXISTS cascade_config (
@@ -222,7 +223,8 @@ export async function ensureTables(): Promise<void> {
 
     ALTER TABLE stored_accounts
       ADD COLUMN IF NOT EXISTS mt5_login TEXT,
-      ADD COLUMN IF NOT EXISTS mt5_server TEXT;
+      ADD COLUMN IF NOT EXISTS mt5_server TEXT,
+      ADD COLUMN IF NOT EXISTS execution_backend TEXT NOT NULL DEFAULT 'metaapi';
 
     ALTER TABLE cascade_zones
       ADD COLUMN IF NOT EXISTS closed_at BIGINT,
