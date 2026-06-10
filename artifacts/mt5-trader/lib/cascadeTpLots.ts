@@ -82,7 +82,7 @@ export function validateEnabledTpPips(cs: TpPipsSlice): boolean {
     { en: cs.tp4Enabled !== false && cs.tp4Pips > 0, pips: cs.tp4Pips },
   ];
   const active = rows.filter((r) => r.en).map((r) => r.pips);
-  if (active.length === 0) return false;
+  if (active.length === 0) return true;  // all-off is valid; downstream handles no partial closes
   if (active.some((p) => !(p > 0))) return false;
   for (let i = 1; i < active.length; i++) {
     if (active[i] <= active[i - 1]) return false;
