@@ -30,6 +30,9 @@ import {
   validateEnabledTpPips,
   validateTpLots,
 } from "@/lib/cascadeTpLots";
+import { authFetch } from "@/lib/authFetch";
+
+const API_BASE = process.env.EXPO_PUBLIC_API_URL ?? "";
 const C = Colors.dark;
 const NOTIFY_TP3_KEY = "notify_tp3";
 const NOTIFY_R1_KEY = "notify_r1";
@@ -156,6 +159,8 @@ export default function SettingsScreen() {
   } = useCascadeSettings();
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [testNotifState, setTestNotifState] = useState<"idle" | "sending" | "sent" | "error">("idle");
+  const [testNotifError, setTestNotifError] = useState<string | null>(null);
 
   const runnerLots = runnerRemainderLots(cs, cascadeLotSize);
 
@@ -204,6 +209,38 @@ export default function SettingsScreen() {
   const persistNotify = useCallback((key: string, value: boolean) => {
     void AsyncStorage.setItem(key, String(value));
   }, []);
+
+  const canTestPush = status === "connected" && !!accountId && !!API_BASE;
+
+  const handleTestNotification = useCallback(async () => {
+    if (!canTestPush) return;
+    setTestNotifState("sending");
+    setTestNotifError(null);
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    try {
+      const res = await authFetch(`${API_BASE}/ea/test-notification`, { method: "POST" });
+      const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string; message?: string };
+      if (!res.ok || !data.ok) {
+        const msg = data.error ?? `Request failed (${res.status})`;
+        setTestNotifState("error");
+        setTestNotifError(msg);
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+        Alert.alert("Test notification failed", msg);
+        return;
+      }
+      setTestNotifState("sent");
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      Alert.alert("Test sent", data.message ?? "Check your device for the notification.");
+    } catch (e) {
+      const msg = (e as Error).message || "Network error";
+      setTestNotifState("error");
+      setTestNotifError(msg);
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      Alert.alert("Test notification failed", msg);
+    } finally {
+      setTimeout(() => setTestNotifState("idle"), 4000);
+    }
+  }, [canTestPush]);
 
   const rfColor =
     cs.riskFreePips > 0 ? C.gold : cs.riskFreePips < 0 ? C.sell : C.textMuted;
@@ -701,6 +738,37 @@ export default function SettingsScreen() {
                 color={C.teal}
               />
             </View>
+            <Pressable
+              style={({ pressed }) => [
+                styles.testNotifBtn,
+                !canTestPush && styles.testNotifBtnDisabled,
+                pressed && canTestPush && { opacity: 0.85, transform: [{ scale: 0.98 }] },
+                testNotifState === "sending" && { opacity: 0.6 },
+              ]}
+              disabled={!canTestPush || testNotifState === "sending"}
+              onPress={() => { void handleTestNotification(); }}
+            >
+              {testNotifState === "sending" ? (
+                <ActivityIndicator size="small" color={C.gold} />
+              ) : (
+                <Feather
+                  name={testNotifState === "sent" ? "check" : testNotifState === "error" ? "alert-circle" : "bell"}
+                  size={15}
+                  color={testNotifState === "error" ? C.sell : C.gold}
+                />
+              )}
+              <Text style={[styles.testNotifBtnText, testNotifState === "error" && { color: C.sell }]}>
+                {testNotifState === "sending" ? "Sending…"
+                  : testNotifState === "sent" ? "Test notification sent"
+                  : testNotifState === "error" ? (testNotifError ?? "Send failed")
+                  : "Send test notification"}
+              </Text>
+            </Pressable>
+            {!canTestPush && (
+              <Text style={styles.testNotifHint}>
+                Connect MT5 on this device to register a push token.
+              </Text>
+            )}
           </View>
 
           {/* Help & Support */}
@@ -1030,6 +1098,33 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontFamily: "Inter_600SemiBold",
     color: "#000",
+  },
+  testNotifBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    marginTop: 8,
+    borderRadius: 14,
+    paddingVertical: 14,
+    borderWidth: 1,
+    borderColor: "rgba(201,168,76,0.45)",
+    backgroundColor: "rgba(201,168,76,0.08)",
+  },
+  testNotifBtnDisabled: {
+    opacity: 0.45,
+  },
+  testNotifBtnText: {
+    fontSize: 14,
+    fontFamily: "Inter_600SemiBold",
+    color: C.gold,
+  },
+  testNotifHint: {
+    fontSize: 12,
+    fontFamily: "Inter_400Regular",
+    color: C.textMuted,
+    textAlign: "center",
+    marginTop: -4,
   },
   settingsTabBar: {
     flexDirection: "row",
