@@ -5643,11 +5643,12 @@ async function sendExpoPush(
   title: string,
   body: string,
   data: Record<string, unknown> = {},
-): Promise<void> {
+): Promise<{ ok: boolean; error?: string }> {
   if (!token.startsWith("ExponentPushToken[") && !token.startsWith("ExpoPushToken[")) {
     // Reject malformed tokens early — Expo will 400 otherwise.
+    const error = "Invalid push token shape";
     console.warn(`[notif] skipping invalid token shape: ${token.slice(0, 20)}…`);
-    return;
+    return { ok: false, error };
   }
   try {
     const res = await fetch("https://exp.host/--/api/v2/push/send", {
@@ -5666,15 +5667,21 @@ async function sendExpoPush(
       data?: Array<{ status?: string; message?: string; details?: { error?: string } }>;
     };
     if (!res.ok) {
+      const error = `Expo push HTTP ${res.status}`;
       console.warn(`[notif] push HTTP ${res.status}: ${JSON.stringify(payload)}`);
-      return;
+      return { ok: false, error };
     }
     const ticket = payload.data?.[0];
     if (ticket?.status === "error") {
+      const error = ticket.message ?? ticket.details?.error ?? "Expo push ticket error";
       console.warn(`[notif] push ticket error: ${ticket.message ?? ""} ${ticket.details?.error ?? ""}`);
+      return { ok: false, error };
     }
+    return { ok: true };
   } catch (e) {
-    console.warn(`[notif] push error: ${(e as Error).message}`);
+    const error = (e as Error).message;
+    console.warn(`[notif] push error: ${error}`);
+    return { ok: false, error };
   }
 }
 
@@ -5898,6 +5905,31 @@ router.put("/mt5/notifications/prefs", async (req: Request, res: Response) => {
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }
+});
+
+// POST /api/ea/test-notification — send an immediate test push to the user's token.
+router.post("/ea/test-notification", async (req: Request, res: Response) => {
+  const userId = (req as unknown as Record<string, unknown>)["userId"] as string;
+  const prefs = await loadPrefsForUser(userId, { freshToken: true });
+  if (!prefs?.expoPushToken) {
+    res.status(400).json({
+      ok: false,
+      error: "No push token registered. Connect MT5 and allow notifications on this device.",
+    });
+    return;
+  }
+  const result = await sendExpoPush(
+    prefs.expoPushToken,
+    "Test notification",
+    "Push notifications are working.",
+    { type: "test" },
+  );
+  if (!result.ok) {
+    res.status(502).json({ ok: false, error: result.error ?? "Failed to send push notification" });
+    return;
+  }
+  console.log(`[notif] sent test push to user ${userId}`);
+  res.json({ ok: true, message: "Test notification sent" });
 });
 
 // ── SSE stream route ──────────────────────────────────────────────────────────
