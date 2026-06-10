@@ -653,10 +653,13 @@ export default function ZoneCard({
           onSkipClose={() => setShowRunnerPanel(false)}
           onActivate={async (targets, autos) => {
             setRunnerBusy(true);
-            const result = await onActivateRunner(zone.zoneId, targets, autos);
-            setRunnerBusy(false);
-            if (result.ok) setShowRunnerPanel(false);
-            return result;
+            try {
+              const result = await onActivateRunner(zone.zoneId, targets, autos);
+              if (result.ok) setShowRunnerPanel(false);
+              return result;
+            } finally {
+              setRunnerBusy(false);
+            }
           }}
         />
       )}
@@ -673,10 +676,13 @@ export default function ZoneCard({
           onSkipClose={() => setShowEditRunners(false)}
           onActivate={async (targets, autos) => {
             setRunnerBusy(true);
-            const result = await onActivateRunner(zone.zoneId, targets, autos);
-            setRunnerBusy(false);
-            if (result.ok) setShowEditRunners(false);
-            return result;
+            try {
+              const result = await onActivateRunner(zone.zoneId, targets, autos);
+              if (result.ok) setShowEditRunners(false);
+              return result;
+            } finally {
+              setRunnerBusy(false);
+            }
           }}
         />
       )}
@@ -752,10 +758,13 @@ export default function ZoneCard({
                     setMenuOpen(false);
                     if (!onRiskFree || busy) return;
                     setBusy(true);
-                    await triggerAppHaptic(hapticEnabled, "medium");
-                    const result = await onRiskFree(zone.zoneId);
-                    setBusy(false);
-                    if (!result.ok) Alert.alert("Risk Free failed", result.message ?? "Try again");
+                    try {
+                      await triggerAppHaptic(hapticEnabled, "medium");
+                      const result = await onRiskFree(zone.zoneId);
+                      if (!result.ok) Alert.alert("Risk Free failed", result.message ?? "Try again");
+                    } finally {
+                      setBusy(false);
+                    }
                   }}
                   disabled={actionBusy}
                 >
@@ -769,10 +778,13 @@ export default function ZoneCard({
                     setMenuOpen(false);
                     if (!onCloseAllWorst || worstBusy || !canCloseAllWorst) return;
                     setWorstBusy(true);
-                    await triggerAppHaptic(hapticEnabled, "medium");
-                    const result = await onCloseAllWorst(zone.zoneId);
-                    setWorstBusy(false);
-                    if (!result.ok) Alert.alert("Secure failed", result.message ?? "Try again");
+                    try {
+                      await triggerAppHaptic(hapticEnabled, "medium");
+                      const result = await onCloseAllWorst(zone.zoneId);
+                      if (!result.ok) Alert.alert("Secure failed", result.message ?? "Try again");
+                    } finally {
+                      setWorstBusy(false);
+                    }
                   }}
                   disabled={actionBusy || !canCloseAllWorst}
                 >
@@ -786,14 +798,17 @@ export default function ZoneCard({
                     setMenuOpen(false);
                     if (!onCancelOrders || delBusy) return;
                     setDelBusy(true);
-                    await triggerAppHaptic(hapticEnabled, "light");
-                    const result = await onCancelOrders(zone.zoneId);
-                    setDelBusy(false);
-                    if (result.ok) {
-                      setLimitsDeleted(true);
-                      void AsyncStorage.setItem(limitsDeletedKey(zone.zoneId), "true");
-                    } else {
-                      Alert.alert("Delete limits failed", result.message ?? "Try again");
+                    try {
+                      await triggerAppHaptic(hapticEnabled, "light");
+                      const result = await onCancelOrders(zone.zoneId);
+                      if (result.ok) {
+                        setLimitsDeleted(true);
+                        void AsyncStorage.setItem(limitsDeletedKey(zone.zoneId), "true");
+                      } else {
+                        Alert.alert("Delete limits failed", result.message ?? "Try again");
+                      }
+                    } finally {
+                      setDelBusy(false);
                     }
                   }}
                   disabled={actionBusy}

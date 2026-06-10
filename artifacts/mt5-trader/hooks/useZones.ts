@@ -364,9 +364,8 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
       const data = await res.json().catch(() => ({})) as {
         ok?: boolean; message?: string; error?: string; cancelledCount?: number; zoneClosed?: boolean;
       };
-      void refresh();
-      setTimeout(() => { void refresh(); }, 1500);
       if (res.ok && data.ok) {
+        void refresh();
         return { ok: true, cancelledCount: data.cancelledCount };
       }
       return { ok: false, message: data.message ?? data.error ?? `HTTP ${res.status}` };

@@ -12,6 +12,7 @@ import React, {
 import { AppState, Platform, type AppStateStatus } from "react-native";
 
 import { emitAccountEvent } from "@/lib/accountEventBus";
+import { authFetchWithTimeout } from "@/lib/authFetch";
 import { getAuthToken } from "@/lib/authToken";
 import { registerPushToken } from "@/lib/registerPushToken";
 import { buildCascadeComment, newCascadeZoneId } from "@/lib/zoneComments";
@@ -1517,20 +1518,21 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
     async (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number; runnerN?: number; emergency?: boolean }): Promise<{ ok: boolean; message: string }> => {
       if (status !== "connected") return { ok: false, message: "Not connected" };
       try {
-        const r = await authFetch(
+        const r = await authFetchWithTimeout(
           `${API_BASE}/mt5/account/${accountId}/zones/${encodeURIComponent(zoneId)}/close-partial?region=${region}`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(opts),
           },
+          35_000,
         );
         const d = await safeJson<{ ok?: boolean; message?: string; error?: string }>(r);
-        void Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
-        return {
-          ok: r.ok && !!d.ok,
-          message: d.message ?? d.error ?? (r.ok ? "" : `Request failed (${r.status})`),
-        };
+        if (r.ok && d.ok) {
+          void Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
+          return { ok: true, message: d.message ?? "" };
+        }
+        return { ok: false, message: d.message ?? d.error ?? `HTTP ${r.status}` };
       } catch (err) {
         return { ok: false, message: err instanceof Error ? err.message : "Failed" };
       }
