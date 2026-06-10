@@ -3851,9 +3851,9 @@ async function resolveLivePositionsForZoneAction(
       tp4Hit: cached?.tp4Hit ?? false,
     });
   }
-  if (relinked > 0 || tagged.length > fromDb.length) {
+  if (relinked > 0) {
     console.log(
-      `[zone ${zoneId}] resolved ${live.length} leg(s) for zone action (dbOpen=${fromDb.length} tagged=${tagged.length} relinked=${relinked})`,
+      `[zone ${zoneId}] resolved ${live.length} leg(s) for zone action (dbOpen=${openRows.length} live=${live.length} relinked=${relinked})`,
     );
   }
   return live;
