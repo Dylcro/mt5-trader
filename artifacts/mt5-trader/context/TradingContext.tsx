@@ -1547,9 +1547,12 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
             body: JSON.stringify(opts),
           },
         );
-        const d = await safeJson<{ ok?: boolean; message?: string }>(r);
+        const d = await safeJson<{ ok?: boolean; message?: string; error?: string }>(r);
         void Promise.all([refreshPositions(), refreshPendingOrders(), refreshAccountInfo()]);
-        return { ok: r.ok && !!d.ok, message: d.message ?? "" };
+        return {
+          ok: r.ok && !!d.ok,
+          message: d.message ?? d.error ?? (r.ok ? "" : `Request failed (${r.status})`),
+        };
       } catch (err) {
         return { ok: false, message: err instanceof Error ? err.message : "Failed" };
       }

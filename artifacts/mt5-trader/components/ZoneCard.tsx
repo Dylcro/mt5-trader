@@ -48,50 +48,74 @@ function roundLot(v: number): number {
   return Math.round(v / LOT_STEP) * LOT_STEP;
 }
 
+/** Match server: enabled flag, or inferred from % > 0 when flag missing. */
+function tpLevelEnabled(zone: Zone, lvl: 1 | 2 | 3): boolean {
+  const pct = lvl === 1 ? zone.tp1Pct : lvl === 2 ? zone.tp2Pct : zone.tp3Pct;
+  const flag = lvl === 1 ? zone.tp1Enabled : lvl === 2 ? zone.tp2Enabled : zone.tp3Enabled;
+  return flag ?? (pct ?? 0) > 0;
+}
+
+function tpLevelLots(zone: Zone, lvl: 1 | 2 | 3): number {
+  const pct = lvl === 1 ? zone.tp1Pct : lvl === 2 ? zone.tp2Pct : zone.tp3Pct;
+  const origVol = zone.originalVolume ?? 0;
+  return roundLot(origVol * (pct ?? 0) / 100);
+}
+
+function resolveManualTpLevel(zone: Zone): 1 | 2 | 3 | null {
+  if (zone.nextTp != null && zone.nextTp >= 1 && zone.nextTp <= 3) {
+    return zone.nextTp as 1 | 2 | 3;
+  }
+  if (tpLevelEnabled(zone, 1) && !zone.tp1Hit) return 1;
+  if (tpLevelEnabled(zone, 2) && !zone.tp2Hit) return 2;
+  if (tpLevelEnabled(zone, 3) && !zone.tp3Hit) return 3;
+  return null;
+}
+
 type TpAction = {
   label: string;
   sub: string;
-  call: () => void;
+  call: () => Promise<void>;
 } | null;
 
 type ClosePartialOpts = { pct?: number; lots?: number; tpLevel?: number; runnerN?: number; emergency?: boolean };
+
+async function runClosePartial(
+  onClosePartial: ((zoneId: string, opts: ClosePartialOpts) => Promise<{ ok: boolean; message?: string }>) | undefined,
+  zoneId: string,
+  opts: ClosePartialOpts,
+  failTitle: string,
+): Promise<void> {
+  if (!onClosePartial) return;
+  const result = await onClosePartial(zoneId, opts);
+  if (!result.ok) {
+    Alert.alert(failTitle, result.message ?? "Try again in a moment.");
+  }
+}
 
 function getNextTpAction(
   zone: Zone,
   onClosePartial: ((zoneId: string, opts: ClosePartialOpts) => Promise<{ ok: boolean; message?: string }>) | undefined,
   setShowRunnerPanel: (v: boolean) => void,
 ): TpAction {
-  const origVol = zone.originalVolume ?? 0;
-  const tp1Lots = roundLot(origVol * (zone.tp1Pct ?? 25) / 100);
-  const tp2Lots = roundLot(origVol * (zone.tp2Pct ?? 25) / 100);
-  const tp3Lots = roundLot(origVol * (zone.tp3Pct ?? 25) / 100);
-
-  if (zone.tp1Enabled !== false && !zone.tp1Hit) {
+  const manualLvl = resolveManualTpLevel(zone);
+  if (manualLvl != null) {
+    const lots = tpLevelLots(zone, manualLvl);
     return {
-      label: "Take TP1",
-      sub: `${tp1Lots.toFixed(2)} lots`,
-      call: () => { void onClosePartial?.(zone.zoneId, { pct: zone.tp1Pct ?? 25, tpLevel: 1, emergency: true }); },
-    };
-  }
-  if (zone.tp2Enabled !== false && !zone.tp2Hit) {
-    return {
-      label: "Take TP2",
-      sub: `${tp2Lots.toFixed(2)} lots`,
-      call: () => { void onClosePartial?.(zone.zoneId, { pct: zone.tp2Pct ?? 25, tpLevel: 2, emergency: true }); },
-    };
-  }
-  if (zone.tp3Enabled !== false && !zone.tp3Hit) {
-    return {
-      label: "Take TP3",
-      sub: `${tp3Lots.toFixed(2)} lots`,
-      call: () => { void onClosePartial?.(zone.zoneId, { pct: zone.tp3Pct ?? 25, tpLevel: 3, emergency: true }); },
+      label: `Take TP${manualLvl}`,
+      sub: `${lots.toFixed(2)} lots`,
+      call: () => runClosePartial(
+        onClosePartial,
+        zone.zoneId,
+        { tpLevel: manualLvl, emergency: true },
+        `Take TP${manualLvl} failed`,
+      ),
     };
   }
   if (!zone.runnerActive) {
     return {
       label: "Set Runners",
       sub: "open panel",
-      call: () => setShowRunnerPanel(true),
+      call: async () => { setShowRunnerPanel(true); },
     };
   }
   for (const n of [1, 2, 3] as const) {
@@ -99,7 +123,12 @@ function getNextTpAction(
       return {
         label: `Bank R${n}`,
         sub: `${(zone[`runner${n}Lots`] ?? 0).toFixed(2)} lots`,
-        call: () => { void onClosePartial?.(zone.zoneId, { lots: zone[`runner${n}Lots`] ?? undefined, runnerN: n }); },
+        call: () => runClosePartial(
+          onClosePartial,
+          zone.zoneId,
+          { lots: zone[`runner${n}Lots`] ?? undefined, runnerN: n },
+          `Bank R${n} failed`,
+        ),
       };
     }
   }
@@ -424,13 +453,13 @@ export default function ZoneCard({
   const canCancelOrders = !historical && zone.status !== "CLOSED" && !!onCancelOrders && !limitsDeleted;
   const tpLevels = useMemo(() => {
     const rows: { key: string; label: string; price: number; hit: boolean }[] = [];
-    if (zone.tp1Enabled !== false && zone.tp1Price != null) {
+    if (tpLevelEnabled(zone, 1) && zone.tp1Price != null) {
       rows.push({ key: "tp1", label: "TP1", price: zone.tp1Price, hit: Boolean(zone.tp1Hit) });
     }
-    if (zone.tp2Enabled !== false && zone.tp2Price != null) {
+    if (tpLevelEnabled(zone, 2) && zone.tp2Price != null) {
       rows.push({ key: "tp2", label: "TP2", price: zone.tp2Price, hit: Boolean(zone.tp2Hit) });
     }
-    if (zone.tp3Enabled !== false && zone.tp3Price != null) {
+    if (tpLevelEnabled(zone, 3) && zone.tp3Price != null) {
       rows.push({ key: "tp3", label: "TP3", price: zone.tp3Price, hit: Boolean(zone.tp3Hit) });
     }
     return rows;
@@ -681,10 +710,14 @@ export default function ZoneCard({
           style={({ pressed }) => [styles.takeTpBtn, takeTpBusy && { opacity: 0.6 }, btnPressed(pressed)]}
           disabled={actionBusy}
           onPress={async () => {
+            if (takeTpBusy || !nextTpAction) return;
             setTakeTpBusy(true);
             await triggerAppHaptic(hapticEnabled, "medium");
-            nextTpAction.call();
-            setTakeTpBusy(false);
+            try {
+              await nextTpAction.call();
+            } finally {
+              setTakeTpBusy(false);
+            }
           }}
         >
           <Text style={styles.takeTpLabel}>Take TP NOW</Text>

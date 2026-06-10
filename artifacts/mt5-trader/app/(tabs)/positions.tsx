@@ -399,12 +399,14 @@ export default function PositionsScreen() {
   );
 
   const handleClosePartial = useCallback(
-    async (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number; runnerN?: number }) => {
+    async (zoneId: string, opts: { pct?: number; lots?: number; tpLevel?: number; runnerN?: number; emergency?: boolean }) => {
       const result = await closeZonePartial(zoneId, opts);
-      if (result.ok) void refreshZones();
+      if (result.ok) {
+        void Promise.all([refreshZones(), refreshPositions()]);
+      }
       return result;
     },
-    [closeZonePartial, refreshZones],
+    [closeZonePartial, refreshZones, refreshPositions],
   );
 
   const handleRiskFree = useCallback(
