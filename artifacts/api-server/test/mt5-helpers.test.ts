@@ -54,9 +54,31 @@ import {
   legNeedsTpSlice,
   computeNextTakeTpLevel,
   stopLossToRestoreForZoneLeg,
+  isTpPriceOnProfitableSide,
+  shiftZoneTpPricesForAnchorMove,
 } from "../src/routes/mt5";
 
 const PIP = 0.10;
+
+describe("anchor / TP price alignment", () => {
+  it("isTpPriceOnProfitableSide rejects BUY TP below anchor", () => {
+    expect(isTpPriceOnProfitableSide("buy", 4160.905, 4158.57)).toBe(false);
+    expect(isTpPriceOnProfitableSide("buy", 4160.905, 4162.905)).toBe(true);
+  });
+
+  it("isTpPriceOnProfitableSide rejects SELL TP above anchor", () => {
+    expect(isTpPriceOnProfitableSide("sell", 4160.905, 4162.905)).toBe(false);
+    expect(isTpPriceOnProfitableSide("sell", 4160.905, 4158.57)).toBe(true);
+  });
+
+  it("shiftZoneTpPricesForAnchorMove preserves pip distance from entry", () => {
+    const zone = { tp1Price: 4158.57, tp2Price: 4160.57, tp3Price: 4168.57, tp4Price: null as number | null };
+    expect(shiftZoneTpPricesForAnchorMove(zone, 4156.57, 4160.905)).toBe(true);
+    expect(zone.tp2Price).toBeCloseTo(4164.9, 1);
+    expect(zone.tp3Price).toBeCloseTo(4172.9, 1);
+  });
+});
+
 // `pips` is SIGNED: negative = drawdown side (protective), positive = profit side.
 // Default ZONE_RISK_FREE_PIPS is negative — protective is the conventional behaviour.
 const DEFAULT_ABS_OFFSET = Math.abs(ZONE_RISK_FREE_PIPS) * PIP;

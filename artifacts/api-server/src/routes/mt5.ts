@@ -509,6 +509,63 @@ export function computeTpPricesFromPips(
   };
 }
 
+/** Validate absolute TP prices for app cascade zones (TP1 optional when disabled). */
+/** TP absolute price must sit on the profitable side of the zone anchor. */
+export function isTpPriceOnProfitableSide(
+  direction: "buy" | "sell",
+  anchorPrice: number,
+  tpPrice: number,
+): boolean {
+  if (!(anchorPrice > 0) || !(tpPrice > 0)) return true;
+  return direction === "buy" ? tpPrice > anchorPrice : tpPrice < anchorPrice;
+}
+
+/**
+ * When the broker fill price differs from the pre-trade anchor hint, shift stored
+ * TP levels by the same delta so pip distances from entry stay correct.
+ */
+export function shiftZoneTpPricesForAnchorMove(
+  zone: {
+    tp1Price: number | null;
+    tp2Price: number | null;
+    tp3Price: number | null;
+    tp4Price: number | null;
+  },
+  oldAnchor: number,
+  newAnchor: number,
+): boolean {
+  if (!(oldAnchor > 0) || !(newAnchor > 0) || oldAnchor === newAnchor) return false;
+  const delta = newAnchor - oldAnchor;
+  const round2 = (v: number) => parseFloat(v.toFixed(2));
+  if (zone.tp1Price != null) zone.tp1Price = round2(zone.tp1Price + delta);
+  if (zone.tp2Price != null) zone.tp2Price = round2(zone.tp2Price + delta);
+  if (zone.tp3Price != null) zone.tp3Price = round2(zone.tp3Price + delta);
+  if (zone.tp4Price != null) zone.tp4Price = round2(zone.tp4Price + delta);
+  return true;
+}
+
+export function cascadeTpPricesValid(
+  direction: "buy" | "sell",
+  anchor: number,
+  prices: { tp1: number | null; tp2: number | null; tp3: number | null; tp4: number | null },
+  enabled: { tp1: boolean; tp2: boolean; tp3: boolean },
+): boolean {
+  const cmp = direction === "buy"
+    ? (a: number, b: number) => a > b
+    : (a: number, b: number) => a < b;
+  if (!enabled.tp2 || prices.tp2 == null) return false;
+  if (!enabled.tp3 || prices.tp3 == null) return false;
+  if (anchor > 0 && !cmp(prices.tp2, anchor)) return false;
+  if (enabled.tp1) {
+    if (prices.tp1 == null) return false;
+    if (anchor > 0 && !cmp(prices.tp1, anchor)) return false;
+    if (!cmp(prices.tp2, prices.tp1)) return false;
+  }
+  if (!cmp(prices.tp3, prices.tp2)) return false;
+  if (prices.tp4 != null && !cmp(prices.tp4, prices.tp3)) return false;
+  return true;
+}
+
 export function tpPipsOrderingValid(
   config: Pick<CascadeConfig, "tp1Pips" | "tp2Pips" | "tp3Pips" | "tp4Pips" | "tp1Enabled" | "tp2Enabled" | "tp3Enabled" | "tp4Enabled">,
 ): boolean {
@@ -3998,6 +4055,7 @@ async function closeZonePosition(
   return closeWithRetry(async () => {
     const r = await tradeAction(token, region, accountId, body);
     if (!r.ok) console.warn(`[zone] close posId=${positionId} vol=${volume ?? "full"} failed code=${r.code} msg="${r.message ?? ""}"`);
+    else console.log(`[zone] close posId=${positionId} vol=${volume ?? "full"} ok`);
     return r.ok;
   });
 }
@@ -5003,6 +5061,7 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       if (!live.some((leg) => legNeedsTpSlice(leg, st, lvl))) continue;
       const tpPrice = st[`tp${lvl}Price`];
       if (tpPrice == null || st[`tp${lvl}PassedAt`]) continue;
+      if (!isTpPriceOnProfitableSide(st.direction, st.anchorPrice, tpPrice)) continue;
       const crossed = st.direction === "buy"
         ? hit(tpPrice, st.highestPriceSeen ?? 0)
         : hit(tpPrice, st.lowestPriceSeen ?? Infinity);
@@ -5014,6 +5073,7 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       const tpPct = st[`tp${lvl}Pct`];
       const enabled = st[`tp${lvl}Enabled`] !== false;
       if (tpPrice == null || !enabled || !(tpPct > 0)) continue;
+      if (!isTpPriceOnProfitableSide(st.direction, st.anchorPrice, tpPrice)) continue;
 
       if (!hit(tpPrice)) continue;
 
@@ -7596,12 +7656,28 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
                   const positions = await fetchOpenPositions(getToken(), region, accountId);
                   const me = positions.find(p => p.id === positionId);
                   if (me && me.openPrice > 0 && me.openPrice !== zoneState.anchorPrice) {
+                    const oldAnchor = zoneState.anchorPrice;
+                    const shifted = shiftZoneTpPricesForAnchorMove(zoneState, oldAnchor, me.openPrice);
                     zoneState.anchorPrice = me.openPrice;
+                    if (shifted) {
+                      console.log(
+                        `[zone ${zoneState.zoneId}] anchor refined ${oldAnchor} → ${me.openPrice}; `
+                        + `TP prices shifted (tp2=${zoneState.tp2Price} tp3=${zoneState.tp3Price})`,
+                      );
+                    }
                     const existingPos = zoneState.trackedPositions.get(positionId);
                     zoneState.trackedPositions.set(positionId, { volume, entryPrice: me.openPrice, tp1Hit: existingPos?.tp1Hit ?? false, tp2Hit: existingPos?.tp2Hit ?? false, tp3Hit: existingPos?.tp3Hit ?? false, tp4Hit: existingPos?.tp4Hit ?? false });
                     await Promise.all([
                       db.update(cascadeZonesTable)
-                        .set({ anchorPrice: me.openPrice })
+                        .set({
+                          anchorPrice: me.openPrice,
+                          ...(shifted ? {
+                            tp1Price: zoneState.tp1Price,
+                            tp2Price: zoneState.tp2Price,
+                            tp3Price: zoneState.tp3Price,
+                            tp4Price: zoneState.tp4Price,
+                          } : {}),
+                        })
                         .where(eq(cascadeZonesTable.zoneId, zoneState.zoneId))
                         .catch((e: Error) => console.warn(`[zone ${zoneState.zoneId}] anchor update failed:`, e.message)),
                       db.update(zonePositionsTable)
