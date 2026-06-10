@@ -1322,81 +1322,51 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
             }
           }
         } else {
-          // Normal path: fire market + all limits in parallel — one round-trip instead of two
-          const [marketResult, ...limitResults] = await Promise.all([
-            submitOrderRaw({
-              direction: params.direction,
-              volume: params.volume,
-              stopLoss: params.stopLoss,
-              comment: buildCascadeComment(zoneId, 1, total),
-              zoneId,
-              // Absolute TP prices ride along on the market leg — that's the
-              // trade that triggers zone creation server-side.
-              tp1Price: params.tp1Price,
-              tp2Price: params.tp2Price,
-              tp3Price: params.tp3Price,
-              tp4Price: params.tp4Price,
-              anchorPrice: params.anchorPrice,
-              tp1Pct: params.tp1Pct,
-              tp2Pct: params.tp2Pct,
-              tp3Pct: params.tp3Pct,
-              tp4Pct: params.tp4Pct,
-              autoBeAtTp: params.autoBeAtTp,
-            }),
-            ...params.limitEntries.map((limitPrice, i) =>
-              submitOrderRaw({
+          console.log("[cascade] placing via /cascade/place dir=" + params.direction + " limits=" + String(params.limitEntries.length));
+          const cascadeRes = await authFetch(
+            `${API_BASE}/mt5/account/${accountId}/cascade/place?region=${region}`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
                 direction: params.direction,
                 volume: params.volume,
-                limitPrice,
+                limitEntries: params.limitEntries,
                 stopLoss: params.stopLoss,
-                comment: buildCascadeComment(zoneId, i + 2, total),
                 zoneId,
-              })
-            ),
-          ]);
-
-          if (marketResult.success) {
-            placed++;
-            if (marketResult.positionId) marketPositionId = marketResult.positionId;
-          } else {
-            failed++;
-            errors.push(`Market: ${marketResult.message}`);
-            await new Promise((r) => setTimeout(r, 1500));
-            let anchorActuallyOpen = true;
-            try {
-              const posRes = await authFetch(`${API_BASE}/mt5/account/${accountId}/positions?region=${region}`);
-              if (posRes.ok) {
-                const positions = (await posRes.json()) as Array<Record<string, unknown>>;
-                anchorActuallyOpen = Array.isArray(positions) && positions.some((p) => {
-                  const t = String(p.type ?? "");
-                  const dirMatch = params.direction === "buy" ? t.includes("BUY") : t.includes("SELL");
-                  return dirMatch && Math.abs(Number(p.volume ?? 0) - params.volume) < 1e-6;
-                });
-              }
-            } catch {
-              anchorActuallyOpen = true;
-            }
-            if (!anchorActuallyOpen) {
-              const toCancel = limitResults.filter((r) => r.success && r.orderId).map((r) => r.orderId!);
-              if (toCancel.length > 0) {
-                void Promise.all(toCancel.map((id) =>
-                  authFetch(`${API_BASE}/mt5/account/${accountId}/cancel-order/${id}?region=${region}`, { method: "POST" })
-                ));
-              }
-            } else {
-              console.log("[cascade] market reported failure but an anchor is open — false negative; keeping limits");
-            }
+                tp1Price: params.tp1Price,
+                tp2Price: params.tp2Price,
+                tp3Price: params.tp3Price,
+                tp4Price: params.tp4Price,
+                anchorPrice: params.anchorPrice,
+                tp1Pct: params.tp1Pct,
+                tp2Pct: params.tp2Pct,
+                tp3Pct: params.tp3Pct,
+                tp4Pct: params.tp4Pct,
+                autoBeAtTp: params.autoBeAtTp,
+              }),
+            },
+          );
+          const cascadeData = await safeJson<{
+            ok?: boolean;
+            message?: string;
+            error?: string;
+            placed?: number;
+            failed?: number;
+            positionId?: string;
+            marketPositionId?: string;
+            limitOrderIds?: string[];
+          }>(cascadeRes);
+          if (!cascadeRes.ok || !cascadeData.ok) {
+            const msg = cascadeData.message ?? cascadeData.error ?? `Cascade failed (${cascadeRes.status})`;
+            console.error("[cascade] /cascade/place failed:", msg);
+            return { success: false, placed: 0, failed: total, message: msg, zoneId };
           }
-
-          for (const r of limitResults) {
-            if (r.success) {
-              placed++;
-              if (r.orderId) limitOrderIds.push(r.orderId);
-            } else {
-              failed++;
-              errors.push(`Limit: ${r.message}`);
-            }
-          }
+          placed = cascadeData.placed ?? total;
+          failed = cascadeData.failed ?? 0;
+          marketPositionId = cascadeData.marketPositionId ?? cascadeData.positionId;
+          if (cascadeData.limitOrderIds) limitOrderIds.push(...cascadeData.limitOrderIds);
+          if (failed > 0) errors.push(cascadeData.message ?? `${failed} limit(s) failed`);
         }
       } catch (err) {
         errors.push(err instanceof Error ? err.message : "Unknown error");
