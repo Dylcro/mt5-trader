@@ -4504,8 +4504,28 @@ function markCloseAttempt(zoneId: string): void {
   zoneCloseCooldown.set(zoneId, Date.now());
 }
 
+class NotReadyError extends Error {
+  constructor() { super("Server not ready — broker connection not yet synchronized"); }
+}
+
+async function ensureConnectionReady(conn: unknown | undefined, timeoutMs = 8_000): Promise<void> {
+  if (!conn) throw new NotReadyError();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const c = conn as any;
+  if (c.terminalState?.connected && c.terminalState?.connectedToBroker) return;
+  try {
+    await c.waitSynchronized({ timeoutInSeconds: Math.ceil(timeoutMs / 1000) });
+  } catch {
+    throw new NotReadyError();
+  }
+}
+
 function respondZoneActionError(res: Response, label: string, err: unknown): void {
   console.error(`[${label}]`, err);
+  if (err instanceof NotReadyError) {
+    res.status(503).json({ ok: false, error: err.message, message: err.message });
+    return;
+  }
   const msg = isRateLimitError(err) ? MARKET_BUSY_MSG : ZONE_ACTION_RETRY_MSG;
   res.status(isRateLimitError(err) ? 429 : 500).json({ ok: false, error: msg, message: msg });
 }
@@ -6183,6 +6203,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-partial", checkOwner, a
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
     if (rejectIfPriceNotReady(res, accountId)) return;
+    await ensureConnectionReady(activeConnections.get(accountId));
     await ensureCascadeZoneRunnerColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
@@ -6378,6 +6399,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
     if (rejectIfPriceNotReady(res, accountId)) return;
+    await ensureConnectionReady(activeConnections.get(accountId));
     await ensureCascadeZoneRfColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
@@ -6540,6 +6562,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
     if (rejectIfPriceNotReady(res, accountId)) return;
+    await ensureConnectionReady(activeConnections.get(accountId));
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     // DB-first read via the single loadZone path (cache → DB → hydrate).
@@ -6758,6 +6781,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/cancel-pending", checkOwner, 
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
     if (rejectIfPriceNotReady(res, accountId)) return;
+    await ensureConnectionReady(activeConnections.get(accountId));
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     if (!zoneStates.has(zoneId)) {
@@ -7720,6 +7744,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
     }
 
     const conn = activeConnections.get(accountId);
+    await ensureConnectionReady(conn);
     const tradeResult = await executeTradeRequest(conn, region, accountId, token, body);
     code = tradeResult.code;
     data = tradeResult.data;
@@ -7922,7 +7947,9 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
     });
   } catch (err) {
     pendingAppCascades.delete(accountId);
-    return res.status(500).json({ success: false, code: 0, message: err instanceof Error ? err.message : "Trade failed" });
+    return res.status(err instanceof NotReadyError ? 503 : 500).json({
+      success: false, code: 0, message: err instanceof Error ? err.message : "Trade failed",
+    });
   }
 });
 
