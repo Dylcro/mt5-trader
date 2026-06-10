@@ -21,6 +21,11 @@ async function main() {
   await loadCascadeConfig();
   await loadPlatformFlags();
 
+  // Hydrate zones + notification prefs before accepting requests so zone
+  // actions never hit an empty in-memory cache right after a deploy/restart.
+  await loadZoneState();
+  await loadNotificationPrefs();
+
   app.listen(port, () => {
     console.log(`Server listening on port ${port}`);
   });
@@ -32,9 +37,6 @@ async function main() {
   // Watchdog: every 30 s, reconnect any account whose stream has dropped.
   startConnectionWatchdog();
 
-  // Hydrate in-memory zone state from DB and start the 3 s TP monitor.
-  await loadZoneState();
-  await loadNotificationPrefs();
   startZoneTpMonitor();
 
 }

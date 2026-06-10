@@ -3126,8 +3126,9 @@ interface ZoneState {
   status: "OPEN" | "RISK_FREE" | "CLOSED" | "ARMED";
   /** Sub-min-lot slice carry across TP steps (zone-keyed, survives leg closes). */
   tpCarryLot: number;
-  busy: boolean; // debounce: prevent overlapping monitor ticks for this zone
+  busy: boolean; // user-action lock via tryAcquireZoneBusy
   busySince?: number; // epoch ms when busy was set — safety reset after 10s
+  evalBusy: boolean; // debounce: prevent overlapping evaluateZone ticks for this zone
   // In-memory mirror of zone_positions(status=OPEN) for this zone, used as a
   // fallback when the DB query inside evaluateZone fails — prevents transient
   // DB blips from silently blinding the TP engine for an entire zone. We carry
@@ -3486,7 +3487,7 @@ function prepareZoneForCascade(
     autoBeAtTp: resolveAutoBeAtTp(sanitizeAutoBeAtTp(tps.autoBeAtTp), {
       tp1: tp1Enabled, tp2: tp2Enabled, tp3: tp3Enabled,
     }),
-    status: "OPEN", tpCarryLot: 0, busy: false, busySince: 0,
+    status: "OPEN", tpCarryLot: 0, busy: false, busySince: 0, evalBusy: false,
     trackedPositions: new Map(),
     riskFreeOffset: sanitizeRiskFreePips(riskFreeOffset),
   };
@@ -4124,7 +4125,7 @@ async function handleClosePartial(
   token: string,
   region: string,
 ): Promise<{ ok: boolean; message?: string }> {
-  let st = await loadZone(zoneId);
+  let st = await getZoneOrReload(zoneId);
   if (!st || st.accountId !== accountId) return { ok: false, message: "Zone not found" };
   if (st.status === "CLOSED") {
     const reopened = await reopenClosedZoneIfBrokerLegsRemain(token, region, accountId, zoneId, st);
@@ -4810,8 +4811,8 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
     return;
   }
   if (st.status === "ARMED") return;
-  if (st.busy) return;
-  st.busy = true;
+  if (st.evalBusy) return;
+  st.evalBusy = true;
   try {
     const region = activeRegions.get(st.accountId) ?? knownAccounts.get(st.accountId)?.region ?? DEFAULT_REGION;
     // Fetch this zone's tracked positions from DB (OPEN status only).
@@ -5250,7 +5251,7 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
   } catch (e) {
     console.error(`[zone ${zoneId}] evaluate error:`, (e as Error).message);
   } finally {
-    st.busy = false;
+    st.evalBusy = false;
   }
 }
 
@@ -5384,6 +5385,7 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
     tpCarryLot: 0,
     busy: false,
     busySince: 0,
+    evalBusy: false,
     trackedPositions: new Map(),
     runner1Price: (z as { runner1Price?: number | null }).runner1Price != null
       ? Number((z as { runner1Price: number }).runner1Price) : null,
@@ -5406,6 +5408,12 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
     runnerActive: Boolean((z as { runnerActive?: boolean }).runnerActive),
     riskFreeOffset: sanitizeRiskFreePips((z as { riskFreeOffset?: number }).riskFreeOffset ?? 0),
   };
+}
+
+export async function getZoneOrReload(zoneId: string): Promise<ZoneState | null> {
+  if (zoneStates.has(zoneId)) return zoneStates.get(zoneId)!;
+  console.log(`[zone] ${zoneId} not in memory — reloading from DB`);
+  return loadZone(zoneId);
 }
 
 // Cache-first zone reader: check in-memory map first, hydrate from DB on miss,
@@ -6284,7 +6292,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     await ensureCascadeZoneRfColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
-    st = await loadZone(zoneId);
+    st = await getZoneOrReload(zoneId);
     if (!st || st.accountId !== accountId || st.status === "CLOSED") { res.status(404).json({ error: "Zone not found" }); return; }
     if (st.status === "ARMED") {
       res.status(409).json({ error: "Zone not active yet — wait for the first order to fill" });
@@ -6381,7 +6389,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
     if (rejectIfPriceNotReady(res, accountId)) return;
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
-    const st = await loadZone(zoneId);
+    const st = await getZoneOrReload(zoneId);
     if (!st || st.accountId !== accountId) {
       res.status(404).json({ error: "Zone not found" });
       return;
@@ -6423,7 +6431,6 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
       return;
     }
     const remaining = live.length - 1;
-    await new Promise((r) => setTimeout(r, 800));
     broadcastZoneUpdate(zoneId);
     broadcastToAccount(accountId, "deal", { type: "position_changed" });
     console.log(
@@ -6458,7 +6465,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     // DB-first read via the single loadZone path (cache → DB → hydrate).
     // DB errors bubble up to the surrounding try/catch and return 500.
-    let st = await loadZone(zoneId);
+    let st = await getZoneOrReload(zoneId);
     if (!st || st.accountId !== accountId) {
       const liveOrphans = await fetchOpenPositions(token, region, accountId);
       const orphans = liveOrphans.filter((p) => positionBelongsToZone(p, zoneId));
@@ -6658,8 +6665,10 @@ router.post("/mt5/account/:accountId/zones/:zoneId/cancel-pending", checkOwner, 
     if (rejectIfPriceNotReady(res, accountId)) return;
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
-    if (!zoneStates.has(zoneId)) {
-      await loadZone(zoneId);
+    const st = await getZoneOrReload(zoneId);
+    if (!st || st.accountId !== accountId) {
+      res.status(404).json({ ok: false, message: "Zone not found" });
+      return;
     }
     const pendingBefore = orderIdsForZone(accountId, zoneId).length;
     await cancelZoneLimits(token, region, accountId, zoneId);
