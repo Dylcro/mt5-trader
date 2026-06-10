@@ -266,6 +266,11 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
     }
   }, [accountId, includeClosed]);
 
+  const dropZoneFromList = useCallback((zoneId: string) => {
+    hitLatch.current.delete(zoneId);
+    setZones((prev) => prev.filter((z) => z.zoneId !== zoneId));
+  }, []);
+
   const closeZone = useCallback(async (
     zoneId: string,
   ): Promise<{ ok: boolean; message?: string; closedCount?: number }> => {
@@ -278,21 +283,26 @@ export function useZones(accountId: string, options: UseZonesOptions = {}) {
       const data = await res.json().catch(() => ({})) as {
         ok?: boolean; message?: string; error?: string; closedCount?: number; alreadyClosed?: boolean;
       };
-      await refresh();
-      if (res.ok && data.ok) return { ok: true, closedCount: data.closedCount };
+      if (res.ok && data.ok) {
+        dropZoneFromList(zoneId);
+        void refresh();
+        return { ok: true, closedCount: data.closedCount };
+      }
       if (data.alreadyClosed || await zoneClosedOnServer(zoneId)) {
-        await refresh();
+        dropZoneFromList(zoneId);
+        void refresh();
         return { ok: true, closedCount: data.closedCount ?? 0 };
       }
       return { ok: false, message: data.message ?? data.error ?? `HTTP ${res.status}` };
     } catch (e) {
       if (await zoneClosedOnServer(zoneId)) {
-        await refresh();
+        dropZoneFromList(zoneId);
+        void refresh();
         return { ok: true, closedCount: 0 };
       }
       return { ok: false, message: (e as Error).message };
     }
-  }, [accountId, region, refresh, zoneClosedOnServer]);
+  }, [accountId, region, refresh, zoneClosedOnServer, dropZoneFromList]);
 
   // Cancel pending cascade limit orders for the zone without touching open
   // positions. Powers the "Delete Orders" button on each zone card.

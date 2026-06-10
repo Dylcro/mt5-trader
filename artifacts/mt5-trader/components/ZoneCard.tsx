@@ -432,10 +432,13 @@ export default function ZoneCard({
   const runCloseZone = async () => {
     if (!onCloseZone || closeBusy) return;
     setCloseBusy(true);
-    await triggerAppHaptic(hapticEnabled, "heavy");
-    const result = await onCloseZone(zone.zoneId);
-    setCloseBusy(false);
-    if (!result.ok) Alert.alert("Couldn't close zone", result.message ?? "Try again");
+    try {
+      await triggerAppHaptic(hapticEnabled, "heavy");
+      const result = await onCloseZone(zone.zoneId);
+      if (!result.ok) Alert.alert("Couldn't close zone", result.message ?? "Try again");
+    } finally {
+      setCloseBusy(false);
+    }
   };
 
   const actionBusy = busy || worstBusy || closeBusy || delBusy || runnerBusy || tpBusy != null || takeTpBusy;

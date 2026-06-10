@@ -392,7 +392,9 @@ export default function PositionsScreen() {
   const handleCloseZone = useCallback(
     async (zoneId: string) => {
       const result = await closeZone(zoneId);
-      await Promise.all([refreshZones(), refreshPositions(), refreshPendingOrders()]);
+      if (result.ok) {
+        void Promise.all([refreshZones(), refreshPositions(), refreshPendingOrders()]);
+      }
       return result;
     },
     [closeZone, refreshZones, refreshPositions, refreshPendingOrders],
@@ -639,9 +641,7 @@ export default function PositionsScreen() {
           onCloseAllWorst={(zoneId) =>
             withSessionReady(() => closeAllWorst(zoneId))
           }
-          onCloseZone={(zoneId) =>
-            withSessionReady(() => handleCloseZone(zoneId))
-          }
+          onCloseZone={handleCloseZone}
           onClosePartial={(zoneId, opts) =>
             withSessionReady(() => handleClosePartial(zoneId, opts))
           }
