@@ -882,6 +882,12 @@ function broadcastZoneUpdate(zoneId: string): void {
       tp4Enabled: merged.tp4Enabled,
       enabledTpCount,
       hitEnabledTpCount,
+      nextTp: (
+        merged.tp1Enabled && !merged.tp1Hit ? 1 :
+        merged.tp2Enabled && !merged.tp2Hit ? 2 :
+        merged.tp3Enabled && !merged.tp3Hit ? 3 :
+        (merged.tp4Enabled && !merged.tp4Hit && tp4Price != null) ? 4 : 0
+      ) as 0 | 1 | 2 | 3 | 4,
       positionCount: merged.positionCount,
       trackedPositionIds,
       tp2SlIsBestEffort: (dbRow as { tp2SlIsBestEffort?: boolean } | undefined)?.tp2SlIsBestEffort
@@ -4188,7 +4194,23 @@ async function handleClosePartial(
     }
     const closeLots = await closeTpSliceOnEveryLiveLeg(token, region, st, zoneId, pendingLegs, tpLevel);
     if (closeLots < 0.01) return { ok: false, message: "Lot too small" };
+    // MetaAPI close confirmed — persist the leg-pointer to Postgres.
+    // Failure here means broker and DB are desynced; surface a distinct error
+    // so the user knows to reload rather than silently showing stale state.
     st[`tp${tpLevel}Hit`] = true;
+    try {
+      await db.update(cascadeZonesTable)
+        .set({ [`tp${tpLevel}Hit`]: true } as Record<string, boolean>)
+        .where(eq(cascadeZonesTable.zoneId, zoneId));
+    } catch (dbErr) {
+      const posIds = pendingLegs.map((l) => l.id).join(", ");
+      console.error(
+        `[take-tp] RECONCILE NEEDED zone=${zoneId} tp=TP${tpLevel} `
+        + `closedLots=${closeLots.toFixed(2)} posIds=[${posIds}]`,
+        (dbErr as Error).message,
+      );
+      return { ok: false, message: "TP closed on broker but state could not be saved — please reload" };
+    }
     await mergeZoneHitsFromPositions(zoneId, {
       tp1Hit: st.tp1Hit, tp2Hit: st.tp2Hit, tp3Hit: st.tp3Hit, tp4Hit: st.tp4Hit,
       tp1Enabled: st.tp1Enabled, tp2Enabled: st.tp2Enabled,
