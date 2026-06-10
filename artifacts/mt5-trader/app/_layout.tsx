@@ -25,6 +25,7 @@ import { HapticSettingsProvider } from "@/hooks/useHapticSettings";
 import { DisplayCurrencyProvider } from "@/hooks/useDisplayCurrency";
 import { NotificationSettingsProvider } from "@/hooks/useNotificationSettings";
 import { useNotificationDeepLink } from "@/hooks/useNotificationDeepLink";
+import { useNotifications } from "@/hooks/useNotifications";
 
 SplashScreen.preventAutoHideAsync();
 initSentry();
@@ -33,6 +34,7 @@ const queryClient = new QueryClient();
 
 function RootLayoutNav() {
   useNotificationDeepLink();
+  useNotifications();
   return (
     <Stack screenOptions={{ headerShown: false }}>
       <Stack.Screen name="(auth)" options={{ headerShown: false }} />

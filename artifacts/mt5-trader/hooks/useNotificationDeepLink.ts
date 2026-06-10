@@ -11,7 +11,15 @@ export function useNotificationDeepLink(): void {
 
   useEffect(() => {
     const go = (data: unknown) => {
-      const zoneId = (data as { zoneId?: unknown } | null)?.zoneId;
+      const d = data as { type?: unknown; zoneId?: unknown } | null;
+      const type = d?.type;
+      const zoneId = d?.zoneId;
+      const toPositions =
+        type === "tp3_runners"
+        || (typeof type === "string" && type.startsWith("runner_"))
+        || type === "tp3_complete"
+        || type === "runner_hit";
+      if (!toPositions && typeof zoneId !== "string") return;
       try {
         router.push(typeof zoneId === "string" && zoneId
           ? { pathname: "/positions", params: { zoneId, highlightZone: zoneId } }

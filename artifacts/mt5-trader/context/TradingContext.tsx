@@ -13,6 +13,7 @@ import { AppState, Platform, type AppStateStatus } from "react-native";
 
 import { emitAccountEvent } from "@/lib/accountEventBus";
 import { getAuthToken } from "@/lib/authToken";
+import { registerPushToken } from "@/lib/registerPushToken";
 import { buildCascadeComment, newCascadeZoneId } from "@/lib/zoneComments";
 
 // Secure credential helpers — used to silently re-establish the MetaAPI account
@@ -696,6 +697,13 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
       void syncSession(true);
     }
   }, [status, accountId, syncSession]);
+
+  // Register Expo push token once MT5 account is connected (startup + reconnect).
+  useEffect(() => {
+    if (status === "connected" && accountId) {
+      void registerPushToken(accountId);
+    }
+  }, [status, accountId]);
 
   // Foreground refresh + account heartbeat while app is active.
   useEffect(() => {
