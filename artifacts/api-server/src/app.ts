@@ -7,6 +7,7 @@ import { fileURLToPath } from "url";
 import router from "./routes";
 import adminRouter from "./routes/admin";
 import authRouter from "./routes/auth";
+import eaRouter from "./routes/ea";
 import healthRouter from "./routes/health";
 import systemRouter from "./routes/system";
 import { authLimiter, apiLimiter } from "./lib/rateLimiters";
@@ -47,6 +48,7 @@ app.use("/api", healthRouter);
 app.use("/api/admin", adminRouter);
 app.use("/api/system", systemRouter);
 app.use("/api/auth", authLimiter, authRouter);
+app.use("/ea", eaRouter);
 app.use("/api", apiLimiter);
 
 /** Invite link landing — opens app sign-up with ?code= pre-filled when possible. */

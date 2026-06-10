@@ -196,6 +196,20 @@ export async function ensureTables(): Promise<void> {
       created_at     BIGINT NOT NULL,
       status         TEXT NOT NULL DEFAULT 'unread'
     );
+
+    CREATE TABLE IF NOT EXISTS executor_commands (
+      id           TEXT PRIMARY KEY,
+      account_id   TEXT NOT NULL,
+      type         TEXT NOT NULL,
+      payload      JSONB NOT NULL,
+      status       TEXT NOT NULL DEFAULT 'pending',
+      result       JSONB,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      claimed_at   TIMESTAMPTZ,
+      completed_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS executor_commands_acct_status_created
+      ON executor_commands (account_id, status, created_at);
   `);
 
   // Additive migrations for DBs created before the full bootstrap above.

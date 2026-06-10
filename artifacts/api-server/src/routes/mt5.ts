@@ -8006,4 +8006,30 @@ router.put("/cascade-config", async (req: Request, res: Response) => {
   return res.json(nextConfig);
 });
 
+/**
+ * Called by POST /ea/state after normalizing the EA snapshot.
+ * Seeds brokerSnapshotCache so evaluateZone reads fresh EA data,
+ * then runs the zone-eval pipeline identically to processStreamingTickBatch.
+ */
+export async function handleEaStateSnapshot(
+  accountId: string,
+  positions: LivePosition[],
+  orders: Array<{ id: string; comment?: string; magic?: number }>,
+): Promise<void> {
+  brokerSnapshotCache.set(accountId, { positions, orders, fetchedAt: Date.now() });
+
+  let token: string;
+  try { token = getToken(); } catch { return; }
+
+  const snap: BrokerSnap = { positions, orders };
+  for (const [zoneId, st] of zoneStates.entries()) {
+    if (st.accountId !== accountId || st.status === "CLOSED") continue;
+    try {
+      await evaluateZone(zoneId, token, { brokerSnap: snap });
+    } catch (err) {
+      console.error(`[ea-state] ${zoneId}:`, (err as Error).message);
+    }
+  }
+}
+
 export default router;
