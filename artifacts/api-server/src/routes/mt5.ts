@@ -1671,6 +1671,29 @@ export function startConnectionWatchdog(): void {
 }
 
 
+function pickPositiveNumber(v: unknown): number | null {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** MetaAPI trade payload — zone metadata must not be forwarded to the broker. */
+function toBrokerTradeBody(body: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {
+    actionType: body.actionType,
+    symbol: typeof body.symbol === "string" && body.symbol ? body.symbol : "XAUUSD",
+    volume: body.volume,
+  };
+  const sl = pickPositiveNumber(body.stopLoss);
+  if (sl != null) out.stopLoss = sl;
+  const tp = pickPositiveNumber(body.takeProfit);
+  if (tp != null) out.takeProfit = tp;
+  if (body.openPrice != null) out.openPrice = body.openPrice;
+  if (body.comment != null) out.comment = body.comment;
+  if (body.orderId != null) out.orderId = body.orderId;
+  if (body.magic != null) out.magic = body.magic;
+  return out;
+}
+
 // ── SDK connection-based trade execution ─────────────────────────────────────
 // Uses the already-open streaming WebSocket instead of making new HTTP requests
 // to MetaAPI REST for every order. Falls back to REST if connection unavailable.
@@ -1754,14 +1777,16 @@ async function executeTradeRequest(
 
   const actionType = String(body.actionType ?? "");
   const isLimit = actionType.endsWith("_LIMIT");
-  let result = await runOnce(body);
+  const brokerBody = () => toBrokerTradeBody(body);
+  let result = await runOnce(brokerBody());
   if (!TRADE_SUCCESS_CODES.has(result.code) && isLimit && isPricePassedError(result.code, result.data.message)) {
     const marketType = actionType === "ORDER_TYPE_BUY_LIMIT" ? "ORDER_TYPE_BUY"
       : actionType === "ORDER_TYPE_SELL_LIMIT" ? "ORDER_TYPE_SELL" : null;
     if (marketType) {
       console.log(`[cascade] limit at ${String(body.openPrice)} passed through, placing market`);
-      const { openPrice: _omit, ...rest } = body;
-      result = await runOnce({ ...rest, actionType: marketType });
+      body.actionType = marketType;
+      delete body.openPrice;
+      result = await runOnce(brokerBody());
     }
   }
   return result;
@@ -1907,39 +1932,40 @@ async function triggerMt5OneClickAutoCascadeInner(
   const { limitEntries, stopLoss } = buildCascadeLevels(anchorPrice, direction!, config);
   const total = 1 + limitEntries.length;
 
-  // Match app cascade: anchor carries its own SL + zone tag (not borrowed from pending limits).
-  await tagMt5AnchorForZone(token, region, accountId, posId, zoneState.zoneId, stopLoss, total);
-
-  let placedCount = 0;
-
-  for (let i = 0; i < limitEntries.length; i++) {
-    const limitPrice = limitEntries[i]!;
-    const legNum = i + 2;
-    const cascadeComment = buildCascadeComment(zoneState.zoneId, legNum, total);
-    const actionType = direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT";
-    try {
-      const orderId = await placeCascadeLimitFast(
-        conn, region, accountId, token,
-        {
-          actionType,
-          symbol,
-          volume,
-          openPrice: limitPrice,
-          stopLoss,
-          comment: cascadeComment,
-        },
-        legNum,
-        total,
-      );
-      if (orderId) {
-        placedCount++;
-        trackCascadeOrder(accountId, orderId);
-        await attachLimitOrderToZone(accountId, orderId, cascadeComment, direction);
+  // Place all limits immediately (parallel) — SL/tag anchor after limits confirm.
+  const limitResults = await Promise.all(
+    limitEntries.map(async (limitPrice, i) => {
+      const legNum = i + 2;
+      const cascadeComment = buildCascadeComment(zoneState.zoneId, legNum, total);
+      const actionType = direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT";
+      try {
+        const orderId = await placeCascadeLimitFast(
+          conn, region, accountId, token,
+          {
+            actionType,
+            symbol,
+            volume,
+            openPrice: limitPrice,
+            stopLoss,
+            comment: cascadeComment,
+          },
+          legNum,
+          total,
+        );
+        if (orderId) {
+          trackCascadeOrder(accountId, orderId);
+          await attachLimitOrderToZone(accountId, orderId, cascadeComment, direction);
+          return true;
+        }
+      } catch (e) {
+        console.error(`[auto-cascade] limit ${legNum}/${total} failed for zone ${zoneState.zoneId}:`, (e as Error).message);
       }
-    } catch (e) {
-      console.error(`[auto-cascade] limit ${legNum}/${total} failed for zone ${zoneState.zoneId}:`, (e as Error).message);
-    }
-  }
+      return false;
+    }),
+  );
+  const placedCount = limitResults.filter(Boolean).length;
+
+  await tagMt5AnchorForZone(token, region, accountId, posId, zoneState.zoneId, stopLoss, total);
 
   recordCascade(accountId, anchorPrice);
   scheduleCascadeReconcile(accountId, region, token);
@@ -3101,6 +3127,7 @@ interface ZoneState {
   /** Sub-min-lot slice carry across TP steps (zone-keyed, survives leg closes). */
   tpCarryLot: number;
   busy: boolean; // debounce: prevent overlapping monitor ticks for this zone
+  busySince?: number; // epoch ms when busy was set — safety reset after 10s
   // In-memory mirror of zone_positions(status=OPEN) for this zone, used as a
   // fallback when the DB query inside evaluateZone fails — prevents transient
   // DB blips from silently blinding the TP engine for an entire zone. We carry
@@ -3459,7 +3486,7 @@ function prepareZoneForCascade(
     autoBeAtTp: resolveAutoBeAtTp(sanitizeAutoBeAtTp(tps.autoBeAtTp), {
       tp1: tp1Enabled, tp2: tp2Enabled, tp3: tp3Enabled,
     }),
-    status: "OPEN", tpCarryLot: 0, busy: false,
+    status: "OPEN", tpCarryLot: 0, busy: false, busySince: 0,
     trackedPositions: new Map(),
     riskFreeOffset: sanitizeRiskFreePips(riskFreeOffset),
   };
@@ -4374,6 +4401,32 @@ interface LivePosition {
 
 const ZONE_ACTION_RETRY_MSG = "Action failed — please retry in a moment";
 const MARKET_BUSY_MSG = "Market busy — please try again in a moment";
+const ZONE_BUSY_TIMEOUT_MS = 10_000;
+
+/** Reset stale busy locks so a crashed handler cannot block Risk Free indefinitely. */
+function tryAcquireZoneBusy(
+  st: ZoneState,
+  zoneId: string,
+  res: Response,
+): boolean {
+  if (st.busy) {
+    const busySince = st.busySince ?? 0;
+    if (Date.now() - busySince > ZONE_BUSY_TIMEOUT_MS) {
+      console.log(`[zone] ${zoneId} busy timeout — resetting`);
+      st.busy = false;
+      st.busySince = 0;
+    } else {
+      res.status(429).json({
+        ok: false,
+        message: "Action in progress — please wait",
+      });
+      return false;
+    }
+  }
+  st.busy = true;
+  st.busySince = Date.now();
+  return true;
+}
 const CLOSE_COOLDOWN_MS = 1500;
 const zoneCloseCooldown = new Map<string, number>();
 
@@ -5330,6 +5383,7 @@ export function rowToZoneState(z: typeof cascadeZonesTable.$inferSelect): ZoneSt
           : "OPEN",
     tpCarryLot: 0,
     busy: false,
+    busySince: 0,
     trackedPositions: new Map(),
     runner1Price: (z as { runner1Price?: number | null }).runner1Price != null
       ? Number((z as { runner1Price: number }).runner1Price) : null,
@@ -6236,7 +6290,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       res.status(409).json({ error: "Zone not active yet — wait for the first order to fill" });
       return;
     }
-    st.busy = true;
+    if (!tryAcquireZoneBusy(st, zoneId, res)) return;
     const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
     if (live.length === 0) {
       res.status(409).json({ error: "No open positions in this zone" }); return;
@@ -6311,7 +6365,10 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
   } catch (err) {
     respondZoneActionError(res, "risk-free", err);
   } finally {
-    if (st) st.busy = false;
+    if (st) {
+      st.busy = false;
+      st.busySince = 0;
+    }
   }
 });
 
@@ -6606,13 +6663,11 @@ router.post("/mt5/account/:accountId/zones/:zoneId/cancel-pending", checkOwner, 
     }
     const pendingBefore = orderIdsForZone(accountId, zoneId).length;
     await cancelZoneLimits(token, region, accountId, zoneId);
-    await restoreZoneStopLossAfterLimitCancel(token, region, accountId, zoneId);
     const pendingAfter = orderIdsForZone(accountId, zoneId).length;
     const cancelledCount = Math.max(0, pendingBefore - pendingAfter);
-    broadcastToAccount(accountId, "pending_order", {});
     broadcastZoneUpdate(zoneId);
     console.log(`[zone ${zoneId}] cancel-pending: user-initiated, cancelled=${cancelledCount}/${pendingBefore}`);
-    res.json({ ok: true, cancelledCount });
+    return res.json({ ok: true, cancelledCount });
   } catch (err) {
     respondZoneActionError(res, "cancel-pending", err);
   }
@@ -7435,6 +7490,218 @@ const TRADE_ERROR_MESSAGES: Record<number, string> = {
 // POST /api/mt5/account/:accountId/trade?region=london
 // Tries the SDK WebSocket path first (reuses existing stream connection → no new TCP/TLS to MetaAPI).
 // Falls back to REST if the connection is unavailable or the SDK call throws.
+// POST /api/mt5/account/:accountId/cascade/place
+// App BUY/SELL: anchor market first → all limits in parallel → SL on anchor last.
+router.post("/mt5/account/:accountId/cascade/place", checkOwner, async (req: Request, res: Response) => {
+  const accountId = String(req.params.accountId);
+  const trading = getTradingStatus();
+  if (!trading.trading_enabled) {
+    res.status(503).json({ ok: false, error: trading.message });
+    return;
+  }
+  if (rejectIfPriceNotReady(res, accountId)) return;
+
+  const userId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
+  const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
+  const raw = (req.body ?? {}) as Record<string, unknown>;
+  const direction = raw.direction === "buy" || raw.direction === "sell" ? raw.direction : null;
+  const volume = Number(raw.volume ?? 0);
+  const limitEntries = Array.isArray(raw.limitEntries)
+    ? (raw.limitEntries as unknown[]).map((v) => Number(v)).filter((n) => Number.isFinite(n) && n > 0)
+    : [];
+  const stopLoss = Number(raw.stopLoss ?? 0);
+  const anchorPrice = Number(raw.anchorPrice ?? 0);
+  const zoneId = typeof raw.zoneId === "string" && raw.zoneId.trim()
+    ? raw.zoneId.trim()
+    : newZoneId();
+  const pickPrice = (v: unknown): number | null =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+  const tp1Price = pickPrice(raw.tp1Price);
+  const tp2Price = pickPrice(raw.tp2Price);
+  const tp3Price = pickPrice(raw.tp3Price);
+  const tp4Price = pickPrice(raw.tp4Price);
+  const cascadeCfg = getCascadeConfig(accountId, userId);
+  const pickBool = (v: unknown, def: boolean) => typeof v === "boolean" ? v : def;
+  const tp1Enabled = pickBool(raw.tp1Enabled, cascadeCfg.tp1Enabled);
+  const tp2Enabled = pickBool(raw.tp2Enabled, cascadeCfg.tp2Enabled);
+  const tp3Enabled = pickBool(raw.tp3Enabled, cascadeCfg.tp3Enabled);
+  const tp4Enabled = pickBool(raw.tp4Enabled, cascadeCfg.tp4Enabled);
+  const pickPct = (v: unknown, def: number) => {
+    const n = typeof v === "number" && Number.isFinite(v) ? v : def;
+    return Math.min(100, Math.max(0, n));
+  };
+  const tp1Pct = pickPct(raw.tp1Pct, cascadeCfg.tp1Pct);
+  const tp2Pct = pickPct(raw.tp2Pct, cascadeCfg.tp2Pct);
+  const tp3Pct = pickPct(raw.tp3Pct, cascadeCfg.tp3Pct);
+  const tp4Pct = pickPct(raw.tp4Pct, cascadeCfg.tp4Pct);
+
+  if (!direction) {
+    res.status(400).json({ ok: false, message: "direction must be buy or sell" });
+    return;
+  }
+  if (volume < ZONE_MIN_LOT_PER_ENTRY) {
+    res.status(400).json({ ok: false, message: `Cascade lot size must be at least ${ZONE_MIN_LOT_PER_ENTRY}` });
+    return;
+  }
+  const expectedLimits = Math.max(0, cascadeCfg.numPositions - 1);
+  if (limitEntries.length !== expectedLimits) {
+    res.status(400).json({
+      ok: false,
+      message: `Expected ${expectedLimits} limit order(s) for numPositions=${cascadeCfg.numPositions}, got ${limitEntries.length}`,
+    });
+    return;
+  }
+  if (!(stopLoss > 0)) {
+    res.status(400).json({ ok: false, message: "stopLoss is required" });
+    return;
+  }
+  const tpsValid = cascadeTpPricesValid(
+    direction, anchorPrice,
+    { tp1: tp1Price, tp2: tp2Price, tp3: tp3Price, tp4: tp4Price },
+    { tp1: tp1Enabled, tp2: tp2Enabled, tp3: tp3Enabled },
+  );
+  if (!tpsValid) {
+    res.status(400).json({ ok: false, message: "Invalid cascade TP prices for direction and anchor" });
+    return;
+  }
+
+  pendingAppCascades.add(accountId);
+  let token: string;
+  try {
+    token = getToken();
+  } catch (e) {
+    pendingAppCascades.delete(accountId);
+    res.status(500).json({ ok: false, message: (e as Error).message });
+    return;
+  }
+  const conn = activeConnections.get(accountId);
+  const total = 1 + limitEntries.length;
+  const actionType = direction === "buy" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL";
+  const cascadeComment = buildCascadeComment(zoneId, 1, total);
+  const existingPositionId = typeof raw.existingPositionId === "string" ? raw.existingPositionId : undefined;
+
+  try {
+    let positionId = existingPositionId;
+    if (!positionId) {
+      console.log(`[cascade/place] step1 market ${direction} vol=${volume} zone=${zoneId}`);
+      const marketResult = await executeTradeRequest(conn, region, accountId, token, {
+        actionType,
+        symbol: "XAUUSD",
+        volume,
+        comment: cascadeComment,
+        magic: zoneMagicNumber(zoneId),
+        anchorPrice,
+        tp1Price, tp2Price, tp3Price, tp4Price,
+        tp1Pct, tp2Pct, tp3Pct, tp4Pct,
+        tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+        autoBeAtTp: raw.autoBeAtTp,
+        zoneId,
+      });
+      if (!TRADE_SUCCESS_CODES.has(marketResult.code)) {
+        const msg = userFacingTradeMessage(marketResult.code, marketResult.data.message);
+        console.error(`[cascade/place] anchor market failed code=${marketResult.code} msg=${msg}`);
+        res.status(400).json({ ok: false, message: msg ?? "Anchor market order failed" });
+        return;
+      }
+      positionId = marketResult.data.positionId;
+      if (!positionId) {
+        console.error(`[cascade/place] anchor market succeeded but no positionId zone=${zoneId}`);
+        res.status(502).json({ ok: false, message: "Anchor filled but positionId missing — retry" });
+        return;
+      }
+      markCascaded(accountId, positionId);
+    }
+
+    const resolvedTp1 = tp1Price ?? (anchorPrice > 0
+      ? computeTpPricesFromPips(anchorPrice, direction, cascadeCfg).tp1Price
+      : tp2Price!);
+    const zoneState = prepareZoneForCascade(
+      accountId, direction, userId,
+      {
+        tp1Price: resolvedTp1, tp2Price: tp2Price!, tp3Price: tp3Price!, tp4Price,
+        tp1Pct: tp1Enabled ? tp1Pct : 0, tp2Pct: tp2Enabled ? tp2Pct : 0,
+        tp3Pct: tp3Enabled ? tp3Pct : 0, tp4Pct: tp4Enabled ? tp4Pct : 0,
+        tp1Enabled, tp2Enabled, tp3Enabled, tp4Enabled,
+        autoBeAtTp: raw.autoBeAtTp,
+      },
+      volume,
+      zoneId,
+      anchorPrice,
+      cascadeCfg.riskFreePips,
+    );
+    const tick = latestPrice(accountId);
+    if (anchorPrice > 0) zoneState.anchorPrice = anchorPrice;
+    else if (tick) zoneState.anchorPrice = direction === "buy" ? tick.ask : tick.bid;
+
+    await persistPreparedZone(zoneState, userId, positionId!, volume);
+    zoneStates.set(zoneState.zoneId, zoneState);
+
+    console.log(`[cascade/place] step2 placing ${limitEntries.length} limit(s) zone=${zoneId}`);
+    const limitAction = direction === "buy" ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_SELL_LIMIT";
+    const limitResults = await Promise.all(
+      limitEntries.map(async (limitPrice, i) => {
+        const legNum = i + 2;
+        const comment = buildCascadeComment(zoneId, legNum, total);
+        try {
+          const result = await executeTradeRequest(conn, region, accountId, token, {
+            actionType: limitAction,
+            symbol: "XAUUSD",
+            volume,
+            openPrice: limitPrice,
+            stopLoss,
+            comment,
+            magic: zoneMagicNumber(zoneId),
+            zoneId,
+          });
+          if (!TRADE_SUCCESS_CODES.has(result.code)) {
+            const msg = userFacingTradeMessage(result.code, result.data.message);
+            console.error(`[cascade/place] limit ${legNum} failed code=${result.code} msg=${msg}`);
+            return { ok: false as const, message: msg };
+          }
+          const orderId = result.data.orderId;
+          if (orderId) {
+            trackCascadeOrder(accountId, orderId);
+            await attachLimitOrderToZone(accountId, orderId, comment, direction);
+          }
+          return { ok: true as const, orderId };
+        } catch (e) {
+          console.error(`[cascade/place] limit ${legNum} threw:`, (e as Error).message);
+          return { ok: false as const, message: (e as Error).message };
+        }
+      }),
+    );
+    const limitOrderIds = limitResults.filter((r) => r.ok && r.orderId).map((r) => r.orderId!);
+    const limitFailed = limitResults.filter((r) => !r.ok).length;
+
+    console.log(`[cascade/place] step3 anchor SL zone=${zoneId} posId=${positionId}`);
+    await tagMt5AnchorForZone(token, region, accountId, positionId!, zoneId, stopLoss, total);
+
+    scheduleCascadeReconcile(accountId, region, token);
+    broadcastZoneUpdate(zoneId);
+    broadcastToAccount(accountId, "deal", { type: "position_changed" });
+
+    const placed = 1 + limitOrderIds.length;
+    res.json({
+      ok: true,
+      success: true,
+      zoneId,
+      positionId,
+      marketPositionId: positionId,
+      limitOrderIds,
+      placed,
+      failed: limitFailed,
+      message: limitFailed > 0
+        ? `${placed}/${total} placed (${limitFailed} limit(s) failed)`
+        : `${placed} orders placed — 1 market + ${limitEntries.length} limit`,
+    });
+  } catch (err) {
+    console.error(`[cascade/place] failed zone=${zoneId}:`, (err as Error).message);
+    respondZoneActionError(res, "cascade/place", err);
+  } finally {
+    pendingAppCascades.delete(accountId);
+  }
+});
+
 router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, res: Response) => {
   const accountId = String(req.params.accountId);
   const trading = getTradingStatus();
@@ -7473,25 +7740,30 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
       const direction = _tradeActionType === "ORDER_TYPE_BUY" ? "buy"
         : _tradeActionType === "ORDER_TYPE_SELL" ? "sell" : null;
       if (direction) {
+        const uId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
+        const cascadeCfg = getCascadeConfig(accountId, uId);
         const pickP = (v: unknown): number | null =>
           typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+        const pickBool = (v: unknown, def: boolean) => typeof v === "boolean" ? v : def;
+        const tp1Enabled = pickBool(body.tp1Enabled, cascadeCfg.tp1Enabled);
+        const tp2Enabled = pickBool(body.tp2Enabled, cascadeCfg.tp2Enabled);
+        const tp3Enabled = pickBool(body.tp3Enabled, cascadeCfg.tp3Enabled);
         const tp1 = pickP(body.tp1Price);
         const tp2 = pickP(body.tp2Price);
         const tp3 = pickP(body.tp3Price);
         const tp4 = pickP(body.tp4Price);
         const anchor = Number(body.anchorPrice ?? 0) || 0;
         const vol = Number(body.volume ?? 0) || 0;
-        const cmp = direction === "buy"
-          ? (a: number, b: number) => a > b
-          : (a: number, b: number) => a < b;
-        const tpsOk = tp1 != null && tp2 != null && tp3 != null
-          && (anchor <= 0 || cmp(tp1, anchor))
-          && cmp(tp2, tp1) && cmp(tp3, tp2)
-          && (tp4 == null || cmp(tp4, tp3));
+        const tpsOk = cascadeTpPricesValid(
+          direction, anchor,
+          { tp1, tp2, tp3, tp4 },
+          { tp1: tp1Enabled, tp2: tp2Enabled, tp3: tp3Enabled },
+        );
         if (!tpsOk) {
+          const reqTps = tp1Enabled ? "TP1, TP2, TP3" : "TP2, TP3";
           return res.status(400).json({
             success: false, code: 0,
-            message: `Cascade requires TP1, TP2, TP3 absolute prices in strictly ${direction === "buy" ? "ascending" : "descending"} order on the profitable side of the entry. TP4 optional.`,
+            message: `Cascade requires ${reqTps} absolute prices in strictly ${direction === "buy" ? "ascending" : "descending"} order on the profitable side of the entry. TP4 optional.`,
           });
         }
         if (vol < ZONE_MIN_LOT_PER_ENTRY) {
