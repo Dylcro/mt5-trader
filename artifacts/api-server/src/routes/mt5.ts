@@ -11,7 +11,7 @@ import { usdToTargetRate } from "../lib/usdFx.js";
 import { type ExecutionAdapter, NotReadyError } from "../lib/execution/types";
 import { MetaApiAdapter } from "../lib/execution/metaApiAdapter";
 import { EaAdapter } from "../lib/execution/eaAdapter";
-import { getEaState, reregisterEaTerminalAccount } from "../lib/eaState";
+import { getEaState, getLastEaPollAt, reregisterEaTerminalAccount } from "../lib/eaState";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
 // In dev (tsx/ESM) import.meta.url is the real file URL.
 // In production (esbuild CJS) build.ts injects a __importMetaUrl banner and
@@ -4560,12 +4560,18 @@ async function ensureConnectionReady(conn: unknown | undefined, timeoutMs = 8_00
   }
 }
 
-// For ea accounts readiness means a fresh /ea/state snapshot (≤10 s old).
+// EA liveness: pass if state snapshot OR last /ea/poll is within this window.
+const EA_LIVENESS_MS = 30_000;
+
+// For ea accounts, readiness is confirmed by either a recent /ea/state push
+// or a recent /ea/poll — the terminal is alive even between state pushes.
 // For metaapi accounts use the existing MetaApi connection check.
 async function ensureReadyForAccount(accountId: string, timeoutMs = 8_000): Promise<void> {
   if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
     const state = getEaState(accountId);
-    if (!state || Date.now() - state.receivedAt > 10_000) {
+    const stateAge = state ? Date.now() - state.receivedAt : Infinity;
+    const pollAge  = Date.now() - getLastEaPollAt(accountId);
+    if (stateAge > EA_LIVENESS_MS && pollAge > EA_LIVENESS_MS) {
       throw new NotReadyError("EA terminal not connected or state is stale");
     }
     return;
@@ -6993,16 +6999,20 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         knownAccounts.set(existingId, { accountId: existingId, userId: userId ?? undefined, region });
         // res.json interceptor fires reregisterEaTerminalAccount
         const eaState = getEaState(existingId);
-        const live = eaState != null && Date.now() - eaState.receivedAt < 10_000;
+        const live = eaState != null
+          ? (Date.now() - eaState.receivedAt < EA_LIVENESS_MS || Date.now() - getLastEaPollAt(existingId) < EA_LIVENESS_MS)
+          : (Date.now() - getLastEaPollAt(existingId) < EA_LIVENESS_MS);
         if (live) {
           return res.json({
             status: "connected",
             accountId: existingId,
             region,
-            balance: eaState.accountInfo.balance,
-            equity: eaState.accountInfo.equity,
-            marginFree: eaState.accountInfo.marginFree,
-            currency: "USD",
+            ...(eaState ? {
+              balance:    eaState.accountInfo.balance,
+              equity:     eaState.accountInfo.equity,
+              marginFree: eaState.accountInfo.marginFree,
+              currency:   "USD",
+            } : {}),
           });
         }
         return res.json({ status: "connecting", accountId: existingId, region });
@@ -7114,16 +7124,18 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       // res.json interceptor fires reregisterEaTerminalAccount + bindAccount
 
       const eaState = getEaState(eaAccountId);
-      const live = eaState != null && Date.now() - eaState.receivedAt < 10_000;
+      const live = eaState != null
+        ? (Date.now() - eaState.receivedAt < EA_LIVENESS_MS || Date.now() - getLastEaPollAt(eaAccountId) < EA_LIVENESS_MS)
+        : (Date.now() - getLastEaPollAt(eaAccountId) < EA_LIVENESS_MS);
       return res.json({
         status: live ? "connected" : "connecting",
         accountId: eaAccountId,
         region,
-        ...(live ? {
-          balance: eaState.accountInfo.balance,
-          equity: eaState.accountInfo.equity,
+        ...(live && eaState ? {
+          balance:    eaState.accountInfo.balance,
+          equity:     eaState.accountInfo.equity,
           marginFree: eaState.accountInfo.marginFree,
-          currency: "USD",
+          currency:   "USD",
         } : {}),
       });
     }
@@ -7894,8 +7906,10 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
 
     if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
       // EA backend: check liveness then route through EaAdapter.
-      const eaState = getEaState(accountId);
-      if (!eaState || Date.now() - eaState.receivedAt > 10_000) {
+      const eaState  = getEaState(accountId);
+      const _stateAge = eaState ? Date.now() - eaState.receivedAt : Infinity;
+      const _pollAge  = Date.now() - getLastEaPollAt(accountId);
+      if (_stateAge > EA_LIVENESS_MS && _pollAge > EA_LIVENESS_MS) {
         throw new NotReadyError("EA terminal not connected or state is stale");
       }
       const adapter = getAdapter(accountId);

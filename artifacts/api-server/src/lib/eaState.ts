@@ -9,6 +9,18 @@ export interface EaStateEntry {
 
 const cache = new Map<string, EaStateEntry>();
 
+// Track the last time /ea/poll was served for each account.
+// Lets ensureReadyForAccount declare liveness even before the first state push.
+const lastPollAt = new Map<string, number>();
+
+export function recordEaPoll(accountId: string): void {
+  lastPollAt.set(accountId, Date.now());
+}
+
+export function getLastEaPollAt(accountId: string): number {
+  return lastPollAt.get(accountId) ?? 0;
+}
+
 export function setEaState(
   accountId: string,
   positions: LivePosition[],

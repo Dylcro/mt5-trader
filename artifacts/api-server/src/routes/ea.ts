@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { pool } from "@workspace/db";
 import { handleEaStateSnapshot } from "./mt5";
-import { setEaState, initTerminalToken, resolveTerminalToken } from "../lib/eaState";
+import { setEaState, initTerminalToken, resolveTerminalToken, recordEaPoll } from "../lib/eaState";
 import type { LivePosition, PendingOrder, AccountInfo } from "../lib/execution/types";
 
 const router = Router();
@@ -50,6 +50,7 @@ router.get("/poll", async (req: Request, res: Response) => {
     for (const row of rows) {
       console.log(`[ea] claimed command id=${row.id} type=${row.type} account=${accountId}`);
     }
+    recordEaPoll(accountId);
     res.json({ serverTime: new Date().toISOString(), commands: rows });
   } catch (err) {
     console.error("[ea] poll error:", (err as Error).message);
