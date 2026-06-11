@@ -1108,10 +1108,19 @@ function handleStreamingTick(accountId: string, price: any): void {
   // Reject ticks from any symbol other than XAUUSD — MT5 accounts can stream
   // multiple symbols simultaneously and we must not mix e.g. GBPUSD (~1.34)
   // with gold prices (~4500), which causes the alternating display bug.
-  if (price.symbol && !price.symbol.toUpperCase().includes("XAUUSD")) return;
+  const _sym: string | undefined = price.symbol;
+  const _gatePass = !_sym || _sym.toUpperCase().includes("XAUUSD");
+  if (!_gatePass) {
+    console.log(`[TICK_DBG] entered symbol=${_sym} gatePass=false bidOk=n/a stored=false`);
+    return;
+  }
   const bid = Number(price.bid);
   const ask = Number(price.ask);
-  if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0) return;
+  if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0) {
+    console.log(`[TICK_DBG] entered symbol=${_sym ?? "(none)"} gatePass=true bidOk=false bid=${bid} ask=${ask} stored=false`);
+    return;
+  }
+  console.log(`[TICK_DBG] entered symbol=${_sym ?? "(none)"} gatePass=true bidOk=true bid=${bid} ask=${ask} stored=true`);
   // Cache the tick so latestPrice() / candle builders stay current even when
   // the mobile app isn't polling /price (e.g. backgrounded).
   storeTick(accountId, bid, ask);

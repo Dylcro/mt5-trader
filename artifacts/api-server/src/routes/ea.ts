@@ -154,6 +154,8 @@ router.post("/state", async (req: Request, res: Response) => {
     terminalTime?: string;
   };
 
+  console.log(`[EA_STATE_DBG] symbol=${body.price?.symbol ?? "(none)"} bid=${body.price?.bid ?? "(none)"} ask=${body.price?.ask ?? "(none)"}`);
+
   // Only track positions/orders opened by this EA (magic 770001).
   // Other magic numbers belong to manual trades or third-party EAs.
   const EA_MAGIC = 770001;
@@ -192,7 +194,13 @@ router.post("/state", async (req: Request, res: Response) => {
   const price = (body.price?.bid != null && body.price?.ask != null)
     ? { bid: Number(body.price.bid), ask: Number(body.price.ask), symbol: body.price.symbol }
     : undefined;
-  await handleEaStateSnapshot(accountId, positions, orders, price);
+  try {
+    await handleEaStateSnapshot(accountId, positions, orders, price);
+  } catch (err) {
+    const e = err as Error;
+    console.error(`[EA_STATE_DBG] snapshot threw: ${e.message}\n${e.stack ?? ""}`);
+    throw err;
+  }
 
   res.json({ ok: true });
 });
