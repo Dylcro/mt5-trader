@@ -6697,15 +6697,20 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
     // DB errors bubble up to the surrounding try/catch and return 500.
     let st = await loadZone(zoneId);
     if (!st || st.accountId !== accountId) {
-      const liveOrphans = await fetchOpenPositions(token, region, accountId);
-      const orphans = liveOrphans.filter((p) => positionBelongsToZone(p, zoneId));
+      const isEa = (executionBackends.get(accountId) ?? "ea") !== "metaapi";
+      const allLive = isEa
+        ? (getEaState(accountId)?.positions ?? [])
+        : await fetchOpenPositions(token, region, accountId);
+      const orphans = allLive.filter((p) => positionBelongsToZone(p, zoneId));
       if (orphans.length > 0) {
         let { failed } = await closeLiveZoneLegs(accountId, zoneId, orphans);
         if (failed.length > 0) {
           invalidateBrokerSnapshot(accountId);
-          const stillOpen = await fetchOpenPositions(token, region, accountId, { fresh: true });
+          const afterClose = isEa
+            ? (getEaState(accountId)?.positions ?? [])
+            : await fetchOpenPositions(token, region, accountId, { fresh: true });
           const orphanIds = new Set(orphans.map((p) => p.id));
-          const remaining = stillOpen.filter((p) => orphanIds.has(p.id));
+          const remaining = afterClose.filter((p) => orphanIds.has(p.id));
           if (remaining.length === 0) failed = [];
         }
         if (failed.length > 0) {
@@ -6735,7 +6740,10 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
       await cancelZoneLimits(accountId, zoneId);
     }
 
-    const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+    const _isEaClose = (executionBackends.get(accountId) ?? "ea") !== "metaapi";
+    const live = _isEaClose
+      ? await resolveEaPositionsForZone(accountId, zoneId, st)
+      : await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
 
     // Zone already CLOSED in DB but anchor (or other leg) still open on MT5 — sweep.
     if (st.status === "CLOSED") {
@@ -6747,9 +6755,9 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
       for (const id of live.map((p) => p.id)) st.trackedPositions.delete(id);
       if (failed.length > 0) {
         invalidateBrokerSnapshot(accountId);
-        const remaining = await resolveLivePositionsForZoneAction(
-          token, region, accountId, zoneId, st, { fresh: true },
-        );
+        const remaining = _isEaClose
+          ? await resolveEaPositionsForZone(accountId, zoneId, st)
+          : await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st, { fresh: true });
         if (remaining.length === 0) {
           console.log(`[zone ${zoneId}] close cleanup: broker empty after ${failed.length} API failure(s)`);
           failed = [];
@@ -6783,9 +6791,9 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
 
     if (failed.length > 0) {
       invalidateBrokerSnapshot(accountId);
-      const remaining = await resolveLivePositionsForZoneAction(
-        token, region, accountId, zoneId, st, { fresh: true },
-      );
+      const remaining = _isEaClose
+        ? await resolveEaPositionsForZone(accountId, zoneId, st)
+        : await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st, { fresh: true });
       if (remaining.length === 0) {
         console.log(`[zone ${zoneId}] close: broker empty after ${failed.length} API failure(s) — reconciled`);
         failed = [];
