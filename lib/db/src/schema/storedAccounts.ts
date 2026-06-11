@@ -10,8 +10,8 @@ export const storedAccountsTable = pgTable("stored_accounts", {
   mt5Login:         text("mt5_login"),
   /** Broker server name (e.g. VantageInternational-Live). */
   mt5Server:        text("mt5_server"),
-  /** Execution backend for this account: 'metaapi' (default) or 'ea'. */
-  executionBackend: text("execution_backend").notNull().default("metaapi"),
+  /** Execution backend for this account: 'ea' (default) or 'metaapi'. */
+  executionBackend: text("execution_backend").notNull().default("ea"),
 });
 
 export type StoredAccount = typeof storedAccountsTable.$inferSelect;

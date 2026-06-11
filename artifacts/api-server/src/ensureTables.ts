@@ -27,7 +27,7 @@ export async function ensureTables(): Promise<void> {
       user_id             TEXT,
       mt5_login           TEXT,
       mt5_server          TEXT,
-      execution_backend   TEXT NOT NULL DEFAULT 'metaapi'
+      execution_backend   TEXT NOT NULL DEFAULT 'ea'
     );
 
     CREATE TABLE IF NOT EXISTS cascade_config (
@@ -238,7 +238,7 @@ export async function ensureTables(): Promise<void> {
     ALTER TABLE stored_accounts
       ADD COLUMN IF NOT EXISTS mt5_login TEXT,
       ADD COLUMN IF NOT EXISTS mt5_server TEXT,
-      ADD COLUMN IF NOT EXISTS execution_backend TEXT NOT NULL DEFAULT 'metaapi';
+      ADD COLUMN IF NOT EXISTS execution_backend TEXT NOT NULL DEFAULT 'ea';
 
     ALTER TABLE cascade_zones
       ADD COLUMN IF NOT EXISTS closed_at BIGINT,

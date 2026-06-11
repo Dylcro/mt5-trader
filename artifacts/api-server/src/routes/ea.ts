@@ -1,18 +1,15 @@
 import { Router, type Request, type Response } from "express";
 import { pool } from "@workspace/db";
 import { handleEaStateSnapshot } from "./mt5";
-import { setEaState } from "../lib/eaState";
+import { setEaState, initTerminalToken, resolveTerminalToken } from "../lib/eaState";
 import type { LivePosition, PendingOrder, AccountInfo } from "../lib/execution/types";
 
 const router = Router();
 
-// Single env-var token → accountId mapping.
-// Structured as a Map so additional token→account pairs can be added later
-// without changing the auth logic.
-const TERMINAL_TOKENS = new Map<string, string>(); // token → accountId
+// Seed the shared token registry from env vars at startup.
 const _rawToken = process.env["EA_TERMINAL_TOKEN"];
 const _rawAccount = process.env["EA_TERMINAL_ACCOUNT"];
-if (_rawToken && _rawAccount) TERMINAL_TOKENS.set(_rawToken, _rawAccount);
+if (_rawToken && _rawAccount) initTerminalToken(_rawToken, _rawAccount);
 
 function resolveAccount(req: Request, res: Response): string | null {
   const token = req.headers["x-terminal-token"];
@@ -21,7 +18,7 @@ function resolveAccount(req: Request, res: Response): string | null {
     res.status(401).json({ error: "Unauthorized" });
     return null;
   }
-  const accountId = TERMINAL_TOKENS.get(token);
+  const accountId = resolveTerminalToken(token);
   if (!accountId) {
     console.warn(`[ea] invalid X-Terminal-Token from ${req.ip}`);
     res.status(401).json({ error: "Unauthorized" });

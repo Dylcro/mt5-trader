@@ -25,3 +25,25 @@ export function getEaState(accountId: string): EaStateEntry | undefined {
 export function isEaAccount(accountId: string): boolean {
   return cache.has(accountId);
 }
+
+// ── Terminal token registry ───────────────────────────────────────────────────
+// Shared between ea.ts (auth) and mt5.ts (account registration) without a
+// circular import. Keyed token → accountId.
+const terminalTokens = new Map<string, string>();
+
+export function initTerminalToken(token: string, accountId: string): void {
+  terminalTokens.set(token, accountId);
+}
+
+export function resolveTerminalToken(token: string): string | undefined {
+  return terminalTokens.get(token);
+}
+
+/** Re-point every registered token to a new accountId. Called when the user
+ *  replaces their MT5 account so /ea/poll routes to the correct account. */
+export function reregisterEaTerminalAccount(accountId: string): void {
+  for (const token of terminalTokens.keys()) {
+    terminalTokens.set(token, accountId);
+  }
+  console.log(`[ea-tokens] terminal token(s) re-pointed to account ${accountId}`);
+}

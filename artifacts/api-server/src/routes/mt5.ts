@@ -10,6 +10,7 @@ import { usdToTargetRate } from "../lib/usdFx.js";
 import { type ExecutionAdapter, NotReadyError } from "../lib/execution/types";
 import { MetaApiAdapter } from "../lib/execution/metaApiAdapter";
 import { EaAdapter } from "../lib/execution/eaAdapter";
+import { getEaState, reregisterEaTerminalAccount } from "../lib/eaState";
 // Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
 // In dev (tsx/ESM) import.meta.url is the real file URL.
 // In production (esbuild CJS) build.ts injects a __importMetaUrl banner and
@@ -122,8 +123,8 @@ const activeRegions = new Map<string, string>();  // accountId → region (used 
 interface KnownAccount { accountId: string; userId?: string; region: string; }
 const knownAccounts = new Map<string, KnownAccount>(); // accountId → KnownAccount
 // Mirrors execution_backend column — populated at startup and on watchdog refresh.
-// Defaults to 'metaapi' when absent so live accounts are never accidentally switched.
-const executionBackends = new Map<string, string>(); // accountId → 'metaapi' | 'ea'
+// Defaults to 'ea' when absent so unknown accounts never accidentally open MetaApi streams.
+const executionBackends = new Map<string, string>(); // accountId → 'ea' | 'metaapi'
 let sdkInstance: InstanceType<typeof MetaApi> | null = null;
 
 /** Idempotent — safe when drizzle push was skipped (RF history columns). */
@@ -200,6 +201,11 @@ async function upsertStoredAccount(params: {
       target: storedAccountsTable.accountId,
       set,
     });
+  // Keep the in-memory map consistent so startStreaming and getAdapter see the
+  // correct backend before the next watchdog tick.
+  if (!executionBackends.has(params.accountId)) {
+    executionBackends.set(params.accountId, "ea");
+  }
 }
 
 // ── Cascade Config ────────────────────────────────────────────────────────────
@@ -1476,6 +1482,11 @@ export async function disconnectUserMt5(userId: string): Promise<number> {
 }
 
 async function startStreaming(token: string, accountId: string, region: string = DEFAULT_REGION, userId?: string): Promise<void> {
+  // EA accounts don't use MetaApi streaming — the EA terminal pushes state directly.
+  if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
+    if (userId) knownAccounts.set(accountId, { accountId, userId, region });
+    return;
+  }
   if (activeStreams.has(accountId)) return;
   activeStreams.add(accountId);
   // Load persisted cascade history BEFORE sync so post-sync catch-up
@@ -1616,6 +1627,20 @@ export async function startAutoConnect(): Promise<void> {
     for (const account of rows) {
       try {
         console.log(`[startup] restoring ${account.accountId}`);
+        executionBackends.set(account.accountId, account.executionBackend);
+        const region = normalizeRegion(account.region);
+        if (account.userId) {
+          knownAccounts.set(account.accountId, {
+            accountId: account.accountId,
+            userId: account.userId,
+            region,
+          });
+        }
+        // EA accounts don't need a MetaApi connection — skip entirely.
+        if (account.executionBackend === "ea") {
+          console.log(`[startup] ${account.accountId} is ea backend — registered without MetaApi connection`);
+          continue;
+        }
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         let metaAccount: any | null = null;
         let definitivelyGone = false;
@@ -1643,15 +1668,6 @@ export async function startAutoConnect(): Promise<void> {
           }
           continue;
         }
-        const region = normalizeRegion(account.region);
-        if (account.userId) {
-          knownAccounts.set(account.accountId, {
-            accountId: account.accountId,
-            userId: account.userId,
-            region,
-          });
-        }
-        executionBackends.set(account.accountId, account.executionBackend);
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         await (metaAccount as any).waitConnected(60000).catch(() => null);
         void startStreaming(token, account.accountId, region, account.userId ?? undefined);
@@ -1691,6 +1707,7 @@ export function startConnectionWatchdog(): void {
         }
       }
       for (const { accountId, region } of accounts) {
+        if (executionBackends.get(accountId) === "ea") continue;
         if (!activeStreams.has(accountId)) {
           console.log(`[watchdog] ${accountId} not streaming — reconnecting`);
           void startStreaming(token, accountId, region);
@@ -2133,7 +2150,7 @@ function getToken(): string {
 }
 
 function getAdapter(accountId: string): ExecutionAdapter {
-  if ((executionBackends.get(accountId) ?? "metaapi") === "ea") {
+  if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
     return new EaAdapter(accountId);
   }
   return new MetaApiAdapter({
@@ -6914,7 +6931,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
     };
 
     // Intercept res.json so every successful response with an accountId field automatically
-    // evicts any old account and binds the new one — no need to call these at every return point.
+    // evicts any old account, binds the new one, and re-points EA routing.
     const _origJson = res.json.bind(res);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (res as any).json = (body: unknown) => {
@@ -6923,6 +6940,9 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         // Fire eviction async — must not block the HTTP response
         void evictPreviousAccount(newId);
         bindAccount(newId);
+        // Mark as ea backend in memory and re-point the terminal token.
+        executionBackends.set(newId, "ea");
+        reregisterEaTerminalAccount(newId);
       }
       return _origJson(body);
     };
@@ -7033,14 +7053,28 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       return false;
     };
 
-    // Hard guard — DB first: never create if user already has a stored account.
+    // Hard guard — DB first: never create if user already has a stored account
+    // with matching credentials. If credentials differ, evict the old account so
+    // the user can cleanly add a new one.
     if (userId) {
       const [dbExisting] = await db.select().from(storedAccountsTable)
         .where(eq(storedAccountsTable.userId, userId))
         .limit(1);
       if (dbExisting) {
-        console.log(`[connect] reusing ${dbExisting.accountId}`);
-        if (await respondReconnect(dbExisting.accountId, dbExisting.region)) return;
+        const credentialsKnown = dbExisting.mt5Login != null && dbExisting.mt5Server != null;
+        const sameLogin = !credentialsKnown || String(dbExisting.mt5Login).trim() === loginStr;
+        const sameServer = !credentialsKnown
+          || normalizeServer(String(dbExisting.mt5Server)) === normalizeServer(serverStr);
+        if (sameLogin && sameServer) {
+          console.log(`[connect] reusing ${dbExisting.accountId}`);
+          if (await respondReconnect(dbExisting.accountId, dbExisting.region)) return;
+        } else {
+          console.log(`[connect] credentials changed (${dbExisting.mt5Login}→${loginStr}) — evicting ${dbExisting.accountId}`);
+          await stopStreaming(dbExisting.accountId);
+          await db.delete(storedAccountsTable)
+            .where(eq(storedAccountsTable.accountId, dbExisting.accountId));
+          userAccountCache.delete(userId);
+        }
       }
     }
 
@@ -7478,9 +7512,15 @@ router.get("/mt5/account/:accountId/realized-pnl", checkOwner, async (req: Reque
 // GET /api/mt5/account/:accountId/info?region=london
 router.get("/mt5/account/:accountId/info", checkOwner, async (req: Request, res: Response) => {
   try {
+    const { accountId } = req.params as { accountId: string };
+    if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
+      const state = getEaState(accountId);
+      if (!state) return res.status(503).json({ error: "EA terminal not connected — no state received yet" });
+      return res.json(state.accountInfo);
+    }
     const token = getToken();
     const region = qstr(req.query.region) || DEFAULT_REGION;
-    const info = await getAccountInfo(token, String(req.params.accountId), region);
+    const info = await getAccountInfo(token, accountId, region);
     return res.json(info);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
@@ -7536,16 +7576,7 @@ router.get("/mt5/account/:accountId/display-fx", checkOwner, async (req: Request
 // GET /api/mt5/account/:accountId/positions?region=london
 router.get("/mt5/account/:accountId/positions", checkOwner, async (req: Request, res: Response) => {
   try {
-    const token = getToken();
-    const region = qstr(req.query.region) || DEFAULT_REGION;
     const { accountId } = req.params as { accountId: string };
-    const posRes = await fetch(
-      `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
-      { headers: authHeaders(token) }
-    );
-    if (!posRes.ok) return res.status(posRes.status).json({ error: "Positions fetch failed" });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const body = await posRes.json() as any[];
     const positionToZoneId = new Map<string, string>();
     try {
       const rows = await db.select({
@@ -7565,6 +7596,20 @@ router.get("/mt5/account/:accountId/positions", checkOwner, async (req: Request,
     } catch (e) {
       console.warn(`[positions] zone enrichment lookup failed accountId=${accountId}:`, (e as Error).message);
     }
+    if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
+      const state = getEaState(accountId);
+      const raw: Array<Record<string, unknown>> = (state?.positions ?? []).map(p => ({ ...p }));
+      return res.json(enrichPositionsWithZoneTags(raw, positionToZoneId));
+    }
+    const token = getToken();
+    const region = qstr(req.query.region) || DEFAULT_REGION;
+    const posRes = await fetch(
+      `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
+      { headers: authHeaders(token) }
+    );
+    if (!posRes.ok) return res.status(posRes.status).json({ error: "Positions fetch failed" });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const body = await posRes.json() as any[];
     const enriched = enrichPositionsWithZoneTags(
       Array.isArray(body) ? body as Array<Record<string, unknown>> : [],
       positionToZoneId,
@@ -7578,9 +7623,13 @@ router.get("/mt5/account/:accountId/positions", checkOwner, async (req: Request,
 // GET /api/mt5/account/:accountId/orders?region=london  (pending orders)
 router.get("/mt5/account/:accountId/orders", checkOwner, async (req: Request, res: Response) => {
   try {
+    const { accountId } = req.params as { accountId: string };
+    if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
+      const state = getEaState(accountId);
+      return res.json(state?.orders ?? []);
+    }
     const token = getToken();
     const region = qstr(req.query.region) || DEFAULT_REGION;
-    const { accountId } = req.params as { accountId: string };
     const ordRes = await fetch(
       `${clientBase(region)}/users/current/accounts/${accountId}/orders`,
       { headers: authHeaders(token) }
