@@ -308,7 +308,9 @@ void LoadProcessedIds()
    int n = 0;
    while(!FileIsEnding(fh))
      {
-      string line = StringTrimRight(StringTrimLeft(FileReadString(fh)));
+      string line = FileReadString(fh);
+      StringTrimLeft(line);
+      StringTrimRight(line);
       if(StringLen(line) > 10)
         {
          ArrayResize(all, n + 1);
