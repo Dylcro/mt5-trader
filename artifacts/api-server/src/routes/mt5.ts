@@ -668,6 +668,10 @@ function isDuplicate(dealId: string): boolean {
 const seenPositionIds = new Set<string>();
 /** Prevents concurrent duplicate zone creation when deal + position events race. */
 const autoCascadeInFlight = new Set<string>();
+// EA position tracking: detect new opens for auto-cascade, retain last-known
+// floating profit so settleZoneClosedPnl has data after the position disappears.
+const eaPrevPositionIds     = new Map<string, Set<string>>();
+const eaLastPositionProfits = new Map<string, Map<string, number>>();
 function isDuplicatePosition(accountId: string, positionId: string): boolean {
   const key = `${accountId}:${positionId}`;
   if (seenPositionIds.has(key)) return true;
@@ -2053,8 +2057,7 @@ function isZoneStillPlacing(zoneId: string): boolean {
 function scheduleCascadeReconcile(accountId: string, region: string, token: string): void {
   setTimeout(async () => {
     try {
-      if (!syncReady.has(accountId)) {
-        console.log(`[reconcile ${accountId}] skip orphan sweep — stream not synced yet`);
+      if (!syncReady.has(accountId) || (executionBackends.get(accountId) ?? "ea") !== "metaapi") {
         return;
       }
       const resp = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`, {
@@ -5467,6 +5470,8 @@ export function startZoneTpMonitor(): void {
       for (const [zoneId, st] of zoneStates.entries()) {
         if (st.status === "CLOSED") continue;
         if (!syncReady.has(st.accountId)) continue;
+        // EA reconciliation runs through handleEaStateSnapshot; skip MetaAPI path.
+        if ((executionBackends.get(st.accountId) ?? "ea") !== "metaapi") continue;
         const region = activeRegions.get(st.accountId) ?? knownAccounts.get(st.accountId)?.region ?? DEFAULT_REGION;
         const bucket = byAccount.get(st.accountId) ?? { region, zoneIds: [] };
         bucket.zoneIds.push(zoneId);
@@ -8308,8 +8313,45 @@ export async function handleEaStateSnapshot(
   accountId: string,
   positions: LivePosition[],
   orders: Array<{ id: string; comment?: string; magic?: number }>,
+  price?: { bid?: number; ask?: number; symbol?: string },
 ): Promise<void> {
   brokerSnapshotCache.set(accountId, { positions, orders, fetchedAt: Date.now() });
+
+  // Populate the tick store so priceForZoneEval and zone-action price guards work.
+  if (price?.bid && price?.ask) {
+    handleStreamingTick(accountId, price);
+  }
+
+  // Treat the first EA state push as "stream sync complete" so syncReady guards
+  // (auto-cascade, zone evaluation) behave the same as for MetaAPI accounts.
+  markStreamSyncReady(accountId, "positions");
+
+  // Track last-known floating profit per position for PnL settlement after close.
+  let profitMap = eaLastPositionProfits.get(accountId);
+  if (!profitMap) { profitMap = new Map(); eaLastPositionProfits.set(accountId, profitMap); }
+  for (const p of positions) profitMap.set(p.id, Number(p.profit ?? 0));
+
+  // Detect positions that appeared since the last snapshot.
+  // These are manual MT5 one-click opens — trigger auto-cascade so the server
+  // creates a zone and places the companion limit orders.
+  const prevIds    = eaPrevPositionIds.get(accountId) ?? new Set<string>();
+  const currentIds = new Set(positions.map((p) => p.id));
+  eaPrevPositionIds.set(accountId, currentIds);
+  for (const p of positions) {
+    if (!prevIds.has(p.id)) {
+      void triggerMt5OneClickAutoCascade(accountId, {
+        id: p.id,
+        type: p.type,
+        symbol: p.symbol ?? "XAUUSD",
+        openPrice: p.openPrice,
+        volume: p.volume,
+        comment: p.comment ?? "",
+        magic: p.magic,
+      }).catch((err: Error) =>
+        console.error(`[ea-state] auto-cascade posId=${p.id}:`, err.message),
+      );
+    }
+  }
 
   let token: string;
   try { token = getToken(); } catch { return; }

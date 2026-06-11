@@ -150,6 +150,7 @@ router.post("/state", async (req: Request, res: Response) => {
       comment?: string;
     }>;
     account?: { balance?: number; equity?: number; marginFree?: number };
+    price?: { symbol?: string; bid?: number; ask?: number };
     terminalTime?: string;
   };
 
@@ -188,7 +189,10 @@ router.post("/state", async (req: Request, res: Response) => {
   setEaState(accountId, positions, orders, accountInfo);
 
   // Feed through the existing zone-eval pipeline — same path as MetaApi streaming ticks.
-  await handleEaStateSnapshot(accountId, positions, orders);
+  const price = (body.price?.bid != null && body.price?.ask != null)
+    ? { bid: Number(body.price.bid), ask: Number(body.price.ask), symbol: body.price.symbol }
+    : undefined;
+  await handleEaStateSnapshot(accountId, positions, orders, price);
 
   res.json({ ok: true });
 });

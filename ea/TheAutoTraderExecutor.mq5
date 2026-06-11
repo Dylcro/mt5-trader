@@ -461,6 +461,11 @@ string BuildStateJson()
    double equity     = AccountInfoDouble(ACCOUNT_EQUITY);
    double margin_free = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
 
+   // Current bid/ask so the server can drive TP evaluation without MetaAPI.
+   string sym_chart = Symbol();
+   double bid = SymbolInfoDouble(sym_chart, SYMBOL_BID);
+   double ask = SymbolInfoDouble(sym_chart, SYMBOL_ASK);
+
    return "{"
           + "\"positions\":["  + pos_arr  + "]"
           + ",\"orders\":["    + ord_arr  + "]"
@@ -468,6 +473,11 @@ string BuildStateJson()
           + "\"balance\":"    + DoubleToString(balance,     2)
           + ",\"equity\":"    + DoubleToString(equity,      2)
           + ",\"marginFree\":" + DoubleToString(margin_free, 2)
+          + "}"
+          + ",\"price\":{"
+          + "\"symbol\":\"" + JEsc(sym_chart) + "\""
+          + ",\"bid\":"     + DoubleToString(bid, 5)
+          + ",\"ask\":"     + DoubleToString(ask, 5)
           + "}"
           + ",\"terminalTime\":\"" + FormatISO8601(TimeGMT()) + "\""
           + "}";
