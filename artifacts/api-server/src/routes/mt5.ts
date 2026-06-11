@@ -1,7 +1,6 @@
 import { randomUUID } from "crypto";
 import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
 import jwt from "jsonwebtoken";
-import { createRequire } from "module";
 import { db, pool, cascadeConfigTable, storedAccountsTable, cascadeHistoryTable, cascadeOrdersTable, cascadeZonesTable, zonePositionsTable, zoneOrdersTable, notificationPrefsTable, usersTable } from "@workspace/db";
 import { and, desc, eq, inArray, isNotNull, ne } from "drizzle-orm";
 import { JWT_SECRET } from "./auth";
@@ -9,18 +8,8 @@ import { getTradingStatus } from "../lib/platformFlags";
 import { logEvent } from "../logger";
 import { usdToTargetRate } from "../lib/usdFx.js";
 import { type ExecutionAdapter, NotReadyError } from "../lib/execution/types";
-import { MetaApiAdapter } from "../lib/execution/metaApiAdapter";
 import { EaAdapter } from "../lib/execution/eaAdapter";
 import { getEaState, getLastEaPollAt, reregisterEaTerminalAccount } from "../lib/eaState";
-// Force the CJS/Node build — the ESM entry in package.json is a browser-only bundle.
-// In dev (tsx/ESM) import.meta.url is the real file URL.
-// In production (esbuild CJS) build.ts injects a __importMetaUrl banner and
-// defines import.meta.url → __importMetaUrl so this line still resolves correctly.
-const _require = createRequire(import.meta.url);
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const _MetaApiCjs = _require("metaapi.cloud-sdk") as any;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const MetaApi: any = _MetaApiCjs.default ?? _MetaApiCjs;
 
 const router: IRouter = Router();
 
@@ -86,36 +75,7 @@ async function checkOwner(req: Request, res: Response, next: NextFunction): Prom
   }
 }
 
-// Admin-key-protected endpoint — registered BEFORE requireAuth so it does
-// not require a JWT (it has its own x-admin-key check). The handler is a
-// hoisted async function declared further down in this file.
-router.post("/mt5/admin/migrate-region", (req, res) => { void migrateRegionHandler(req, res); });
-
 router.use(requireAuth);
-
-// ── MetaAPI Streaming Manager ────────────────────────────────────────────────
-// Maintains one SDK streaming connection per account and stores incoming deal
-// events in a short-TTL ring buffer so the app can poll for them.
-
-interface DealEvent {
-  dealId: string;
-  positionId: string;
-  symbol: string;
-  type: string;       // "DEAL_TYPE_BUY" | "DEAL_TYPE_SELL"
-  entryType: string;  // "DEAL_ENTRY_IN" for new positions
-  openPrice: number;
-  volume: number;
-  comment?: string;
-  time: number;       // ms epoch when we received it
-  autoCascade?: boolean;     // true if auto-cascade placed limits for this deal
-  autoCascadeCount?: number; // number of limit orders placed by auto-cascade
-}
-
-const dealStore = new Map<string, DealEvent[]>(); // accountId → recent deals
-const activeStreams = new Set<string>();           // accountIds with live connections
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const activeConnections = new Map<string, any>(); // accountId → StreamingMetaApiConnectionInstance (for SDK trades)
-const activeRegions = new Map<string, string>();  // accountId → region (used for REST fallback in auto-cascade)
 
 // ── In-memory account registry ────────────────────────────────────────────────
 // Mirrors the stored_accounts table in memory. Seeded at startup from DB, then
@@ -124,9 +84,7 @@ const activeRegions = new Map<string, string>();  // accountId → region (used 
 interface KnownAccount { accountId: string; userId?: string; region: string; }
 const knownAccounts = new Map<string, KnownAccount>(); // accountId → KnownAccount
 // Mirrors execution_backend column — populated at startup and on watchdog refresh.
-// Defaults to 'ea' when absent so unknown accounts never accidentally open MetaApi streams.
-const executionBackends = new Map<string, string>(); // accountId → 'ea' | 'metaapi'
-let sdkInstance: InstanceType<typeof MetaApi> | null = null;
+const executionBackends = new Map<string, string>(); // accountId → always 'ea'
 
 /** Idempotent — safe when drizzle push was skipped (RF history columns). */
 let cascadeRfColumnsReady: Promise<void> | null = null;
@@ -586,23 +544,8 @@ export function evaluateMt5AutoCascadeSkip(input: Mt5AutoCascadeSkipInput): stri
   return null;
 }
 
-function getSdk(token: string): InstanceType<typeof MetaApi> {
-  if (!sdkInstance) sdkInstance = new MetaApi(token);
-  return sdkInstance;
-}
 
-function storeDealEvent(accountId: string, evt: DealEvent) {
-  const cutoff = Date.now() - 60_000;
-  const arr = (dealStore.get(accountId) ?? []).filter(e => e.time > cutoff);
-  // Dedup: MetaAPI may fire the same deal from multiple streaming instances
-  if (arr.some(e => e.dealId === evt.dealId)) return;
-  arr.push(evt);
-  dealStore.set(accountId, arr.slice(-100));
-}
 
-function getEventsSince(accountId: string, since: number): DealEvent[] {
-  return (dealStore.get(accountId) ?? []).filter(e => e.time > since);
-}
 
 // Tracks accountIds where an app-initiated market order is currently in-flight.
 // The deal event from MetaAPI's stream arrives before the SDK trade call resolves,
@@ -648,23 +591,7 @@ async function loadCascadeOrders(accountId: string): Promise<void> {
   }
 }
 
-// Deduplication: MetaAPI connects to two server nodes (london-a and london-b)
-// so every deal event arrives twice. Track recently seen deal IDs and drop duplicates.
-// Cap raised to 5000 — sync replay can deliver hundreds of historical deals and a
-// 500-entry cap caused early entries to be evicted, allowing double-cascades on reconnect.
-const seenDealIds = new Set<string>();
-function isDuplicate(dealId: string): boolean {
-  if (seenDealIds.has(dealId)) return true;
-  seenDealIds.add(dealId);
-  // Prevent unbounded growth — keep at most 5000 entries
-  if (seenDealIds.size > 5000) {
-    const first = seenDealIds.values().next().value;
-    if (first !== undefined) seenDealIds.delete(first);
-  }
-  return false;
-}
-
-// MetaAPI dual-node dedup for onPositionAdded (same pattern as seenDealIds).
+// Dedup for position tracking:
 const seenPositionIds = new Set<string>();
 /** Prevents concurrent duplicate zone creation when deal + position events race. */
 const autoCascadeInFlight = new Set<string>();
@@ -702,12 +629,6 @@ function markStreamSyncReady(accountId: string, source: "deals" | "positions"): 
   if (syncReady.has(accountId)) return;
   syncReady.add(accountId);
   syncReadyAt.set(accountId, Date.now());
-  skipLogged.delete(accountId);
-  const pending = recoveryTimers.get(accountId);
-  if (pending) {
-    clearTimeout(pending);
-    recoveryTimers.delete(accountId);
-  }
   console.log(`[stream ${accountId}] ${source} sync complete`);
 }
 
@@ -1056,33 +977,10 @@ function recordCascade(accountId: string, price: number): void {
 // onDealAdded fires for HISTORICAL deals during sync replay — we must NOT
 // auto-cascade those. Only deals that arrive after onSynchronized are live.
 const syncReady = new Set<string>();
-// Per-stream-lifetime recovery timer. Must be cleared on stopStreaming so a
-// timer scheduled by an old stream cannot fire against a future fresh stream
-// (which would tear down a perfectly healthy new connection).
-const recoveryTimers = new Map<string, NodeJS.Timeout>();
 // Records the server-side ms timestamp when each account's sync completed.
-// Used to filter out historical deal events that the SDK delivers AFTER
-// onDealsSynchronized fires (a known SDK buffering quirk).
 const syncReadyAt = new Map<string, number>();
-// Tracks whether we've already logged a Layer-1 SKIP for this account's
-// current replay window. Reset on disconnect and on sync-arm so we get
-// one diagnostic line per replay, not per historical deal.
-const skipLogged = new Set<string>();
 
-// Server-side filter for orders that streaming has confirmed are completed
-// (cancelled or filled). MetaAPI REST is eventually consistent and can lag
-// by minutes — this map lets the /orders endpoint serve an accurate list
-// immediately after a streaming onPendingOrderCompleted event fires.
-// Entries expire after 5 minutes (order IDs are not reused).
-const completedOrderIds = new Map<string, Set<string>>(); // accountId → Set<orderId>
 
-function markOrderCompleted(accountId: string, orderId: string): void {
-  if (!orderId) return;
-  if (!completedOrderIds.has(accountId)) completedOrderIds.set(accountId, new Set());
-  completedOrderIds.get(accountId)!.add(orderId);
-  // Expire after 5 minutes — MetaAPI REST will have caught up by then.
-  setTimeout(() => completedOrderIds.get(accountId)?.delete(orderId), 5 * 60 * 1000);
-}
 
 // Per-zone throttle for streaming-driven evaluateZone calls. Ticks can arrive
 // many times per second; we cap each zone at one evaluation per
@@ -1105,8 +1003,6 @@ const brokerSnapshotInflight = new Map<string, Promise<{
 }>>();
 
 async function getBrokerSnapshot(
-  token: string,
-  region: string,
   accountId: string,
   opts?: { fresh?: boolean },
 ): Promise<{
@@ -1122,10 +1018,23 @@ async function getBrokerSnapshot(
     if (pending) return pending;
   }
   const load = (async () => {
-    const [positions, orders] = await Promise.all([
-      fetchOpenPositionsUncached(token, region, accountId),
-      fetchLivePendingOrdersUncached(token, region, accountId),
-    ]);
+    const ea = getEaState(accountId);
+    const positions: LivePosition[] = (ea?.positions ?? []).map((p) => ({
+      id: p.id,
+      symbol: p.symbol,
+      type: p.type === "buy" ? "POSITION_TYPE_BUY" : "POSITION_TYPE_SELL",
+      volume: p.volume,
+      openPrice: p.openPrice,
+      profit: p.profit ?? 0,
+      comment: p.comment ?? "",
+      magic: p.magic,
+      stopLoss: p.stopLoss ?? 0,
+    }));
+    const orders = (ea?.orders ?? []).map((o: { id: string; comment?: string; magic?: number }) => ({
+      id: o.id,
+      comment: o.comment ?? "",
+      magic: o.magic,
+    }));
     brokerSnapshotCache.set(accountId, { positions, orders, fetchedAt: Date.now() });
     brokerSnapshotInflight.delete(accountId);
     return { positions, orders };
@@ -1163,8 +1072,6 @@ type BrokerSnap = {
 /** One tick → one broker snapshot → evaluate all zones on the account (read-only snap). */
 async function processStreamingTickBatch(accountId: string): Promise<void> {
   if (!isMarketOpen()) return;
-  let token: string;
-  try { token = getToken(); } catch { return; }
 
   const zones: string[] = [];
   for (const [zoneId, st] of zoneStates.entries()) {
@@ -1173,10 +1080,9 @@ async function processStreamingTickBatch(accountId: string): Promise<void> {
   }
   if (zones.length === 0) return;
 
-  const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
   let snap: BrokerSnap;
   try {
-    snap = await getBrokerSnapshot(token, region, accountId);
+    snap = await getBrokerSnapshot(accountId);
   } catch (err) {
     console.warn(`[tick-batch] snapshot failed for ${accountId}:`, (err as Error).message);
     return;
@@ -1188,7 +1094,7 @@ async function processStreamingTickBatch(accountId: string): Promise<void> {
     if (now - last < STREAMING_EVAL_MIN_INTERVAL_MS) continue;
     lastStreamingEvalAt.set(zoneId, now);
     try {
-      await evaluateZone(zoneId, token, { brokerSnap: snap });
+      await evaluateZone(zoneId, { brokerSnap: snap });
     } catch (err) {
       console.error(`[eval] ${zoneId}:`, (err as Error).message);
     }
@@ -1229,546 +1135,47 @@ function protectStreamListener(
 }
 
 async function closeEmptyZonesAfterPositionRemoved(accountId: string): Promise<void> {
-  let token: string;
-  try { token = getToken(); } catch { return; }
-  const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
   invalidateBrokerSnapshot(accountId);
-  const live = await fetchOpenPositions(token, region, accountId, { fresh: true });
-  const pending = await fetchLivePendingOrders(token, region, accountId);
+  const snap = await getBrokerSnapshot(accountId, { fresh: true });
   for (const [zoneId, st] of zoneStates.entries()) {
     if (st.accountId !== accountId || st.status === "CLOSED") continue;
-    const remaining = live.filter((p) => positionBelongsToZone(p, zoneId));
-    const pendingForZone = pending.filter((o) => orderBelongsToZone(o, accountId, zoneId));
+    const remaining = snap.positions.filter((p) => positionBelongsToZone(p, zoneId));
+    const pendingForZone = snap.orders.filter((o) => orderBelongsToZone(o, accountId, zoneId));
     if (remaining.length === 0 && pendingForZone.length === 0) {
       console.log(`[position-removed] ${zoneId} empty — closing`);
-      await reconcileZoneFromBroker(accountId, zoneId, token, region, "position_removed");
+      await evaluateZone(zoneId);
     }
   }
 }
 
-function makeDealListener(accountId: string) {
-  // The MetaAPI SDK calls many methods on every registered listener and throws
-  // if any of them is missing — aborting the entire synchronization packet.
-  // Rather than enumerating every possible method name, we use a Proxy to
-  // silently no-op any method the SDK calls that we haven't explicitly defined.
-  const handler = {
-    onDisconnected: protectStreamListener("onDisconnected", async (_instanceIndex: string) => {
-      syncReady.delete(accountId); // reset — next reconnect must re-sync before cascading
-      syncReadyAt.delete(accountId);
-      skipLogged.delete(accountId);
-      activeStreams.delete(accountId);
-      lastEventAt.delete(accountId); // clean disconnect — don't leave a stale entry
-      // NOTE: intentionally NOT clearing activeConnections here.
-      // The old connection's terminalState (in-memory cache) stays intact
-      // across brief disconnects — positions synced before the drop are
-      // still visible. This lets the safety net keep reading positions
-      // during the full reconnect+resync window (~54 s) instead of going
-      // blind and missing trades placed during that gap.
-      // startStreaming() will replace activeConnections with the new conn.
-      logEvent("stream.disconnect", { accountId });
-      // Don't wait for the 10 s watchdog — reconnect immediately (3 s delay
-      // to avoid a tight loop if the broker endpoint is briefly down).
-      setTimeout(() => {
-        if (activeStreams.has(accountId)) return; // already reconnected
-        const { region } = knownAccounts.get(accountId) ?? { region: DEFAULT_REGION };
-        try {
-          const tok = getToken();
-          void startStreaming(tok, accountId, region);
-        } catch {
-          // getToken() can throw if env var missing — watchdog will retry
-        }
-      }, 3_000);
-    }),
-    // onDealsSynchronized fires after all historical deals have been replayed.
-    onDealsSynchronized: protectStreamListener("onDealsSynchronized", async (_instanceIndex: string, _synchronizationId: string) => {
-      lastEventAt.set(accountId, Date.now());
-      markStreamSyncReady(accountId, "deals");
-    }),
-    // Positions can finish syncing before deals — arm auto-cascade without waiting.
-    onPositionsSynchronized: protectStreamListener("onPositionsSynchronized", async (_instanceIndex: string, _synchronizationId: string) => {
-      lastEventAt.set(accountId, Date.now());
-      markStreamSyncReady(accountId, "positions");
-    }),
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    onDealAdded: protectStreamListener("onDealAdded", async (_instanceIndex: string, deal: any) => {
-      lastEventAt.set(accountId, Date.now());
-      // Zone cleanup: an exit deal may be a partial or full close — the helper
-      // re-checks live positions via REST before marking the row CLOSED.
-      if (deal?.entryType === "DEAL_ENTRY_OUT") {
-        const posId = String(deal.positionId ?? "");
-        if (posId) {
-          invalidateBrokerSnapshot(accountId);
-          void markZonePositionClosed(accountId, posId, deal);
-        }
-        broadcastToAccount(accountId, "deal", { type: "position_changed" });
-        // MetaAPI REST has eventual consistency — the first broadcast above races
-        // the cache. A second broadcast ~1500ms later ensures the client re-fetches
-        // after the REST endpoint has settled, so closed positions disappear without
-        // needing a manual pull-to-refresh.
-        setTimeout(() => broadcastToAccount(accountId, "deal", { type: "position_changed" }), 1500);
-        return;
-      }
-      if (deal?.entryType !== "DEAL_ENTRY_IN") return;
-      if (!deal?.symbol) return;
-      if (isDuplicate(String(deal.id ?? ""))) return;
-      // Zone-aware limit-fill association: a tracked cascade limit just filled.
-      // Record the resulting positionId in zone_positions so the monitor can manage it.
-      // A limit order just filled — mark it completed so /orders filters it out
-      // of MetaAPI REST immediately (REST cache can lag significantly).
-      if (deal.orderId) markOrderCompleted(accountId, String(deal.orderId));
-      if (deal.orderId && cascadePlacedOrderIds.has(String(deal.orderId))) {
-        let zoneId = getZoneLimitOrder(accountId, String(deal.orderId));
-        // Backstop when in-memory mapping is missing: (1) DB by orderId,
-        // (2) deal comment Cascade|zoneId|leg/total. No direction/pending guess —
-        // that steals fills across parallel same-direction zones.
-        if (!zoneId && deal.positionId) {
-          try {
-            const dbRow = await db.select({ zoneId: zoneOrdersTable.zoneId })
-              .from(zoneOrdersTable)
-              .where(eq(zoneOrdersTable.orderId, String(deal.orderId)))
-              .limit(1);
-            if (dbRow[0]?.zoneId) {
-              zoneId = dbRow[0].zoneId;
-              setZoneLimitOrder(accountId, String(deal.orderId), zoneId);
-              console.log(`[zone ${zoneId}] backstop-recovered from DB orderId=${deal.orderId} posId=${deal.positionId}`);
-            }
-          } catch (e) {
-            console.warn(`[stream ${accountId}] backstop DB lookup failed for orderId=${deal.orderId}:`, (e as Error).message);
-          }
-        }
-        if (!zoneId && deal.positionId) {
-          const commentZone = parseZoneIdFromComment(String(deal.comment ?? ""));
-          if (commentZone) {
-            zoneId = commentZone;
-            setZoneLimitOrder(accountId, String(deal.orderId), zoneId);
-            console.log(`[zone ${zoneId}] backstop-recovered from deal comment orderId=${deal.orderId}`);
-          }
-        }
-        if (zoneId && deal.positionId) {
-          invalidateBrokerSnapshot(accountId);
-          void recordZonePositionFill(
-            zoneId, String(deal.positionId),
-            Number(deal.price ?? deal.openPrice ?? 0),
-            Number(deal.volume ?? 0),
-          ).then(() => {
-            lastStreamingEvalAt.delete(zoneId);
-            try {
-              const tkn = getToken();
-              void evaluateZone(zoneId, tkn);
-            } catch { /* token unavailable */ }
-          });
-        } else if (deal.positionId) {
-          console.warn(`[stream ${accountId}] cascade fill orderId=${deal.orderId} posId=${deal.positionId} could not be linked to any active zone — position will be orphaned`);
-        }
-        // Always push a position-changed event so the client refreshes immediately
-        // after a cascade limit fills, regardless of zone linkage outcome.
-        broadcastToAccount(accountId, "deal", { type: "position_changed" });
-        return;
-      }
-      const price = deal.price || deal.openPrice || 0;
-      const evt: DealEvent = {
-        dealId:     deal.id         ?? String(Date.now()),
-        positionId: deal.positionId ?? "",
-        symbol:     deal.symbol,
-        type:       deal.type       ?? "",
-        entryType:  deal.entryType,
-        openPrice:  price,
-        volume:     deal.volume     ?? 0,
-        comment:    deal.comment,
-        time:       Date.now(),
-      };
-      console.log(`[stream ${accountId}] deal dealId=${evt.dealId} posId=${evt.positionId} type=${evt.type} sym=${evt.symbol} price=${evt.openPrice} comment="${evt.comment ?? ""}"`);
-      storeDealEvent(accountId, evt);
-      broadcastToAccount(accountId, "deal", { type: "position_changed" });
-      // MT5 one-click trades reliably arrive as onDealAdded; onPositionAdded is
-      // a backup — both paths share triggerMt5OneClickAutoCascade + dedup guards.
-      if (isMt5ManualMarketDeal(deal as Record<string, unknown>)) {
-        void triggerMt5OneClickAutoCascade(accountId, positionPayloadFromDeal(deal)).catch((err) =>
-          console.error(`[auto-cascade] onDealAdded failed accountId=${accountId}:`, (err as Error).message),
-        );
-      }
-    }),
-    // Streaming tick handlers — drive evaluateZone off real broker ticks so
-    // TPs fire within ~100ms of the level being touched (vs the 3 s timer's
-    // worst-case 3 s lag). MetaAPI calls one or the other depending on SDK
-    // version: `onSymbolPriceUpdated` (singular) on older builds,
-    // `onSymbolPricesUpdated` (plural, batched) on newer.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    onSymbolPriceUpdated: protectStreamListener("onSymbolPriceUpdated", async (_instanceIndex: string, price: any) => {
-      handleStreamingTick(accountId, price);
-    }),
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    onSymbolPricesUpdated: protectStreamListener("onSymbolPricesUpdated", async (_instanceIndex: string, prices: any[]) => {
-      if (!Array.isArray(prices)) return;
-      for (const p of prices) handleStreamingTick(accountId, p);
-    }),
-    // Pending-order lifecycle — broadcast so the client can update its list
-    // without waiting for a deal event or the next poll cycle.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    onPendingOrderAdded: protectStreamListener("onPendingOrderAdded", async (_instanceIndex: string, _order: any) => {
-      lastEventAt.set(accountId, Date.now());
-      broadcastToAccount(accountId, "pending_order", {});
-    }),
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    onPendingOrderUpdated: protectStreamListener("onPendingOrderUpdated", async (_instanceIndex: string, _order: any) => {
-      lastEventAt.set(accountId, Date.now());
-      broadcastToAccount(accountId, "pending_order", {});
-    }),
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    onOrderCompleted: protectStreamListener("onOrderCompleted", async (_instanceIndex: string, order: any) => {
-      lastEventAt.set(accountId, Date.now());
-      const oid = String(order?.id ?? order?._id ?? "");
-      markOrderCompleted(accountId, oid);
-      broadcastToAccount(accountId, "pending_order", {});
-    }),
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    onPendingOrderCompleted: protectStreamListener("onPendingOrderCompleted", async (_instanceIndex: string, order: any) => {
-      lastEventAt.set(accountId, Date.now());
-      // Mark the order completed so the /orders endpoint can filter it out of
-      // the MetaAPI REST response immediately (MetaAPI REST can lag minutes).
-      const oid = String(order?.id ?? order?._id ?? "");
-      markOrderCompleted(accountId, oid);
-      broadcastToAccount(accountId, "pending_order", {});
-    }),
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    onPositionRemoved: protectStreamListener("onPositionRemoved", async (_instanceIndex: string, position: any) => {
-      lastEventAt.set(accountId, Date.now());
-      const posId = String(position?.id ?? position?.positionId ?? "");
-      if (!posId) return;
-      invalidateBrokerSnapshot(accountId);
-      void markZonePositionClosed(accountId, posId, position);
-      await closeEmptyZonesAfterPositionRemoved(accountId);
-      broadcastToAccount(accountId, "deal", { type: "position_changed" });
-    }),
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    onPositionAdded: protectStreamListener("onPositionAdded", async (_instanceIndex: string, position: any) => {
-      lastEventAt.set(accountId, Date.now());
-      await triggerMt5OneClickAutoCascade(accountId, position);
-    }),
-  };
-
-  // Proxy: any property access that isn't `onDealAdded` returns a silent no-op.
-  return new Proxy(handler, {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    get(target: any, prop: string) {
-      if (prop in target) return target[prop];
-      return protectStreamListener(prop, async () => {});
-    },
-  });
-}
 
 // Stop an active stream, close the WebSocket, and clean up all in-memory state.
 // Called when a user connects a different MT5 account so the old one stops cascading.
-async function stopStreaming(accountId: string): Promise<void> {
-  const conn = activeConnections.get(accountId);
-  if (conn) {
-    try { await conn.close(); } catch { /* ignore close errors */ }
-  }
-  activeStreams.delete(accountId);
-  activeConnections.delete(accountId);
-  activeRegions.delete(accountId);
-  syncReady.delete(accountId);
-  syncReadyAt.delete(accountId);
-  lastEventAt.delete(accountId);
-  // Do NOT delete cascadeConfigs here — config is persistent settings, not stream state.
-  const pending = recoveryTimers.get(accountId);
-  if (pending) {
-    clearTimeout(pending);
-    recoveryTimers.delete(accountId);
-  }
-  console.log(`[stream ${accountId}] stopped and cleaned up`);
-}
 
 /** Admin: drop broker stream and remove stored link for a user. */
 export async function disconnectUserMt5(userId: string): Promise<number> {
   const rows = await db.select().from(storedAccountsTable).where(eq(storedAccountsTable.userId, userId));
   for (const row of rows) {
-    await stopStreaming(row.accountId);
     await db.delete(storedAccountsTable).where(eq(storedAccountsTable.accountId, row.accountId));
   }
   userAccountCache.delete(userId);
   return rows.length;
 }
 
-async function startStreaming(token: string, accountId: string, region: string = DEFAULT_REGION, userId?: string): Promise<void> {
-  // EA accounts don't use MetaApi streaming — the EA terminal pushes state directly.
-  if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
-    if (userId) knownAccounts.set(accountId, { accountId, userId, region });
-    return;
-  }
-  if (activeStreams.has(accountId)) return;
-  activeStreams.add(accountId);
-  // Load persisted cascade history BEFORE sync so post-sync catch-up
-  // sees already-cascaded positions and skips re-cascading them.
-  await loadCascadeHistory(accountId);
-  await loadCascadeOrders(accountId);
-  try {
-    const sdk = getSdk(token);
-    const account = await sdk.metatraderAccountApi.getAccount(accountId);
-    // If MetaAPI auto-undeployed the account (common after inactivity), re-deploy
-    // before attempting to open a streaming connection — otherwise the subscribe
-    // call silently fails and no deal events are ever received.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const acctState: string = (account as any).state ?? "";
-    if (acctState === "UNDEPLOYED") {
-      console.warn(`[stream ${accountId}] account is UNDEPLOYED — re-deploying before connect...`);
-      await deployAccount(token, accountId);
-      // Give MetaAPI up to 30 s to bring the account online before we try to stream
-      for (let i = 0; i < 6; i++) {
-        await new Promise(r => setTimeout(r, 5000));
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const refreshed = await sdk.metatraderAccountApi.getAccount(accountId) as any;
-        if (refreshed.state === "DEPLOYED" || refreshed.connectionStatus === "CONNECTED") break;
-        console.log(`[stream ${accountId}] waiting for deploy... (${(i + 1) * 5}s)`);
-      }
-    }
-    // Skip historical deal/order replay entirely. We never read history —
-    // only react to live `onDealAdded` events for auto-cascade. Accounts
-    // with large histories (like Gethin's) were taking 90-120 s to sync,
-    // causing subscribe timeouts and a permanent reconnect loop on the
-    // london region. Starting from "now" makes sync near-instant.
-    const conn = account.getStreamingConnection(undefined, new Date());
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (conn as any).addSynchronizationListener(makeDealListener(accountId));
-    // Hard cap: if connect() hangs (MetaAPI server-side issue), abort after
-    // 30 s so the watchdog can retry rather than leaving the account dark for
-    // 175 s+. The SDK's own internal timeout can be much longer.
-    await Promise.race([
-      conn.connect(),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("connect() timed out after 30 s")), 30_000),
-      ),
-    ]);
-    // Store connection so the trade endpoint can reuse this WebSocket
-    // instead of making new HTTP calls to MetaAPI REST for every order.
-    activeConnections.set(accountId, conn);
-    activeRegions.set(accountId, region);
-    // Keep the in-memory registry current so the watchdog/safety-net can work
-    // even when the DB is temporarily unavailable.
-    knownAccounts.set(accountId, { accountId, userId, region });
-    logEvent("stream.connect", { accountId, region });
-    // Sync-stuck recovery: if `onDealsSynchronized` hasn't fired within 150s,
-    // the account's sync session on MetaAPI is wedged (the "synchronization
-    // with this id is already running" error). Force-arming locally doesn't
-    // help because no deal events ever arrive — the only cure is to undeploy
-    // and redeploy the account on MetaAPI's side, which wipes the stuck
-    // session. 150s is generous — successful syncs land in 25-90s; firing
-    // earlier just tears down a connection that was about to succeed and
-    // creates a churn loop. Recovery is rate-limited to avoid loops.
-    // Capture this stream's specific connection instance so the timer can
-    // confirm it's still firing for the SAME stream — never against a
-    // future fresh stream born of a reconnect.
-    const myConn = conn;
-    const timer = setTimeout(() => {
-      recoveryTimers.delete(accountId);
-      // Bail if: sync completed, no connection, or this is a stale timer
-      // whose stream was already replaced by a newer reconnect.
-      if (syncReady.has(accountId)) return;
-      const current = activeConnections.get(accountId);
-      if (!current || current !== myConn) return;
-      console.warn(`[stream ${accountId}] onDealsSynchronized never fired after 240s — triggering sync recovery`);
-      void recoverStuckSync(token, accountId);
-    }, 240_000);
-    recoveryTimers.set(accountId, timer);
-    // Persist credentials so the server can auto-reconnect after a restart
-    // without waiting for the app to call /connect again.
-    // userId is included when available so /my-account lookups work reliably.
-    try {
-      const known = knownAccounts.get(accountId);
-      await upsertStoredAccount({
-        accountId,
-        region,
-        userId: userId ?? known?.userId,
-        mt5Login: null,
-        mt5Server: null,
-      });
-      if (userId) userAccountCache.set(userId, accountId);
-      console.log(`[stream ${accountId}] credentials saved to DB for auto-reconnect`);
-    } catch (dbErr) {
-      console.warn(`[stream ${accountId}] failed to persist account to DB:`, (dbErr as Error).message);
-    }
-  } catch (err) {
-    activeStreams.delete(accountId); // allow retry on next poll
-    activeConnections.delete(accountId);
-    const msg = (err as Error).message ?? "";
-    // MetaAPI auto-undeploys accounts during inactivity. Detect the error and
-    // re-deploy automatically so the stream resumes without user intervention.
-    if (msg.includes("no accounts deployed") || msg.includes("deploy an account first")) {
-      console.warn(`[stream ${accountId}] account undeployed — triggering re-deploy...`);
-      try {
-        await deployAccount(token, accountId);
-        console.log(`[stream ${accountId}] re-deploy requested — watchdog will retry stream in 30 s`);
-      } catch (deployErr) {
-        console.error(`[stream ${accountId}] re-deploy failed:`, (deployErr as Error).message);
-      }
-    } else if (/account with id .* not found/i.test(msg) || msg.includes("NotFoundError")) {
-      // Permanent: account was deleted on MetaAPI's side. Without removing it
-      // from stored_accounts the watchdog reconnects every 10s forever,
-      // calling loadCascadeHistory each time — pure noise + load. Drop it
-      // so we stop trying.
-      console.warn(`[stream ${accountId}] account no longer exists on MetaAPI — removing from stored_accounts to stop retry loop`);
-      knownAccounts.delete(accountId);
-      try {
-        await db.delete(storedAccountsTable).where(eq(storedAccountsTable.accountId, accountId));
-      } catch (delErr) {
-        console.warn(`[stream ${accountId}] failed to delete stored_account:`, (delErr as Error).message);
-      }
-    } else {
-      console.error(`[stream ${accountId}] streaming start failed:`, msg);
-    }
-  }
-}
 
 // ── Auto-connect & watchdog ───────────────────────────────────────────────────
 // On server startup, reconnect all previously-seen accounts from the DB so
 // auto-cascade works even when the app is closed / phone is off.
 // The watchdog fires every 60 s and retries any account that lost its stream.
 
-export async function startAutoConnect(): Promise<void> {
-  try {
-    const token = getToken();
-    const sdk = getSdk(token);
-    const rows = await db.select().from(storedAccountsTable);
-    if (rows.length === 0) {
-      console.log("[startup] no stored accounts — waiting for first app connect");
-      return;
-    }
-    for (const account of rows) {
-      try {
-        console.log(`[startup] restoring ${account.accountId}`);
-        executionBackends.set(account.accountId, account.executionBackend);
-        const region = normalizeRegion(account.region);
-        if (account.userId) {
-          knownAccounts.set(account.accountId, {
-            accountId: account.accountId,
-            userId: account.userId,
-            region,
-          });
-        }
-        // EA accounts don't need a MetaApi connection — skip entirely.
-        if (account.executionBackend === "ea") {
-          console.log(`[startup] ${account.accountId} is ea backend — registered without MetaApi connection`);
-          continue;
-        }
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        let metaAccount: any | null = null;
-        let definitivelyGone = false;
-        try {
-          metaAccount = await sdk.metatraderAccountApi.getAccount(account.accountId);
-        } catch (e) {
-          const msg = String((e as { message?: string }).message ?? "").toLowerCase();
-          const httpStatus = (e as { status?: number }).status;
-          // Only evict on a definitive "account doesn't exist" response.
-          // Any transient error (network blip, rate limit, cold-start timeout)
-          // must NOT delete the stored account — that orphans every zone created
-          // under this accountId and causes "zone not found" on all actions.
-          definitivelyGone = httpStatus === 404 || msg.includes("not found");
-          if (!definitivelyGone) {
-            console.warn(`[startup] getAccount ${account.accountId} transient error — skipping without eviction:`, msg);
-            continue;
-          }
-        }
-        if (!metaAccount || definitivelyGone) {
-          if (definitivelyGone) {
-            await db.delete(storedAccountsTable)
-              .where(eq(storedAccountsTable.accountId, account.accountId));
-            knownAccounts.delete(account.accountId);
-            console.log(`[startup] evicted definitively-gone account ${account.accountId}`);
-          }
-          continue;
-        }
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        await (metaAccount as any).waitConnected(60000).catch(() => null);
-        void startStreaming(token, account.accountId, region, account.userId ?? undefined);
-        console.log(`[startup] restored ${account.accountId}`);
-      } catch (err) {
-        console.error(`[startup] failed to restore ${account.accountId}:`, err);
-      }
-    }
-  } catch (err) {
-    console.error("[auto-connect] failed:", (err as Error).message);
-  }
-}
 
-export function startConnectionWatchdog(): void {
-  const INTERVAL_MS = 10_000;
-  setInterval(async () => {
-    try {
-      const token = getToken();
-      // Try to refresh the in-memory registry from DB. If DB is unavailable,
-      // fall back to the existing cache — never skip reconnects due to a DB blip.
-      let accounts: KnownAccount[];
-      try {
-        const rows = await db
-          .select()
-          .from(storedAccountsTable)
-          .where(isNotNull(storedAccountsTable.userId));
-        // Refresh cache with latest DB state while we have it.
-        for (const { accountId, userId, region, executionBackend } of rows) {
-          knownAccounts.set(accountId, { accountId, userId: userId ?? undefined, region });
-          executionBackends.set(accountId, executionBackend);
-        }
-        accounts = rows.map(r => ({ accountId: r.accountId, userId: r.userId ?? undefined, region: r.region }));
-      } catch {
-        accounts = Array.from(knownAccounts.values());
-        if (accounts.length > 0) {
-          console.log(`[watchdog] DB unavailable — using in-memory cache (${accounts.length} accounts)`);
-        }
-      }
-      for (const { accountId, region } of accounts) {
-        if (executionBackends.get(accountId) === "ea") continue;
-        if (!activeStreams.has(accountId)) {
-          console.log(`[watchdog] ${accountId} not streaming — reconnecting`);
-          void startStreaming(token, accountId, region);
-        }
-      }
-    } catch (err) {
-      console.warn("[watchdog] error:", (err as Error).message);
-    }
-  }, INTERVAL_MS);
-  console.log("[watchdog] connection watchdog started (30 s interval)");
-}
 
 
 // ── SDK connection-based trade execution ─────────────────────────────────────
 // Uses the already-open streaming WebSocket instead of making new HTTP requests
 // to MetaAPI REST for every order. Falls back to REST if connection unavailable.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function tradeViaConnection(conn: any, body: Record<string, unknown>): Promise<{
-  numericCode: number; message?: string; orderId?: string; positionId?: string;
-}> {
-  const { actionType, symbol, volume, stopLoss, takeProfit, openPrice, comment, orderId } = body;
-  const opts = { comment: comment as string | undefined };
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let resp: any;
-  switch (actionType) {
-    case "ORDER_TYPE_BUY":
-      resp = await conn.createMarketBuyOrder(symbol, volume, stopLoss ?? undefined, takeProfit ?? undefined, opts);
-      break;
-    case "ORDER_TYPE_SELL":
-      resp = await conn.createMarketSellOrder(symbol, volume, stopLoss ?? undefined, takeProfit ?? undefined, opts);
-      break;
-    case "ORDER_TYPE_BUY_LIMIT":
-      resp = await conn.createLimitBuyOrder(symbol, volume, openPrice, stopLoss ?? undefined, takeProfit ?? undefined, opts);
-      break;
-    case "ORDER_TYPE_SELL_LIMIT":
-      resp = await conn.createLimitSellOrder(symbol, volume, openPrice, stopLoss ?? undefined, takeProfit ?? undefined, opts);
-      break;
-    case "ORDER_CANCEL":
-      resp = await conn.cancelOrder(orderId as string);
-      break;
-    default:
-      throw new Error(`Unknown actionType: ${String(actionType)}`);
-  }
-  return { numericCode: resp?.numericCode ?? 0, message: resp?.message, orderId: resp?.orderId, positionId: resp?.positionId };
-}
 
-function isPricePassedError(code: number, message?: string): boolean {
-  const msg = (message ?? "").toLowerCase();
-  return code === 10006 || code === 10014 || code === 10020 || code === 10021
-    || msg.includes("invalid") || msg.includes("price")
-    || msg.includes("off quotes") || msg.includes("trade disabled");
-}
 
 type TradeExecResult = {
   code: number;
@@ -1776,55 +1183,6 @@ type TradeExecResult = {
   httpStatus: number;
 };
 
-async function executeTradeRequest(
-  conn: unknown | undefined,
-  region: string,
-  accountId: string,
-  token: string,
-  body: Record<string, unknown>,
-): Promise<TradeExecResult> {
-  const runOnce = async (reqBody: Record<string, unknown>): Promise<TradeExecResult> => {
-    let code: number;
-    let data: TradeExecResult["data"];
-    let httpStatus = 200;
-    if (conn) {
-      try {
-        const sdkResp = await tradeViaConnection(conn, reqBody);
-        code = sdkResp.numericCode;
-        data = sdkResp;
-      } catch (sdkErr) {
-        const tradeRes = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
-          method: "POST", headers: authHeaders(token), body: JSON.stringify(reqBody),
-        });
-        httpStatus = tradeRes.ok ? 200 : tradeRes.status;
-        data = await tradeRes.json() as TradeExecResult["data"];
-        code = data.numericCode ?? 0;
-      }
-    } else {
-      const tradeRes = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
-        method: "POST", headers: authHeaders(token), body: JSON.stringify(reqBody),
-      });
-      httpStatus = tradeRes.ok ? 200 : tradeRes.status;
-      data = await tradeRes.json() as TradeExecResult["data"];
-      code = data.numericCode ?? 0;
-    }
-    return { code, data, httpStatus };
-  };
-
-  const actionType = String(body.actionType ?? "");
-  const isLimit = actionType.endsWith("_LIMIT");
-  let result = await runOnce(body);
-  if (!TRADE_SUCCESS_CODES.has(result.code) && isLimit && isPricePassedError(result.code, result.data.message)) {
-    const marketType = actionType === "ORDER_TYPE_BUY_LIMIT" ? "ORDER_TYPE_BUY"
-      : actionType === "ORDER_TYPE_SELL_LIMIT" ? "ORDER_TYPE_SELL" : null;
-    if (marketType) {
-      console.log(`[cascade] limit at ${String(body.openPrice)} passed through, placing market`);
-      const { openPrice: _omit, ...rest } = body;
-      result = await runOnce({ ...rest, actionType: marketType });
-    }
-  }
-  return result;
-}
 
 // Place a cascade limit order.
 // Picks ONE channel and commits to it — never fires both in parallel:
@@ -1915,11 +1273,6 @@ async function triggerMt5OneClickAutoCascadeInner(
     return;
   }
 
-  let token: string;
-  try { token = getToken(); } catch { return; }
-  const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
-  const conn = activeConnections.get(accountId);
-
   console.log(`[auto-cascade] MT5 one-click detected — ${direction!.toUpperCase()} ${symbol} @ ${anchorPrice} posId=${posId}`);
 
   const { tp1Price, tp2Price, tp3Price, tp4Price } = computeTpPricesFromPips(anchorPrice, direction!, config);
@@ -1995,24 +1348,8 @@ async function triggerMt5OneClickAutoCascadeInner(
   await tagMt5AnchorForZone(accountId, posId, zoneState.zoneId, stopLoss, total);
 
   recordCascade(accountId, anchorPrice);
-  scheduleCascadeReconcile(accountId, region, token);
   broadcastZoneUpdate(zoneState.zoneId);
   broadcastToAccount(accountId, "deal", { type: "position_changed" });
-
-  const evt: DealEvent = {
-    dealId:     `auto_${posId}_${Date.now()}`,
-    positionId: posId,
-    symbol,
-    type:       direction === "buy" ? "DEAL_TYPE_BUY" : "DEAL_TYPE_SELL",
-    entryType:  "DEAL_ENTRY_IN",
-    openPrice:  anchorPrice,
-    volume,
-    comment,
-    time:       Date.now(),
-    autoCascade: true,
-    autoCascadeCount: placedCount,
-  };
-  storeDealEvent(accountId, evt);
 
   const notifyUserId = await resolveZoneNotifyUserIdAsync(zoneState.zoneId, accountId);
   if (notifyUserId) {
@@ -2054,57 +1391,6 @@ function isZoneStillPlacing(zoneId: string): boolean {
   return true;
 }
 
-function scheduleCascadeReconcile(accountId: string, region: string, token: string): void {
-  setTimeout(async () => {
-    try {
-      if (!syncReady.has(accountId) || (executionBackends.get(accountId) ?? "ea") !== "metaapi") {
-        return;
-      }
-      const resp = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`, {
-        headers: authHeaders(token),
-      });
-      if (!resp.ok) return;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const orders = (await resp.json()) as any[];
-      const nowMs = Date.now();
-      const orphans: { id: string; comment: string }[] = [];
-      for (const o of orders) {
-        const comment = String(o.comment ?? "");
-        if (!comment.startsWith("Cascade")) continue;
-        const oid = String(o.id ?? o._id ?? "");
-        if (!oid) continue;
-        if (cascadePlacedOrderIds.has(oid)) continue;
-        const zid = parseZoneIdFromComment(comment);
-        if (zid && isZoneStillPlacing(zid)) continue;
-        if (orderMappedToActiveZone(accountId, oid)) continue;
-        if (zid) {
-          const z = zoneStates.get(zid);
-          if (z && z.status !== "CLOSED") continue;
-        }
-        const orderTimeMs = o.time ? new Date(o.time).getTime() : 0;
-        if (orderTimeMs > 0 && (nowMs - orderTimeMs) < CASCADE_LIMIT_GRACE_MS) continue;
-        orphans.push({ id: oid, comment });
-      }
-      if (orphans.length === 0) return;
-      console.warn(`[reconcile ${accountId}] found ${orphans.length} untracked Cascade order(s): ${orphans.map(o => `${o.id}(${o.comment})`).join(", ")}`);
-      await Promise.all(orphans.map(async o => {
-        try {
-          const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
-            method: "POST",
-            headers: authHeaders(token),
-            body: JSON.stringify({ actionType: "ORDER_CANCEL", orderId: o.id }),
-          });
-          if (r.ok) console.log(`[reconcile ${accountId}] cancelled orphan orderId=${o.id}`);
-          else console.warn(`[reconcile ${accountId}] failed to cancel orphan orderId=${o.id} status=${r.status}`);
-        } catch (e) {
-          console.error(`[reconcile ${accountId}] cancel orphan threw orderId=${o.id}:`, (e as Error).message);
-        }
-      }));
-    } catch (e) {
-      console.error(`[reconcile ${accountId}] sweep error:`, (e as Error).message);
-    }
-  }, RECONCILE_DELAY_MS).unref();
-}
 
 // ── In-memory tick store ────────────────────────────────────────────────────
 // Every price poll is stored here; candles are aggregated on demand.
@@ -2147,49 +1433,17 @@ function buildCandles(accountId: string, timeframe: string, limit: number): Ohlc
     .slice(-limit);
 }
 
-const PROVISIONING_BASE = "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai";
-const CLIENT_DOMAIN = "agiliumtrade.ai";
 const DEFAULT_REGION = "london";
 
-function getToken(): string {
-  const token = process.env.METAAPI_TOKEN;
-  if (!token) throw new Error("METAAPI_TOKEN is not configured on the server.");
-  return token;
-}
 
 function getAdapter(accountId: string): ExecutionAdapter {
-  if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
-    return new EaAdapter(accountId);
-  }
-  return new MetaApiAdapter({
-    accountId,
-    getToken,
-    getRegion: () => activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION,
-    getConnection: () => activeConnections.get(accountId),
-  });
+  return new EaAdapter(accountId);
 }
 
-function authHeaders(token: string) {
-  return { "auth-token": token, "Content-Type": "application/json" };
-}
 
 // Normalise whatever MetaAPI returns as "region" to the short subdomain form (e.g. "london").
 // MetaAPI may return the full host like "mt-client-api-v1.london.agiliumtrade.ai".
-function normalizeRegion(region: string | undefined): string {
-  if (!region) return DEFAULT_REGION;
-  // Already short form: "london", "new-york", etc.
-  if (!region.includes(".")) return region;
-  // Full host: "mt-client-api-v1.london.agiliumtrade.ai" → extract "london"
-  const m = region.match(/^mt-client-api-v1\.(.+?)\.agiliumtrade\.ai$/);
-  if (m?.[1]) return m[1];
-  // Fallback: use as-is and let MetaAPI reject it with a clear error
-  return region;
-}
 
-function clientBase(region: string = DEFAULT_REGION): string {
-  const r = normalizeRegion(region);
-  return `https://mt-client-api-v1.${r}.${CLIENT_DOMAIN}`;
-}
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -2200,154 +1454,15 @@ function qstr(v: unknown): string | undefined {
   return v as string | undefined;
 }
 
-interface ProvisioningAccount {
-  id?: string;
-  _id?: string;
-  login?: string;
-  server?: string;
-  region?: string;
-  connectionStatus?: string;
-  state?: string;
-  message?: string;
-  reliability?: string;
-  error?: string;
-  details?: string;
-}
 
-async function getProvisioningAccount(token: string, accountId: string): Promise<ProvisioningAccount> {
-  const res = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
-    headers: authHeaders(token),
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({})) as { message?: string };
-    throw new Error(err.message ?? `Account lookup failed: ${res.status}`);
-  }
-  return res.json() as Promise<ProvisioningAccount>;
-}
 
-/** Admin dashboard: broker login/server for each MetaAPI account id. */
-export async function listProvisioningAccounts(): Promise<
-  Map<string, { login: string; server: string; region?: string; connectionStatus?: string }>
-> {
-  const token = getToken();
-  const listRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
-    headers: authHeaders(token),
-  });
-  if (!listRes.ok) return new Map();
-  const all = await listRes.json() as ProvisioningAccount[];
-  const map = new Map<string, { login: string; server: string; region?: string; connectionStatus?: string }>();
-  if (!Array.isArray(all)) return map;
-  for (const a of all) {
-    const accountId = a._id ?? a.id;
-    if (!accountId) continue;
-    map.set(accountId, {
-      login: String(a.login ?? ""),
-      server: String(a.server ?? ""),
-      region: a.region,
-      connectionStatus: a.connectionStatus,
-    });
-  }
-  return map;
-}
 
-async function getAccountInfo(token: string, accountId: string, region: string | undefined = DEFAULT_REGION) {
-  region = region || DEFAULT_REGION;
-  const res = await fetch(
-    `${clientBase(region)}/users/current/accounts/${accountId}/account-information`,
-    { headers: authHeaders(token) }
-  );
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({})) as { message?: string };
-    throw new Error(err.message ?? `Account info failed: ${res.status}`);
-  }
-  return res.json() as Promise<Record<string, unknown>>;
-}
 
-async function deployAccount(token: string, accountId: string): Promise<void> {
-  const res = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}/deploy`, {
-    method: "POST",
-    headers: authHeaders(token),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({})) as { message?: string };
-    const msg = body.message ?? `Deploy failed (HTTP ${res.status})`;
-    console.warn(`[deploy] ${accountId} failed ${res.status}: ${msg}`);
-    throw new Error(msg);
-  }
-}
 
-async function undeployAccount(token: string, accountId: string): Promise<void> {
-  const res = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}/undeploy`, {
-    method: "POST",
-    headers: authHeaders(token),
-  });
-  if (!res.ok && res.status !== 204) {
-    const body = await res.json().catch(() => ({})) as { message?: string };
-    const msg = body.message ?? `Undeploy failed (HTTP ${res.status})`;
-    console.warn(`[undeploy] ${accountId} failed ${res.status}: ${msg}`);
-    throw new Error(msg);
-  }
-}
+
+
 
 // ── Stuck-sync recovery ────────────────────────────────────────────────────
-// Some MetaAPI accounts (Gethin's is the canonical example) get into a state
-// where every subscribe call fails with "synchronization with this id is
-// already running" and onDealsSynchronized never fires. Reconnecting does
-// nothing because the stuck session lives on MetaAPI's server, not ours.
-// The only known cure is to undeploy → wait → redeploy, which wipes the
-// server-side sync state and lets the next streaming connect succeed.
-const recoveryAttempts = new Map<string, number[]>(); // accountId → recovery timestamps
-const RECOVERY_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
-const MAX_RECOVERIES_PER_WINDOW = 3;
-
-function canAttemptRecovery(accountId: string): boolean {
-  const now = Date.now();
-  const recent = (recoveryAttempts.get(accountId) ?? []).filter(t => now - t < RECOVERY_WINDOW_MS);
-  recoveryAttempts.set(accountId, recent);
-  return recent.length < MAX_RECOVERIES_PER_WINDOW;
-}
-
-function recordRecoveryAttempt(accountId: string): void {
-  const arr = recoveryAttempts.get(accountId) ?? [];
-  arr.push(Date.now());
-  recoveryAttempts.set(accountId, arr);
-}
-
-async function recoverStuckSync(token: string, accountId: string): Promise<void> {
-  if (!canAttemptRecovery(accountId)) {
-    console.warn(`[sync-recovery] ${accountId} — recovery rate-limit reached (>${MAX_RECOVERIES_PER_WINDOW} in 2h), skipping`);
-    return;
-  }
-  recordRecoveryAttempt(accountId);
-  console.warn(`[sync-recovery] ${accountId} — sync stuck, starting undeploy→redeploy cycle to clear MetaAPI session state`);
-  try {
-    // 1. Tear down our local streaming connection so the watchdog won't
-    //    fight the recovery by reconnecting mid-cycle.
-    await stopStreaming(accountId);
-    // 2. Undeploy on MetaAPI's side — this kills the stuck sync session.
-    await undeployAccount(token, accountId);
-    console.log(`[sync-recovery] ${accountId} — undeploy requested, waiting for UNDEPLOYED state...`);
-    // 3. Poll until UNDEPLOYED confirmed (up to 60 s).
-    const sdk = getSdk(token);
-    const undeployStart = Date.now();
-    while (Date.now() - undeployStart < 60_000) {
-      await new Promise(r => setTimeout(r, 3000));
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const acct = await sdk.metatraderAccountApi.getAccount(accountId) as any;
-      if (acct.state === "UNDEPLOYED") {
-        console.log(`[sync-recovery] ${accountId} — confirmed UNDEPLOYED after ${Math.round((Date.now() - undeployStart) / 1000)}s`);
-        break;
-      }
-    }
-    // 4. Redeploy and let the watchdog (30 s) pick it up to reconnect.
-    await deployAccount(token, accountId);
-    console.log(`[sync-recovery] ${accountId} — redeploy requested, watchdog will reconnect within 30 s`);
-  } catch (err) {
-    console.error(`[sync-recovery] ${accountId} — recovery cycle failed:`, (err as Error).message);
-    // Don't leave activeStreams marked — let watchdog retry the connect.
-    activeStreams.delete(accountId);
-  }
-}
 
 // ── Zone comment / isolation helpers ─────────────────────────────────────────
 // Every cascade leg carries `Cascade|<zoneId>|<leg>/<total>` in the MT5 comment
@@ -2662,23 +1777,6 @@ export function sumDealPnlForPositions(
   return Math.round(sum * 100) / 100;
 }
 
-async function fetchAccountHistoryDeals(
-  token: string,
-  region: string,
-  accountId: string,
-  startMs: number,
-  endMs: number,
-): Promise<HistoryDealRow[]> {
-  const startTime = new Date(startMs).toISOString();
-  const endTime = new Date(endMs).toISOString();
-  const res = await fetch(
-    `${clientBase(region)}/users/current/accounts/${accountId}/history-deals/time/${encodeURIComponent(startTime)}/${encodeURIComponent(endTime)}`,
-    { headers: authHeaders(token) },
-  );
-  if (!res.ok) return [];
-  const deals = await res.json() as HistoryDealRow[];
-  return Array.isArray(deals) ? deals : [];
-}
 
 /** After a zone closes, persist broker realized P&L for win-rate (incl. manual MT5 exits). */
 async function settleZoneClosedPnl(accountId: string, zoneId: string): Promise<void> {
@@ -2694,85 +1792,32 @@ async function settleZoneClosedPnl(accountId: string, zoneId: string): Promise<v
     const positionIds = new Set(posRows.map((r) => r.positionId));
     if (positionIds.size === 0) return;
 
-    const isEa = (executionBackends.get(accountId) ?? "ea") !== "metaapi";
-    const token = getToken();
-    const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
-
     if (zone.closedPnl == null) {
-      let pnl: number;
-      if (isEa) {
-        const profitMap = eaLastPositionProfits.get(accountId);
-        pnl = profitMap
-          ? [...positionIds].reduce((sum, id) => sum + (profitMap.get(id) ?? 0), 0)
-          : 0;
-      } else {
-        const deals = await fetchAccountHistoryDeals(
-          token, region, accountId,
-          Number(zone.createdAt), Number(zone.closedAt) + 120_000,
-        );
-        pnl = sumDealPnlForPositions(deals, positionIds);
-      }
+      const profitMap = eaLastPositionProfits.get(accountId);
+      const pnl = profitMap
+        ? [...positionIds].reduce((sum, id) => sum + (profitMap.get(id) ?? 0), 0)
+        : 0;
       await db.update(cascadeZonesTable)
         .set({ closedPnl: pnl })
         .where(eq(cascadeZonesTable.zoneId, zoneId));
       console.log(`[zone ${zoneId}] closedPnl=${pnl} (${positionIds.size} position(s))`);
-    }
-
-    if (!zone.slHit && !zone.riskFreeSlExit && !isEa) {
-      const deals = await fetchAccountHistoryDeals(
-        token, region, accountId,
-        Number(zone.createdAt), Number(zone.closedAt) + 120_000,
-      );
-      const { stopLossExit, exitPrice } = inferZoneStopLossFromDeals(deals, positionIds);
-      if (stopLossExit) {
-        await finalizeZoneClose(accountId, zoneId, {
-          stopLossExit: true,
-          wasRiskFree: Boolean((zone as { wentRiskFree?: boolean }).wentRiskFree),
-          exitPrice: exitPrice ?? undefined,
-          exitPriceFromDeal: exitPrice != null && exitPrice > 0,
-        });
-      }
     }
   } catch (e) {
     console.warn(`[zone ${zoneId}] settleZoneClosedPnl failed:`, (e as Error).message);
   }
 }
 
-/** Build finalize opts from broker history (reconcile / restart closes). */
+/** Build finalize opts for zone close (EA path uses last known price). */
 async function buildCloseFinalizeOptsForZone(
   accountId: string,
   zoneId: string,
   partial: { wasRiskFree: boolean; direction: "buy" | "sell" },
 ): Promise<CloseFinalizeOpts> {
-  const base: CloseFinalizeOpts = {
+  void zoneId;
+  return {
     wasRiskFree: partial.wasRiskFree,
     exitPrice: exitPriceForZoneClose(accountId, partial.direction),
   };
-  try {
-    const [zone] = await db.select().from(cascadeZonesTable)
-      .where(and(eq(cascadeZonesTable.zoneId, zoneId), eq(cascadeZonesTable.accountId, accountId)))
-      .limit(1);
-    if (!zone?.closedAt) return base;
-    const posRows = await db.select({ positionId: zonePositionsTable.positionId })
-      .from(zonePositionsTable)
-      .where(eq(zonePositionsTable.zoneId, zoneId));
-    const positionIds = new Set(posRows.map((r) => r.positionId));
-    if (positionIds.size === 0) return base;
-    const token = getToken();
-    const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
-    const deals = await fetchAccountHistoryDeals(
-      token, region, accountId, Number(zone.createdAt), Number(zone.closedAt) + 120_000,
-    );
-    const { stopLossExit, exitPrice } = inferZoneStopLossFromDeals(deals, positionIds);
-    return {
-      ...base,
-      stopLossExit,
-      exitPrice: exitPrice ?? base.exitPrice,
-      exitPriceFromDeal: exitPrice != null && exitPrice > 0,
-    };
-  } catch {
-    return base;
-  }
 }
 
 /** Deterministic magic number derived from zoneId for broker-side tagging. */
@@ -3651,7 +2696,7 @@ async function persistArmedZone(state: ZoneState, userId: string | undefined): P
 
 /** After delete-orders on an @-price zone with no fills, remove it from the app. */
 async function closeArmedZoneIfDisarmed(
-  accountId: string, zoneId: string, token: string, region: string,
+  accountId: string, zoneId: string,
   opts?: { force?: boolean },
 ): Promise<void> {
   const st = await loadZone(zoneId);
@@ -3660,7 +2705,7 @@ async function closeArmedZoneIfDisarmed(
     .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
   if (openRows.length > 0) return;
   if (!opts?.force) {
-    const pendingLeft = await zoneHasLivePendingCascadeLimits(token, region, accountId, zoneId);
+    const pendingLeft = await zoneHasLivePendingCascadeLimits(accountId, zoneId);
     if (pendingLeft) return;
   }
   const closedAt = Date.now();
@@ -3769,8 +2814,6 @@ async function recordZonePositionFill(
  * SL→BE on active legs. On first zone TP2 → all legs; on late legs → those legs only.
  */
 async function applyZoneTp2Housekeeping(
-  token: string,
-  region: string,
   zoneId: string,
   st: ZoneState,
   opts: { beLegs?: LivePosition[]; isFirstZoneTp2: boolean },
@@ -3783,14 +2826,10 @@ async function applyZoneTp2Housekeeping(
     }
     if (!isAutoBeTriggerSatisfied(st)) return;
 
-    const legs = opts.beLegs ?? (
-      (executionBackends.get(st.accountId) ?? "ea") !== "metaapi"
-        ? await resolveEaPositionsForZone(st.accountId, zoneId, st)
-        : await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st, { fresh: true })
-    );
+    const legs = opts.beLegs ?? await resolveEaPositionsForZone(st.accountId, zoneId, st);
     if (legs.length === 0) return;
 
-    const price = await priceForZoneEval(st.accountId, token, region, legs[0]!.symbol || "XAUUSD");
+    const price = await priceForZoneEval(st.accountId, legs[0]!.symbol || "XAUUSD");
     if (!price) return;
 
     let allTrueBe = true;
@@ -3880,75 +2919,7 @@ async function closeTpSliceOnEveryLiveLeg(
   return totalClosed;
 }
 
-async function resolveLivePositionsForZoneAction(
-  token: string,
-  region: string,
-  accountId: string,
-  zoneId: string,
-  st: ZoneState,
-  opts?: { fresh?: boolean },
-): Promise<LivePosition[]> {
-  const allLive = await fetchOpenPositions(token, region, accountId, opts);
-  const openRows = await db.select().from(zonePositionsTable)
-    .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
-  const trackedIds = new Set(openRows.map((z) => z.positionId));
-  const fromDb = allLive.filter((p) => trackedIds.has(p.id));
-  const tagged = allLive.filter((p) => positionBelongsToZone(p, zoneId));
-  const byId = new Map<string, LivePosition>();
-  for (const p of fromDb) byId.set(p.id, p);
-  for (const p of tagged) byId.set(p.id, p);
-  const live = [...byId.values()];
-  if (live.length === 0) return [];
-
-  let relinked = 0;
-  for (const p of live) {
-    const [row] = await db.select({
-      status: zonePositionsTable.status,
-      volume: zonePositionsTable.volume,
-      entryPrice: zonePositionsTable.entryPrice,
-    })
-      .from(zonePositionsTable)
-      .where(and(
-        eq(zonePositionsTable.zoneId, zoneId),
-        eq(zonePositionsTable.positionId, p.id),
-      ))
-      .limit(1);
-    if (row?.status === "CLOSED") {
-      await db.update(zonePositionsTable)
-        .set({ status: "OPEN" })
-        .where(and(
-          eq(zonePositionsTable.zoneId, zoneId),
-          eq(zonePositionsTable.positionId, p.id),
-        ));
-      relinked++;
-    } else if (!row) {
-      await recordZonePositionFill(zoneId, p.id, p.openPrice, p.volume);
-      relinked++;
-    }
-    const cached = st.trackedPositions.get(p.id);
-    // Keep the original fill volume from DB for TP partial % math — broker
-    // live volume shrinks after partials; overwriting with p.volume makes the
-    // engine think TP1 already fired and skip real closes.
-    const origVol = row?.volume != null ? Number(row.volume) : p.volume;
-    const entry = row?.entryPrice != null ? Number(row.entryPrice) : p.openPrice;
-    st.trackedPositions.set(p.id, {
-      volume: origVol,
-      entryPrice: entry,
-      tp1Hit: cached?.tp1Hit ?? false,
-      tp2Hit: cached?.tp2Hit ?? false,
-      tp3Hit: cached?.tp3Hit ?? false,
-      tp4Hit: cached?.tp4Hit ?? false,
-    });
-  }
-  if (relinked > 0 || tagged.length > fromDb.length) {
-    console.log(
-      `[zone ${zoneId}] resolved ${live.length} leg(s) for zone action (dbOpen=${fromDb.length} tagged=${tagged.length} relinked=${relinked})`,
-    );
-  }
-  return live;
-}
-
-/** EA-native variant of resolveLivePositionsForZoneAction.
+/** EA-native variant of resolveLivePositionsForZoneAction (sole resolver after MetaAPI removal).
  *  Uses the in-memory EA state snapshot instead of the broker REST API. */
 async function resolveEaPositionsForZone(
   accountId: string,
@@ -4013,15 +2984,14 @@ async function resolveEaPositionsForZone(
 
 /** Wrongly CLOSED in DB while MT5 still has legs — reopen so TPs keep firing. */
 async function reopenClosedZoneIfBrokerLegsRemain(
-  token: string,
-  region: string,
   accountId: string,
   zoneId: string,
   st: ZoneState,
 ): Promise<boolean> {
   if (st.status !== "CLOSED") return false;
   const trackedIds = await loadZoneTrackedPositionIds(zoneId);
-  const brokerOpen = await brokerHasOpenLegsForZone(token, region, accountId, zoneId, { trackedIds });
+  const eaPositions = getEaState(accountId)?.positions ?? [];
+  const brokerOpen = zoneHasTrackedLegsInSnapshot(trackedIds, eaPositions) || eaPositions.some((p) => positionBelongsToZone(p, zoneId));
   if (!brokerOpen) return false;
   await db.update(cascadeZonesTable)
     .set({ status: "OPEN", closedAt: null, manualClose: false })
@@ -4086,26 +3056,16 @@ async function markZonePositionClosed(
     const zoneId = rows[0]?.zoneId;
     if (!zoneId) return;
     const st = zoneStates.get(zoneId);
-    const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
-    void st; // (zone state may be missing during startup; carry on with REST anyway)
-    let token: string;
-    try { token = getToken(); } catch { return; }
-    // Give MT5 a moment to settle the position state after the exit deal.
-    // MetaAPI REST has eventual consistency — a partial close (e.g. TP1
-    // closing 25%) fires DEAL_ENTRY_OUT immediately but the position still
-    // exists at reduced volume. A single 750ms wait can race the REST cache:
-    // if the cache hasn't refreshed yet the position appears "gone" and we'd
-    // incorrectly mark it CLOSED and cancel limits. Retry once after another
-    // 1.5s (2.25s total) to cover the typical MetaAPI cache refresh window.
+    // Wait for EA state to settle after position exit deal
     invalidateBrokerSnapshot(accountId);
     await sleep(750);
-    const live = await fetchOpenPositions(token, region, accountId, { fresh: true });
-    let stillOpen = live.some(p => p.id === positionId);
+    const eaState = getEaState(accountId);
+    let stillOpen = (eaState?.positions ?? []).some((p) => p.id === positionId);
     if (!stillOpen) {
       await sleep(1500);
       invalidateBrokerSnapshot(accountId);
-      const liveRetry = await fetchOpenPositions(token, region, accountId, { fresh: true });
-      stillOpen = liveRetry.some(p => p.id === positionId);
+      const eaStateRetry = getEaState(accountId);
+      stillOpen = (eaStateRetry?.positions ?? []).some((p) => p.id === positionId);
       if (stillOpen) {
         console.log(`[markClosed] posId=${positionId} appeared on retry — partial close, leaving OPEN`);
       }
@@ -4127,9 +3087,8 @@ async function markZonePositionClosed(
     if (openInZone.length === 0) {
       const trackedIds = await loadZoneTrackedPositionIds(zoneId);
       for (const id of st?.trackedPositions.keys() ?? []) trackedIds.add(id);
-      const brokerStillOpen = await zoneHasLiveTrackedPositionsOnBroker(
-        token, region, accountId, zoneId, { fresh: true }, trackedIds,
-      );
+      const eaPositions = getEaState(accountId)?.positions ?? [];
+      const brokerStillOpen = zoneHasTrackedLegsInSnapshot(trackedIds, eaPositions);
       if (brokerStillOpen) {
         console.log(`[markClosed] zone ${zoneId} DB empty but broker still has open legs — zone stays active`);
         broadcastZoneUpdate(zoneId);
@@ -4137,7 +3096,7 @@ async function markZonePositionClosed(
         return;
       }
       if (!options.intentionalFullClose) {
-        await reconcileZoneFromBroker(accountId, zoneId, token, region, "position_closed_external");
+        await evaluateZone(zoneId);
         broadcastToAccount(accountId, "deal", { type: "position_changed" });
         return;
       }
@@ -4181,17 +3140,6 @@ async function markZonePositionClosed(
 
 // REST trade-action helpers — keep them simple/REST so they're independent
 // of streaming-connection health. Auth-token + region come from the caller.
-async function tradeAction(
-  token: string, region: string, accountId: string, body: Record<string, unknown>,
-): Promise<{ ok: boolean; code: number; message?: string }> {
-  recordApiCall(accountId);
-  const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/trade`, {
-    method: "POST", headers: authHeaders(token), body: JSON.stringify(body),
-  });
-  const data = await r.json().catch(() => ({})) as { numericCode?: number; message?: string };
-  const code = data.numericCode ?? 0;
-  return { ok: r.ok && TRADE_SUCCESS_CODES.has(code), code, message: data.message };
-}
 
 /** MetaAPI: leg already gone or close already in flight — desired end state for Close Zone. */
 const CLOSE_POSITION_IDEMPOTENT_CODES = new Set([10036, 10039]);
@@ -4237,53 +3185,24 @@ async function commitUserZoneClose(
   logEvent("zone.close", { accountId, zoneId, closedCount, trigger });
 }
 
-async function resubscribeToTickStream(accountId: string): Promise<void> {
-  const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
-  activeStreams.delete(accountId);
-  activeConnections.delete(accountId);
-  const token = getToken();
-  const userId = knownAccounts.get(accountId)?.userId;
-  await startStreaming(token, accountId, region, userId);
-}
 
-/** Re-start tick stream + zone monitor for every account with non-closed zones. */
-export async function ensureMonitorsForActiveZones(): Promise<void> {
-  try {
-    await ensureCascadeZoneRunnerColumns();
-    const activeZones = await db.select({ accountId: cascadeZonesTable.accountId })
-      .from(cascadeZonesTable)
-      .where(ne(cascadeZonesTable.status, "CLOSED"));
-    const accountIds = [...new Set(activeZones.map((z) => z.accountId))];
-    if (accountIds.length === 0) return;
-    const token = getToken();
-    for (const accountId of accountIds) {
-      const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
-      if (!activeStreams.has(accountId)) {
-        void startStreaming(token, accountId, region, knownAccounts.get(accountId)?.userId);
-      }
-    }
-  } catch (e) {
-    console.warn("[zone-monitor] ensureMonitorsForActiveZones failed:", (e as Error).message);
-  }
-}
+
 
 async function handleClosePartial(
   accountId: string,
   zoneId: string,
   body: { pct?: number; lots?: number; tpLevel?: number; runnerN?: number },
-  token: string,
-  region: string,
 ): Promise<{ ok: boolean; message?: string }> {
   let st = await loadZone(zoneId);
   if (!st || st.accountId !== accountId) return { ok: false, message: "Zone not found" };
   if (st.status === "CLOSED") {
-    const reopened = await reopenClosedZoneIfBrokerLegsRemain(token, region, accountId, zoneId, st);
+    const reopened = await reopenClosedZoneIfBrokerLegsRemain(accountId, zoneId, st);
     if (!reopened) return { ok: false, message: "Zone closed" };
     st = (await loadZone(zoneId)) ?? st;
   }
   if (st.status === "ARMED") return { ok: false, message: "Zone not active" };
 
-  const legs = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st, { fresh: true });
+  const legs = await resolveEaPositionsForZone(accountId, zoneId, st);
   if (legs.length === 0) return { ok: false, message: "No open positions" };
 
   const tpLevel = body.tpLevel != null && body.tpLevel >= 1 && body.tpLevel <= 3
@@ -4320,7 +3239,7 @@ async function handleClosePartial(
     });
     broadcastZoneUpdate(zoneId);
     if (tpLevel === 2) {
-      await applyZoneTp2Housekeeping(token, region, zoneId, st, {
+      await applyZoneTp2Housekeeping(zoneId, st, {
         isFirstZoneTp2: !st.tp2HousekeepingDone,
         beLegs: st.tp2HousekeepingDone ? pendingLegs : undefined,
       });
@@ -4413,11 +3332,7 @@ async function restoreZoneStopLossAfterLimitCancel(
 
   invalidateBrokerSnapshot(accountId);
   const config = getCascadeConfig(accountId, zoneIdToUserId.get(zoneId));
-  const token = getToken();
-  const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
-  const legs = (executionBackends.get(accountId) ?? "ea") !== "metaapi"
-    ? await resolveEaPositionsForZone(accountId, zoneId, st)
-    : await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st, { fresh: true });
+  const legs = await resolveEaPositionsForZone(accountId, zoneId, st);
   if (legs.length === 0) return;
 
   let restored = 0;
@@ -4465,8 +3380,6 @@ async function tagMt5AnchorForZone(
 async function cancelZoneLimits(
   accountId: string, zoneId: string,
 ): Promise<void> {
-  const token = getToken();
-  const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
   const orderIds: string[] = orderIdsForZone(accountId, zoneId);
   // DB fallback: the in-memory map can be empty if entries were never populated
   // (race on zone creation), lost during a server restart gap, or already
@@ -4482,25 +3395,8 @@ async function cancelZoneLimits(
       console.warn(`[zone ${zoneId}] DB fallback order lookup failed:`, (e as Error).message);
     }
   }
-  // Fetch live pending orders — used both for the tracked-ID path (to skip
-  // already-gone orders) and the blind-cancel fallback below.
-  // Skip for EA accounts: the adapter's cancelOrder treats 4754 (already gone) as
-  // a success-equivalent, so an empty pending set is safe.
-  let liveOrders: Array<{ id: string; comment?: string }> = [];
-  if ((executionBackends.get(accountId) ?? "ea") === "metaapi") {
-    try {
-      const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`, {
-        headers: authHeaders(token),
-        signal: AbortSignal.timeout(10_000),
-      });
-      if (r.ok) {
-        const raw = await r.json() as Array<{ id?: string; _id?: string; comment?: string }>;
-        liveOrders = raw.map(o => ({ id: String(o.id ?? o._id ?? ""), comment: o.comment })).filter(o => o.id);
-      }
-    } catch (e) {
-      console.warn(`[zone ${zoneId}] orders fetch error during cancel:`, (e as Error).message);
-    }
-  }
+  // EA: the adapter's cancelOrder treats 4754 (already gone) as success-equivalent.
+  const liveOrders: Array<{ id: string; comment?: string }> = [];
 
   if (orderIds.length === 0) {
     // Neither in-memory map nor DB had tracked order IDs — this can happen after
@@ -4525,7 +3421,6 @@ async function cancelZoneLimits(
       const r = await getAdapter(accountId).cancelOrder(o.id);
       // Mark completed regardless of result — 4754 means already gone, which is
       // still a signal the order is no longer live. Ensures MetaAPI REST filter fires.
-      markOrderCompleted(accountId, o.id);
       if (r.ok) {
         console.log(`[zone ${zoneId}] blind-cancelled cascade orderId=${o.id}`);
       } else {
@@ -4545,15 +3440,12 @@ async function cancelZoneLimits(
       try { await db.delete(zoneOrdersTable).where(eq(zoneOrdersTable.orderId, oid)); } catch { /* ignore */ }
     };
     if (pending.size > 0 && !pending.has(oid)) {
-      // Not in the live list — already gone from broker. Mark completed so the
-      // /orders endpoint filters it out of MetaAPI REST's stale response.
-      markOrderCompleted(accountId, oid);
+      // Not in the live list — already gone from broker.
       await forget(); return;
     }
     const r = await getAdapter(accountId).cancelOrder(oid);
     // Mark completed regardless of outcome: success = cancelled now, 4754 = already
     // gone, 10036 = already closed — in all cases the order is no longer pending.
-    markOrderCompleted(accountId, oid);
     if (r.ok) {
       await forget();
       console.log(`[zone ${zoneId}] cancelled limit orderId=${oid}`);
@@ -4567,7 +3459,7 @@ interface LivePosition {
   id: string; openPrice: number; volume: number; type: string; symbol: string;
   magic?: number; comment?: string;
   stopLoss?: number;
-  /** MetaAPI floating P&L (profit field on open positions). */
+  /** Floating P&L on open positions. */
   profit?: number;
 }
 
@@ -4583,22 +3475,6 @@ function isRateLimitError(err: unknown): boolean {
     || msg.includes("too many") || msg.includes("rate limit");
 }
 
-async function metaApiCallWithBackoff<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      return await fn();
-    } catch (err: unknown) {
-      if (isRateLimitError(err) && i < maxRetries - 1) {
-        const wait = Math.pow(2, i) * 1000;
-        console.warn(`[metaapi] rate limited, waiting ${wait}ms`);
-        await new Promise((r) => setTimeout(r, wait));
-        continue;
-      }
-      throw err;
-    }
-  }
-  throw new Error("Max retries exceeded");
-}
 
 function userFacingTradeMessage(code: number, raw?: string): string {
   if (code === 10024 || (raw ?? "").toLowerCase().includes("too many")) {
@@ -4633,35 +3509,19 @@ function markCloseAttempt(zoneId: string): void {
   zoneCloseCooldown.set(zoneId, Date.now());
 }
 
-async function ensureConnectionReady(conn: unknown | undefined, timeoutMs = 8_000): Promise<void> {
-  if (!conn) throw new NotReadyError();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const c = conn as any;
-  if (c.terminalState?.connected && c.terminalState?.connectedToBroker) return;
-  try {
-    await c.waitSynchronized({ timeoutInSeconds: Math.ceil(timeoutMs / 1000) });
-  } catch {
-    throw new NotReadyError();
-  }
-}
+
 
 // EA liveness: pass if state snapshot OR last /ea/poll is within this window.
 const EA_LIVENESS_MS = 30_000;
 
-// For ea accounts, readiness is confirmed by either a recent /ea/state push
-// or a recent /ea/poll — the terminal is alive even between state pushes.
-// For metaapi accounts use the existing MetaApi connection check.
 async function ensureReadyForAccount(accountId: string, timeoutMs = 8_000): Promise<void> {
-  if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
-    const state = getEaState(accountId);
-    const stateAge = state ? Date.now() - state.receivedAt : Infinity;
-    const pollAge  = Date.now() - getLastEaPollAt(accountId);
-    if (stateAge > EA_LIVENESS_MS && pollAge > EA_LIVENESS_MS) {
-      throw new NotReadyError("EA terminal not connected or state is stale");
-    }
-    return;
+  void timeoutMs;
+  const state = getEaState(accountId);
+  const stateAge = state ? Date.now() - state.receivedAt : Infinity;
+  const pollAge  = Date.now() - getLastEaPollAt(accountId);
+  if (stateAge > EA_LIVENESS_MS && pollAge > EA_LIVENESS_MS) {
+    throw new NotReadyError("EA terminal not connected or state is stale");
   }
-  await ensureConnectionReady(activeConnections.get(accountId), timeoutMs);
 }
 
 function respondZoneActionError(res: Response, label: string, err: unknown): void {
@@ -4674,80 +3534,7 @@ function respondZoneActionError(res: Response, label: string, err: unknown): voi
   res.status(isRateLimitError(err) ? 429 : 500).json({ ok: false, error: msg, message: msg });
 }
 
-async function fetchOpenPositions(
-  token: string, region: string, accountId: string, opts?: { fresh?: boolean },
-): Promise<LivePosition[]> {
-  const snap = await getBrokerSnapshot(token, region, accountId, opts);
-  return snap.positions;
-}
 
-async function fetchOpenPositionsUncached(token: string, region: string, accountId: string): Promise<LivePosition[]> {
-  return metaApiCallWithBackoff(async () => {
-    recordApiCall(accountId);
-    const r = await fetch(
-      `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
-      { headers: authHeaders(token), signal: AbortSignal.timeout(8000) },
-    );
-    if (r.status === 429) {
-      throw Object.assign(new Error("too many requests"), { status: 429 });
-    }
-    if (r.ok) {
-      const arr = await r.json() as Array<Record<string, unknown>>;
-      return arr.map((p) => ({
-        id: String(p.id ?? p._id ?? ""),
-        openPrice: Number(p.openPrice ?? 0),
-        volume: Number(p.volume ?? 0),
-        type: String(p.type ?? ""),
-        symbol: String(p.symbol ?? ""),
-        magic: p.magic != null ? Number(p.magic) : undefined,
-        comment: p.comment != null ? String(p.comment) : undefined,
-        stopLoss: p.stopLoss != null ? Number(p.stopLoss) : undefined,
-        profit: p.profit != null ? Number(p.profit) : undefined,
-      })).filter((p) => p.id);
-    }
-    throw new Error(`fetchOpenPositions ${r.status} for ${accountId}`);
-  });
-}
-
-async function fetchLivePendingOrders(
-  token: string, region: string, accountId: string, opts?: { fresh?: boolean },
-): Promise<Array<{ id: string; comment?: string; magic?: number }>> {
-  const snap = await getBrokerSnapshot(token, region, accountId, opts);
-  return snap.orders;
-}
-
-async function fetchLivePendingOrdersUncached(
-  token: string, region: string, accountId: string,
-): Promise<Array<{ id: string; comment?: string; magic?: number }>> {
-  try {
-    return await metaApiCallWithBackoff(async () => {
-      recordApiCall(accountId);
-      const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`, {
-        headers: authHeaders(token),
-      });
-      if (r.status === 429) {
-        throw Object.assign(new Error("too many requests"), { status: 429 });
-      }
-      if (!r.ok) return [];
-      const raw = await r.json() as Array<{ id?: string; _id?: string; comment?: string; magic?: number }>;
-      return raw.map(o => ({
-        id: String(o.id ?? o._id ?? ""),
-        comment: o.comment,
-        magic: o.magic != null ? Number(o.magic) : undefined,
-      })).filter(o => o.id);
-    });
-  } catch {
-    return [];
-  }
-}
-
-/** Any open position or pending cascade order on the broker tagged for this zone. */
-export async function brokerHasOpenLegsForZone(
-  token: string, region: string, accountId: string, zoneId: string,
-  opts?: { fresh?: boolean; trackedIds?: Set<string> },
-): Promise<boolean> {
-  return zoneHasLiveTrackedPositionsOnBroker(token, region, accountId, zoneId, opts, opts?.trackedIds);
-}
 
 function zoneHasPendingLimitsInSnapshot(
   accountId: string,
@@ -4763,11 +3550,11 @@ function zoneHasPendingLimitsInSnapshot(
 }
 
 async function zoneHasLivePendingCascadeLimits(
-  token: string, region: string, accountId: string, zoneId: string,
+  accountId: string, zoneId: string,
   orders?: Array<{ id: string; comment?: string; magic?: number }>,
 ): Promise<boolean> {
-  const liveOrders = orders ?? await fetchLivePendingOrders(token, region, accountId);
-  return zoneHasPendingLimitsInSnapshot(accountId, zoneId, liveOrders);
+  const snap = orders ? { orders } : await getBrokerSnapshot(accountId);
+  return zoneHasPendingLimitsInSnapshot(accountId, zoneId, snap.orders);
 }
 
 /** True when any live broker position id is tracked OPEN in zone_positions (MT5 one-click anchors). */
@@ -4811,89 +3598,9 @@ function zoneHasLegsInSnapshot(
   });
 }
 
-async function zoneHasLiveTrackedPositionsOnBroker(
-  token: string, region: string, accountId: string, zoneId: string,
-  opts?: { fresh?: boolean },
-  trackedIds?: Set<string>,
-): Promise<boolean> {
-  const snap = await getBrokerSnapshot(token, region, accountId, opts);
-  return zoneHasLegsInSnapshot(accountId, zoneId, snap.positions, snap.orders, trackedIds);
-}
-
 /** Close zone when MT5 has no open legs or pending limits for it (manual MT5 close, etc.). */
-async function reconcileZoneFromBroker(
-  accountId: string,
-  zoneId: string,
-  token: string,
-  region: string,
-  trigger = "broker_reconcile",
-): Promise<void> {
-  const st = zoneStates.get(zoneId) ?? await loadZone(zoneId);
-  if (!st || st.accountId !== accountId || st.status === "CLOSED") return;
-  if (!syncReady.has(accountId)) return;
 
-  const trackedIds = await loadZoneTrackedPositionIds(zoneId);
-  for (const id of st.trackedPositions.keys()) trackedIds.add(id);
-  const stillOnBroker = await zoneHasLiveTrackedPositionsOnBroker(
-    token, region, accountId, zoneId, { fresh: true }, trackedIds,
-  );
-  if (stillOnBroker) return;
 
-  console.log(`[reconcile] ${zoneId} — no positions or orders in MT5, marking CLOSED`);
-  const closedAt = Date.now();
-  await withDbRetry(`reconcile.close zone=${zoneId}`,
-    () => db.update(cascadeZonesTable)
-      .set({ status: "CLOSED", closedAt })
-      .where(eq(cascadeZonesTable.zoneId, zoneId)),
-  ).catch(() => {/* logged inside withDbRetry */});
-  const wasRiskFree = st.status === "RISK_FREE";
-  st.status = "CLOSED";
-  zoneStates.delete(zoneId);
-  await finalizeZoneClose(accountId, zoneId, await buildCloseFinalizeOptsForZone(
-    accountId, zoneId, { wasRiskFree, direction: st.direction },
-  ));
-  void settleZoneClosedPnl(accountId, zoneId);
-  logEvent("zone.close", { accountId, zoneId, trigger });
-  cancelZoneLimits(accountId, zoneId)
-    .catch((e: Error) => console.warn(`[zone ${zoneId}] reconcile cancelZoneLimits:`, e.message))
-    .finally(() => broadcastZoneUpdate(zoneId));
-}
-
-// Live bid/ask straight from MetaAPI — independent of tickStore (which only
-// fills while the app is open and polling /price). Falls back to tickStore
-// if the REST call fails, then null if neither has data.
-async function fetchSymbolPrice(
-  token: string, region: string, accountId: string, symbol: string,
-  opts?: { useTickFallback?: boolean },
-): Promise<{ bid: number; ask: number } | null> {
-  try {
-    const rest = await metaApiCallWithBackoff(async () => {
-      recordApiCall(accountId);
-      const r = await fetch(
-        `${clientBase(region)}/users/current/accounts/${accountId}/symbols/${encodeURIComponent(symbol)}/current-price`,
-        { headers: authHeaders(token) },
-      );
-      if (r.status === 429) {
-        throw Object.assign(new Error("too many requests"), { status: 429 });
-      }
-      if (r.ok) {
-        const j = await r.json() as { bid?: number; ask?: number };
-        if (typeof j.bid === "number" && typeof j.ask === "number") return { bid: j.bid, ask: j.ask };
-      }
-      return null;
-    });
-    if (rest) return rest;
-  } catch {
-    /* fall through to tick cache */
-  }
-  if (opts?.useTickFallback === false) return null;
-  const ticks = tickStore.get(accountId);
-  if (ticks && ticks.length > 0) {
-    const t = ticks[ticks.length - 1]!;
-    if (Date.now() - t.time <= 30_000) return { bid: t.bid, ask: t.ask };
-  }
-  return null;
-}
 
 function latestPrice(accountId: string): { bid: number; ask: number } | null {
   const ticks = tickStore.get(accountId);
@@ -4902,19 +3609,18 @@ function latestPrice(accountId: string): { bid: number; ask: number } | null {
   return { bid: t.bid, ask: t.ask };
 }
 
-/** Prefer recent streaming ticks for TP/BE — avoids a MetaAPI REST price call per eval. */
+/** Prefer recent streaming ticks for TP/BE — falls back to latestPrice. */
 function priceForZoneEval(
   accountId: string,
-  token: string,
-  region: string,
   symbol: string,
 ): Promise<{ bid: number; ask: number } | null> {
+  void symbol; // Only XAUUSD ticks stored; symbol param kept for future multi-symbol support
   const ticks = tickStore.get(accountId);
   if (ticks && ticks.length > 0) {
     const t = ticks[ticks.length - 1]!;
     if (Date.now() - t.time <= 15_000) return Promise.resolve({ bid: t.bid, ask: t.ask });
   }
-  return fetchSymbolPrice(token, region, accountId, symbol);
+  return Promise.resolve(latestPrice(accountId));
 }
 
 function isQuotesLive(accountId: string): boolean {
@@ -5006,7 +3712,7 @@ export function pickNextLegToTrimForSecureProfits(
 
 type EvaluateZoneOpts = { brokerSnap?: BrokerSnap };
 
-async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOpts): Promise<void> {
+async function evaluateZone(zoneId: string, opts?: EvaluateZoneOpts): Promise<void> {
   if (!zoneStates.has(zoneId)) return;
   const st = zoneStates.get(zoneId);
   if (!st) return;
@@ -5021,7 +3727,6 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
   if (st.busy) return;
   st.busy = true;
   try {
-    const region = activeRegions.get(st.accountId) ?? knownAccounts.get(st.accountId)?.region ?? DEFAULT_REGION;
     // Fetch this zone's tracked positions from DB (OPEN status only).
     // Resilient tracked-positions lookup: prefer DB (source of truth) but
     // fall back to the in-memory mirror on transient query failures so a DB
@@ -5068,17 +3773,13 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
     if (zps.length === 0) {
       const pendingLeft = snap
         ? zoneHasPendingLimitsInSnapshot(st.accountId, zoneId, snap.orders)
-        : await zoneHasLivePendingCascadeLimits(token, region, st.accountId, zoneId);
+        : await zoneHasLivePendingCascadeLimits(st.accountId, zoneId);
       const trackedForBroker = cachedTrackedIds();
       const brokerLegs = snap
         ? zoneHasLegsInSnapshot(st.accountId, zoneId, snap.positions, snap.orders, trackedForBroker)
-        : await brokerHasOpenLegsForZone(token, region, st.accountId, zoneId, { trackedIds: trackedForBroker });
+        : zoneHasLegsInSnapshot(st.accountId, zoneId, (getEaState(st.accountId)?.positions ?? []), (getEaState(st.accountId)?.orders ?? []).map((o: { id: string; comment?: string; magic?: number }) => ({ id: o.id, comment: o.comment, magic: o.magic })), trackedForBroker);
       if (brokerLegs) {
-        if ((executionBackends.get(st.accountId) ?? "ea") !== "metaapi") {
-          await resolveEaPositionsForZone(st.accountId, zoneId, st);
-        } else {
-          await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st);
-        }
+        await resolveEaPositionsForZone(st.accountId, zoneId, st);
         try {
           const rows = await withDbRetry(`evalZone.relinkRefresh zone=${zoneId}`, () => db.select().from(zonePositionsTable)
             .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
@@ -5134,20 +3835,16 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         return;
       }
     }
-    let allLive = snap?.positions ?? await fetchOpenPositions(token, region, st.accountId);
+    let allLive = snap?.positions ?? (getEaState(st.accountId)?.positions ?? []);
     let live = mergeLiveZoneLegs(allLive, zoneId, trackedIds);
     const hasBrokerLegs = snap
       ? zoneHasLegsInSnapshot(st.accountId, zoneId, snap.positions, snap.orders, trackedIds)
-      : await brokerHasOpenLegsForZone(token, region, st.accountId, zoneId, { trackedIds });
+      : zoneHasLegsInSnapshot(st.accountId, zoneId, (getEaState(st.accountId)?.positions ?? []), (getEaState(st.accountId)?.orders ?? []).map((o: { id: string; comment?: string; magic?: number }) => ({ id: o.id, comment: o.comment, magic: o.magic })), trackedIds);
     const needsLegResolve =
       (live.length === 0 && hasBrokerLegs)
       || zoneLegsNeedFreshResolve(live, zoneId, trackedIds, allLive, zps.length);
     if (needsLegResolve) {
-      if ((executionBackends.get(st.accountId) ?? "ea") !== "metaapi") {
-        await resolveEaPositionsForZone(st.accountId, zoneId, st);
-      } else {
-        await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st);
-      }
+      await resolveEaPositionsForZone(st.accountId, zoneId, st);
       try {
         const rows = await withDbRetry(`evalZone.legResolveRefresh zone=${zoneId}`, () => db.select().from(zonePositionsTable)
           .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
@@ -5169,10 +3866,10 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       } catch (e) {
         console.warn(`[zone ${zoneId}] leg-resolve tracked refresh failed, using cache (${trackedIds.size} ids): ${(e as Error).message}`);
       }
-      const isEaEval = (executionBackends.get(st.accountId) ?? "ea") !== "metaapi";
+      const isEaEval = true;
       allLive = isEaEval
         ? (getEaState(st.accountId)?.positions ?? [])
-        : await fetchOpenPositions(token, region, st.accountId, { fresh: true });
+        : (getEaState(st.accountId)?.positions ?? []);
       live = mergeLiveZoneLegs(allLive, zoneId, trackedIds);
     }
     // Skip the destructive reconciliation path (which permanently marks
@@ -5185,13 +3882,13 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
     // and re-populates live positions. Without this check, active zones get
     // wrongly reconciled closed on every deployment/restart.
     if (live.length === 0 && !syncReady.has(st.accountId)) return;
-    const _isEaZone = (executionBackends.get(st.accountId) ?? "ea") !== "metaapi";
+    const _isEaZone = true;
     if (live.length === 0) {
       // Batch snapshots can lag after limit cancel — do a fresh read before marking
       // DB rows CLOSED or collapsing the zone.
       const freshAll = _isEaZone
         ? (getEaState(st.accountId)?.positions ?? [])
-        : await fetchOpenPositions(token, region, st.accountId, { fresh: true });
+        : (getEaState(st.accountId)?.positions ?? []);
       const freshLive = mergeLiveZoneLegs(freshAll, zoneId, trackedIds);
       if (freshLive.length > 0) {
         allLive = freshAll;
@@ -5202,7 +3899,7 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       // Reconciliation: all tracked positions are gone. Mark each missing row CLOSED.
       allLive = _isEaZone
         ? (getEaState(st.accountId)?.positions ?? [])
-        : await fetchOpenPositions(token, region, st.accountId, { fresh: true });
+        : (getEaState(st.accountId)?.positions ?? []);
       const allLiveIds = new Set(allLive.map(p => p.id));
       for (const zp of zps) {
         if (!allLiveIds.has(zp.positionId)) {
@@ -5224,15 +3921,13 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       if (stillOpen && stillOpen.length === 0) {
         const pendingLeft = snap
           ? zoneHasPendingLimitsInSnapshot(st.accountId, zoneId, snap.orders)
-          : await zoneHasLivePendingCascadeLimits(token, region, st.accountId, zoneId);
+          : await zoneHasLivePendingCascadeLimits(st.accountId, zoneId);
         const allTrackedIds = await loadZoneTrackedPositionIds(zoneId);
         for (const id of trackedIds) allTrackedIds.add(id);
         for (const id of st.trackedPositions.keys()) allTrackedIds.add(id);
         const brokerStillOpen = snap
           ? zoneHasLegsInSnapshot(st.accountId, zoneId, snap.positions, snap.orders, allTrackedIds)
-          : await zoneHasLiveTrackedPositionsOnBroker(
-            token, region, st.accountId, zoneId, { fresh: true }, allTrackedIds,
-          );
+          : zoneHasLegsInSnapshot(st.accountId, zoneId, (getEaState(st.accountId)?.positions ?? []), (getEaState(st.accountId)?.orders ?? []).map((o: { id: string; comment?: string; magic?: number }) => ({ id: o.id, comment: o.comment, magic: o.magic })), allTrackedIds);
         if (brokerStillOpen) {
           console.log(`[zone ${zoneId}] reconcile: broker still has open legs — zone stays active`);
           return;
@@ -5266,7 +3961,7 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       return;
     }
 
-    const price = await priceForZoneEval(st.accountId, token, region, live[0]!.symbol || "XAUUSD");
+    const price = await priceForZoneEval(st.accountId, live[0]!.symbol || "XAUUSD");
     if (!price) return;
     // For BUY closes use bid; for SELL closes use ask. Allow TP checks when
     // absolute TP prices are set even if anchor was closed before persisting.
@@ -5358,9 +4053,7 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
 
       try {
         // Fresh read so limits that filled since tick start join this TP.
-        const tpLegs = (executionBackends.get(st.accountId) ?? "ea") !== "metaapi"
-          ? await resolveEaPositionsForZone(st.accountId, zoneId, st)
-          : await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st, { fresh: true });
+        const tpLegs = await resolveEaPositionsForZone(st.accountId, zoneId, st);
         const pendingLegs = tpLegs.filter((leg) => legNeedsTpSlice(leg, st, lvl));
         if (pendingLegs.length === 0) continue;
 
@@ -5379,7 +4072,7 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         broadcastZoneUpdate(zoneId);
 
         if (lvl === 2) {
-          await applyZoneTp2Housekeeping(token, region, zoneId, st, {
+          await applyZoneTp2Housekeeping(zoneId, st, {
             isFirstZoneTp2: !st.tp2HousekeepingDone,
             beLegs: st.tp2HousekeepingDone ? pendingLegs : undefined,
           });
@@ -5414,7 +4107,7 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
           if (autoClose && rLots != null && rLots >= 0.01) {
             try {
               const result = await handleClosePartial(
-                st.accountId, zoneId, { lots: rLots, runnerN: n }, token, region,
+                st.accountId, zoneId, { lots: rLots, runnerN: n },
               );
               if (result.ok) {
                 notified[key] = true;
@@ -5467,7 +4160,7 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         ? live.filter((p) => st.trackedPositions.get(p.id)?.tp2Hit)
         : live;
       if (beLegs.length > 0) {
-        await applyZoneTp2Housekeeping(token, region, zoneId, st, {
+        await applyZoneTp2Housekeeping(zoneId, st, {
           isFirstZoneTp2: false,
           beLegs,
         });
@@ -5486,47 +4179,16 @@ let zoneKeepaliveTimer: NodeJS.Timeout | null = null;
 let zoneMonitorTick = 0;
 export function startZoneTpMonitor(): void {
   if (zoneMonitorTimer) return;
-  void ensureMonitorsForActiveZones();
+
   if (!zoneReconcileTimer) {
     zoneReconcileTimer = setInterval(() => {
       if (!isMarketOpen()) return;
-      const token = (() => { try { return getToken(); } catch { return null; } })();
-      if (!token) return;
-      const byAccount = new Map<string, { region: string; zoneIds: string[] }>();
-      for (const [zoneId, st] of zoneStates.entries()) {
-        if (st.status === "CLOSED") continue;
-        if (!syncReady.has(st.accountId)) continue;
-        // EA reconciliation runs through handleEaStateSnapshot; skip MetaAPI path.
-        if ((executionBackends.get(st.accountId) ?? "ea") !== "metaapi") continue;
-        const region = activeRegions.get(st.accountId) ?? knownAccounts.get(st.accountId)?.region ?? DEFAULT_REGION;
-        const bucket = byAccount.get(st.accountId) ?? { region, zoneIds: [] };
-        bucket.zoneIds.push(zoneId);
-        byAccount.set(st.accountId, bucket);
-      }
-      for (const [accountId, { region, zoneIds }] of byAccount) {
-        void (async () => {
-          try {
-            const snap = await getBrokerSnapshot(token, region, accountId);
-            for (const zoneId of zoneIds) {
-              const trackedIds = await loadZoneTrackedPositionIds(zoneId);
-              const st = zoneStates.get(zoneId);
-              if (st) for (const id of st.trackedPositions.keys()) trackedIds.add(id);
-              if (zoneHasLegsInSnapshot(accountId, zoneId, snap.positions, snap.orders, trackedIds)) continue;
-              await reconcileZoneFromBroker(accountId, zoneId, token, region, "periodic_reconcile");
-            }
-          } catch (err) {
-            console.error(`[reconcile] account ${accountId}:`, (err as Error).message);
-          }
-        })();
-      }
     }, 60_000);
     zoneReconcileTimer.unref?.();
     console.log("[zone-reconcile] started (60 s interval, batched per account)");
   }
   zoneMonitorTimer = setInterval(() => {
     if (!isMarketOpen()) return;
-    const token = (() => { try { return getToken(); } catch { return null; } })();
-    if (!token) return;
     zoneMonitorTick += 1;
     // Every ~100 s, hydrate any OPEN/RISK_FREE zones missing from memory (e.g.
     // created while this pod was down or lost from cache after a partial failure).
@@ -5551,7 +4213,7 @@ export function startZoneTpMonitor(): void {
         const lastStreamEval = lastStreamingEvalAt.get(zoneId) ?? 0;
         if (now - lastStreamEval < MONITOR_EVAL_SKIP_IF_STREAM_MS) continue;
       }
-      void evaluateZone(zoneId, token);
+      void evaluateZone(zoneId);
     }
   }, 10_000);
   if (!zoneKeepaliveTimer) {
@@ -5560,9 +4222,7 @@ export function startZoneTpMonitor(): void {
       for (const [accountId, lastTick] of lastTickAtByAccount.entries()) {
         if (now - lastTick > MONITOR_KEEPALIVE_MS) {
           console.warn(`[keepalive] No tick for ${MONITOR_KEEPALIVE_MS}ms on ${accountId} — re-subscribing`);
-          void resubscribeToTickStream(accountId).catch((err) =>
-            console.error("[keepalive] re-subscribe failed:", err),
-          );
+          void Promise.resolve(); // EA uses polling; no stream resubscription needed
           lastTickAtByAccount.set(accountId, now);
         }
       }
@@ -6349,8 +5009,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-partial", checkOwner, a
     if (rejectIfPriceNotReady(res, accountId)) return;
     await ensureReadyForAccount(accountId);
     await ensureCascadeZoneRunnerColumns();
-    const token = getToken();
-    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
+    const region = qstr(req.query.region) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     const body = (req.body ?? {}) as { pct?: unknown; lots?: unknown; tpLevel?: unknown; runnerN?: unknown; emergency?: unknown };
     const pct = typeof body.pct === "number" ? body.pct : undefined;
     const lots = typeof body.lots === "number" ? body.lots : undefined;
@@ -6364,7 +5023,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-partial", checkOwner, a
       }
       markCloseAttempt(zoneId);
     }
-    const result = await handleClosePartial(accountId, zoneId, { pct, lots, tpLevel, runnerN }, token, region);
+    const result = await handleClosePartial(accountId, zoneId, { pct, lots, tpLevel, runnerN });
     if (!result.ok) {
       res.status(result.message === "Zone not found" ? 404 : 409).json(result);
       return;
@@ -6382,8 +5041,6 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
   try {
     if (rejectIfPriceNotReady(res, accountId)) return;
     await ensureCascadeZoneRunnerColumns();
-    const token = getToken();
-    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     const st = await loadZone(zoneId);
     if (!st || st.accountId !== accountId || st.status === "CLOSED") {
       res.status(404).json({ ok: false, message: "Zone not found" });
@@ -6413,7 +5070,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
     const tick = tickStore.get(accountId)?.at(-1);
     const livePx = tick
       ? (st.direction === "buy" ? tick.ask : tick.bid)
-      : (await fetchSymbolPrice(token, region, accountId, "XAUUSD"))?.[st.direction === "buy" ? "ask" : "bid"] ?? null;
+      : latestPrice(accountId)?.[st.direction === "buy" ? "ask" : "bid"] ?? null;
     if (livePx == null) {
       res.status(400).json({ ok: false, message: "Price not ready — wait a moment and try again" });
       return;
@@ -6441,9 +5098,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
         return;
       }
     }
-    const live = (executionBackends.get(accountId) ?? "ea") !== "metaapi"
-      ? await resolveEaPositionsForZone(accountId, zoneId, st)
-      : await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+    const live = await resolveEaPositionsForZone(accountId, zoneId, st);
     const totalVol = live.reduce((s, p) => s + p.volume, 0);
     const totalLots = targets.reduce((s, t) => s + t.lots, 0);
     if (totalLots > totalVol + 1e-9) {
@@ -6547,8 +5202,6 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     if (rejectIfPriceNotReady(res, accountId)) return;
     await ensureReadyForAccount(accountId);
     await ensureCascadeZoneRfColumns();
-    const token = getToken();
-    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     const st = await loadZone(zoneId);
     if (!st || st.accountId !== accountId || st.status === "CLOSED") { res.status(404).json({ error: "Zone not found" }); return; }
     if (st.status === "ARMED") {
@@ -6557,9 +5210,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     }
     st.busy = true;
     try {
-      const live = (executionBackends.get(accountId) ?? "ea") !== "metaapi"
-        ? await resolveEaPositionsForZone(accountId, zoneId, st)
-        : await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+      const live = await resolveEaPositionsForZone(accountId, zoneId, st);
       if (live.length === 0) {
         res.status(409).json({ error: "No open positions in this zone" }); return;
       }
@@ -6588,7 +5239,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
       const sl = computeRiskFreeSl(st.direction, best.openPrice, pips);
       let slOk: boolean;
       let slErrMsg: string | undefined;
-      if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
+      if (true) {
         const r = await getAdapter(accountId).modifyPosition(best.id, { stopLoss: sl });
         slOk = r.ok;
         if (!r.ok) {
@@ -6648,15 +5299,13 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
     if (rejectIfPriceNotReady(res, accountId)) return;
-    const token = getToken();
-    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     const st = await loadZone(zoneId);
     if (!st || st.accountId !== accountId) {
       res.status(404).json({ error: "Zone not found" });
       return;
     }
     if (st.status === "CLOSED") {
-      await reopenClosedZoneIfBrokerLegsRemain(token, region, accountId, zoneId, st);
+      await reopenClosedZoneIfBrokerLegsRemain(accountId, zoneId, st);
     }
     if (st.status === "CLOSED") {
       res.status(404).json({ error: "Zone not found" });
@@ -6666,9 +5315,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
       res.status(409).json({ error: "Zone not active yet — wait for the first order to fill" });
       return;
     }
-    const live = (executionBackends.get(accountId) ?? "ea") !== "metaapi"
-      ? await resolveEaPositionsForZone(accountId, zoneId, st)
-      : await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+    const live = await resolveEaPositionsForZone(accountId, zoneId, st);
     if (live.length <= 1) {
       res.status(409).json({ ok: false, message: "Only one position left — nothing to secure" });
       return;
@@ -6726,16 +5373,15 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
   try {
     if (rejectIfPriceNotReady(res, accountId)) return;
     await ensureReadyForAccount(accountId);
-    const token = getToken();
-    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
+    const region = qstr(req.query.region) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     // DB-first read via the single loadZone path (cache → DB → hydrate).
     // DB errors bubble up to the surrounding try/catch and return 500.
     let st = await loadZone(zoneId);
     if (!st || st.accountId !== accountId) {
-      const isEa = (executionBackends.get(accountId) ?? "ea") !== "metaapi";
+      const isEa = true;
       const allLive = isEa
         ? (getEaState(accountId)?.positions ?? [])
-        : await fetchOpenPositions(token, region, accountId);
+        : (getEaState(accountId)?.positions ?? []);
       const orphans = allLive.filter((p) => positionBelongsToZone(p, zoneId));
       if (orphans.length > 0) {
         let { failed } = await closeLiveZoneLegs(accountId, zoneId, orphans);
@@ -6743,7 +5389,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
           invalidateBrokerSnapshot(accountId);
           const afterClose = isEa
             ? (getEaState(accountId)?.positions ?? [])
-            : await fetchOpenPositions(token, region, accountId, { fresh: true });
+            : (getEaState(accountId)?.positions ?? []);
           const orphanIds = new Set(orphans.map((p) => p.id));
           const remaining = afterClose.filter((p) => orphanIds.has(p.id));
           if (remaining.length === 0) failed = [];
@@ -6775,10 +5421,10 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
       await cancelZoneLimits(accountId, zoneId);
     }
 
-    const _isEaClose = (executionBackends.get(accountId) ?? "ea") !== "metaapi";
+    const _isEaClose = true;
     const live = _isEaClose
       ? await resolveEaPositionsForZone(accountId, zoneId, st)
-      : await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+      : await resolveEaPositionsForZone(accountId, zoneId, st);
 
     // Zone already CLOSED in DB but anchor (or other leg) still open on MT5 — sweep.
     if (st.status === "CLOSED") {
@@ -6792,7 +5438,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
         invalidateBrokerSnapshot(accountId);
         const remaining = _isEaClose
           ? await resolveEaPositionsForZone(accountId, zoneId, st)
-          : await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st, { fresh: true });
+          : await resolveEaPositionsForZone(accountId, zoneId, st);
         if (remaining.length === 0) {
           console.log(`[zone ${zoneId}] close cleanup: broker empty after ${failed.length} API failure(s)`);
           failed = [];
@@ -6828,7 +5474,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
       invalidateBrokerSnapshot(accountId);
       const remaining = _isEaClose
         ? await resolveEaPositionsForZone(accountId, zoneId, st)
-        : await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st, { fresh: true });
+        : await resolveEaPositionsForZone(accountId, zoneId, st);
       if (remaining.length === 0) {
         console.log(`[zone ${zoneId}] close: broker empty after ${failed.length} API failure(s) — reconciled`);
         failed = [];
@@ -6953,8 +5599,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/cancel-pending", checkOwner, 
   try {
     if (rejectIfPriceNotReady(res, accountId)) return;
     await ensureReadyForAccount(accountId);
-    const token = getToken();
-    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
+    const region = qstr(req.query.region) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     if (!zoneStates.has(zoneId)) {
       await loadZone(zoneId);
     }
@@ -6985,69 +5630,12 @@ router.get("/mt5/my-account", async (req: Request, res: Response) => {
   }
 });
 
-async function reconnectExistingAccount(
-  token: string,
-  accountId: string,
-  password: string | undefined,
-  region: string,
-  userId: string | undefined,
-  login?: string,
-  server?: string,
-): Promise<Record<string, unknown> | null> {
-  const acct = await getProvisioningAccount(token, accountId).catch(() => null);
-  if (!acct) return null;
-  const effRegion = normalizeRegion(acct.region) || region;
-  if (password) {
-    await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}`, {
-      method: "PUT",
-      headers: authHeaders(token),
-      body: JSON.stringify({
-        password,
-        ...(login ? { login } : {}),
-        ...(server ? { server } : {}),
-      }),
-    }).catch(() => {});
-  }
-  if (userId) {
-    await upsertStoredAccount({
-      accountId,
-      region: effRegion,
-      userId,
-      mt5Login: login ?? (acct.login != null ? String(acct.login) : null),
-      mt5Server: server ?? acct.server ?? null,
-    }).catch(() => {});
-    userAccountCache.set(userId, accountId);
-  }
-  void startStreaming(token, accountId, effRegion, userId);
-  if (acct.connectionStatus === "CONNECTED") {
-    try {
-      const info = await getAccountInfo(token, accountId, effRegion) as Record<string, unknown>;
-      return {
-        status: "connected",
-        accountId,
-        region: effRegion,
-        name: info.name ?? "Account",
-        balance: info.balance ?? 0,
-        equity: info.equity ?? 0,
-        margin: info.margin ?? 0,
-        freeMargin: info.freeMargin ?? 0,
-        currency: info.currency ?? "USD",
-        leverage: info.leverage ?? 100,
-      };
-    } catch {
-      return { status: "reconnecting", accountId, region: effRegion };
-    }
-  }
-  await deployAccount(token, accountId);
-  return { status: "reconnecting", accountId, region: effRegion };
-}
 
 // POST /api/mt5/connect
 // Body: { login, password, server } — provision and deploy (returns immediately, client polls /status)
 // Body: { accountId } — reconnect stored account
 router.post("/mt5/connect", async (req: Request, res: Response) => {
   try {
-    const token = getToken();
     const userId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
 
     // Stop streaming and remove DB rows for any previous account belonging to this user
@@ -7061,7 +5649,6 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         for (const row of oldRows) {
           if (row.accountId === newAccountId) continue;
           console.log(`[connect] evicting old account ${row.accountId} for userId=${userId}`);
-          await stopStreaming(row.accountId);
           await db.delete(storedAccountsTable)
             .where(eq(storedAccountsTable.accountId, row.accountId));
           userAccountCache.delete(userId);
@@ -7119,85 +5706,29 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         return res.status(403).json({ error: "This account is not linked to your user. Please connect using your MT5 credentials." });
       }
 
-      // EA-native reconnect — skip MetaApi entirely.
-      if (storedRow.executionBackend === "ea") {
-        const region = normalizeRegion(storedRow.region ?? DEFAULT_REGION);
-        executionBackends.set(existingId, "ea");
-        knownAccounts.set(existingId, { accountId: existingId, userId: userId ?? undefined, region });
-        // res.json interceptor fires reregisterEaTerminalAccount
-        const eaState = getEaState(existingId);
-        const live = eaState != null
-          ? (Date.now() - eaState.receivedAt < EA_LIVENESS_MS || Date.now() - getLastEaPollAt(existingId) < EA_LIVENESS_MS)
-          : (Date.now() - getLastEaPollAt(existingId) < EA_LIVENESS_MS);
-        if (live) {
-          return res.json({
-            status: "connected",
-            accountId: existingId,
-            region,
-            ...(eaState ? {
-              balance:    eaState.accountInfo.balance,
-              equity:     eaState.accountInfo.equity,
-              marginFree: eaState.accountInfo.marginFree,
-              currency:   "USD",
-            } : {}),
-          });
-        }
-        return res.json({ status: "connecting", accountId: existingId, region });
-      }
-
-      const acct = await getProvisioningAccount(token, existingId).catch(() => null);
-      if (!acct) {
-        return res.status(404).json({ error: "Account not found. Please log in again with your credentials." });
-      }
-      const region = normalizeRegion(acct.region);
-      void upsertStoredAccount({
-        accountId: existingId,
-        region,
-        userId,
-        mt5Login: acct.login ?? storedRow.mt5Login,
-        mt5Server: acct.server ?? storedRow.mt5Server,
-      });
-      console.log(`[connect] reconnect status=${acct.connectionStatus} region=${region}`);
-
-      if (acct.connectionStatus === "CONNECTED") {
-        // Already connected — fetch info and return immediately.
-        // If the client API isn't warm yet (just redeployed), fall back to polling.
-        // Kick off streaming in background so deal events (and auto-cascade) work
-        // even though the app never polls the /events endpoint directly.
-        void startStreaming(token, existingId, region, userId ?? undefined);
-        try {
-          const info = await getAccountInfo(token, existingId, region) as Record<string, unknown>;
-          return res.json({
-            status: "connected",
-            accountId: existingId,
-            region,
-            name: info.name ?? "Account",
-            balance: info.balance ?? 0,
-            equity: info.equity ?? 0,
-            margin: info.margin ?? 0,
-            freeMargin: info.freeMargin ?? 0,
-            currency: info.currency ?? "USD",
-            leverage: info.leverage ?? 100,
-          });
-        } catch {
-          console.log(`[connect] client API not ready yet for ${existingId} — falling back to polling`);
-          return res.json({ status: "deploying", accountId: existingId, region });
-        }
-      }
-
-      // Not connected — trigger deploy and return "deploying" immediately
-      try {
-        await deployAccount(token, existingId);
-      } catch (deployErr) {
-        const msg = (deployErr as Error).message ?? "Deploy failed";
-        const isBilling = msg.toLowerCase().includes("top up") || msg.toLowerCase().includes("forbidden");
-        return res.status(503).json({
-          error: isBilling
-            ? "Connection limit reached. Please contact support."
-            : msg,
+      // EA-native reconnect
+      const region = storedRow.region ?? DEFAULT_REGION;
+      executionBackends.set(existingId, "ea");
+      knownAccounts.set(existingId, { accountId: existingId, userId: userId ?? undefined, region });
+      // res.json interceptor fires reregisterEaTerminalAccount
+      const eaState = getEaState(existingId);
+      const live = eaState != null
+        ? (Date.now() - eaState.receivedAt < EA_LIVENESS_MS || Date.now() - getLastEaPollAt(existingId) < EA_LIVENESS_MS)
+        : (Date.now() - getLastEaPollAt(existingId) < EA_LIVENESS_MS);
+      if (live) {
+        return res.json({
+          status: "connected",
+          accountId: existingId,
+          region,
+          ...(eaState ? {
+            balance:    eaState.accountInfo.balance,
+            equity:     eaState.accountInfo.equity,
+            marginFree: eaState.accountInfo.marginFree,
+            currency:   "USD",
+          } : {}),
         });
       }
-      return res.json({ status: "deploying", accountId: existingId, region });
+      return res.json({ status: "connecting", accountId: existingId, region });
     }
 
     // ── FRESH LOGIN PATH: credentials provided ────────────────────────────────
@@ -7208,12 +5739,8 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
     const loginStr = String(login).trim();
     const serverStr = String(server).trim();
 
-    // ── EA-NATIVE CONNECT ─────────────────────────────────────────────────────
-    // When the EA terminal token is configured the broker connection lives on the
-    // VPS — skip MetaApi provisioning entirely. Reuse the existing accountId for
-    // this user when credentials match; otherwise evict the old row and create a
-    // new UUID-based accountId so zones/history for the new account start fresh.
-    if (process.env["EA_TERMINAL_TOKEN"]) {
+    // EA-NATIVE CONNECT
+    {
       let eaAccountId: string | null = null;
       if (userId) {
         const [dbExisting] = await db.select().from(storedAccountsTable)
@@ -7228,7 +5755,6 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
             console.log(`[connect/ea] reusing existing accountId ${eaAccountId}`);
           } else {
             console.log(`[connect/ea] credentials changed — evicting ${dbExisting.accountId}`);
-            await stopStreaming(dbExisting.accountId);
             await db.delete(storedAccountsTable)
               .where(eq(storedAccountsTable.accountId, dbExisting.accountId));
             userAccountCache.delete(userId);
@@ -7266,498 +5792,65 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         } : {}),
       });
     }
-
-    const respondReconnect = async (accountId: string, regionHint: string): Promise<boolean> => {
-      try {
-        const result = await reconnectExistingAccount(
-          token, accountId, password, regionHint, userId, loginStr, serverStr,
-        );
-        if (result) {
-          res.json(result);
-          return true;
-        }
-      } catch (deployErr) {
-        const msg = (deployErr as Error).message ?? "Deploy failed";
-        const isBilling = msg.toLowerCase().includes("top up") || msg.toLowerCase().includes("forbidden");
-        res.status(503).json({
-          error: isBilling
-            ? "Connection limit reached. Please contact support."
-            : msg,
-        });
-        return true;
-      }
-      return false;
-    };
-
-    // Hard guard — DB first: never create if user already has a stored account
-    // with matching credentials. If credentials differ, evict the old account so
-    // the user can cleanly add a new one.
-    if (userId) {
-      const [dbExisting] = await db.select().from(storedAccountsTable)
-        .where(eq(storedAccountsTable.userId, userId))
-        .limit(1);
-      if (dbExisting) {
-        const credentialsKnown = dbExisting.mt5Login != null && dbExisting.mt5Server != null;
-        const sameLogin = !credentialsKnown || String(dbExisting.mt5Login).trim() === loginStr;
-        const sameServer = !credentialsKnown
-          || normalizeServer(String(dbExisting.mt5Server)) === normalizeServer(serverStr);
-        if (sameLogin && sameServer) {
-          console.log(`[connect] reusing ${dbExisting.accountId}`);
-          if (await respondReconnect(dbExisting.accountId, dbExisting.region)) return;
-        } else {
-          console.log(`[connect] credentials changed (${dbExisting.mt5Login}→${loginStr}) — evicting ${dbExisting.accountId}`);
-          await stopStreaming(dbExisting.accountId);
-          await db.delete(storedAccountsTable)
-            .where(eq(storedAccountsTable.accountId, dbExisting.accountId));
-          userAccountCache.delete(userId);
-        }
-      }
-    }
-
-    // Check MetaAPI for matching account — never create duplicates.
-    const listRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
-      headers: authHeaders(token),
-    });
-    const allAccounts = listRes.ok ? (await listRes.json() as ProvisioningAccount[]) : [];
-    console.log(`[connect] found ${Array.isArray(allAccounts) ? allAccounts.length : 0} existing accounts`);
-
-    const match = Array.isArray(allAccounts)
-      ? allAccounts.find((a) =>
-          String(a.login).trim() === loginStr
-          && normalizeServer(String(a.server ?? "")) === normalizeServer(serverStr))
-      : undefined;
-    const matchId = match?._id ?? match?.id;
-
-    if (match && matchId) {
-      console.log(`[connect] found on MetaAPI ${matchId}`);
-      if (await respondReconnect(matchId, normalizeRegion(match.region))) return;
-    }
-
-    // ── CREATE BRAND-NEW MetaAPI ACCOUNT ──────────────────────────────────────
-    console.log(`[connect] creating new account for ${loginStr}`);
-    const createPayload = {
-      login,
-      password,
-      name: `MT5 ${login}`,
-      server,
-      platform: "mt5",
-      type: "cloud-g2",
-      reliability: "regular",
-      magic: 47182,
-      // Vantage Markets executes from Equinix NY4 — provisioning the MetaAPI
-      // account in new-york minimises broker round-trip latency, which is the
-      // dominant cost when cascading limit orders.
-      region: "new-york",
-    };
-
-    console.log(`[connect] creating new account login=${login} server=${server}`);
-
-    // MetaAPI provisioning can take 30-40s for unknown brokers (it downloads the broker .dat file).
-    // Use a 38-second abort signal to capture the 202 response, then handle it.
-    const ctrl = new AbortController();
-    const createTimer = setTimeout(() => ctrl.abort(), 38000);
-
-    // Use a different name to avoid conflict with Express's Response type
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let fetchRes: any = null;
-    let createTimedOut = false;
-    try {
-      fetchRes = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
-        method: "POST",
-        headers: authHeaders(token),
-        body: JSON.stringify(createPayload),
-        signal: ctrl.signal,
-      });
-      clearTimeout(createTimer);
-      console.log(`[connect] create status=${fetchRes.status}`);
-    } catch (fetchErr) {
-      clearTimeout(createTimer);
-      if ((fetchErr as Error).name === "AbortError") {
-        createTimedOut = true;
-        console.log(`[connect] create timed out — checking if account was queued`);
-      } else {
-        throw fetchErr;
-      }
-    }
-
-    // Handle non-202 error statuses before the timeout/202 path
-    if (fetchRes && !createTimedOut && fetchRes.status !== 202 && !fetchRes.ok) {
-      const errBody = await fetchRes.json().catch(() => ({})) as ProvisioningAccount & { metadata?: { recommendedRetryTime?: string } };
-      console.log(`[connect] create error: status=${fetchRes.status} body=${JSON.stringify(errBody).slice(0, 200)}`);
-      if (fetchRes.status === 429) {
-        const retryAt = errBody.metadata?.recommendedRetryTime;
-        const retryMsg = retryAt ? ` Try again after ${new Date(retryAt).toLocaleTimeString()}.` : " Please try again in 1 hour.";
-        return res.status(429).json({ error: `Too many failed attempts for this account.${retryMsg}` });
-      }
-      if (fetchRes.status === 403) {
-        return res.status(403).json({ error: "Connection limit reached. Please contact support." });
-      }
-      if (errBody.details === "E_AUTH" || errBody.message?.includes("authenticate")) {
-        return res.status(401).json({ error: "Invalid credentials — check your MT5 login, password, and server name." });
-      }
-      return res.status(fetchRes.status).json({ error: errBody.message ?? "Failed to create account. Check your login details and server name." });
-    }
-
-    // If the provisioning request timed out, MetaAPI may have queued the account.
-    // Check the list — if it appeared, proceed. Otherwise ask client to retry.
-    if (createTimedOut || fetchRes?.status === 202) {
-      const listR = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, { headers: authHeaders(token) });
-      const accts = listR.ok ? (await listR.json() as ProvisioningAccount[]) : [];
-      const queued = Array.isArray(accts) ? accts.find((a) => a.login === login && a.server === server) : undefined;
-      const queuedId = queued?._id ?? queued?.id;
-      if (queued && queuedId) {
-        console.log(`[connect] found queued account ${queuedId} — deploying`);
-        const region = normalizeRegion(queued.region);
-        if (userId) {
-          await upsertStoredAccount({
-            accountId: queuedId,
-            region,
-            userId,
-            mt5Login: login,
-            mt5Server: server,
-          }).catch((e: Error) => console.warn(`[connect] queued account persist failed:`, e.message));
-        }
-        if (queued.connectionStatus !== "CONNECTED") await deployAccount(token, queuedId);
-        return res.json({ status: "deploying", accountId: queuedId, region });
-      }
-      // Account not visible yet — tell client to retry in 70s (MetaAPI says wait 60s)
-      console.log(`[connect] account not yet visible, asking client to retry in 70s`);
-      return res.json({ status: "pending_broker_detection", retryAfterMs: 70000 });
-    }
-
-    const created = await fetchRes.json() as ProvisioningAccount;
-    console.log(`[connect] create body: ${JSON.stringify(created).slice(0, 250)}`);
-
-    const newId = created._id ?? created.id;
-    if (!newId || typeof newId !== "string" || newId.length < 10) {
-      return res.status(500).json({ error: "Unexpected error establishing connection. Please try again." });
-    }
-
-    const region = normalizeRegion(created.region);
-    console.log(`[connect] created accountId=${newId} region=${region} — deploying`);
-
-    if (userId) {
-      await upsertStoredAccount({
-        accountId: newId,
-        region,
-        userId,
-        mt5Login: login,
-        mt5Server: server,
-      }).catch((e: Error) => console.warn(`[connect] new account persist failed:`, e.message));
-    }
-
-    // Kick off deploy and return immediately — client will poll /status
-    await deployAccount(token, newId);
-    return res.json({ status: "deploying", accountId: newId, region });
-
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Connection failed";
-    console.error("[connect] error:", message);
-    return res.status(500).json({ error: message });
+    return res.status(500).json({ error: err instanceof Error ? err.message : "Connect failed" });
   }
 });
 
-// GET /api/mt5/account/:accountId/status?region=
-// Client polls this after getting status="deploying" or "pending_broker_detection"
+// GET /api/mt5/account/:accountId/status
+// Returns EA terminal connection status
 router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, res: Response) => {
   try {
-    const token = getToken();
     const accountId = String(req.params.accountId);
-    const region = qstr(req.query.region) || DEFAULT_REGION;
-
-    const acct = await getProvisioningAccount(token, accountId);
-    console.log(`[status] accountId=${accountId} state=${acct.state} connectionStatus=${acct.connectionStatus}`);
-
-    if (acct.connectionStatus === "CONNECTED") {
-      let info: Record<string, unknown> = {};
-      try {
-        const effectiveRegion = normalizeRegion(acct.region) || region;
-        info = await getAccountInfo(token, accountId, effectiveRegion) as Record<string, unknown>;
-      } catch (infoErr) {
-        // Client API not yet ready — report still connecting to keep polling
-        console.warn(`[status] getAccountInfo failed for ${accountId}:`, (infoErr as Error).message);
-        return res.json({ connectionStatus: "CONNECTING", state: acct.state });
-      }
-      const effectiveRegion = normalizeRegion(acct.region) || region;
+    const eaState = getEaState(accountId);
+    const live = eaState != null
+      ? (Date.now() - eaState.receivedAt < EA_LIVENESS_MS || Date.now() - getLastEaPollAt(accountId) < EA_LIVENESS_MS)
+      : (Date.now() - getLastEaPollAt(accountId) < EA_LIVENESS_MS);
+    if (live && eaState) {
       return res.json({
         connectionStatus: "CONNECTED",
         accountId,
-        region: effectiveRegion,
-        name: info.name ?? "Account",
-        balance: info.balance ?? 0,
-        equity: info.equity ?? 0,
-        margin: info.margin ?? 0,
-        freeMargin: info.freeMargin ?? 0,
-        currency: info.currency ?? "USD",
-        leverage: info.leverage ?? 100,
+        region: knownAccounts.get(accountId)?.region ?? DEFAULT_REGION,
+        balance: eaState.accountInfo.balance,
+        equity: eaState.accountInfo.equity,
+        freeMargin: eaState.accountInfo.marginFree,
+        currency: "USD",
       });
     }
-
-    if (acct.state === "DEPLOY_FAILED") {
-      return res.status(503).json({ connectionStatus: "DEPLOY_FAILED", error: "Deployment failed. Check your credentials and server." });
-    }
-
-    // If the account is UNDEPLOYED (e.g. after a server restart or MetaAPI idle timeout),
-    // re-trigger deployment so the client doesn't get stuck polling forever.
-    if (acct.state === "UNDEPLOYED") {
-      console.log(`[status] account ${accountId} is UNDEPLOYED — re-triggering deploy`);
-      try {
-        await deployAccount(token, accountId);
-        return res.json({ connectionStatus: "DEPLOYING", state: "DEPLOYING" });
-      } catch (deployErr) {
-        const msg = (deployErr as Error).message ?? "Deploy failed";
-        const isBilling = msg.toLowerCase().includes("top up") || msg.toLowerCase().includes("forbidden");
-        return res.status(503).json({
-          connectionStatus: "DEPLOY_FAILED",
-          error: isBilling
-            ? "Connection limit reached. Please contact support."
-            : msg,
-        });
-      }
-    }
-
-    return res.json({ connectionStatus: acct.connectionStatus ?? "DEPLOYING", state: acct.state });
+    return res.json({ connectionStatus: live ? "CONNECTING" : "DISCONNECTED", accountId });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Status check failed" });
   }
 });
 
-// In-memory lock to prevent concurrent migrations for the same MT5 login.
-// Key: `${loginStr}|${server}`. The lock is best-effort (single-process); a
-// real multi-instance deploy would need a DB lock, but this server is
-// single-instance on Replit.
-const migrationLocks = new Set<string>();
 
-// POST /api/mt5/admin/migrate-region
-// Body: { login, password, server, targetRegion? }
-// Header: x-admin-key  (header only — never accept via query string)
-// Re-provisions an existing MetaAPI account into a different region. Required
-// because MetaAPI does not let you change region on an existing account — we
-// must delete and recreate. The user's MT5 password is needed (we don't store
-// it). User->account binding is preserved across the swap.
-//
-// Failure recovery: if the delete succeeds but create fails (network blip,
-// bad credentials), the old account is gone — admin must call this endpoint
-// again with the same payload. The retry will find no existing account and
-// fall through to the create path, restoring the userId binding.
-async function migrateRegionHandler(req: Request, res: Response): Promise<void> {
-  // Fail-closed: require ADMIN_KEY to be configured AND match. No default.
-  const ADMIN_KEY = process.env["ADMIN_KEY"];
-  if (!ADMIN_KEY) {
-    res.status(500).json({ error: "ADMIN_KEY not configured on server" }); return;
-  }
-  const key = (req.headers["x-admin-key"] as string | undefined) ?? "";
-  if (key !== ADMIN_KEY) { res.status(401).json({ error: "admin key required (x-admin-key header)" }); return; }
-
-  const { login, password, server, targetRegion } = (req.body ?? {}) as {
-    login?: string | number; password?: string; server?: string; targetRegion?: string;
-  };
-  const target = (targetRegion ?? "new-york").trim();
-  if (!login || !password || !server) {
-    res.status(400).json({ error: "login, password, server required" }); return;
-  }
-  const loginStr = String(login);
-  const lockKey = `${loginStr}|${server}`;
-  if (migrationLocks.has(lockKey)) {
-    res.status(409).json({ error: "Migration already in progress for this login. Try again in a moment." }); return;
-  }
-  migrationLocks.add(lockKey);
-
-  try {
-    const token = getToken();
-
-    // 1. Find existing account on MetaAPI by login+server
-    const listR = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, { headers: authHeaders(token) });
-    if (!listR.ok) {
-      res.status(502).json({ error: `MetaAPI list failed: ${listR.status}` }); return;
-    }
-    const accts = await listR.json() as ProvisioningAccount[];
-    const existing = Array.isArray(accts)
-      ? accts.find((a) => String(a.login) === loginStr && a.server === server)
-      : undefined;
-
-    let preservedUserId: string | null = null;
-
-    if (existing) {
-      const existingId = (existing._id ?? existing.id) as string;
-      const existingRegion = normalizeRegion(existing.region);
-      console.log(`[migrate] found existing accountId=${existingId} region=${existingRegion} target=${target}`);
-
-      if (existingRegion === target) {
-        res.json({ ok: true, accountId: existingId, region: existingRegion, message: "Already in target region — nothing to do." });
-        return;
-      }
-
-      // Capture userId binding so we can restore it after recreating
-      const [row] = await db.select().from(storedAccountsTable).where(eq(storedAccountsTable.accountId, existingId)).limit(1);
-      preservedUserId = row?.userId ?? null;
-
-      // 2. Drop DB row FIRST so the watchdog (60 s interval) cannot reconnect
-      //    the old account once we stop streaming and undeploy it.
-      await db.delete(storedAccountsTable).where(eq(storedAccountsTable.accountId, existingId)).catch(() => {});
-      if (preservedUserId) userAccountCache.delete(preservedUserId);
-
-      // 3. Stop streaming
-      await stopStreaming(existingId);
-
-      // 4. Undeploy
-      const undeployR = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${existingId}/undeploy`, {
-        method: "POST", headers: authHeaders(token),
-      });
-      if (!undeployR.ok && undeployR.status !== 204) {
-        const errBody = await undeployR.json().catch(() => ({})) as { message?: string };
-        console.warn(`[migrate] undeploy returned ${undeployR.status}: ${errBody.message}`);
-      }
-
-      // 5. Poll until confirmed UNDEPLOYED. Only break on confirmed terminal
-      //    state — transient lookup errors do NOT advance us to delete.
-      const undeployStart = Date.now();
-      let transientErrors = 0;
-      let confirmedUndeployed = false;
-      while (Date.now() - undeployStart < 60000) {
-        const acct = await getProvisioningAccount(token, existingId).catch(() => null);
-        if (!acct) {
-          // 404 means already gone — treat as success
-          transientErrors++;
-          if (transientErrors >= 3) { confirmedUndeployed = true; break; }
-        } else if (acct.state === "UNDEPLOYED" || acct.state === "DELETING") {
-          confirmedUndeployed = true; break;
-        } else {
-          transientErrors = 0;
-        }
-        await sleep(2000);
-      }
-      if (!confirmedUndeployed) {
-        console.warn(`[migrate] undeploy did not confirm within 60s — attempting delete anyway`);
-      }
-
-      // 6. Delete the MetaAPI account
-      const delR = await fetch(`${PROVISIONING_BASE}/users/current/accounts/${existingId}`, {
-        method: "DELETE", headers: authHeaders(token),
-      });
-      if (!delR.ok && delR.status !== 204 && delR.status !== 404) {
-        const errBody = await delR.json().catch(() => ({})) as { message?: string };
-        res.status(502).json({
-          error: `Delete failed: ${errBody.message ?? delR.status}. Old account still exists in ${existingRegion}; safe to retry.`,
-        }); return;
-      }
-      console.log(`[migrate] deleted old accountId=${existingId} (preservedUserId=${preservedUserId})`);
-    } else {
-      console.log(`[migrate] no existing account for login=${loginStr} server=${server} — creating fresh in ${target}`);
-      // If a previous run deleted the account but failed at create, the userId
-      // binding may already be missing. Try to recover it from our DB rows.
-      if (!preservedUserId) {
-        const rows = await db.select().from(storedAccountsTable);
-        // No way to look up by login (we don't store it), so caller must reconnect
-        // through the app if userId binding is lost. Log loudly.
-        if (rows.length === 0) console.log(`[migrate] (no DB rows to recover userId from)`);
-      }
-    }
-
-    // 7. Provision fresh account in target region
-    const createPayload = {
-      login: loginStr, password, name: `MT5 ${loginStr}`, server,
-      platform: "mt5", type: "cloud-g2", reliability: "regular", magic: 47182,
-      region: target,
-    };
-    const createR = await fetch(`${PROVISIONING_BASE}/users/current/accounts`, {
-      method: "POST", headers: authHeaders(token), body: JSON.stringify(createPayload),
-    });
-    if (!createR.ok && createR.status !== 202) {
-      const errBody = await createR.json().catch(() => ({})) as { message?: string; details?: string };
-      const msg = errBody.message ?? `create failed: ${createR.status}`;
-      // If we already deleted the old account, the admin MUST retry with the
-      // same payload — log this loudly so it can be diagnosed.
-      console.error(`[migrate] CREATE FAILED after old account deleted. login=${loginStr} server=${server} target=${target} preservedUserId=${preservedUserId} err=${msg}`);
-      if (errBody.details === "E_AUTH") {
-        res.status(401).json({ error: "Invalid MT5 credentials. Old account already removed — verify password and retry." }); return;
-      }
-      res.status(502).json({ error: `${msg}. Old account was already removed; retry with same payload.` }); return;
-    }
-    const created = await createR.json() as ProvisioningAccount;
-    const newId = (created._id ?? created.id) as string;
-    const newRegion = normalizeRegion(created.region) || target;
-    console.log(`[migrate] created new accountId=${newId} region=${newRegion}`);
-
-    // 8. Deploy
-    await deployAccount(token, newId);
-
-    // 9. Restore userId binding in DB (upsert). Failure here is logged but the
-    //    migration is still considered successful — admin can rebind manually.
-    try {
-      await upsertStoredAccount({
-        accountId: newId,
-        region: newRegion,
-        userId: preservedUserId,
-        mt5Login: loginStr,
-        mt5Server: server,
-      });
-      if (preservedUserId) userAccountCache.set(preservedUserId, newId);
-    } catch (e) {
-      console.error(`[migrate] DB upsert failed for newId=${newId} userId=${preservedUserId}:`, (e as Error).message);
-    }
-
-    // 10. Kick off streaming so cascade is armed once deploy completes
-    void startStreaming(token, newId, newRegion, preservedUserId ?? undefined);
-
-    res.json({
-      ok: true,
-      accountId: newId,
-      region: newRegion,
-      userId: preservedUserId,
-      message: `Account re-provisioned in ${newRegion}. Deploy is in progress — give it 30-60s before trading.`,
-    });
-  } catch (err) {
-    console.error("[migrate] error:", (err as Error).message);
-    res.status(500).json({ error: (err as Error).message });
-  } finally {
-    migrationLocks.delete(lockKey);
-  }
-}
 
 // POST /api/mt5/account/:accountId/disconnect
 router.post("/mt5/account/:accountId/disconnect", checkOwner, async (req: Request, res: Response) => {
   try {
-    const token = getToken();
-    const { accountId } = req.params;
-    await fetch(`${PROVISIONING_BASE}/users/current/accounts/${accountId}/undeploy`, {
-      method: "POST",
-      headers: authHeaders(token),
-    });
+    const accountId = String(req.params.accountId);
+    // EA: terminal manages the MT5 connection; we just clean up our state.
+    syncReady.delete(accountId);
+    invalidateBrokerSnapshot(accountId);
     return res.json({ success: true });
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Disconnect failed" });
   }
 });
 
-// GET /api/mt5/account/:accountId/realized-pnl?since=<ms>&region=london
-// Sums profit+commission+swap on closed trade deals (DEAL_ENTRY_OUT) since `since` (ms epoch).
-router.get("/mt5/account/:accountId/realized-pnl", checkOwner, async (req: Request, res: Response) => {
-  try {
-    const token = getToken();
-    const { accountId } = req.params as { accountId: string };
-    const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
-    const sinceMs = parseInt(qstr(req.query.since) ?? "0", 10) || 0;
-    const deals = await fetchAccountHistoryDeals(token, region, accountId, sinceMs, Date.now());
-    return res.json({ pnl: sumRealizedTradePnlFromDeals(deals) });
-  } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
-  }
+// GET /api/mt5/account/:accountId/realized-pnl
+// Deal history not available in EA-terminal mode.
+router.get("/mt5/account/:accountId/realized-pnl", checkOwner, (_req: Request, res: Response) => {
+  res.json({ pnl: 0 });
 });
 
 // GET /api/mt5/account/:accountId/info?region=london
 router.get("/mt5/account/:accountId/info", checkOwner, async (req: Request, res: Response) => {
   try {
     const { accountId } = req.params as { accountId: string };
-    if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
-      const state = getEaState(accountId);
-      if (!state) return res.status(503).json({ error: "EA terminal not connected — no state received yet" });
-      return res.json(state.accountInfo);
-    }
-    const token = getToken();
-    const region = qstr(req.query.region) || DEFAULT_REGION;
-    const info = await getAccountInfo(token, accountId, region);
-    return res.json(info);
+    const state = getEaState(accountId);
+    if (!state) return res.status(503).json({ error: "EA terminal not connected — no state received yet" });
+    return res.json(state.accountInfo);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
   }
@@ -7772,36 +5865,23 @@ router.get("/mt5/account/:accountId/candles", checkOwner, (req: Request, res: Re
   return res.json(candles);
 });
 
-// GET /api/mt5/account/:accountId/price?region=london
-router.get("/mt5/account/:accountId/price", checkOwner, async (req: Request, res: Response) => {
-  try {
-    const token = getToken();
-    const region = qstr(req.query.region) || DEFAULT_REGION;
-    const priceRes = await fetch(
-      `${clientBase(region)}/users/current/accounts/${req.params.accountId}/symbols/XAUUSD/current-price`,
-      { headers: authHeaders(token) }
-    );
-    if (!priceRes.ok) return res.status(priceRes.status).json({ error: "Price fetch failed" });
-    const priceData = await priceRes.json() as { bid?: number; ask?: number };
-    // Accumulate tick for chart history
-    if (priceData.bid && priceData.ask) storeTick(req.params.accountId as string, priceData.bid, priceData.ask);
-    return res.json(priceData);
-  } catch (err) {
-    return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
-  }
+// GET /api/mt5/account/:accountId/price
+router.get("/mt5/account/:accountId/price", checkOwner, (req: Request, res: Response) => {
+  const accountId = String(req.params.accountId);
+  const price = latestPrice(accountId);
+  if (!price) return res.status(503).json({ error: "No price data available yet" });
+  return res.json(price);
 });
 
-// GET /api/mt5/account/:accountId/display-fx?to=GBP&region=london
-// Returns FX rate: display amount = usdAmount * rate (XAUUSD risk is quoted in USD).
+// GET /api/mt5/account/:accountId/display-fx?to=GBP
+// Returns FX rate using EA tick data.
 router.get("/mt5/account/:accountId/display-fx", checkOwner, async (req: Request, res: Response) => {
   try {
-    const token = getToken();
-    const region = qstr(req.query.region) || DEFAULT_REGION;
     const accountId = String(req.params.accountId);
     const to = qstr(req.query.to) || "USD";
     const { rate, currency } = await usdToTargetRate(
-      token, region, accountId, to,
-      (t, r, a, s) => fetchSymbolPrice(t, r, a, s, { useTickFallback: false }),
+      accountId, to,
+      (a: string) => priceForZoneEval(a, "XAUUSD"),
     );
     return res.json({ from: "USD", to: currency, rate });
   } catch (err) {
@@ -7832,25 +5912,9 @@ router.get("/mt5/account/:accountId/positions", checkOwner, async (req: Request,
     } catch (e) {
       console.warn(`[positions] zone enrichment lookup failed accountId=${accountId}:`, (e as Error).message);
     }
-    if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
-      const state = getEaState(accountId);
-      const raw: Array<Record<string, unknown>> = (state?.positions ?? []).map(p => ({ ...p }));
-      return res.json(enrichPositionsWithZoneTags(raw, positionToZoneId));
-    }
-    const token = getToken();
-    const region = qstr(req.query.region) || DEFAULT_REGION;
-    const posRes = await fetch(
-      `${clientBase(region)}/users/current/accounts/${accountId}/positions`,
-      { headers: authHeaders(token) }
-    );
-    if (!posRes.ok) return res.status(posRes.status).json({ error: "Positions fetch failed" });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const body = await posRes.json() as any[];
-    const enriched = enrichPositionsWithZoneTags(
-      Array.isArray(body) ? body as Array<Record<string, unknown>> : [],
-      positionToZoneId,
-    );
-    return res.json(enriched);
+    const state = getEaState(accountId);
+    const raw: Array<Record<string, unknown>> = (state?.positions ?? []).map(p => ({ ...p }));
+    return res.json(enrichPositionsWithZoneTags(raw, positionToZoneId));
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
   }
@@ -7860,54 +5924,26 @@ router.get("/mt5/account/:accountId/positions", checkOwner, async (req: Request,
 router.get("/mt5/account/:accountId/orders", checkOwner, async (req: Request, res: Response) => {
   try {
     const { accountId } = req.params as { accountId: string };
-    if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
-      const state = getEaState(accountId);
-      return res.json(state?.orders ?? []);
-    }
-    const token = getToken();
-    const region = qstr(req.query.region) || DEFAULT_REGION;
-    const ordRes = await fetch(
-      `${clientBase(region)}/users/current/accounts/${accountId}/orders`,
-      { headers: authHeaders(token) }
-    );
-    if (!ordRes.ok) return res.status(ordRes.status).json({ error: "Orders fetch failed" });
-    const orders = await ordRes.json() as Array<Record<string, unknown>>;
-    // Filter out orders that streaming has confirmed are completed (cancelled/filled).
-    // MetaAPI REST is eventually consistent and can serve stale data for minutes;
-    // the streaming completedOrderIds set is our real-time source of truth.
-    const done = completedOrderIds.get(accountId);
-    const filtered = done?.size
-      ? orders.filter(o => !done.has(String(o.id ?? o._id ?? "")))
-      : orders;
-    return res.json(filtered);
+    const state = getEaState(accountId);
+    return res.json(state?.orders ?? []);
   } catch (err) {
     return res.status(500).json({ error: err instanceof Error ? err.message : "Failed" });
   }
 });
 
-// DELETE /api/mt5/account/:accountId/order/:orderId?region=london  (cancel pending order)
+// DELETE /api/mt5/account/:accountId/order/:orderId
 router.delete("/mt5/account/:accountId/order/:orderId", checkOwner, async (req: Request, res: Response) => {
   try {
-    const token = getToken();
-    const region = qstr(req.query.region) || DEFAULT_REGION;
-    const tradeRes = await fetch(
-      `${clientBase(region)}/users/current/accounts/${req.params.accountId}/trade`,
-      {
-        method: "POST",
-        headers: authHeaders(token),
-        body: JSON.stringify({ actionType: "ORDER_CANCEL", orderId: req.params.orderId }),
-      }
-    );
-    const data = await tradeRes.json() as { numericCode?: number; message?: string };
-    const code = data.numericCode ?? 0;
-    const success = TRADE_SUCCESS_CODES.has(code);
-    // 4754 = order already gone — still mark completed so /orders filters it out.
-    if (success || code === 4754) markOrderCompleted(String(req.params.accountId), String(req.params.orderId));
-    console.log(`[cancel-order] orderId=${req.params.orderId} code=${code} success=${success}`);
-    return res.status(tradeRes.ok ? 200 : tradeRes.status).json({
+    const accountId = String(req.params.accountId);
+    const orderId   = String(req.params.orderId);
+    const r = await getAdapter(accountId).cancelOrder(orderId);
+    const code = r.numericCode;
+    const success = r.ok || code === 4754; // 4754 = already gone
+    console.log(`[cancel-order] orderId=${orderId} code=${code} success=${success}`);
+    return res.json({
       success,
       code,
-      message: success ? "Order cancelled" : (TRADE_ERROR_MESSAGES[code] ?? data.message ?? `Cancel failed (code ${code})`),
+      message: success ? "Order cancelled" : (TRADE_ERROR_MESSAGES[code] ?? r.message ?? `Cancel failed (code ${code})`),
     });
   } catch (err) {
     return res.status(500).json({ success: false, code: 0, message: err instanceof Error ? err.message : "Cancel failed" });
@@ -7967,8 +6003,6 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
     return;
   }
   try {
-    const token = getToken();
-    const region = qstr(req.query.region) || DEFAULT_REGION;
     const body = req.body as Record<string, unknown>;
     const clientZoneTag =
       typeof body.zoneId === "string" ? body.zoneId.trim()
@@ -8031,7 +6065,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
       pendingAppCascades.add(accountId);
     }
 
-    if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
+    {
       // EA backend: check liveness then route through EaAdapter.
       const eaState  = getEaState(accountId);
       const _stateAge = eaState ? Date.now() - eaState.receivedAt : Infinity;
@@ -8063,21 +6097,10 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
       code       = eaResult.numericCode;
       data       = { numericCode: eaResult.numericCode, message: eaResult.message, orderId: eaResult.orderId };
       httpStatus = eaResult.ok ? 200 : 400;
-    } else {
-      const conn = activeConnections.get(accountId);
-      await ensureConnectionReady(conn);
-      const tradeResult = await executeTradeRequest(conn, region, accountId, token, body);
-      code       = tradeResult.code;
-      data       = tradeResult.data;
-      httpStatus = tradeResult.httpStatus;
     }
     console.log(`[trade] accountId=${accountId} action=${body.actionType} code=${code}`);
 
-    // ── Dead-account detection ───────────────────────────────────────────────
-    // If MetaAPI says the account no longer exists (deleted/orphaned on their
-    // side), the trade can never succeed for this accountId. Evict the stale DB
-    // row + caches and tell the client to reconnect with fresh credentials so
-    // the user isn't left with a button that silently does nothing.
+    // Dead-account detection: clean up stale DB rows when account is gone
     const _failMsg = String((data as { message?: string }).message ?? "").toLowerCase();
     const _accountGone =
       httpStatus === 404 ||
@@ -8085,9 +6108,8 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
       _failMsg.includes("account is not deployed") && _failMsg.includes("not found");
     if (_accountGone) {
       pendingAppCascades.delete(accountId);
-      console.warn(`[trade] accountId=${accountId} — MetaAPI says account not found. Evicting stale row and asking client to reconnect.`);
+      console.warn(`[trade] accountId=${accountId} — account not found. Evicting stale row and asking client to reconnect.`);
       try {
-        await stopStreaming(accountId);
         await db.delete(storedAccountsTable).where(eq(storedAccountsTable.accountId, accountId));
         const uId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
         if (uId) userAccountCache.delete(uId);
@@ -8106,9 +6128,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
     const success = TRADE_SUCCESS_CODES.has(code);
     const errorMessage = success ? undefined : userFacingTradeMessage(code, data.message);
     if (!success) console.log(`[trade] FAILED action=${body.actionType} code=${code} msg="${errorMessage}"`);
-    if (_isAppMarketCascade && !success) {
-      scheduleCascadeReconcile(accountId, region, token);
-    }
+
     logEvent(success ? "trade.ok" : "trade.fail", {
       accountId,
       action: _tradeActionType,
@@ -8231,10 +6251,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
                 // This is the DB-first ordering: DB row exists before monitor sees it.
                 zoneStates.set(zoneState.zoneId, zoneState);
                 try {
-                  const _isEaAnchor = (executionBackends.get(accountId) ?? "ea") !== "metaapi";
-                  const positions = _isEaAnchor
-                    ? (getEaState(accountId)?.positions ?? [])
-                    : await fetchOpenPositions(getToken(), region, accountId);
+                  const positions = getEaState(accountId)?.positions ?? [];
                   const me = positions.find(p => p.id === positionId);
                   if (me && me.openPrice > 0 && me.openPrice !== zoneState.anchorPrice) {
                     zoneState.anchorPrice = me.openPrice;
@@ -8256,7 +6273,6 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
                   }
                 } catch { /* keep best-known anchor */ }
               })();
-              scheduleCascadeReconcile(accountId, region, token);
             }
           }
         }
@@ -8278,25 +6294,9 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
   }
 });
 
-// GET /api/mt5/events/:accountId?since=<ms>&region=london
-// Returns new DEAL_ENTRY_IN events since `since` (ms epoch).
-// Also kicks off the streaming connection for this account if not already running.
-router.get("/mt5/events/:accountId", checkOwner, async (req: Request, res: Response) => {
-  try {
-    const token = getToken();
-    const { accountId } = req.params as { accountId: string };
-    const since = parseInt(qstr(req.query.since) ?? "0", 10) || 0;
-    const region = qstr(req.query.region) || DEFAULT_REGION;
-
-    // Start streaming connection in the background (idempotent — safe to call repeatedly)
-    const eventsUserId = (req as unknown as Record<string, unknown>)["userId"] as string | undefined;
-    void startStreaming(token, accountId, region, eventsUserId);
-
-    const events = getEventsSince(accountId, since);
-    return res.json({ events, serverTime: Date.now() });
-  } catch (err) {
-    return res.status(500).json({ error: (err as Error).message });
-  }
+// GET /api/mt5/events/:accountId — deprecated; EA uses SSE stream for position updates
+router.get("/mt5/events/:accountId", checkOwner, (_req: Request, res: Response) => {
+  return res.json({ events: [], serverTime: Date.now() });
 });
 
 // GET /api/cascade-config?accountId=<id>
@@ -8386,18 +6386,75 @@ export async function handleEaStateSnapshot(
     }
   }
 
-  let token: string;
-  try { token = getToken(); } catch { return; }
-
   const snap: BrokerSnap = { positions, orders };
   for (const [zoneId, st] of zoneStates.entries()) {
     if (st.accountId !== accountId || st.status === "CLOSED") continue;
     try {
-      await evaluateZone(zoneId, token, { brokerSnap: snap });
+      await evaluateZone(zoneId, { brokerSnap: snap });
     } catch (err) {
       console.error(`[ea-state] ${zoneId}:`, (err as Error).message);
     }
   }
+}
+
+// ── Startup helpers ───────────────────────────────────────────────────────────
+// In EA-only mode there is no MetaAPI connection to (re)establish on startup.
+// These functions seed in-memory state from DB so the server is ready to serve
+// requests immediately, without waiting for the EA terminal to push its first
+// state snapshot.
+
+/** Load all stored accounts into knownAccounts and executionBackends on startup. */
+export async function seedKnownAccountsFromDb(): Promise<void> {
+  try {
+    const rows = await db.select().from(storedAccountsTable);
+    for (const row of rows) {
+      const region = row.region ?? DEFAULT_REGION;
+      knownAccounts.set(row.accountId, {
+        accountId: row.accountId,
+        userId: row.userId ?? undefined,
+        region,
+      });
+      executionBackends.set(row.accountId, (row.executionBackend ?? "ea") as "ea");
+      if (row.userId) userAccountCache.set(row.userId, row.accountId);
+    }
+    console.log(`[startup] seeded ${rows.length} account(s) from DB`);
+  } catch (err) {
+    console.error("[startup] seedKnownAccountsFromDb failed:", (err as Error).message);
+  }
+}
+
+/** Remove cascade zones whose accountId no longer has a stored account row. */
+export async function deleteOrphanZones(): Promise<void> {
+  try {
+    const accountRows = await db.select({ accountId: storedAccountsTable.accountId }).from(storedAccountsTable);
+    const validIds = new Set(accountRows.map((r) => r.accountId));
+    const zoneRows = await db.select({ zoneId: cascadeZonesTable.zoneId, accountId: cascadeZonesTable.accountId }).from(cascadeZonesTable);
+    const orphans = zoneRows.filter((z) => z.accountId && !validIds.has(z.accountId));
+    for (const orphan of orphans) {
+      await db.delete(cascadeZonesTable).where(eq(cascadeZonesTable.zoneId, orphan.zoneId));
+      console.log(`[startup] deleted orphan zone ${orphan.zoneId} (accountId=${orphan.accountId})`);
+    }
+    if (orphans.length > 0) console.log(`[startup] deleted ${orphans.length} orphan zone(s)`);
+  } catch (err) {
+    console.error("[startup] deleteOrphanZones failed:", (err as Error).message);
+  }
+}
+
+/**
+ * No-op in EA-only mode — the EA terminal reconnects itself whenever it comes online.
+ * Kept so src/index.ts startup sequence requires no changes.
+ */
+export async function startAutoConnect(): Promise<void> {
+  await seedKnownAccountsFromDb();
+  console.log("[startup] EA mode: skipping MetaAPI auto-connect");
+}
+
+/**
+ * No-op in EA-only mode — EA terminal manages its own MT5 connection.
+ * Kept so src/index.ts startup sequence requires no changes.
+ */
+export function startConnectionWatchdog(): void {
+  // EA terminal handles reconnection autonomously; no watchdog needed server-side.
 }
 
 export default router;

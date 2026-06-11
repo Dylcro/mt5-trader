@@ -1,6 +1,6 @@
 /**
  * Convert USD-denominated amounts (e.g. XAUUSD risk) to account/display currency
- * using live FX quotes from MetaAPI on the connected MT5 account.
+ * using live FX quotes from the EA terminal tick store.
  */
 
 const rateCache = new Map<string, { rate: number; expiresAt: number }>();
@@ -10,13 +10,10 @@ const CACHE_MS = 60_000;
 const PREFER_INVERSE_PAIR = new Set(["GBP", "EUR", "AUD", "NZD", "CHF", "CAD"]);
 
 async function fetchSymbolMid(
-  token: string,
-  region: string,
-  accountId: string,
   symbol: string,
-  fetchPrice: (t: string, r: string, a: string, s: string) => Promise<{ bid: number; ask: number } | null>,
+  fetchPrice: (s: string) => Promise<{ bid: number; ask: number } | null>,
 ): Promise<number | null> {
-  const px = await fetchPrice(token, region, accountId, symbol);
+  const px = await fetchPrice(symbol);
   if (!px || px.bid <= 0 || px.ask <= 0) return null;
   return (px.bid + px.ask) / 2;
 }
@@ -32,11 +29,9 @@ export function isPlausibleUsdFxRate(currency: string, rate: number): boolean {
 
 /** How many units of `target` currency equal 1 USD. */
 export async function usdToTargetRate(
-  token: string,
-  region: string,
   accountId: string,
   target: string,
-  fetchPrice: (t: string, r: string, a: string, s: string) => Promise<{ bid: number; ask: number } | null>,
+  fetchPrice: (s: string) => Promise<{ bid: number; ask: number } | null>,
 ): Promise<{ rate: number; currency: string }> {
   const currency = target.toUpperCase().trim();
   if (currency === "USD") return { rate: 1, currency: "USD" };
@@ -48,12 +43,12 @@ export async function usdToTargetRate(
   let rate = 1;
 
   const tryDirect = async (): Promise<number | null> => {
-    const mid = await fetchSymbolMid(token, region, accountId, `USD${currency}`, fetchPrice);
+    const mid = await fetchSymbolMid(`USD${currency}`, fetchPrice);
     return mid != null && isPlausibleUsdFxRate(currency, mid) ? mid : null;
   };
 
   const tryInverse = async (): Promise<number | null> => {
-    const mid = await fetchSymbolMid(token, region, accountId, `${currency}USD`, fetchPrice);
+    const mid = await fetchSymbolMid(`${currency}USD`, fetchPrice);
     if (mid == null || mid <= 0) return null;
     const inverted = 1 / mid;
     return isPlausibleUsdFxRate(currency, inverted) ? inverted : null;

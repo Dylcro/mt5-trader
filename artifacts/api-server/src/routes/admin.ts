@@ -12,7 +12,7 @@ import {
 } from "@workspace/db";
 import { desc, eq, inArray, sql } from "drizzle-orm";
 import { resetAuthLockouts } from "../lib/rateLimiters";
-import { getStreamHealth, getZoneCounts, listProvisioningAccounts, disconnectUserMt5 } from "./mt5";
+import { getStreamHealth, getZoneCounts, disconnectUserMt5 } from "./mt5";
 import { getTelemetry } from "../telemetry";
 import { ADMIN_PAGE_CSS, APP_THEME } from "../lib/appTheme";
 import { renderAdminDashboard } from "../lib/adminDashboardPage";
@@ -108,15 +108,15 @@ router.get("/", async (req: Request, res: Response) => {
     const todayStart = startOfUtcDayMs();
     const weekStart = todayStart - 7 * 24 * 60 * 60 * 1000;
 
-    const [allUsers, allAccounts, tickets, waitlist, provMap, health, zones] = await Promise.all([
+    const [allUsers, allAccounts, tickets, waitlist, health, zones] = await Promise.all([
       db.select().from(usersTable).orderBy(desc(usersTable.createdAt)),
       db.select().from(storedAccountsTable).orderBy(desc(storedAccountsTable.storedAt)),
       db.select().from(supportTicketsTable).orderBy(desc(supportTicketsTable.createdAt)),
       db.select().from(waitlistTable).orderBy(desc(waitlistTable.createdAt)),
-      listProvisioningAccounts().catch(() => new Map()),
       Promise.resolve(getStreamHealth()),
       Promise.resolve(getZoneCounts()),
     ]);
+    const provMap = new Map<string, { login: string; server: string; region?: string }>();
 
     let dbOk = false;
     try {
@@ -208,7 +208,7 @@ router.get("/", async (req: Request, res: Response) => {
       health: {
         backend: true,
         database: dbOk,
-        metaapi: Boolean(process.env.METAAPI_TOKEN ?? process.env.META_API_TOKEN),
+        ea_terminal: Boolean(process.env.EA_TERMINAL_TOKEN),
         streamsHealthy: health.healthy,
         liveStreamCount: health.accounts.filter((a) => !a.stale).length,
       },
