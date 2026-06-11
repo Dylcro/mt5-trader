@@ -73,24 +73,43 @@ string JStr(const string json, const string key, const string def = "")
       if(c == ':' || c == ' ' || c == '\t') p++;
       else break;
      }
-   if(p >= len || StringGetCharacter(json, p) != '"') return def;
-   p++;
-   string result = "";
-   while(p < len)
+   if(p >= len) return def;
+   // quoted string
+   if(StringGetCharacter(json, p) == '"')
      {
-      ushort c = StringGetCharacter(json, p++);
-      if(c == '\\' && p < len)
+      p++;
+      string result = "";
+      while(p < len)
         {
-         ushort e = StringGetCharacter(json, p++);
-         if(e == 'n') result += "\n";
-         else if(e == 't') result += "\t";
-         else if(e == 'r') result += "\r";
-         else result += ShortToString(e);
+         ushort c = StringGetCharacter(json, p++);
+         if(c == '\\' && p < len)
+           {
+            ushort e = StringGetCharacter(json, p++);
+            if(e == 'n') result += "\n";
+            else if(e == 't') result += "\t";
+            else if(e == 'r') result += "\r";
+            else result += ShortToString(e);
+           }
+         else if(c == '"') break;
+         else result += ShortToString(c);
         }
-      else if(c == '"') break;
-      else result += ShortToString(c);
+      return result;
      }
-   return result;
+   // bare numeric token — accept digits, sign, dot so positionId:123 works
+   ushort first = StringGetCharacter(json, p);
+   if((first >= '0' && first <= '9') || first == '-')
+     {
+      string num = "";
+      while(p < len)
+        {
+         ushort c = StringGetCharacter(json, p);
+         if((c >= '0' && c <= '9') || c == '-' || c == '.' || c == 'e' || c == 'E' || c == '+')
+           { num += ShortToString(c); p++; }
+         else break;
+        }
+      return num;
+     }
+   return def;
   }
 
 //+------------------------------------------------------------------+
