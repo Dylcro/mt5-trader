@@ -153,10 +153,14 @@ router.post("/state", async (req: Request, res: Response) => {
     terminalTime?: string;
   };
 
+  // Only track positions/orders opened by this EA (magic 770001).
+  // Other magic numbers belong to manual trades or third-party EAs.
+  const EA_MAGIC = 770001;
+
   // Normalize into the same LivePosition shape MetaApi streaming produces.
   // Direction detection in the zone engine uses .includes("BUY") / .includes("SELL")
   // on the type field, so we map the EA's short form to the MetaApi token form.
-  const positions: LivePosition[] = (body.positions ?? []).map(p => ({
+  const positions: LivePosition[] = (body.positions ?? []).filter(p => p.magic === EA_MAGIC).map(p => ({
     id:        String(p.ticket),
     symbol:    p.symbol,
     type:      p.type.toUpperCase() === "BUY" ? "POSITION_TYPE_BUY" : "POSITION_TYPE_SELL",
@@ -168,7 +172,7 @@ router.post("/state", async (req: Request, res: Response) => {
     comment:   p.comment,
   }));
 
-  const orders: PendingOrder[] = (body.orders ?? []).map(o => ({
+  const orders: PendingOrder[] = (body.orders ?? []).filter(o => o.magic === EA_MAGIC).map(o => ({
     id:      String(o.ticket),
     comment: o.comment,
     magic:   o.magic,
