@@ -4555,6 +4555,19 @@ async function ensureConnectionReady(conn: unknown | undefined, timeoutMs = 8_00
   }
 }
 
+// For ea accounts readiness means a fresh /ea/state snapshot (≤10 s old).
+// For metaapi accounts use the existing MetaApi connection check.
+async function ensureReadyForAccount(accountId: string, timeoutMs = 8_000): Promise<void> {
+  if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
+    const state = getEaState(accountId);
+    if (!state || Date.now() - state.receivedAt > 10_000) {
+      throw new NotReadyError("EA terminal not connected or state is stale");
+    }
+    return;
+  }
+  await ensureConnectionReady(activeConnections.get(accountId), timeoutMs);
+}
+
 function respondZoneActionError(res: Response, label: string, err: unknown): void {
   console.error(`[${label}]`, err);
   if (err instanceof NotReadyError) {
@@ -6223,7 +6236,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-partial", checkOwner, a
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
     if (rejectIfPriceNotReady(res, accountId)) return;
-    await ensureConnectionReady(activeConnections.get(accountId));
+    await ensureReadyForAccount(accountId);
     await ensureCascadeZoneRunnerColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
@@ -6419,7 +6432,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
     if (rejectIfPriceNotReady(res, accountId)) return;
-    await ensureConnectionReady(activeConnections.get(accountId));
+    await ensureReadyForAccount(accountId);
     await ensureCascadeZoneRfColumns();
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
@@ -6582,7 +6595,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close", checkOwner, async (re
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
     if (rejectIfPriceNotReady(res, accountId)) return;
-    await ensureConnectionReady(activeConnections.get(accountId));
+    await ensureReadyForAccount(accountId);
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     // DB-first read via the single loadZone path (cache → DB → hydrate).
@@ -6801,7 +6814,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/cancel-pending", checkOwner, 
   const { accountId, zoneId } = req.params as { accountId: string; zoneId: string };
   try {
     if (rejectIfPriceNotReady(res, accountId)) return;
-    await ensureConnectionReady(activeConnections.get(accountId));
+    await ensureReadyForAccount(accountId);
     const token = getToken();
     const region = qstr(req.query.region) || activeRegions.get(accountId) || knownAccounts.get(accountId)?.region || DEFAULT_REGION;
     if (!zoneStates.has(zoneId)) {
@@ -7795,12 +7808,44 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
       pendingAppCascades.add(accountId);
     }
 
-    const conn = activeConnections.get(accountId);
-    await ensureConnectionReady(conn);
-    const tradeResult = await executeTradeRequest(conn, region, accountId, token, body);
-    code = tradeResult.code;
-    data = tradeResult.data;
-    httpStatus = tradeResult.httpStatus;
+    if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
+      // EA backend: check liveness then route through EaAdapter.
+      const eaState = getEaState(accountId);
+      if (!eaState || Date.now() - eaState.receivedAt > 10_000) {
+        throw new NotReadyError("EA terminal not connected or state is stale");
+      }
+      const adapter = getAdapter(accountId);
+      const actionType = String(body.actionType ?? "");
+      const symbol   = String(body.symbol ?? "XAUUSD");
+      const volume   = Number(body.volume ?? 0);
+      const sl       = body.stopLoss   !== undefined ? Number(body.stopLoss)   : undefined;
+      const tp       = body.takeProfit !== undefined ? Number(body.takeProfit) : undefined;
+      const openPx   = Number(body.openPrice ?? 0);
+      const comment  = body.comment   !== undefined ? String(body.comment)    : undefined;
+      let eaResult;
+      if (actionType === "ORDER_TYPE_BUY") {
+        eaResult = await adapter.placeMarketOrder("buy",  symbol, volume, sl, tp, { comment });
+      } else if (actionType === "ORDER_TYPE_SELL") {
+        eaResult = await adapter.placeMarketOrder("sell", symbol, volume, sl, tp, { comment });
+      } else if (actionType === "ORDER_TYPE_BUY_LIMIT") {
+        eaResult = await adapter.placeLimitOrder("buy",  symbol, volume, openPx, sl, tp, { comment });
+      } else if (actionType === "ORDER_TYPE_SELL_LIMIT") {
+        eaResult = await adapter.placeLimitOrder("sell", symbol, volume, openPx, sl, tp, { comment });
+      } else {
+        pendingAppCascades.delete(accountId);
+        return res.status(400).json({ success: false, code: 0, message: `Unsupported actionType for EA backend: ${actionType}` });
+      }
+      code       = eaResult.numericCode;
+      data       = { numericCode: eaResult.numericCode, message: eaResult.message, orderId: eaResult.orderId };
+      httpStatus = eaResult.ok ? 200 : 400;
+    } else {
+      const conn = activeConnections.get(accountId);
+      await ensureConnectionReady(conn);
+      const tradeResult = await executeTradeRequest(conn, region, accountId, token, body);
+      code       = tradeResult.code;
+      data       = tradeResult.data;
+      httpStatus = tradeResult.httpStatus;
+    }
     console.log(`[trade] accountId=${accountId} action=${body.actionType} code=${code}`);
 
     // ── Dead-account detection ───────────────────────────────────────────────
