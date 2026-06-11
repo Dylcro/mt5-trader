@@ -6426,6 +6426,13 @@ export async function seedKnownAccountsFromDb(): Promise<void> {
       executionBackends.set(row.accountId, (row.executionBackend ?? "ea") as "ea");
       if (row.userId) userAccountCache.set(row.userId, row.accountId);
     }
+    // Re-point the EA terminal token to the stored account so EA_TERMINAL_ACCOUNT
+    // env var mismatches (e.g. after a broker credential change mints a new UUID)
+    // are corrected before the first /ea/state push arrives.
+    if (rows.length === 1) {
+      reregisterEaTerminalAccount(rows[0].accountId);
+      console.log(`[startup] terminal token re-pointed to stored account ${rows[0].accountId}`);
+    }
     console.log(`[startup] seeded ${rows.length} account(s) from DB`);
   } catch (err) {
     console.error("[startup] seedKnownAccountsFromDb failed:", (err as Error).message);
