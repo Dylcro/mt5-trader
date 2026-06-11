@@ -32,11 +32,11 @@ router.get("/health", async (_req: Request, res: Response) => {
     dbOk = false;
   }
   const streams = getStreamHealth();
-  const metaConfigured = Boolean(process.env.METAAPI_TOKEN ?? process.env.META_API_TOKEN);
+  const eaConfigured = Boolean(process.env.EA_TERMINAL_TOKEN);
   res.json({
     backend: true,
     database: dbOk,
-    metaapi_configured: metaConfigured,
+    ea_configured: eaConfigured,
     streams_healthy: streams.healthy,
     live_stream_count: streams.accounts.filter((a) => !a.stale).length,
   });

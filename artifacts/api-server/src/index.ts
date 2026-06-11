@@ -1,6 +1,6 @@
 import app from "./app";
 import { ensureTables } from "./ensureTables";
-import { loadCascadeConfig, startAutoConnect, startConnectionWatchdog, loadZoneState, startZoneTpMonitor, loadNotificationPrefs } from "./routes/mt5";
+import { loadCascadeConfig, startAutoConnect, startConnectionWatchdog, loadZoneState, startZoneTpMonitor, loadNotificationPrefs, deleteOrphanZones } from "./routes/mt5";
 import { startEaCommandSweeper } from "./lib/execution/eaAdapter";
 import { loadPlatformFlags } from "./lib/platformFlags";
 
@@ -16,6 +16,7 @@ async function main() {
   const port = Number(process.env.PORT) || 3000;
 
   await ensureTables();
+  await deleteOrphanZones();
 
   // Load persisted cascade config from the database before accepting requests
   // so that GET /cascade-config never returns stale defaults on a fresh start.

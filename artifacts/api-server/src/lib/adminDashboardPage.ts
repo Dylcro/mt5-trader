@@ -19,7 +19,7 @@ export type AdminDashboardData = {
   health: {
     backend: boolean;
     database: boolean;
-    metaapi: boolean;
+    ea_terminal: boolean;
     streamsHealthy: boolean;
     liveStreamCount: number;
   };
@@ -87,7 +87,7 @@ export function renderAdminDashboard(d: AdminDashboardData): string {
       <div class="health-row" id="healthPills">
         <span class="health-pill ok">Backend up</span>
         <span class="health-pill ${d.health.database ? "ok" : "bad"}">Database ${d.health.database ? "connected" : "down"}</span>
-        <span class="health-pill ${d.health.metaapi ? "ok" : "bad"}">MetaAPI ${d.health.metaapi ? "configured" : "missing token"}</span>
+        <span class="health-pill ${d.health.ea_terminal ? "ok" : "bad"}">EA Terminal ${d.health.ea_terminal ? "configured" : "not configured"}</span>
         <span class="health-pill ${d.health.streamsHealthy ? "ok" : "warn"}">Streams ${d.health.liveStreamCount} live</span>
       </div>
     </div>
