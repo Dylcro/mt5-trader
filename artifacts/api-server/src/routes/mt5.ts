@@ -3932,6 +3932,69 @@ async function resolveLivePositionsForZoneAction(
   return live;
 }
 
+/** EA-native variant of resolveLivePositionsForZoneAction.
+ *  Uses the in-memory EA state snapshot instead of the broker REST API. */
+async function resolveEaPositionsForZone(
+  accountId: string,
+  zoneId: string,
+  st: ZoneState,
+): Promise<LivePosition[]> {
+  const eaState = getEaState(accountId);
+  if (!eaState) return [];
+  const openRows = await db.select().from(zonePositionsTable)
+    .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")));
+  const trackedIds = new Set(openRows.map((z) => z.positionId));
+  const fromDb  = eaState.positions.filter((p) => trackedIds.has(p.id));
+  const tagged  = eaState.positions.filter((p) => positionBelongsToZone(p, zoneId));
+  const byId = new Map<string, LivePosition>();
+  for (const p of fromDb)  byId.set(p.id, p);
+  for (const p of tagged)  byId.set(p.id, p);
+  const live = [...byId.values()];
+  if (live.length === 0) return [];
+
+  let relinked = 0;
+  for (const p of live) {
+    const [row] = await db.select({
+      status:     zonePositionsTable.status,
+      volume:     zonePositionsTable.volume,
+      entryPrice: zonePositionsTable.entryPrice,
+    })
+      .from(zonePositionsTable)
+      .where(and(
+        eq(zonePositionsTable.zoneId, zoneId),
+        eq(zonePositionsTable.positionId, p.id),
+      ))
+      .limit(1);
+    if (row?.status === "CLOSED") {
+      await db.update(zonePositionsTable)
+        .set({ status: "OPEN" })
+        .where(and(
+          eq(zonePositionsTable.zoneId, zoneId),
+          eq(zonePositionsTable.positionId, p.id),
+        ));
+      relinked++;
+    } else if (!row) {
+      await recordZonePositionFill(zoneId, p.id, p.openPrice, p.volume);
+      relinked++;
+    }
+    const cached  = st.trackedPositions.get(p.id);
+    const origVol = row?.volume    != null ? Number(row.volume)    : p.volume;
+    const entry   = row?.entryPrice != null ? Number(row.entryPrice) : p.openPrice;
+    st.trackedPositions.set(p.id, {
+      volume:    origVol,
+      entryPrice: entry,
+      tp1Hit: cached?.tp1Hit ?? false,
+      tp2Hit: cached?.tp2Hit ?? false,
+      tp3Hit: cached?.tp3Hit ?? false,
+      tp4Hit: cached?.tp4Hit ?? false,
+    });
+  }
+  if (relinked > 0 || tagged.length > fromDb.length) {
+    console.log(`[zone ${zoneId}] EA resolved ${live.length} leg(s) (dbOpen=${fromDb.length} tagged=${tagged.length} relinked=${relinked})`);
+  }
+  return live;
+}
+
 /** Wrongly CLOSED in DB while MT5 still has legs — reopen so TPs keep firing. */
 async function reopenClosedZoneIfBrokerLegsRemain(
   token: string,
@@ -6455,7 +6518,9 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
     }
     st.busy = true;
     try {
-      const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+      const live = (executionBackends.get(accountId) ?? "ea") !== "metaapi"
+        ? await resolveEaPositionsForZone(accountId, zoneId, st)
+        : await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
       if (live.length === 0) {
         res.status(409).json({ error: "No open positions in this zone" }); return;
       }
@@ -6482,7 +6547,20 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
         ? sanitizeRiskFreePips(body.riskFreePips)
         : (st.riskFreeOffset ?? ZONE_RISK_FREE_PIPS);
       const sl = computeRiskFreeSl(st.direction, best.openPrice, pips);
-      const slOk = await modifyZonePositionSl(accountId, best.id, sl);
+      let slOk: boolean;
+      let slErrMsg: string | undefined;
+      if ((executionBackends.get(accountId) ?? "ea") !== "metaapi") {
+        const r = await getAdapter(accountId).modifyPosition(best.id, { stopLoss: sl });
+        slOk = r.ok;
+        if (!r.ok) {
+          slErrMsg = r.numericCode === 10016
+            ? `SL (${sl}) is within the broker's minimum stop distance — wait for price to move further`
+            : `SL modify failed (code ${r.numericCode})`;
+          console.warn(`[zone ${zoneId}] risk-free SL modify failed posId=${best.id} sl=${sl} code=${r.numericCode}`);
+        }
+      } else {
+        slOk = await modifyZonePositionSl(accountId, best.id, sl);
+      }
       if (failed.length > 0 || !slOk) {
         console.warn(`[zone ${zoneId}] risk-free partial: failedCloses=${failed.length} slOk=${slOk}`);
         res.status(207).json({
@@ -6491,7 +6569,7 @@ router.post("/mt5/account/:accountId/zones/:zoneId/risk-free", checkOwner, async
           sl, slOk,
           closedCount: others.length - failed.length,
           failedPositionIds: failed,
-          message: "Some operations failed. Retry to clear remaining issues.",
+          message: slErrMsg ?? "Some operations failed. Retry to clear remaining issues.",
         });
         return;
       }
