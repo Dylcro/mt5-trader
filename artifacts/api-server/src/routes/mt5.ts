@@ -5061,7 +5061,11 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
         ? zoneHasLegsInSnapshot(st.accountId, zoneId, snap.positions, snap.orders, trackedForBroker)
         : await brokerHasOpenLegsForZone(token, region, st.accountId, zoneId, { trackedIds: trackedForBroker });
       if (brokerLegs) {
-        await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st);
+        if ((executionBackends.get(st.accountId) ?? "ea") !== "metaapi") {
+          await resolveEaPositionsForZone(st.accountId, zoneId, st);
+        } else {
+          await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st);
+        }
         try {
           const rows = await withDbRetry(`evalZone.relinkRefresh zone=${zoneId}`, () => db.select().from(zonePositionsTable)
             .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
@@ -5126,7 +5130,11 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       (live.length === 0 && hasBrokerLegs)
       || zoneLegsNeedFreshResolve(live, zoneId, trackedIds, allLive, zps.length);
     if (needsLegResolve) {
-      await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st);
+      if ((executionBackends.get(st.accountId) ?? "ea") !== "metaapi") {
+        await resolveEaPositionsForZone(st.accountId, zoneId, st);
+      } else {
+        await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st);
+      }
       try {
         const rows = await withDbRetry(`evalZone.legResolveRefresh zone=${zoneId}`, () => db.select().from(zonePositionsTable)
           .where(and(eq(zonePositionsTable.zoneId, zoneId), eq(zonePositionsTable.status, "OPEN")))
@@ -5148,7 +5156,10 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       } catch (e) {
         console.warn(`[zone ${zoneId}] leg-resolve tracked refresh failed, using cache (${trackedIds.size} ids): ${(e as Error).message}`);
       }
-      allLive = await fetchOpenPositions(token, region, st.accountId, { fresh: true });
+      const isEaEval = (executionBackends.get(st.accountId) ?? "ea") !== "metaapi";
+      allLive = isEaEval
+        ? (getEaState(st.accountId)?.positions ?? [])
+        : await fetchOpenPositions(token, region, st.accountId, { fresh: true });
       live = mergeLiveZoneLegs(allLive, zoneId, trackedIds);
     }
     // Skip the destructive reconciliation path (which permanently marks
@@ -5161,10 +5172,13 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
     // and re-populates live positions. Without this check, active zones get
     // wrongly reconciled closed on every deployment/restart.
     if (live.length === 0 && !syncReady.has(st.accountId)) return;
+    const _isEaZone = (executionBackends.get(st.accountId) ?? "ea") !== "metaapi";
     if (live.length === 0) {
-      // Batch snapshots can lag after limit cancel — fresh REST before we mark
-      // DB rows CLOSED or collapse the zone (MT5 one-click anchors lack tags).
-      const freshAll = await fetchOpenPositions(token, region, st.accountId, { fresh: true });
+      // Batch snapshots can lag after limit cancel — do a fresh read before marking
+      // DB rows CLOSED or collapsing the zone.
+      const freshAll = _isEaZone
+        ? (getEaState(st.accountId)?.positions ?? [])
+        : await fetchOpenPositions(token, region, st.accountId, { fresh: true });
       const freshLive = mergeLiveZoneLegs(freshAll, zoneId, trackedIds);
       if (freshLive.length > 0) {
         allLive = freshAll;
@@ -5172,11 +5186,10 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       }
     }
     if (live.length === 0) {
-      // Reconciliation: all tracked positions are gone (possibly closed during
-      // a server restart — DEAL_ENTRY_OUT events from that window are lost
-      // because the streaming connection starts from `new Date()`). Mark each
-      // missing row CLOSED, then close the zone.
-      allLive = await fetchOpenPositions(token, region, st.accountId, { fresh: true });
+      // Reconciliation: all tracked positions are gone. Mark each missing row CLOSED.
+      allLive = _isEaZone
+        ? (getEaState(st.accountId)?.positions ?? [])
+        : await fetchOpenPositions(token, region, st.accountId, { fresh: true });
       const allLiveIds = new Set(allLive.map(p => p.id));
       for (const zp of zps) {
         if (!allLiveIds.has(zp.positionId)) {
@@ -5331,10 +5344,10 @@ async function evaluateZone(zoneId: string, token: string, opts?: EvaluateZoneOp
       if (!hit(tpPrice)) continue;
 
       try {
-        // Fresh broker read so limits that filled since tick start join this TP.
-        const tpLegs = await resolveLivePositionsForZoneAction(
-          token, region, st.accountId, zoneId, st, { fresh: true },
-        );
+        // Fresh read so limits that filled since tick start join this TP.
+        const tpLegs = (executionBackends.get(st.accountId) ?? "ea") !== "metaapi"
+          ? await resolveEaPositionsForZone(st.accountId, zoneId, st)
+          : await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st, { fresh: true });
         const pendingLegs = tpLegs.filter((leg) => legNeedsTpSlice(leg, st, lvl));
         if (pendingLegs.length === 0) continue;
 
