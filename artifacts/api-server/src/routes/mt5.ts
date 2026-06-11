@@ -4399,7 +4399,9 @@ async function restoreZoneStopLossAfterLimitCancel(
   const config = getCascadeConfig(accountId, zoneIdToUserId.get(zoneId));
   const token = getToken();
   const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
-  const legs = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st, { fresh: true });
+  const legs = (executionBackends.get(accountId) ?? "ea") !== "metaapi"
+    ? await resolveEaPositionsForZone(accountId, zoneId, st)
+    : await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st, { fresh: true });
   if (legs.length === 0) return;
 
   let restored = 0;
@@ -4466,18 +4468,22 @@ async function cancelZoneLimits(
   }
   // Fetch live pending orders — used both for the tracked-ID path (to skip
   // already-gone orders) and the blind-cancel fallback below.
+  // Skip for EA accounts: the adapter's cancelOrder treats 4754 (already gone) as
+  // a success-equivalent, so an empty pending set is safe.
   let liveOrders: Array<{ id: string; comment?: string }> = [];
-  try {
-    const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`, {
-      headers: authHeaders(token),
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (r.ok) {
-      const raw = await r.json() as Array<{ id?: string; _id?: string; comment?: string }>;
-      liveOrders = raw.map(o => ({ id: String(o.id ?? o._id ?? ""), comment: o.comment })).filter(o => o.id);
+  if ((executionBackends.get(accountId) ?? "ea") === "metaapi") {
+    try {
+      const r = await fetch(`${clientBase(region)}/users/current/accounts/${accountId}/orders`, {
+        headers: authHeaders(token),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (r.ok) {
+        const raw = await r.json() as Array<{ id?: string; _id?: string; comment?: string }>;
+        liveOrders = raw.map(o => ({ id: String(o.id ?? o._id ?? ""), comment: o.comment })).filter(o => o.id);
+      }
+    } catch (e) {
+      console.warn(`[zone ${zoneId}] orders fetch error during cancel:`, (e as Error).message);
     }
-  } catch (e) {
-    console.warn(`[zone ${zoneId}] orders fetch error during cancel:`, (e as Error).message);
   }
 
   if (orderIds.length === 0) {
