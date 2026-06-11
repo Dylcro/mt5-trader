@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { createRequire } from "module";
@@ -176,6 +177,7 @@ async function upsertStoredAccount(params: {
   userId?: string | null;
   mt5Login?: string | null;
   mt5Server?: string | null;
+  executionBackend?: string;
 }): Promise<void> {
   const now = Date.now();
   const set: {
@@ -184,10 +186,12 @@ async function upsertStoredAccount(params: {
     userId?: string;
     mt5Login?: string;
     mt5Server?: string;
+    executionBackend?: string;
   } = { region: params.region, storedAt: now };
   if (params.userId) set.userId = params.userId;
   if (params.mt5Login) set.mt5Login = params.mt5Login;
   if (params.mt5Server) set.mt5Server = params.mt5Server;
+  if (params.executionBackend) set.executionBackend = params.executionBackend;
   await db.insert(storedAccountsTable)
     .values({
       accountId: params.accountId,
@@ -196,6 +200,7 @@ async function upsertStoredAccount(params: {
       userId: params.userId ?? undefined,
       mt5Login: params.mt5Login ?? undefined,
       mt5Server: params.mt5Server ?? undefined,
+      ...(params.executionBackend ? { executionBackend: params.executionBackend } : {}),
     })
     .onConflictDoUpdate({
       target: storedAccountsTable.accountId,
@@ -204,7 +209,7 @@ async function upsertStoredAccount(params: {
   // Keep the in-memory map consistent so startStreaming and getAdapter see the
   // correct backend before the next watchdog tick.
   if (!executionBackends.has(params.accountId)) {
-    executionBackends.set(params.accountId, "ea");
+    executionBackends.set(params.accountId, params.executionBackend ?? "ea");
   }
 }
 
@@ -6981,6 +6986,28 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         return res.status(403).json({ error: "This account is not linked to your user. Please connect using your MT5 credentials." });
       }
 
+      // EA-native reconnect — skip MetaApi entirely.
+      if (storedRow.executionBackend === "ea") {
+        const region = normalizeRegion(storedRow.region ?? DEFAULT_REGION);
+        executionBackends.set(existingId, "ea");
+        knownAccounts.set(existingId, { accountId: existingId, userId: userId ?? undefined, region });
+        // res.json interceptor fires reregisterEaTerminalAccount
+        const eaState = getEaState(existingId);
+        const live = eaState != null && Date.now() - eaState.receivedAt < 10_000;
+        if (live) {
+          return res.json({
+            status: "connected",
+            accountId: existingId,
+            region,
+            balance: eaState.accountInfo.balance,
+            equity: eaState.accountInfo.equity,
+            marginFree: eaState.accountInfo.marginFree,
+            currency: "USD",
+          });
+        }
+        return res.json({ status: "connecting", accountId: existingId, region });
+      }
+
       const acct = await getProvisioningAccount(token, existingId).catch(() => null);
       if (!acct) {
         return res.status(404).json({ error: "Account not found. Please log in again with your credentials." });
@@ -7043,6 +7070,63 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
 
     const loginStr = String(login).trim();
     const serverStr = String(server).trim();
+
+    // ── EA-NATIVE CONNECT ─────────────────────────────────────────────────────
+    // When the EA terminal token is configured the broker connection lives on the
+    // VPS — skip MetaApi provisioning entirely. Reuse the existing accountId for
+    // this user when credentials match; otherwise evict the old row and create a
+    // new UUID-based accountId so zones/history for the new account start fresh.
+    if (process.env["EA_TERMINAL_TOKEN"]) {
+      let eaAccountId: string | null = null;
+      if (userId) {
+        const [dbExisting] = await db.select().from(storedAccountsTable)
+          .where(eq(storedAccountsTable.userId, userId)).limit(1);
+        if (dbExisting) {
+          const sameLogin = dbExisting.mt5Login == null
+            || String(dbExisting.mt5Login).trim() === loginStr;
+          const sameServer = dbExisting.mt5Server == null
+            || normalizeServer(String(dbExisting.mt5Server)) === normalizeServer(serverStr);
+          if (sameLogin && sameServer) {
+            eaAccountId = dbExisting.accountId;
+            console.log(`[connect/ea] reusing existing accountId ${eaAccountId}`);
+          } else {
+            console.log(`[connect/ea] credentials changed — evicting ${dbExisting.accountId}`);
+            await stopStreaming(dbExisting.accountId);
+            await db.delete(storedAccountsTable)
+              .where(eq(storedAccountsTable.accountId, dbExisting.accountId));
+            userAccountCache.delete(userId);
+          }
+        }
+      }
+      if (!eaAccountId) {
+        eaAccountId = randomUUID();
+        console.log(`[connect/ea] created new accountId ${eaAccountId} for login=${loginStr}`);
+      }
+
+      const region = DEFAULT_REGION;
+      await upsertStoredAccount({
+        accountId: eaAccountId, region, userId,
+        mt5Login: loginStr, mt5Server: serverStr,
+        executionBackend: "ea",
+      });
+      executionBackends.set(eaAccountId, "ea");
+      if (userId) knownAccounts.set(eaAccountId, { accountId: eaAccountId, userId, region });
+      // res.json interceptor fires reregisterEaTerminalAccount + bindAccount
+
+      const eaState = getEaState(eaAccountId);
+      const live = eaState != null && Date.now() - eaState.receivedAt < 10_000;
+      return res.json({
+        status: live ? "connected" : "connecting",
+        accountId: eaAccountId,
+        region,
+        ...(live ? {
+          balance: eaState.accountInfo.balance,
+          equity: eaState.accountInfo.equity,
+          marginFree: eaState.accountInfo.marginFree,
+          currency: "USD",
+        } : {}),
+      });
+    }
 
     const respondReconnect = async (accountId: string, regionHint: string): Promise<boolean> => {
       try {
