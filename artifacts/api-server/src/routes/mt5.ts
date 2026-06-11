@@ -2694,24 +2694,35 @@ async function settleZoneClosedPnl(accountId: string, zoneId: string): Promise<v
     const positionIds = new Set(posRows.map((r) => r.positionId));
     if (positionIds.size === 0) return;
 
+    const isEa = (executionBackends.get(accountId) ?? "ea") !== "metaapi";
     const token = getToken();
     const region = activeRegions.get(accountId) ?? knownAccounts.get(accountId)?.region ?? DEFAULT_REGION;
-    const deals = await fetchAccountHistoryDeals(
-      token,
-      region,
-      accountId,
-      Number(zone.createdAt),
-      Number(zone.closedAt) + 120_000,
-    );
+
     if (zone.closedPnl == null) {
-      const pnl = sumDealPnlForPositions(deals, positionIds);
+      let pnl: number;
+      if (isEa) {
+        const profitMap = eaLastPositionProfits.get(accountId);
+        pnl = profitMap
+          ? [...positionIds].reduce((sum, id) => sum + (profitMap.get(id) ?? 0), 0)
+          : 0;
+      } else {
+        const deals = await fetchAccountHistoryDeals(
+          token, region, accountId,
+          Number(zone.createdAt), Number(zone.closedAt) + 120_000,
+        );
+        pnl = sumDealPnlForPositions(deals, positionIds);
+      }
       await db.update(cascadeZonesTable)
         .set({ closedPnl: pnl })
         .where(eq(cascadeZonesTable.zoneId, zoneId));
       console.log(`[zone ${zoneId}] closedPnl=${pnl} (${positionIds.size} position(s))`);
     }
 
-    if (!zone.slHit && !zone.riskFreeSlExit) {
+    if (!zone.slHit && !zone.riskFreeSlExit && !isEa) {
+      const deals = await fetchAccountHistoryDeals(
+        token, region, accountId,
+        Number(zone.createdAt), Number(zone.closedAt) + 120_000,
+      );
       const { stopLossExit, exitPrice } = inferZoneStopLossFromDeals(deals, positionIds);
       if (stopLossExit) {
         await finalizeZoneClose(accountId, zoneId, {
@@ -3772,8 +3783,10 @@ async function applyZoneTp2Housekeeping(
     }
     if (!isAutoBeTriggerSatisfied(st)) return;
 
-    const legs = opts.beLegs ?? await resolveLivePositionsForZoneAction(
-      token, region, st.accountId, zoneId, st, { fresh: true },
+    const legs = opts.beLegs ?? (
+      (executionBackends.get(st.accountId) ?? "ea") !== "metaapi"
+        ? await resolveEaPositionsForZone(st.accountId, zoneId, st)
+        : await resolveLivePositionsForZoneAction(token, region, st.accountId, zoneId, st, { fresh: true })
     );
     if (legs.length === 0) return;
 
@@ -6428,7 +6441,9 @@ router.post("/mt5/account/:accountId/zones/:zoneId/activate-runner", checkOwner,
         return;
       }
     }
-    const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+    const live = (executionBackends.get(accountId) ?? "ea") !== "metaapi"
+      ? await resolveEaPositionsForZone(accountId, zoneId, st)
+      : await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
     const totalVol = live.reduce((s, p) => s + p.volume, 0);
     const totalLots = targets.reduce((s, t) => s + t.lots, 0);
     if (totalLots > totalVol + 1e-9) {
@@ -6651,7 +6666,9 @@ router.post("/mt5/account/:accountId/zones/:zoneId/close-worst", checkOwner, asy
       res.status(409).json({ error: "Zone not active yet — wait for the first order to fill" });
       return;
     }
-    const live = await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
+    const live = (executionBackends.get(accountId) ?? "ea") !== "metaapi"
+      ? await resolveEaPositionsForZone(accountId, zoneId, st)
+      : await resolveLivePositionsForZoneAction(token, region, accountId, zoneId, st);
     if (live.length <= 1) {
       res.status(409).json({ ok: false, message: "Only one position left — nothing to secure" });
       return;
@@ -8214,7 +8231,10 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
                 // This is the DB-first ordering: DB row exists before monitor sees it.
                 zoneStates.set(zoneState.zoneId, zoneState);
                 try {
-                  const positions = await fetchOpenPositions(getToken(), region, accountId);
+                  const _isEaAnchor = (executionBackends.get(accountId) ?? "ea") !== "metaapi";
+                  const positions = _isEaAnchor
+                    ? (getEaState(accountId)?.positions ?? [])
+                    : await fetchOpenPositions(getToken(), region, accountId);
                   const me = positions.find(p => p.id === positionId);
                   if (me && me.openPrice > 0 && me.openPrice !== zoneState.anchorPrice) {
                     zoneState.anchorPrice = me.openPrice;
