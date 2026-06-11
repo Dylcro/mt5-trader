@@ -1108,7 +1108,7 @@ function handleStreamingTick(accountId: string, price: any): void {
   // Reject ticks from any symbol other than XAUUSD — MT5 accounts can stream
   // multiple symbols simultaneously and we must not mix e.g. GBPUSD (~1.34)
   // with gold prices (~4500), which causes the alternating display bug.
-  if (price.symbol && price.symbol !== "XAUUSD") return;
+  if (price.symbol && !price.symbol.toUpperCase().includes("XAUUSD")) return;
   const bid = Number(price.bid);
   const ask = Number(price.ask);
   if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0) return;
@@ -5710,7 +5710,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       const region = storedRow.region ?? DEFAULT_REGION;
       executionBackends.set(existingId, "ea");
       knownAccounts.set(existingId, { accountId: existingId, userId: userId ?? undefined, region });
-      // res.json interceptor fires reregisterEaTerminalAccount
+      reregisterEaTerminalAccount(existingId);
       const eaState = getEaState(existingId);
       const live = eaState != null
         ? (Date.now() - eaState.receivedAt < EA_LIVENESS_MS || Date.now() - getLastEaPollAt(existingId) < EA_LIVENESS_MS)
@@ -5774,7 +5774,7 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       });
       executionBackends.set(eaAccountId, "ea");
       if (userId) knownAccounts.set(eaAccountId, { accountId: eaAccountId, userId, region });
-      // res.json interceptor fires reregisterEaTerminalAccount + bindAccount
+      reregisterEaTerminalAccount(eaAccountId);
 
       const eaState = getEaState(eaAccountId);
       const live = eaState != null
