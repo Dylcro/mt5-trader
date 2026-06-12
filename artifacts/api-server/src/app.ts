@@ -18,6 +18,9 @@ const __dirname = path.dirname(__filename);
 
 const app: Express = express();
 
+// Trust Railway's load balancer so X-Forwarded-For is used for rate limiting and IP detection.
+app.set("trust proxy", 1);
+
 // ── Security headers ─────────────────────────────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: false }));
 
