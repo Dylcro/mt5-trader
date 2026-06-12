@@ -5730,7 +5730,8 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
           balance:    eaState.accountInfo.balance,
           equity:     eaState.accountInfo.equity,
           marginFree: eaState.accountInfo.marginFree,
-          currency:   "USD",
+          currency:   eaState.accountInfo.currency ?? "USD",
+          leverage:   eaState.accountInfo.leverage ?? 100,
         } : {}),
       });
     }
@@ -5781,7 +5782,8 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
           balance:    eaState.accountInfo.balance,
           equity:     eaState.accountInfo.equity,
           marginFree: eaState.accountInfo.marginFree,
-          currency:   "USD",
+          currency:   eaState.accountInfo.currency ?? "USD",
+          leverage:   eaState.accountInfo.leverage ?? 100,
         } : {}),
       });
     }
@@ -5807,7 +5809,8 @@ router.get("/mt5/account/:accountId/status", checkOwner, async (req: Request, re
         balance: eaState.accountInfo.balance,
         equity: eaState.accountInfo.equity,
         freeMargin: eaState.accountInfo.marginFree,
-        currency: "USD",
+        currency: eaState.accountInfo.currency ?? "USD",
+        leverage: eaState.accountInfo.leverage ?? 100,
       });
     }
     return res.json({ connectionStatus: live ? "CONNECTING" : "DISCONNECTED", accountId });

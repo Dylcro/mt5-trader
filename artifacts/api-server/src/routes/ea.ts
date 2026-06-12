@@ -149,7 +149,7 @@ router.post("/state", async (req: Request, res: Response) => {
       magic?: number;
       comment?: string;
     }>;
-    account?: { balance?: number; equity?: number; marginFree?: number };
+    account?: { balance?: number; equity?: number; marginFree?: number; currency?: string; leverage?: number };
     price?: { symbol?: string; bid?: number; ask?: number };
     terminalTime?: string;
   };
@@ -185,6 +185,8 @@ router.post("/state", async (req: Request, res: Response) => {
     balance:    Number(body.account?.balance ?? 0),
     equity:     Number(body.account?.equity ?? 0),
     marginFree: Number(body.account?.marginFree ?? 0),
+    ...(body.account?.currency ? { currency: body.account.currency } : {}),
+    ...(body.account?.leverage != null ? { leverage: Number(body.account.leverage) } : {}),
   };
 
   // Persist to in-memory cache (read by EaAdapter in commit 3).

@@ -460,6 +460,8 @@ string BuildStateJson()
    double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
    double equity     = AccountInfoDouble(ACCOUNT_EQUITY);
    double margin_free = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   long   leverage   = AccountInfoInteger(ACCOUNT_LEVERAGE);
+   string currency   = AccountInfoString(ACCOUNT_CURRENCY);
 
    // Current bid/ask so the server can drive TP evaluation without MetaAPI.
    string sym_chart = Symbol();
@@ -473,6 +475,8 @@ string BuildStateJson()
           + "\"balance\":"    + DoubleToString(balance,     2)
           + ",\"equity\":"    + DoubleToString(equity,      2)
           + ",\"marginFree\":" + DoubleToString(margin_free, 2)
+          + ",\"currency\":\"" + JEsc(currency) + "\""
+          + ",\"leverage\":"   + IntegerToString(leverage)
           + "}"
           + ",\"price\":{"
           + "\"symbol\":\"" + JEsc(sym_chart) + "\""

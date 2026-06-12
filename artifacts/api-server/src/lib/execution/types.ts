@@ -20,6 +20,8 @@ export interface AccountInfo {
   balance: number;
   equity: number;
   marginFree: number;
+  currency?: string;
+  leverage?: number;
 }
 
 export interface TradeResult {
