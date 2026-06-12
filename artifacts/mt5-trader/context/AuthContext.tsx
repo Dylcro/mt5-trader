@@ -15,7 +15,7 @@ interface AuthContextValue {
   isSignedIn: boolean;
   user: AuthUser | null;
   getToken: () => Promise<string | null>;
-  signIn: (email: string, password: string) => Promise<{ error?: string }>;
+  signIn: (email: string, password: string) => Promise<{ error?: string; token?: string }>;
   signUp: (fullName: string, email: string, password: string, inviteCode?: string) => Promise<{ error?: string }>;
   signOut: () => Promise<void>;
 }
@@ -90,7 +90,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return null;
   }, [token]);
 
-  const signIn = useCallback(async (email: string, password: string): Promise<{ error?: string }> => {
+  const signIn = useCallback(async (email: string, password: string): Promise<{ error?: string; token?: string }> => {
     try {
       const res = await fetch(`${API_BASE}/auth/login`, {
         method: "POST",
@@ -102,7 +102,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       await storeToken(data.token);
       setToken(data.token);
       setUser(data.user);
-      return {};
+      return { token: data.token };
     } catch {
       return { error: "Network error. Check your connection." };
     }

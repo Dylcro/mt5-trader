@@ -4,7 +4,7 @@ import { Redirect, Tabs } from "expo-router";
 import { NativeTabs } from "expo-router/unstable-native-tabs";
 import { MaterialCommunityIcons, Feather } from "@expo/vector-icons";
 import { SymbolView } from "expo-symbols";
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, Platform, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -20,6 +20,7 @@ import { setAuthTokenGetter } from "@/lib/authToken";
 import { clearPendingInviteCode, loadPendingInviteCode } from "@/lib/inviteStorage";
 
 const C = Colors.dark;
+const API_BASE = process.env.EXPO_PUBLIC_API_URL || "/api";
 
 function TabEmoji({ emoji, focused }: { emoji: string; focused: boolean }) {
   return <Text style={{ fontSize: 26, lineHeight: 30, opacity: focused ? 1 : 0.55 }}>{emoji}</Text>;
@@ -35,15 +36,8 @@ function TabChrome({
   onOnboardingComplete: () => void;
 }) {
   const { signIn, signUp } = useAuth();
-  const { connect, status, errorMsg } = useTrading();
+  const { connect } = useTrading();
   const [pendingInviteCode, setPendingInviteCode] = useState("");
-  const statusRef = useRef(status);
-  const errorRef = useRef(errorMsg);
-
-  useEffect(() => {
-    statusRef.current = status;
-    errorRef.current = errorMsg;
-  }, [status, errorMsg]);
 
   useEffect(() => {
     void loadPendingInviteCode().then((code) => {
@@ -66,16 +60,6 @@ function TabChrome({
   const onConnectMT5 = useCallback(
     async (creds: { login: string; password: string; server: string }) => {
       await connect(creds);
-      const deadline = Date.now() + 120_000;
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 400));
-        const s = statusRef.current;
-        if (s === "connected") return;
-        if (s === "error") {
-          throw new Error(errorRef.current || "Connection failed");
-        }
-      }
-      throw new Error("Connection timed out — try again.");
     },
     [connect],
   );
@@ -246,15 +230,8 @@ export default function TabLayout() {
 /** Full-screen onboarding before tabs (includes in-wizard auth + MT5 connect). */
 function OnboardingOnly({ onComplete }: { onComplete: () => void }) {
   const { signIn, signUp } = useAuth();
-  const { connect, status, errorMsg } = useTrading();
+  const { connect } = useTrading();
   const [pendingInviteCode, setPendingInviteCode] = useState("");
-  const statusRef = useRef(status);
-  const errorRef = useRef(errorMsg);
-
-  useEffect(() => {
-    statusRef.current = status;
-    errorRef.current = errorMsg;
-  }, [status, errorMsg]);
 
   useEffect(() => {
     void loadPendingInviteCode().then((code) => {
@@ -265,7 +242,22 @@ function OnboardingOnly({ onComplete }: { onComplete: () => void }) {
   const onSignIn = useCallback(async (email: string, password: string) => {
     const res = await signIn(email, password);
     if (res.error) throw new Error(res.error);
-  }, [signIn]);
+    // If user already has a linked MT5 account, skip the MT5 steps entirely.
+    if (res.token) {
+      try {
+        const r = await fetch(`${API_BASE}/mt5/my-account`, {
+          headers: { Authorization: `Bearer ${res.token}` },
+        });
+        if (r.ok) {
+          const d = await r.json() as { accountId?: string };
+          if (d.accountId) {
+            onComplete();
+            return;
+          }
+        }
+      } catch { /* ignore — proceed to MT5 steps */ }
+    }
+  }, [signIn, onComplete]);
 
   const onCreateAccount = useCallback(async (fullName: string, email: string, password: string, inviteCode?: string) => {
     const res = await signUp(fullName, email, password, inviteCode);
@@ -277,16 +269,6 @@ function OnboardingOnly({ onComplete }: { onComplete: () => void }) {
   const onConnectMT5 = useCallback(
     async (creds: { login: string; password: string; server: string }) => {
       await connect(creds);
-      const deadline = Date.now() + 120_000;
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 400));
-        const s = statusRef.current;
-        if (s === "connected") return;
-        if (s === "error") {
-          throw new Error(errorRef.current || "Connection failed");
-        }
-      }
-      throw new Error("Connection timed out — try again.");
     },
     [connect],
   );

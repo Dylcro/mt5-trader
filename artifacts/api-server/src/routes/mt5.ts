@@ -5715,29 +5715,24 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
         return res.status(403).json({ error: "This account is not linked to your user. Please connect using your MT5 credentials." });
       }
 
-      // EA-native reconnect
+      // EA-native reconnect: the EA owns the broker connection, so we never
+      // need to wait for liveness — return connected immediately.
       const region = storedRow.region ?? DEFAULT_REGION;
       executionBackends.set(existingId, "ea");
       knownAccounts.set(existingId, { accountId: existingId, userId: userId ?? undefined, region });
       reregisterEaTerminalAccount(existingId);
       const eaState = getEaState(existingId);
-      const live = eaState != null
-        ? (Date.now() - eaState.receivedAt < EA_LIVENESS_MS || Date.now() - getLastEaPollAt(existingId) < EA_LIVENESS_MS)
-        : (Date.now() - getLastEaPollAt(existingId) < EA_LIVENESS_MS);
-      if (live) {
-        return res.json({
-          status: "connected",
-          accountId: existingId,
-          region,
-          ...(eaState ? {
-            balance:    eaState.accountInfo.balance,
-            equity:     eaState.accountInfo.equity,
-            marginFree: eaState.accountInfo.marginFree,
-            currency:   "USD",
-          } : {}),
-        });
-      }
-      return res.json({ status: "connecting", accountId: existingId, region });
+      return res.json({
+        status: "connected",
+        accountId: existingId,
+        region,
+        ...(eaState ? {
+          balance:    eaState.accountInfo.balance,
+          equity:     eaState.accountInfo.equity,
+          marginFree: eaState.accountInfo.marginFree,
+          currency:   "USD",
+        } : {}),
+      });
     }
 
     // ── FRESH LOGIN PATH: credentials provided ────────────────────────────────
@@ -5749,25 +5744,17 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
     const serverStr = String(server).trim();
 
     // EA-NATIVE CONNECT
+    // Always reuse the existing row for this userId — never evict or mint a
+    // new UUID when credentials change. The EA owns the broker connection, so
+    // we update the stored login/server in-place and return connected immediately.
     {
       let eaAccountId: string | null = null;
       if (userId) {
         const [dbExisting] = await db.select().from(storedAccountsTable)
           .where(eq(storedAccountsTable.userId, userId)).limit(1);
         if (dbExisting) {
-          const sameLogin = dbExisting.mt5Login == null
-            || String(dbExisting.mt5Login).trim() === loginStr;
-          const sameServer = dbExisting.mt5Server == null
-            || normalizeServer(String(dbExisting.mt5Server)) === normalizeServer(serverStr);
-          if (sameLogin && sameServer) {
-            eaAccountId = dbExisting.accountId;
-            console.log(`[connect/ea] reusing existing accountId ${eaAccountId}`);
-          } else {
-            console.log(`[connect/ea] credentials changed — evicting ${dbExisting.accountId}`);
-            await db.delete(storedAccountsTable)
-              .where(eq(storedAccountsTable.accountId, dbExisting.accountId));
-            userAccountCache.delete(userId);
-          }
+          eaAccountId = dbExisting.accountId;
+          console.log(`[connect/ea] reusing existing accountId ${eaAccountId}`);
         }
       }
       if (!eaAccountId) {
@@ -5786,14 +5773,11 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       reregisterEaTerminalAccount(eaAccountId);
 
       const eaState = getEaState(eaAccountId);
-      const live = eaState != null
-        ? (Date.now() - eaState.receivedAt < EA_LIVENESS_MS || Date.now() - getLastEaPollAt(eaAccountId) < EA_LIVENESS_MS)
-        : (Date.now() - getLastEaPollAt(eaAccountId) < EA_LIVENESS_MS);
       return res.json({
-        status: live ? "connected" : "connecting",
+        status: "connected",
         accountId: eaAccountId,
         region,
-        ...(live && eaState ? {
+        ...(eaState ? {
           balance:    eaState.accountInfo.balance,
           equity:     eaState.accountInfo.equity,
           marginFree: eaState.accountInfo.marginFree,
