@@ -6,6 +6,21 @@ import type { LivePosition, PendingOrder, AccountInfo } from "../lib/execution/t
 
 const router = Router();
 
+// Diagnostic: last raw body received from /ea/state (cleared on read).
+let _lastRawBody: string | null = null;
+
+// GET /ea/last-raw — returns the last raw /ea/state body then clears it.
+// Temporary diagnostic endpoint; protected by X-Terminal-Token.
+router.get("/last-raw", (req: Request, res: Response) => {
+  const token = req.headers["x-terminal-token"];
+  if (token !== process.env["EA_TERMINAL_TOKEN"]) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const body = _lastRawBody;
+  _lastRawBody = null;
+  return res.json({ raw: body ?? "(no post received yet)" });
+});
+
 // Seed the shared token registry from env vars at startup.
 const _rawToken = process.env["EA_TERMINAL_TOKEN"];
 const _rawAccount = process.env["EA_TERMINAL_ACCOUNT"];
@@ -154,7 +169,8 @@ router.post("/state", async (req: Request, res: Response) => {
     terminalTime?: string;
   };
 
-  console.log(`[EA_STATE_RAW] ${JSON.stringify(req.body)}`);
+  _lastRawBody = JSON.stringify(req.body);
+  console.log(`[EA_STATE_RAW] ${_lastRawBody}`);
   console.log(`[EA_STATE_DBG] symbol=${body.price?.symbol ?? "(none)"} bid=${body.price?.bid ?? "(none)"} ask=${body.price?.ask ?? "(none)"}`);
 
   // Only track positions/orders opened by this EA (magic 770001).
