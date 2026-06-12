@@ -154,6 +154,7 @@ router.post("/state", async (req: Request, res: Response) => {
     terminalTime?: string;
   };
 
+  console.log(`[EA_STATE_RAW] ${JSON.stringify(req.body)}`);
   console.log(`[EA_STATE_DBG] symbol=${body.price?.symbol ?? "(none)"} bid=${body.price?.bid ?? "(none)"} ask=${body.price?.ask ?? "(none)"}`);
 
   // Only track positions/orders opened by this EA (magic 770001).
