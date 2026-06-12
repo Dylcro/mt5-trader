@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import { pool } from "@workspace/db";
-import { handleEaStateSnapshot } from "./mt5";
+import { handleEaStateSnapshot, broadcastToAccount } from "./mt5";
 import { setEaState, initTerminalToken, resolveTerminalToken, recordEaPoll } from "../lib/eaState";
 import type { LivePosition, PendingOrder, AccountInfo } from "../lib/execution/types";
 
@@ -191,6 +191,16 @@ router.post("/state", async (req: Request, res: Response) => {
 
   // Persist to in-memory cache (read by EaAdapter in commit 3).
   setEaState(accountId, positions, orders, accountInfo);
+
+  // Push live balance/equity to any open SSE streams so the app updates
+  // immediately instead of waiting for the 25 s heartbeat poll.
+  broadcastToAccount(accountId, "account_info", {
+    balance:    accountInfo.balance,
+    equity:     accountInfo.equity,
+    freeMargin: accountInfo.marginFree,
+    currency:   accountInfo.currency,
+    leverage:   accountInfo.leverage,
+  });
 
   // Feed through the existing zone-eval pipeline — same path as MetaApi streaming ticks.
   const price = (body.price?.bid != null && body.price?.ask != null)

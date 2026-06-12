@@ -682,7 +682,7 @@ async function positionAlreadyInZone(accountId: string, positionId: string): Pro
 // Entries are removed when the client disconnects (req.on("close")).
 const sseClients = new Map<string, Set<(payload: string) => void>>();
 
-function broadcastToAccount(accountId: string, event: string, data: unknown): void {
+export function broadcastToAccount(accountId: string, event: string, data: unknown): void {
   const clients = sseClients.get(accountId);
   if (!clients?.size) return;
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -5722,16 +5722,20 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       knownAccounts.set(existingId, { accountId: existingId, userId: userId ?? undefined, region });
       reregisterEaTerminalAccount(existingId);
       const eaState = getEaState(existingId);
+      const eaLive = eaState != null && (
+        Date.now() - eaState.receivedAt < EA_LIVENESS_MS ||
+        Date.now() - getLastEaPollAt(existingId) < EA_LIVENESS_MS
+      );
       return res.json({
         status: "connected",
         accountId: existingId,
         region,
-        ...(eaState ? {
-          balance:    eaState.accountInfo.balance,
-          equity:     eaState.accountInfo.equity,
-          marginFree: eaState.accountInfo.marginFree,
-          currency:   eaState.accountInfo.currency ?? "USD",
-          leverage:   eaState.accountInfo.leverage ?? 100,
+        ...(eaLive ? {
+          balance:    eaState!.accountInfo.balance,
+          equity:     eaState!.accountInfo.equity,
+          marginFree: eaState!.accountInfo.marginFree,
+          currency:   eaState!.accountInfo.currency ?? "USD",
+          leverage:   eaState!.accountInfo.leverage ?? 100,
         } : {}),
       });
     }
@@ -5774,16 +5778,20 @@ router.post("/mt5/connect", async (req: Request, res: Response) => {
       reregisterEaTerminalAccount(eaAccountId);
 
       const eaState = getEaState(eaAccountId);
+      const eaLive = eaState != null && (
+        Date.now() - eaState.receivedAt < EA_LIVENESS_MS ||
+        Date.now() - getLastEaPollAt(eaAccountId) < EA_LIVENESS_MS
+      );
       return res.json({
         status: "connected",
         accountId: eaAccountId,
         region,
-        ...(eaState ? {
-          balance:    eaState.accountInfo.balance,
-          equity:     eaState.accountInfo.equity,
-          marginFree: eaState.accountInfo.marginFree,
-          currency:   eaState.accountInfo.currency ?? "USD",
-          leverage:   eaState.accountInfo.leverage ?? 100,
+        ...(eaLive ? {
+          balance:    eaState!.accountInfo.balance,
+          equity:     eaState!.accountInfo.equity,
+          marginFree: eaState!.accountInfo.marginFree,
+          currency:   eaState!.accountInfo.currency ?? "USD",
+          leverage:   eaState!.accountInfo.leverage ?? 100,
         } : {}),
       });
     }

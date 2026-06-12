@@ -900,6 +900,19 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
                       sseHandlersRef.current.onZoneUpdate(data);
                     } else if (curEvent === "runner_alert") {
                       sseHandlersRef.current.onRunnerAlert(data);
+                    } else if (curEvent === "account_info") {
+                      const b = Number(data.balance);
+                      if (b > 0) {
+                        setAccountInfo((prev) => ({
+                          balance:    b,
+                          equity:     Number(data.equity ?? prev?.equity ?? 0),
+                          margin:     Number(prev?.margin ?? 0),
+                          freeMargin: Number(data.freeMargin ?? prev?.freeMargin ?? 0),
+                          currency:   String(data.currency ?? prev?.currency ?? "USD"),
+                          leverage:   Number(data.leverage ?? prev?.leverage ?? 100),
+                          name:       String(prev?.name ?? "Account"),
+                        }));
+                      }
                     }
                   } catch { /* ignore parse errors */ }
                   curEvent = "";
