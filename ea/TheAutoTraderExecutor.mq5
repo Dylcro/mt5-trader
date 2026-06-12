@@ -5,7 +5,7 @@
 //| No trading decisions — pure hands, not brains.                   |
 //+------------------------------------------------------------------+
 #property copyright "TheAutoTrader"
-#property version   "1.00"
+#property version   "1.10"
 #property description "EA Executor — polls backend, executes commands, pushes state."
 
 #include <Trade/Trade.mqh>
