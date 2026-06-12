@@ -494,6 +494,7 @@ bool PushState()
   {
    int code;
    HttpReq("POST", "/ea/state", BuildStateJson(), code);
+   Print("[executor] state POST code=", code);
    bool ok = (code >= 200 && code <= 299);
    if(ok)
      {
