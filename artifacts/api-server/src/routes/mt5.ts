@@ -225,7 +225,7 @@ const CASCADE_DEFAULTS: CascadeConfig = {
 // In-memory cache: accountId (or "" for global) → config.
 const cascadeConfigs = new Map<string, CascadeConfig>();
 
-function getCascadeConfig(accountId: string, userId?: string): CascadeConfig {
+export function getCascadeConfig(accountId: string, userId?: string): CascadeConfig {
   if (userId && cascadeConfigs.has(userId)) return cascadeConfigs.get(userId)!;
   return cascadeConfigs.get(accountId) ?? cascadeConfigs.get("") ?? { ...CASCADE_DEFAULTS };
 }
@@ -6082,7 +6082,7 @@ router.post("/mt5/account/:accountId/trade", checkOwner, async (req: Request, re
       const symbol   = String(body.symbol ?? "XAUUSD");
       const volume   = Number(body.volume ?? 0);
       const sl       = body.stopLoss   !== undefined ? Number(body.stopLoss)   : undefined;
-      const tp       = body.takeProfit !== undefined ? Number(body.takeProfit) : undefined;
+      const tp       = 0; // EA-managed TP — broker must never own the TP
       const openPx   = Number(body.openPrice ?? 0);
       const comment  = body.comment   !== undefined ? String(body.comment)    : undefined;
       let eaResult;

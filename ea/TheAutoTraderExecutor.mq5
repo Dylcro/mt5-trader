@@ -43,6 +43,196 @@ datetime g_last_nourl_warn  = 0;
 
 static const int BACKOFF_SECS[3] = {1, 2, 5};
 
+// ── EA-managed TP cascade ────────────────────────────────────────────────────
+#define PIP_SIZE       0.10      // XAUUSD: 1 pip = $0.10 price units
+#define MAX_POSITIONS  64
+
+struct TpConfig
+  {
+   int    tp1Pips;  int    tp1Pct;  bool tp1Enabled;
+   int    tp2Pips;  int    tp2Pct;  bool tp2Enabled;
+   int    tp3Pips;  int    tp3Pct;  bool tp3Enabled;
+   int    tp4Pips;  int    tp4Pct;  bool tp4Enabled;
+  };
+
+TpConfig g_tp_config;
+bool     g_tp_config_loaded = false;
+
+// Per-position state: keyed by ticket
+struct PosState
+  {
+   ulong  ticket;
+   double origVol;
+   int    tpFired; // bitmask: bit0=tp1 bit1=tp2 bit2=tp3 bit3=tp4
+  };
+
+PosState g_pos_state[MAX_POSITIONS];
+int      g_pos_state_count = 0;
+
+PosState *FindPosState(ulong ticket)
+  {
+   for(int i = 0; i < g_pos_state_count; i++)
+      if(g_pos_state[i].ticket == ticket) return &g_pos_state[i];
+   return NULL;
+  }
+
+PosState *GetOrCreatePosState(ulong ticket, double origVol)
+  {
+   PosState *p = FindPosState(ticket);
+   if(p != NULL) return p;
+   if(g_pos_state_count >= MAX_POSITIONS) return NULL;
+   g_pos_state[g_pos_state_count].ticket  = ticket;
+   g_pos_state[g_pos_state_count].origVol = origVol;
+   g_pos_state[g_pos_state_count].tpFired = 0;
+   return &g_pos_state[g_pos_state_count++];
+  }
+
+void PurgeStalePosStates()
+  {
+   int total = PositionsTotal();
+   int write = 0;
+   for(int i = 0; i < g_pos_state_count; i++)
+     {
+      bool live = false;
+      for(int j = 0; j < total; j++)
+        {
+         if(PositionGetTicket(j) == g_pos_state[i].ticket) { live = true; break; }
+        }
+      if(live) g_pos_state[write++] = g_pos_state[i];
+     }
+   g_pos_state_count = write;
+  }
+
+bool JBool(const string json, const string key, const bool def = false)
+  {
+   string pat = "\"" + key + "\"";
+   int p = StringFind(json, pat);
+   if(p < 0) return def;
+   p += StringLen(pat);
+   int len = StringLen(json);
+   while(p < len)
+     {
+      ushort c = StringGetCharacter(json, p);
+      if(c == ':' || c == ' ' || c == '\t') p++;
+      else break;
+     }
+   if(p >= len) return def;
+   return StringSubstr(json, p, 4) == "true";
+  }
+
+void ParseTpConfig(const string response)
+  {
+   string obj = JObj(response, "tpConfig");
+   if(StringLen(obj) == 0) return;
+   g_tp_config.tp1Pips    = (int)JNum(obj, "tp1Pips");
+   g_tp_config.tp1Pct     = (int)JNum(obj, "tp1Pct");
+   g_tp_config.tp1Enabled = JBool(obj, "tp1Enabled");
+   g_tp_config.tp2Pips    = (int)JNum(obj, "tp2Pips");
+   g_tp_config.tp2Pct     = (int)JNum(obj, "tp2Pct");
+   g_tp_config.tp2Enabled = JBool(obj, "tp2Enabled");
+   g_tp_config.tp3Pips    = (int)JNum(obj, "tp3Pips");
+   g_tp_config.tp3Pct     = (int)JNum(obj, "tp3Pct");
+   g_tp_config.tp3Enabled = JBool(obj, "tp3Enabled");
+   g_tp_config.tp4Pips    = (int)JNum(obj, "tp4Pips");
+   g_tp_config.tp4Pct     = (int)JNum(obj, "tp4Pct");
+   g_tp_config.tp4Enabled = JBool(obj, "tp4Enabled");
+   g_tp_config_loaded = true;
+  }
+
+// Normalise lots down to the broker's volume step (never round up — avoid over-close).
+double NormLots(const string symbol, double lots)
+  {
+   double step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0) step = 0.01;
+   double min  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   double norm = MathFloor(lots / step) * step;
+   return (norm < min) ? 0.0 : NormalizeDouble(norm, 2);
+  }
+
+// Determine the highest-numbered enabled TP level (1-4).
+int LastEnabledTp()
+  {
+   if(!g_tp_config_loaded) return 0;
+   if(g_tp_config.tp4Enabled && g_tp_config.tp4Pips > 0) return 4;
+   if(g_tp_config.tp3Enabled && g_tp_config.tp3Pips > 0) return 3;
+   if(g_tp_config.tp2Enabled && g_tp_config.tp2Pips > 0) return 2;
+   if(g_tp_config.tp1Enabled && g_tp_config.tp1Pips > 0) return 1;
+   return 0;
+  }
+
+void CheckTpFills()
+  {
+   if(!g_tp_config_loaded) return;
+   if(DryRun) return;
+
+   PurgeStalePosStates();
+
+   int lastTp = LastEnabledTp();
+   if(lastTp == 0) return;
+
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+
+      string sym    = PositionGetString(POSITION_SYMBOL);
+      long   ptype  = PositionGetInteger(POSITION_TYPE);
+      double entry  = PositionGetDouble(POSITION_PRICE_OPEN);
+      double curVol = PositionGetDouble(POSITION_VOLUME);
+      double sign   = (ptype == POSITION_TYPE_BUY) ? 1.0 : -1.0;
+
+      PosState *ps = GetOrCreatePosState(ticket, curVol);
+      if(ps == NULL) continue;
+
+      // TP levels ordered 1→4
+      int    pips[4]    = { g_tp_config.tp1Pips, g_tp_config.tp2Pips, g_tp_config.tp3Pips, g_tp_config.tp4Pips };
+      int    pcts[4]    = { g_tp_config.tp1Pct,  g_tp_config.tp2Pct,  g_tp_config.tp3Pct,  g_tp_config.tp4Pct  };
+      bool   enabled[4] = { g_tp_config.tp1Enabled, g_tp_config.tp2Enabled, g_tp_config.tp3Enabled, g_tp_config.tp4Enabled };
+
+      double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+      double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+      double cmp = (ptype == POSITION_TYPE_BUY) ? bid : ask;
+
+      for(int lvl = 0; lvl < 4; lvl++)
+        {
+         if(!enabled[lvl] || pips[lvl] <= 0) continue;
+         int bit = (1 << lvl);
+         if((ps.tpFired & bit) != 0) continue; // already fired
+
+         double tpPrice = entry + sign * pips[lvl] * PIP_SIZE;
+         bool   hit     = (ptype == POSITION_TYPE_BUY) ? (cmp >= tpPrice) : (cmp <= tpPrice);
+         if(!hit) continue;
+
+         // Re-read volume immediately before closing to avoid stale reads.
+         if(!PositionSelectByTicket(ticket)) break;
+         double liveVol = PositionGetDouble(POSITION_VOLUME);
+         if(liveVol < 0.01) break;
+
+         double closeLots;
+         if((lvl + 1) == lastTp)
+           {
+            closeLots = liveVol; // final active TP — close all remaining
+           }
+         else
+           {
+            closeLots = NormLots(sym, ps.origVol * pcts[lvl] / 100.0);
+            if(closeLots < 0.01 || closeLots > liveVol) closeLots = NormLots(sym, liveVol);
+           }
+
+         if(closeLots < 0.01) { ps.tpFired |= bit; continue; } // nothing left
+
+         g_trade.SetExpertMagicNumber((ulong)MagicNumber);
+         g_trade.SetTypeFilling(BestFilling(sym));
+         bool ok = g_trade.PositionClosePartial(ticket, closeLots);
+         ps.tpFired |= bit; // mark fired regardless — prevent double-close on next poll
+         Print("[executor] TP", (lvl + 1), " ticket=", ticket, " closeLots=", closeLots,
+               " ok=", ok, " retcode=", g_trade.ResultRetcode());
+        }
+     }
+  }
+
 //+------------------------------------------------------------------+
 //| JSON — escape a string value                                     |
 //+------------------------------------------------------------------+
@@ -845,6 +1035,9 @@ void OnTimer()
    OnHttpOk();
    g_url_ok = true;
 
+   // --- refresh TP config from every poll response ---
+   ParseTpConfig(response);
+
    // --- parse and execute commands ---
    string cmds[];
    int cmd_count = SplitCommands(response, cmds);
@@ -865,6 +1058,9 @@ void OnTimer()
       if(ExecuteCommand(cmd_id, cmd_type, payload))
          any_executed = true;
      }
+
+   // --- EA-managed TP exits ---
+   CheckTpFills();
 
    // --- push state on interval or immediately after execution ---
    bool state_due = ((TimeGMT() - g_last_state_push) * 1000 >= StateIntervalMs);

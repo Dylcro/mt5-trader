@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import { pool } from "@workspace/db";
-import { handleEaStateSnapshot, broadcastToAccount } from "./mt5";
+import { handleEaStateSnapshot, broadcastToAccount, getCascadeConfig } from "./mt5";
 import { setEaState, initTerminalToken, resolveTerminalToken, recordEaPoll } from "../lib/eaState";
 import type { LivePosition, PendingOrder, AccountInfo } from "../lib/execution/types";
 
@@ -66,7 +66,14 @@ router.get("/poll", async (req: Request, res: Response) => {
       console.log(`[ea] claimed command id=${row.id} type=${row.type} account=${accountId}`);
     }
     recordEaPoll(accountId);
-    res.json({ serverTime: new Date().toISOString(), commands: rows });
+    const cfg = getCascadeConfig(accountId);
+    const tpConfig = {
+      tp1Pips: cfg.tp1Pips, tp1Pct: cfg.tp1Pct, tp1Enabled: cfg.tp1Enabled,
+      tp2Pips: cfg.tp2Pips, tp2Pct: cfg.tp2Pct, tp2Enabled: cfg.tp2Enabled,
+      tp3Pips: cfg.tp3Pips, tp3Pct: cfg.tp3Pct, tp3Enabled: cfg.tp3Enabled,
+      tp4Pips: cfg.tp4Pips, tp4Pct: cfg.tp4Pct, tp4Enabled: cfg.tp4Enabled,
+    };
+    res.json({ serverTime: new Date().toISOString(), commands: rows, tpConfig });
   } catch (err) {
     console.error("[ea] poll error:", (err as Error).message);
     res.status(500).json({ error: "Internal error" });

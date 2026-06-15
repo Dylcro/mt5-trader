@@ -597,6 +597,21 @@ export default function SettingsScreen() {
             <SectionTitle title="STOP LOSS" />
             <View style={styles.settingRow}>
               <View style={styles.settingRowLeft}>
+                <Text style={styles.settingLabel}>SL distance</Text>
+                <Text style={styles.settingHint}>Pips from entry — applied on order placement</Text>
+              </View>
+              <Stepper
+                value={cs.slPips}
+                onChange={(v) => updateSettings({ slPips: v })}
+                step={5}
+                min={10}
+                max={500}
+                display={`${cs.slPips}p`}
+              />
+            </View>
+            <View style={styles.cascadeDivider} />
+            <View style={styles.settingRow}>
+              <View style={styles.settingRowLeft}>
                 <Text style={styles.settingLabel}>Move SL to BE at TP2</Text>
                 <Text style={styles.settingHint}>Protects remaining position automatically</Text>
               </View>
